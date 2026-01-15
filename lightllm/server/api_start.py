@@ -228,7 +228,7 @@ def normal_or_p_d_start(args):
 
     node_world_size = args.tp // args.nnodes
     can_use_ports = alloc_can_use_network_port(
-        num=8 + node_world_size + args.visual_dp * args.visual_tp, used_nccl_ports=already_uesd_ports
+        num=9 + node_world_size + args.visual_dp * args.visual_tp, used_nccl_ports=already_uesd_ports
     )
     logger.info(f"alloced ports: {can_use_ports}")
     (
@@ -240,8 +240,9 @@ def normal_or_p_d_start(args):
         cache_port,
         metric_port,
         multi_level_kv_cache_port,
-    ) = can_use_ports[0:8]
-    can_use_ports = can_use_ports[8:]
+        lora_port,
+    ) = can_use_ports[0:9]
+    can_use_ports = can_use_ports[9:]
 
     visual_model_tp_ports = []
     for _ in range(args.visual_dp):
@@ -258,6 +259,7 @@ def normal_or_p_d_start(args):
     args.cache_port = cache_port
     args.metric_port = metric_port
     args.multi_level_kv_cache_port = multi_level_kv_cache_port
+    args.lora_port = lora_port
 
     # 申请在 p d 分离模式下，会用的端口
     args.pd_node_infer_rpyc_ports = can_use_ports[0:node_world_size]

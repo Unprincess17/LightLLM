@@ -4,7 +4,7 @@ import torch.functional as F
 import torch.distributed as dist
 import numpy as np
 import triton
-from typing import Tuple
+from typing import Tuple, Optional, Any
 from lightllm.models.qwen3_moe.layer_weights.transformer_layer_weight import Qwen3MOETransformerLayerWeight
 from lightllm.models.llama.layer_infer.transformer_layer_infer import LlamaTransformerLayerInfer
 from lightllm.models.llama.infer_struct import LlamaInferStateInfo
@@ -33,6 +33,11 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
         self.head_dim_ = network_config["head_dim"]
         self.tp_k_head_num_ = max(self.tp_k_head_num_, 1)
         self.tp_v_head_num_ = max(self.tp_v_head_num_, 1)
+
+        # LoRA dispatcher for MoE (set externally for detached mode)
+        self.lora_dispatcher_: Optional[Any] = None
+        self.use_detached_lora_: bool = False
+
         return
 
     def _bind_func(self):
@@ -52,6 +57,21 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
         else:
             self._ffn = partial(LlamaTransformerLayerInfer._ffn, self)
             self._tpsp_ffn = self._tpsp_ffn_tp
+
+    def set_lora_dispatcher(self, dispatcher: Any, use_detached_lora: bool = True):
+        """Set the LoRA dispatcher for MoE layers.
+
+        Args:
+            dispatcher: LoRA dispatcher instance (Qwen3MOELoRADispatcher)
+            use_detached_lora: If True, LoRA runs in detached mode (parallel with base)
+        """
+        self.lora_dispatcher_ = dispatcher
+        self.use_detached_lora_ = use_detached_lora
+
+    def clear_lora_dispatcher(self):
+        """Clear the LoRA dispatcher."""
+        self.lora_dispatcher_ = None
+        self.use_detached_lora_ = False
 
     def _get_qkv(
         self,
@@ -134,6 +154,15 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
         hidden_states = input.view(-1, self.embed_dim_)
         num_tokens, hidden_dim = hidden_states.shape
         router_logits = layer_weight.moe_gate.mm(hidden_states)
+
+        # Apply moe_gate LoRA if using detached mode
+        # This modifies routing decisions
+        if self.use_detached_lora_ and self.lora_dispatcher_ is not None:
+            gate_lora = self.lora_dispatcher_.apply_moe_gate_lora(
+                hidden_states, layer_weight.layer_num_, infer_state
+            )
+            router_logits = router_logits + gate_lora
+
         layer_weight.experts.experts(
             hidden_states,
             router_logits=router_logits,
@@ -143,6 +172,14 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
             topk_group=None,
             num_expert_group=None,
         )
+
+        # Apply w2 LoRA to final output (applied after moe_sum_reduce)
+        if self.use_detached_lora_ and self.lora_dispatcher_ is not None:
+            w2_lora = self.lora_dispatcher_.apply_w2_lora(
+                hidden_states, layer_weight.layer_num_, infer_state
+            )
+            hidden_states = hidden_states + w2_lora
+
         return hidden_states.view(num_tokens, hidden_dim)
 
     def _moe_ffn_edp(
@@ -153,6 +190,14 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
         token_num, hidden_dim = hidden_states.shape
 
         router_logits = layer_weight.moe_gate.mm(hidden_states)
+
+        # Apply moe_gate LoRA if using detached mode
+        if self.use_detached_lora_ and self.lora_dispatcher_ is not None:
+            gate_lora = self.lora_dispatcher_.apply_moe_gate_lora(
+                hidden_states, layer_weight.layer_num_, infer_state
+            )
+            router_logits = router_logits + gate_lora
+
         ep_output = layer_weight.experts.experts(
             hidden_states,
             router_logits=router_logits,
@@ -163,6 +208,13 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
             num_expert_group=None,
             is_prefill=infer_state.is_prefill,
         )
+
+        # Apply w2 LoRA to final output
+        if self.use_detached_lora_ and self.lora_dispatcher_ is not None:
+            w2_lora = self.lora_dispatcher_.apply_w2_lora(
+                ep_output, layer_weight.layer_num_, infer_state
+            )
+            ep_output = ep_output + w2_lora
 
         ep_output = ep_output.view(token_num, hidden_dim)
         return ep_output

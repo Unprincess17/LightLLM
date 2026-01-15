@@ -63,6 +63,24 @@ class ChunkedPrefillBackend(ModeBackend):
 
                 self._try_read_new_reqs()
 
+                # =================================================================
+                # S-LoRA Batched LoRA Mode
+                # Always use batched mode to support multiple adapters in a single batch
+                # =================================================================
+                if getattr(self, 'lora_support', False) and getattr(self, 'use_batched_lora_mode', False):
+                    current_reqs = list(g_infer_context.requests_mapping.values())
+                    if current_reqs:
+                        # Create a Batch object for batched LoRA
+                        from lightllm.server.router.model_infer.infer_batch import Batch
+                        batch = Batch(current_reqs)
+                        if batch.has_lora_adapters():
+                            req_bins = self._prepare_batched_lora_for_batch(batch)
+                            # Set LoRA enabled on all layers
+                            for layer_infer in self.model.layers_infer:
+                                layer_infer.use_detached_lora_ = True
+                                layer_infer.set_req_bins(req_bins)
+                # =================================================================
+
                 prefill_reqs, decode_reqs = self._get_classed_reqs(
                     no_decode=self.classed_req_no_decode,
                     strict_prefill=self.classed_req_strict_prefill,

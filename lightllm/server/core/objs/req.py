@@ -122,6 +122,8 @@ class Req(ctypes.Structure):
         ("cpu_cache_match_page_indexes", CpuCachePageList),
         # 分块hash的块大小
         ("cpu_cache_token_page_size", ctypes.c_int),
+        # adapter_id for LoRA adapter selection (stored as string pointer)
+        ("adapter_id", ctypes.c_int64),  # 0 means no adapter, >0 means adapter ID
     ]
 
     def get_str(self):
@@ -139,6 +141,7 @@ class Req(ctypes.Structure):
         sample_param: Union[dict, SamplingParams],
         tokenizer: Any,
         chunked_prefill_size: int = 0,
+        adapter_id: int = 0,
     ):
         # 只是为了有更好的编码辅助类型提示
         self.index_in_shm_mem: int = self.index_in_shm_mem
@@ -185,6 +188,9 @@ class Req(ctypes.Structure):
         self.cpu_cache_token_page_size = get_env_start_args().cpu_cache_token_page_size
         if get_env_start_args().enable_cpu_cache:
             self._fill_input_token_hash()
+
+        # Initialize LoRA adapter ID (0 means no adapter)
+        self.adapter_id = adapter_id
         return
 
     def post_init(self):
@@ -240,9 +246,10 @@ class Req(ctypes.Structure):
                 self.index_in_shm_mem,
                 self.multimodal_params,
                 self.sample_params.suggested_dp_index,
+                self.adapter_id,  # LoRA adapter ID for detached serving
             )
         else:
-            return (self.request_id, self.index_in_shm_mem, None, self.sample_params.suggested_dp_index)
+            return (self.request_id, self.index_in_shm_mem, None, self.sample_params.suggested_dp_index, self.adapter_id)
 
     def can_release(self):
         # 只有管理节点有一个引用

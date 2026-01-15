@@ -192,8 +192,11 @@ async def chat_completions_impl(request: ChatCompletionRequest, raw_request: Req
     sampling_params.verify()
     multimodal_params = MultimodalParams(**multimodal_params_dict)
 
+    # Extract adapters from request
+    adapters = request.adapters
+
     results_generator = g_objs.httpserver_manager.generate(
-        prompt, sampling_params, multimodal_params, request=raw_request
+        prompt, sampling_params, multimodal_params, request=raw_request, adapters=adapters
     )
 
     # Non-streaming case

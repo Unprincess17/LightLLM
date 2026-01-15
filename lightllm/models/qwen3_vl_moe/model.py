@@ -1,5 +1,6 @@
 import os
 import json
+from typing import Optional, Any
 from lightllm.common.build_utils import repair_config
 from lightllm.models.registry import ModelRegistry
 from lightllm.models.qwen3_moe.model import Qwen3MOEModel
@@ -22,6 +23,11 @@ class Qwen3VLMOETpPartModel(Qwen3MOEModel):
     infer_state_class = Qwen3VLInferStateInfo
 
     def __init__(self, kvargs):
+        # Check if LoRA is configured
+        lora_dirs = kvargs.get("lora_dirs") or kvargs.get("lora_dir")
+        # base_backend.py will handle LoRA adapter initialization
+        self.lora_support = lora_dirs is not None
+
         super().__init__(kvargs)
         return
 
@@ -32,6 +38,13 @@ class Qwen3VLMOETpPartModel(Qwen3MOEModel):
         with open(os.path.join(self.weight_dir_, "config.json"), "r") as json_file:
             all_config = json.load(json_file)
             self.config = all_config["text_config"]
+
+        # Add LoRA configuration from the main config or set defaults
+        if "lora_rank" in all_config:
+            self.config["lora_rank"] = all_config["lora_rank"]
+        if "lora_alpha" in all_config:
+            self.config["lora_alpha"] = all_config["lora_alpha"]
+
         # rename keys
         repair_config(self.config, same_names=["num_attention_heads", "n_head"])
         repair_config(self.config, same_names=["hidden_size", "n_embd", "n_embed"])

@@ -4,7 +4,7 @@ import torch
 import time
 import threading
 import torch.distributed as dist
-from typing import List, Tuple, Callable, Optional
+from typing import List, Tuple, Callable, Optional, Dict, Set
 from transformers.configuration_utils import PretrainedConfig
 from lightllm.utils.infer_utils import set_random_seed
 from lightllm.utils.log_utils import init_logger
@@ -41,7 +41,8 @@ from lightllm.server.pd_io_struct import NIXLChunckedTransTaskRet
 from .multi_level_kv_cache import MultiLevelKvCacheModule
 from lightllm.server.embed_cache.embed_cache_client import CpuEmbedCacheClient
 
-
+import sys
+print(f"DEBUG: Loading base_backend from {__file__}", file=sys.stderr)
 class ModeBackend:
     def __init__(self) -> None:
         self.shm_req_manager = ShmReqManager()
@@ -163,10 +164,25 @@ class ModeBackend:
             "quant_cfg": kvargs.get("quant_cfg", None),
             "run_mode": self.run_mode,
             "wait_events": wait_events,
+            # LoRA configuration for detached serving
+            "lora_dir": kvargs.get("lora_dir", None),
+            "lora_max_size": kvargs.get("lora_max_size", 1024),
+            "lora_adapter_id": kvargs.get("lora_adapter_id", "default"),
+            "lora_port": kvargs.get("lora_port", None),
         }
         self.model, self.is_multimodal = get_model(model_cfg, model_kvargs)
         self.model: TpPartBaseModel = self.model  # for easy typing
         set_random_seed(2147483647)
+
+        # Initialize LoRA adapters for S-LoRA batched mode
+        lora_dir = kvargs.get("lora_dir")
+        if lora_dir:
+            # Use batched mode for S-LoRA
+            self.use_batched_lora_mode = True
+            lora_adapter_dirs = {1: lora_dir}  # adapter_id -> directory mapping
+            self._import_lora_modules(compute_on_cpu=False)
+            self.init_batched_lora_adapters(lora_adapter_dirs)
+
         self.radix_cache = (
             RadixCache(
                 get_unique_server_name(),
@@ -862,3 +878,319 @@ class ModeBackend:
         else:
             self.is_master_in_node = False
         return
+
+    # =========================================================================
+    # S-LoRA Batched LoRA Mode Support
+    # =========================================================================
+    # _import_lora_modules is called from init_model() to set up LoRA functions
+    # for S-LoRA batched mode
+
+    def _import_lora_modules(self, compute_on_cpu: bool):
+        """Import LoRA modules based on model type."""
+        self.lora_support = False
+        self._compute_on_cpu = compute_on_cpu
+
+        model_module = getattr(self.model, '__module__', '')
+
+        # Define module import paths for different model types
+        lora_imports = [
+            ('qwen3_vl_moe',
+             'lightllm.models.qwen3_vl_moe.lora_dispatch',
+             'load_lora_adapter', 'create_vl_moe_lora_dispatcher'),
+            ('qwen3_vl',
+             'lightllm.models.qwen3_vl.lora_dispatch',
+             'load_lora_adapter', 'create_lora_dispatcher'),
+        ]
+
+        for model_pattern, module_path, load_fn_name, create_fn_name in lora_imports:
+            if model_pattern in model_module:
+                try:
+                    module = __import__(module_path, fromlist=[load_fn_name, create_fn_name])
+                    setattr(self, '_load_lora_adapter_fn', getattr(module, load_fn_name))
+                    setattr(self, '_create_lora_dispatcher_fn', getattr(module, create_fn_name))
+                    self.lora_support = True
+                    self.logger.info(f"Using {model_pattern} LoRA modules")
+                    return
+                except (ImportError, AttributeError) as e:
+                    self.logger.warning(f"Failed to import {model_pattern} LoRA modules: {e}")
+                    continue
+
+        # Fallback to default qwen3_vl modules
+        try:
+            from lightllm.models.qwen3_vl.layer_weights.lora_layer_weight import load_lora_adapter
+            from lightllm.models.qwen3_vl.lora_dispatch import create_lora_dispatcher
+            self._load_lora_adapter_fn = load_lora_adapter
+            self._create_lora_dispatcher_fn = create_lora_dispatcher
+            self.lora_support = True
+            self.logger.info("Using default qwen3_vl LoRA modules (fallback)")
+        except ImportError:
+            self.lora_support = False
+            self.logger.warning("LoRA modules not available, detached LoRA serving disabled")  # 0 means no adapter
+
+    # =====================================================================
+    # S-LoRA Batched LoRA Mode Support
+    # =====================================================================
+
+    def init_batched_lora_adapters(self, lora_adapter_dirs: Dict[str, str]):
+        """
+        Initialize LoRA adapters for S-LoRA batched mode.
+
+        In batched mode, all adapters are pre-loaded into a memory pool,
+        and req_bins tracks which adapter each request uses.
+
+        Args:
+            lora_adapter_dirs: Dict mapping adapter_id -> adapter_dir
+        """
+        if not lora_adapter_dirs:
+            return
+
+        self.lora_support = True
+        self.lora_adapter_dirs = lora_adapter_dirs
+        self.use_batched_lora_mode = True
+
+        self.logger.info(f"[LoRA Backend] Initializing batched LoRA mode with {len(lora_adapter_dirs)} adapters")
+
+        # Create LoRA memory pool
+        try:
+            from lightllm.server.lora import create_lora_mem_pool
+
+            config = self.model.config
+            num_layers = config["num_hidden_layers"]
+            num_heads = config.get("num_attention_heads", 32)
+            head_dim = config.get("head_dim", 128)
+            intermediate_dim = config.get("intermediate_size", 512)
+            hidden_size = config["hidden_size"]
+            vocab_size = config.get("vocab_size", 151936)
+            max_rank = 64  # Can be configured
+
+            self.logger.info(f"[LoRA Backend] Config values: hidden_size={hidden_size}, intermediate_dim={intermediate_dim}, num_heads={num_heads}, head_dim={head_dim}")
+
+            self.lora_mem_pool = create_lora_mem_pool(
+                num_layers=num_layers,
+                pool_size=1024,  # Can hold 1024 adapters
+                max_rank=max_rank,
+                num_heads=num_heads,
+                head_dim=head_dim,
+                intermediate_dim=intermediate_dim,
+                hidden_size=hidden_size,
+                vocab_size=vocab_size,
+                dtype=torch.float16,
+                device="cuda"
+            )
+
+            self.logger.info(f"[LoRA Backend] Created LoRA memory pool for {num_layers} layers, max_rank={max_rank}")
+
+        except ImportError as e:
+            self.logger.error(f"[LoRA Backend] Failed to import LoRA memory pool: {e}")
+            self.use_batched_lora_mode = False
+            return
+
+        # Load adapters into memory pool
+        from lightllm.server.lora import LoRATargetType
+
+        for adapter_id, adapter_dir in lora_adapter_dirs.items():
+            try:
+                # Load adapter using the model's LoRA loading function
+                adapter = self._load_lora_adapter_fn(
+                    adapter_dir=adapter_dir,
+                    network_config=self.model.config,
+                    data_type=self.model.data_type,
+                    device="cuda",
+                    swap=False
+                )
+
+                # Convert adapter weights to memory pool format
+                # Format: {layer_id: {target_type: {module_name: {"A": tensor, "B": tensor}}}}
+                rank = adapter.lora_alpha  # Use alpha as rank (or can use specific rank)
+                scaling = 1.0  # Will be set per adapter
+
+                layer_weights = {}
+                for layer_id in range(adapter.num_layers):
+                    weights = adapter.get_layer_weights(layer_id)
+                    if not weights:
+                        continue
+
+                    # Convert to target_type format
+                    target_map = {}
+                    for attr, tensor in weights.items():
+                        # Parse attr like "gate_proj_A" -> "gate_proj" + "_A"
+                        if attr.endswith("_A"):
+                            module_name = attr[:-2]  # "gate_proj"
+                            weight_type = "A"
+                        elif attr.endswith("_B"):
+                            module_name = attr[:-2]  # "gate_proj"
+                            weight_type = "B"
+                        else:
+                            continue
+
+                        # Map module_name to target_type
+                        if module_name == "q_proj":
+                            target_type = LoRATargetType.ATTN_Q_PROJ
+                        elif module_name == "k_proj":
+                            target_type = LoRATargetType.ATTN_K_PROJ
+                        elif module_name == "v_proj":
+                            target_type = LoRATargetType.ATTN_V_PROJ
+                        elif module_name == "o_proj":
+                            target_type = LoRATargetType.ATTN_O_PROJ
+                        elif module_name == "gate_proj":
+                            target_type = LoRATargetType.MOE_GATE_PROJ
+                        elif module_name == "up_proj":
+                            target_type = LoRATargetType.MOE_UP_PROJ
+                        elif module_name == "down_proj":
+                            target_type = LoRATargetType.MOE_DOWN_PROJ
+                        else:
+                            continue
+
+                        if target_type not in target_map:
+                            target_map[target_type] = {}
+                        target_map[target_type][module_name] = {
+                            "A": tensor if weight_type == "A" else None,
+                            "B": tensor if weight_type == "B" else None,
+                        }
+
+                    if target_map:
+                        layer_weights[layer_id] = target_map
+
+                # Load into memory pool
+                self.lora_mem_pool.load_adapter(
+                    adapter_dir=adapter_dir,
+                    rank=rank,
+                    scaling=scaling,
+                    layer_weights=layer_weights
+                )
+                self.logger.info(f"[LoRA Backend] Loaded adapter {adapter_id} from {adapter_dir}")
+
+            except Exception as e:
+                self.logger.error(f"[LoRA Backend] Failed to load adapter {adapter_id} from {adapter_dir}: {e}")
+                import traceback
+                traceback.print_exc()
+
+        # Create dispatcher for each layer
+        self.lora_dispatchers = []
+
+        # Use max rank from registered adapters for buffer allocation
+        # Actual weights come from memory pool per adapter, with each adapter
+        # using its own rank (adapter.r) as tracked by a_len in the pool
+        max_rank = 64  # default
+        if hasattr(self, 'lora_manager') and self.lora_manager is not None:
+            adapters_list = self.lora_manager.list_adapters()
+            for adapter_info in adapters_list:
+                rank = adapter_info.get("lora_rank", 0)
+                if rank and rank > max_rank:
+                    max_rank = rank
+
+        num_layers = self.model.config.get("num_hidden_layers", self.model.layers_num)
+        for layer_id in range(num_layers):
+            dispatcher = self._create_lora_dispatcher_fn(
+                num_layers=1,  # Single layer dispatcher
+                lora_rank=max_rank,
+                lora_alpha=1.0,  # scaling handled separately via a_scaling in pool
+                compute_on_cpu=getattr(self, '_compute_on_cpu', False)
+            )
+            self.lora_dispatchers.append(dispatcher)
+
+        self.logger.info(f"[LoRA Backend] Created {len(self.lora_dispatchers)} LoRA dispatchers for batched mode")
+
+        # Pass dispatchers to layer inference objects for batched S-LoRA mode
+        # Each layer has its own dispatcher in self.lora_dispatchers
+        if hasattr(self.model, 'set_lora_dispatcher'):
+            for layer_id, dispatcher in enumerate(self.lora_dispatchers):
+                if layer_id < len(self.model.layers_infer):
+                    self.model.layers_infer[layer_id].set_lora_dispatcher(dispatcher, use_detached_lora=True)
+            self.logger.info(f"[LoRA Backend] Set {len(self.lora_dispatchers)} LoRA dispatchers on layers")
+
+    def _prepare_batched_lora_for_batch(self, batch) -> torch.Tensor:
+        """
+        Prepare LoRA for a batch of requests.
+
+        Args:
+            batch: Batch object containing requests
+
+        Returns:
+            req_bins tensor mapping request index -> adapter index
+
+        Debug:
+            Logs batch adapter distribution and req_bins configuration
+        """
+        if not self.use_batched_lora_mode:
+            return None
+
+        # Get adapter IDs for all requests
+        adapter_ids = [req.adapter_id for req in batch.reqs]
+
+        # Build adapter order (unique adapter IDs in order of appearance)
+        seen = set()
+        adapter_order = []
+        for aid in adapter_ids:
+            if aid not in seen:
+                seen.add(aid)
+                adapter_order.append(aid)
+
+        self.logger.info(f"[LoRA Backend] Preparing batch: batch_size={len(batch.reqs)}, adapters={adapter_order}")
+
+        # Create req_bins tensor
+        req_bins = batch.get_req_bins(adapter_order)
+
+        self.logger.debug(f"[LoRA Backend]   req_bins={req_bins.tolist()}")
+
+        # Initialize batched mode for all dispatchers
+        for dispatcher in self.lora_dispatchers:
+            dispatcher.init_batched_mode(self.lora_mem_pool, req_bins)
+
+        # Set req_bins on all layer inference objects
+        for layer_infer in self.model.layers_infer:
+            if hasattr(layer_infer, 'set_req_bins'):
+                layer_infer.set_req_bins(req_bins)
+
+        self.logger.debug(f"[LoRA Backend]   Batched mode enabled for {len(self.lora_dispatchers)} dispatchers")
+        return req_bins
+
+    def _get_batch_adapter_status(self, reqs: list) -> Tuple[bool, bool]:
+        """
+        Analyze a batch of requests for adapter usage.
+
+        Returns:
+            Tuple of (has_any_adapter, has_mixed_adapters)
+        """
+        if not reqs:
+            return False, False
+
+        adapter_ids = set()
+        has_adapter = False
+
+        for req in reqs:
+            if hasattr(req, 'adapter_id') and req.adapter_id is not None:
+                has_adapter = True
+                adapter_ids.add(req.adapter_id)
+
+        return has_adapter, len(adapter_ids) > 1
+
+    def _run_batch_with_batched_lora(self, batch):
+        """
+        Run inference on a batch with S-LoRA batched LoRA mode.
+
+        This is the main entry point for batched LoRA inference.
+        """
+        # Prepare batched LoRA
+        req_bins = self._prepare_batched_lora_for_batch(batch)
+
+        # Set LoRA enabled on all layers
+        for layer_infer in self.model.layers_infer:
+            layer_infer.use_detached_lora_ = True
+
+        # Run the actual inference
+        # The actual inference logic is in the subclass implementations
+        # (prefill_batch / decode_batch methods)
+
+        return req_bins
+
+    def cleanup_batched_lora(self):
+        """Clean up batched LoRA resources."""
+        if hasattr(self, 'lora_mem_pool') and self.lora_mem_pool is not None:
+            # Unload all adapters
+            for adapter_dir in list(self.lora_mem_pool.adapter_dirs):
+                self.lora_mem_pool.unload_adapter(adapter_dir)
+
+        self.lora_mem_pool = None
+        self.lora_dispatchers = []
+

@@ -88,6 +88,51 @@ def make_argument_parser() -> argparse.ArgumentParser:
         default=None,
         help="the model weight dir path, the app will load config, weights and tokenizer from this dir",
     )
+
+    # =========================================================================
+    # LoRA Arguments for Detached Serving
+    # =========================================================================
+    parser.add_argument(
+        "--lora_dir",
+        type=str,
+        default=None,
+        help="""Path to LoRA adapter directory for detached LoRA serving.
+        When specified, LoRA weights are loaded separately from base model weights
+        and can be dynamically switched per request.""",
+    )
+    parser.add_argument(
+        "--lora_max_size",
+        type=int,
+        default=1024,
+        help="Maximum number of LoRA adapters to keep in memory (default: 1024)",
+    )
+    parser.add_argument(
+        "--lora_adapter_id",
+        type=str,
+        default="default",
+        help="Default adapter ID to use when server starts with LoRA (default: 'default')",
+    )
+    parser.add_argument(
+        "--lora_rank",
+        type=int,
+        default=16,
+        help="LoRA rank for the adapter (default: 16). Used for initializing LoRA weights.",
+    )
+    parser.add_argument(
+        "--lora_alpha",
+        type=float,
+        default=16.0,
+        help="LoRA alpha scaling factor (default: 16.0).",
+    )
+    parser.add_argument(
+        "--compute_on_cpu",
+        action="store_true",
+        help="""Compute LoRA on CPU instead of GPU.
+        When enabled, LoRA weights stay on CPU and computation happens on CPU.
+        This reduces GPU memory usage at the cost of performance.
+        Useful for running with limited GPU memory or large LoRA ranks.""",
+    )
+
     parser.add_argument(
         "--tokenizer_mode",
         type=str,

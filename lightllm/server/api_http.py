@@ -362,3 +362,119 @@ async def startup_event():
     loop.create_task(g_objs.httpserver_manager.handle_loop())
     logger.info(f"server start up ok, loop use is {asyncio.get_event_loop()}")
     return
+
+
+# ============================================================================
+# LoRA Adapter API Endpoints
+# ============================================================================
+
+@app.get("/v1/lora/adapters", summary="List available LoRA adapters")
+async def list_lora_adapters():
+    """List all registered LoRA adapters."""
+    import zmq
+    try:
+        # Forward request to router process via ZMQ
+        lora_req_socket = g_objs.httpserver_manager.lora_req_socket
+        await lora_req_socket.send_pyobj({"action": "list"})
+        response = await lora_req_socket.recv_pyobj()
+
+        # Handle the response format from router
+        if "adapters" in response:
+            return JSONResponse(response, status_code=200)
+        else:
+            # Fallback if LoRA not enabled
+            return JSONResponse({
+                "adapters": response.get("adapters", []),
+                "count": response.get("count", 0),
+                "message": response.get("message", "")
+            }, status_code=200)
+    except zmq.ZMQError as e:
+        logger.error(f"ZMQ error communicating with router: {e}")
+        return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e))
+    except Exception as e:
+        logger.error(f"Failed to list LoRA adapters: {e}")
+        return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e))
+
+
+@app.post("/v1/lora/adapters", summary="Register a new LoRA adapter")
+async def register_lora_adapter(request: Request):
+    """Register a new LoRA adapter directory.
+
+    Request body:
+    {
+        "adapter_id": "my_adapter",
+        "adapter_dir": "/path/to/adapter"
+    }
+    """
+    import zmq
+    try:
+        request_dict = await request.json()
+        adapter_id = request_dict.get("adapter_id", "default")
+        adapter_dir = request_dict.get("adapter_dir")
+
+        if not adapter_dir:
+            return create_error_response(HTTPStatus.BAD_REQUEST, "adapter_dir is required")
+
+        # Forward request to router process via ZMQ
+        lora_req_socket = g_objs.httpserver_manager.lora_req_socket
+        await lora_req_socket.send_pyobj({
+            "action": "register",
+            "adapter_id": adapter_id,
+            "adapter_dir": adapter_dir
+        })
+        response = await lora_req_socket.recv_pyobj()
+
+        if "error" in response:
+            return create_error_response(HTTPStatus.BAD_REQUEST, response["error"])
+
+        return JSONResponse(response, status_code=201)
+    except zmq.ZMQError as e:
+        logger.error(f"ZMQ error communicating with router: {e}")
+        return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e))
+    except Exception as e:
+        logger.error(f"Failed to register LoRA adapter: {e}")
+        return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e))
+
+
+@app.get("/v1/lora/adapters/{adapter_id}", summary="Get LoRA adapter info")
+async def get_lora_adapter(adapter_id: str):
+    """Get information about a specific LoRA adapter."""
+    import zmq
+    try:
+        # Forward request to router process via ZMQ
+        lora_req_socket = g_objs.httpserver_manager.lora_req_socket
+        await lora_req_socket.send_pyobj({"action": "get", "adapter_id": adapter_id})
+        response = await lora_req_socket.recv_pyobj()
+
+        if "error" in response:
+            return create_error_response(HTTPStatus.NOT_FOUND, response["error"])
+
+        return JSONResponse(response, status_code=200)
+    except zmq.ZMQError as e:
+        logger.error(f"ZMQ error communicating with router: {e}")
+        return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e))
+    except Exception as e:
+        logger.error(f"Failed to get LoRA adapter: {e}")
+        return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e))
+
+
+@app.delete("/v1/lora/adapters/{adapter_id}", summary="Unload a LoRA adapter")
+async def unload_lora_adapter(adapter_id: str):
+    """Unload a LoRA adapter from memory."""
+    import zmq
+    try:
+        # Forward request to router process via ZMQ
+        lora_req_socket = g_objs.httpserver_manager.lora_req_socket
+        await lora_req_socket.send_pyobj({"action": "unload", "adapter_id": adapter_id})
+        response = await lora_req_socket.recv_pyobj()
+
+        if "error" in response:
+            return create_error_response(HTTPStatus.NOT_FOUND, response["error"])
+
+        return JSONResponse(response, status_code=200)
+    except zmq.ZMQError as e:
+        logger.error(f"ZMQ error communicating with router: {e}")
+        return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e))
+    except Exception as e:
+        logger.error(f"Failed to unload LoRA adapter: {e}")
+        return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e))

@@ -83,6 +83,15 @@ class RouterManager:
         self.send_to_detokenization = context.socket(zmq.PUSH)
         self.send_to_detokenization.connect(f"{args.zmq_mode}127.0.0.1:{args.detokenization_port}")
 
+        # LoRA serving: ZMQ socket for HTTP server to query adapter info
+        self.lora_zmq_context = zmq.asyncio.Context(1)
+        self.lora_rep_socket = self.lora_zmq_context.socket(zmq.REP)
+        self.lora_rep_socket.bind(f"tcp://127.0.0.1:{args.lora_port}")
+
+        # ZMQ socket for model to register adapters with router
+        self.lora_model_socket = self.lora_zmq_context.socket(zmq.PULL)
+        self.lora_model_socket.bind(f"tcp://127.0.0.1:{args.lora_port + 1}")
+
         if self.is_multinode_tp:
             self.mulitnode_group = dist.init_process_group(
                 backend="gloo",
@@ -106,6 +115,12 @@ class RouterManager:
             if not self.args.enable_cpu_cache
             else CpuKvCacheClient(only_create_meta_data=True, init_shm_data=False)
         )
+
+        # Initialize LoRA manager in router process (for handling API requests)
+        if args.lora_dir is not None:
+            from lightllm.server.lora.manager import init_lora_manager
+            init_lora_manager(max_adapters=args.lora_max_size if hasattr(args, 'lora_max_size') else 1024)
+            logger.info("Initialized LoRA manager in router process")
         return
 
     async def wait_to_model_ready(self):
@@ -178,6 +193,12 @@ class RouterManager:
             "quant_type": self.args.quant_type,
             "quant_cfg": self.args.quant_cfg,
             "pd_rpyc_ports": self.args.pd_node_infer_rpyc_ports,  # 非 pd 模式可以不设置
+            # LoRA configuration for detached serving
+            "lora_dir": self.args.lora_dir,
+            "lora_max_size": self.args.lora_max_size,
+            "lora_adapter_id": self.args.lora_adapter_id,
+            "lora_port": self.args.lora_port,
+            "compute_on_cpu": self.args.compute_on_cpu,
         }
 
         await self.model_rpc_client.init_model(kvargs=kvargs)
@@ -287,10 +308,145 @@ class RouterManager:
 
             await asyncio.sleep(self._get_schedule_time_interval())
 
+    async def _handle_lora_requests(self):
+        """Handle LoRA adapter info requests from HTTP server."""
+        try:
+            # Try non-blocking receive
+            try:
+                request = await asyncio.wait_for(
+                    self.lora_rep_socket.recv_pyobj(),
+                    timeout=0.001  # Very short timeout for non-blocking behavior
+                )
+            except asyncio.TimeoutError:
+                # No pending request
+                return
+
+            logger.info(f"[LoRA] Received request: {request}")
+
+            # Import here to avoid circular imports
+            from lightllm.server.lora.manager import get_lora_manager
+
+            lora_manager = get_lora_manager()
+            logger.debug(f"[LoRA] lora_manager id={id(lora_manager) if lora_manager else 'None'}, _adapter_info keys={list(lora_manager._adapter_info.keys()) if lora_manager else 'None'}")
+
+            action = request.get("action", "list")
+
+            if action == "list":
+                lora_manager = get_lora_manager()
+                if lora_manager is None:
+                    response = {"adapters": [], "count": 0, "message": "LoRA not enabled"}
+                else:
+                    adapters = lora_manager.list_adapters()
+                    response = {"adapters": adapters, "count": len(adapters)}
+            elif action == "get":
+                adapter_id = request.get("adapter_id")
+                lora_manager = get_lora_manager()
+                if lora_manager is None:
+                    response = {"error": "LoRA not enabled"}
+                elif adapter_id not in lora_manager._adapter_info:
+                    response = {"error": f"Adapter {adapter_id} not found"}
+                else:
+                    info = lora_manager._adapter_info[adapter_id]
+                    response = {
+                        "adapter_id": info.adapter_id,
+                        "adapter_dir": info.adapter_dir,
+                        "lora_rank": info.lora_rank,
+                        "lora_alpha": info.lora_alpha,
+                        "num_layers": info.num_layers,
+                        "is_on_gpu": info.is_on_gpu,
+                        "is_loaded": lora_manager.is_adapter_loaded(adapter_id)
+                    }
+            elif action == "register":
+                adapter_id = request.get("adapter_id", "default")
+                adapter_dir = request.get("adapter_dir")
+                lora_manager = get_lora_manager()
+                if lora_manager is None:
+                    response = {"error": "LoRA not enabled"}
+                else:
+                    info = lora_manager.register_lora_dir(adapter_dir, adapter_id)
+                    response = {
+                        "message": f"Adapter {adapter_id} registered",
+                        "adapter_id": info.adapter_id,
+                        "adapter_dir": info.adapter_dir
+                    }
+            elif action == "unload":
+                adapter_id = request.get("adapter_id")
+                lora_manager = get_lora_manager()
+                if lora_manager is None:
+                    response = {"error": "LoRA not enabled"}
+                elif adapter_id not in lora_manager._adapter_info:
+                    response = {"error": f"Adapter {adapter_id} not found"}
+                else:
+                    # If adapter is active, clear it
+                    if lora_manager._active_adapter_id == adapter_id:
+                        lora_manager.clear_active_adapter()
+                    # Evict from memory if loaded
+                    if adapter_id in lora_manager._adapters:
+                        lora_manager._evict_adapter(adapter_id)
+                    response = {"message": f"Adapter {adapter_id} unloaded successfully"}
+            else:
+                response = {"error": f"Unknown action: {action}"}
+
+            await self.lora_rep_socket.send_pyobj(response)
+            logger.info(f"[LoRA] Sent response: {response}")
+
+        except zmq.ZMQError:
+            # No pending requests
+            pass
+        except Exception as e:
+            logger.error(f"[LoRA] Error handling request: {e}")
+
+    async def _handle_model_registration(self):
+        """Handle adapter registration from model process."""
+        try:
+            # Non-blocking check for model registration
+            try:
+                data = await asyncio.wait_for(
+                    self.lora_model_socket.recv_pyobj(),
+                    timeout=0.001
+                )
+            except asyncio.TimeoutError:
+                return
+
+            logger.debug(f"[LoRA DEBUG] Received model registration: {data}")
+            action = data.get("action")
+
+            if action == "register_adapter":
+                adapter_id = data.get("adapter_id", "default")
+                adapter_dir = data.get("adapter_dir")
+                lora_rank = data.get("lora_rank", 16)
+                lora_alpha = data.get("lora_alpha", 16.0)
+                num_layers = data.get("num_layers", 0)
+
+                # Import here to avoid circular imports
+                from lightllm.server.lora.manager import get_lora_manager
+
+                lora_manager = get_lora_manager()
+                if lora_manager is None:
+                    logger.warning("[LoRA] Router LoRA manager not initialized, cannot register adapter from model")
+                    return
+
+                # Register the adapter in router's manager
+                info = lora_manager.register_lora_dir(adapter_dir, adapter_id)
+                info.lora_rank = lora_rank
+                info.lora_alpha = lora_alpha
+                info.num_layers = num_layers
+
+                logger.info(f"[LoRA] Registered adapter from model: {adapter_id} (rank={lora_rank}, layers={num_layers})")
+
+        except asyncio.TimeoutError:
+            pass
+        except Exception as e:
+            logger.error(f"[LoRA] Error handling model registration: {e}")
+
     async def _step(self):
         """
         事件处理循环
         """
+        # 处理 LoRA API 请求
+        await self._handle_lora_requests()
+        # 处理来自模型的适配器注册
+        await self._handle_model_registration()
         # 接受新请求，并尝试调度
         await self._recv_new_reqs_and_schedule()
         # 判断是否有新请求加入推理

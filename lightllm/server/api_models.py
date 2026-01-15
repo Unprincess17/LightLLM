@@ -174,6 +174,7 @@ class ChatCompletionRequest(BaseModel):
     role_settings: Optional[Dict[str, str]] = None
     character_settings: Optional[List[Dict[str, str]]] = None
     chat_template_kwargs: Optional[Dict[str, bool]] = None
+    adapters: Optional[List[str]] = Field(default=None, description="LoRA adapter IDs")
 
     # Class variables to store loaded default values
     _loaded_defaults: ClassVar[Dict[str, Any]] = {}

@@ -174,3 +174,6 @@ class MultimodalParams:
         ret = {}
         ret["images"] = [i.to_origin_dict() for i in self.images]
         return ret
+    
+    def __repr__(self) -> str:
+        return f"MultimodalParams(images={self.images}, audios={self.audios})"

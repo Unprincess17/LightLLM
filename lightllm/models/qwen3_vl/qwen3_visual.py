@@ -25,6 +25,44 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers.activations import ACT2FN
 
+
+class LoRALayer(nn.Module):
+    """LoRA layer implementation"""
+    def __init__(self, in_dim, out_dim, rank, alpha):
+        super().__init__()
+        self.rank = rank
+        self.alpha = alpha
+        self.scaling = alpha / rank
+
+        self.lora_A = nn.Linear(in_dim, rank, bias=False)
+        self.lora_B = nn.Linear(rank, out_dim, bias=False)
+
+        # Initialize with small random weights
+        nn.init.normal_(self.lora_A.weight, mean=0.0, std=1e-4)
+        nn.init.zeros_(self.lora_B.weight)
+
+    def forward(self, x):
+        return self.lora_B(self.lora_A(x)) * self.scaling
+
+
+def inject_lora(layer, in_dim, out_dim, rank, alpha):
+    """Inject LoRA into a linear layer"""
+    if rank <= 0:
+        return layer
+
+    # Create LoRA wrapper
+    class LoRAWrapped(nn.Module):
+        def __init__(self, base_layer, lora_layer):
+            super().__init__()
+            self.base_layer = base_layer
+            self.lora_layer = lora_layer
+
+        def forward(self, x):
+            return self.base_layer(x) + self.lora_layer(x)
+
+    lora_layer = LoRALayer(in_dim, out_dim, rank, alpha)
+    return LoRAWrapped(layer, lora_layer)
+
 from lightllm.server.multimodal_params import ImageItem
 from lightllm.server.embed_cache.utils import read_shm, get_shm_name_data
 from lightllm.models.qwen2_vl.vision_process import resize_image, Qwen2VLImageProcessor
@@ -125,10 +163,14 @@ class Qwen3VisionTransformerPretrainedModel(nn.Module):
         spatial_merge_size=2,
         temporal_patch_size=2,
         num_position_embeddings=2304,
+        lora_rank=0,  # New: LoRA rank
+        lora_alpha=1.0,  # New: LoRA alpha (scaling factor)
         **kwargs,
     ):
         super().__init__()
         self.data_type = kvargs.get("data_type", "bfloat16")
+        self.lora_rank = lora_rank
+        self.lora_alpha = lora_alpha
 
         self.depth = depth
         self.out_hidden_size = out_hidden_size
@@ -162,12 +204,47 @@ class Qwen3VisionTransformerPretrainedModel(nn.Module):
                 for _ in range(self.depth)
             ]
         )
+
+        # Add LoRA to MLP layers in vision blocks
+        for i, block in enumerate(self.blocks):
+            if self.lora_rank > 0:
+                self.blocks[i].mlp.linear_fc1 = inject_lora(
+                    block.mlp.linear_fc1,
+                    self.hidden_size,
+                    self.intermediate_size,
+                    self.lora_rank,
+                    self.lora_alpha
+                )
+                self.blocks[i].mlp.linear_fc2 = inject_lora(
+                    block.mlp.linear_fc2,
+                    self.intermediate_size,
+                    self.hidden_size,
+                    self.lora_rank,
+                    self.lora_alpha
+                )
         self.merger = Qwen3VLVisionPatchMerger(
             hidden_size=self.hidden_size,
             out_hidden_size=self.out_hidden_size,
             spatial_merge_size=self.spatial_merge_size,
             use_postshuffle_norm=False,
         )
+        # Add LoRA to patch merger
+        if self.lora_rank > 0:
+            self.merger.linear_fc1 = inject_lora(
+                self.merger.linear_fc1,
+                self.hidden_size * (self.spatial_merge_size ** 2),
+                self.hidden_size * (self.spatial_merge_size ** 2),
+                self.lora_rank,
+                self.lora_alpha
+            )
+            self.merger.linear_fc2 = inject_lora(
+                self.merger.linear_fc2,
+                self.hidden_size * (self.spatial_merge_size ** 2),
+                self.out_hidden_size,
+                self.lora_rank,
+                self.lora_alpha
+            )
+
         self.deepstack_visual_indexes = deepstack_visual_indexes
         self.deepstack_merger_list = nn.ModuleList(
             [
@@ -180,6 +257,25 @@ class Qwen3VisionTransformerPretrainedModel(nn.Module):
                 for _ in range(len(self.deepstack_visual_indexes))
             ]
         )
+
+        # Add LoRA to deepstack mergers
+        for i, merger in enumerate(self.deepstack_merger_list):
+            if self.lora_rank > 0:
+                self.deepstack_merger_list[i].linear_fc1 = inject_lora(
+                    merger.linear_fc1,
+                    self.hidden_size * (self.spatial_merge_size ** 2),
+                    self.hidden_size * (self.spatial_merge_size ** 2),
+                    self.lora_rank,
+                    self.lora_alpha
+                )
+                self.deepstack_merger_list[i].linear_fc2 = inject_lora(
+                    merger.linear_fc2,
+                    self.hidden_size * (self.spatial_merge_size ** 2),
+                    self.out_hidden_size,
+                    self.lora_rank,
+                    self.lora_alpha
+                )
+
         self._init_datatype()
 
     def _init_datatype(self):
@@ -232,6 +328,27 @@ class Qwen3VisionTransformerPretrainedModel(nn.Module):
                         weight_dict[k[len("model.visual.") :]] = f.get_tensor(k)
 
         self.load_state_dict(weight_dict)
+
+        # Load LoRA weights if present
+        lora_weight_dict = {}
+        has_lora_weights = False
+
+        for file_ in os.listdir(weight_dir):
+            if file_.endswith(".bin"):
+                f = torch.load(os.path.join(weight_dir, file_), "cpu")
+                for k, v in f.items():
+                    if "lora_" in k:
+                        lora_weight_dict[k] = v
+                        has_lora_weights = True
+            elif file_.endswith(".safetensors"):
+                f = safe_open(os.path.join(weight_dir, file_), "pt", "cpu")
+                for k in f.keys():
+                    if "lora_" in k:
+                        lora_weight_dict[k] = f.get_tensor(k)
+                        has_lora_weights = True
+
+        if has_lora_weights:
+            self.load_state_dict(lora_weight_dict, strict=False)
 
     def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
         merge_size = self.spatial_merge_size

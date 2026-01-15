@@ -50,6 +50,10 @@ class HttpServerManager:
         self.send_to_router = context.socket(zmq.PUSH)
         self.send_to_router.connect(f"{args.zmq_mode}127.0.0.1:{args.router_port}")
 
+        # LoRA serving: ZMQ socket for querying adapter info from router
+        self.lora_req_socket = context.socket(zmq.REQ)
+        self.lora_req_socket.connect(f"tcp://127.0.0.1:{args.lora_port}")
+
         self.multinode_req_manager = None
         self.nnodes = args.nnodes
         self._shm_lock_pool = AtomicShmArrayLock(f"{get_unique_server_name()}_lightllm_resource_lock", 1)
@@ -275,6 +279,8 @@ class HttpServerManager:
         nixl_pd_upload_websocket: ClientConnection = None,
         # 用于等待 pd_master 下发的交换信息
         nixl_pd_event: asyncio.Event = None,
+        # LoRA adapter IDs
+        adapters: list = None,
     ) -> AsyncGenerator[Tuple[int, str, dict, FinishStatus], None]:
         start_time = time.time()
         request_headers = request.headers if request is not None else {}
@@ -339,12 +345,15 @@ class HttpServerManager:
             req_objs = []
             for i, req_index in enumerate(alloced_req_indexes):
                 req_obj = await self.shm_req_manager.async_get_req_obj_by_index(req_index)
+                # Get adapter_id: use 1 for first adapter, 0 for no adapter
+                adapter_id = 1 if adapters and len(adapters) > i else 0
                 req_obj.init(
                     group_request_id + i,
                     prompt_ids,
                     sampling_params,
                     self.tokenizer,
                     chunked_prefill_size=self.args.chunked_prefill_size,
+                    adapter_id=adapter_id,
                 )
                 req_objs.append(req_obj)
 

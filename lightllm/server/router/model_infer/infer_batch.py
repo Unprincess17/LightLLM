@@ -73,17 +73,23 @@ class InferenceContext:
             self.cpu_kv_cache_stream = torch.cuda.Stream()
         return self.cpu_kv_cache_stream
 
-    def add_reqs(self, requests: List[Tuple[int, int, Any, int]], init_prefix_cache: bool = True) -> List["InferReq"]:
+    def add_reqs(self, requests: List[Tuple[int, int, Any, int, Any]], init_prefix_cache: bool = True) -> List["InferReq"]:
+        """Add requests to inference context.
+
+        Request tuple format: (req_id, shm_index, multimodal_params, suggested_dp_index, adapter_id)
+        adapter_id is optional for backward compatibility (None means no LoRA adapter).
+        """
         req_objs = []
         request_ids = []
         for r in requests:
-            r_id, r_index, multimodal_params, _ = r
+            r_id, r_index, multimodal_params, _, adapter_id = r
             assert r_id not in self.requests_mapping.keys()
             r_obj = InferReq(
                 req_id=r_id,
                 req_idx=self.req_manager.alloc(),
                 shm_index=r_index,
                 multimodal_params=multimodal_params,
+                adapter_id=adapter_id,
                 vocab_size=self.vocab_size,
                 init_prefix_cache=init_prefix_cache,
             )
@@ -321,6 +327,7 @@ class InferReq:
         req_idx: int,
         shm_index: int,
         multimodal_params=None,
+        adapter_id: str = None,
         vocab_size: int = -1,
         init_prefix_cache: bool = True,
     ):
@@ -328,6 +335,7 @@ class InferReq:
         self.req_idx = req_idx
         self.shm_index = shm_index
         self.multimodal_params = multimodal_params
+        self.adapter_id = adapter_id  # LoRA adapter identifier for detached serving
         self.vocab_size = vocab_size
 
         # 请求需要被暂停
@@ -585,3 +593,126 @@ class InferReqUpdatePack:
 
             shm_req.candetoken_out_len = self.output_len
         return
+
+
+# =============================================================================
+# S-LoRA Batched Adapter Support
+# =============================================================================
+
+class Batch:
+    """
+    Batch wrapper for S-LoRA mixed adapter batch support.
+
+    This class provides utilities for managing batches where different requests
+    can use different LoRA adapters. The key insight from S-LoRA is to track
+    which adapter each request uses via req_bins, enabling batched LoRA computation.
+    """
+
+    def __init__(self, reqs: List["InferReq"]):
+        """
+        Initialize a batch with a list of requests.
+
+        Args:
+            reqs: List of InferReq objects in this batch
+        """
+        self.reqs = reqs
+        self.batch_id = f"batch_{id(self)}"
+
+    def get_adapter_ids(self) -> set:
+        """
+        Get all unique adapter_ids in this batch.
+
+        Returns:
+            Set of adapter_id strings (None means no adapter/base model)
+        """
+        adapter_ids = set()
+        for req in self.reqs:
+            if hasattr(req, 'adapter_id'):
+                adapter_ids.add(req.adapter_id)
+        return adapter_ids
+
+    def has_mixed_adapters(self) -> bool:
+        """
+        Check if this batch contains requests with different adapters.
+
+        Returns:
+            True if multiple adapter_ids are present
+        """
+        return len(self.get_adapter_ids()) > 1
+
+    def has_lora_adapters(self) -> bool:
+        """
+        Check if any request in this batch uses a LoRA adapter.
+
+        Returns:
+            True if at least one request has adapter_id != None
+        """
+        for req in self.reqs:
+            if hasattr(req, 'adapter_id') and req.adapter_id is not None:
+                return True
+        return False
+
+    def get_req_bins(self, adapter_order: List[str]) -> torch.Tensor:
+        """
+        Create req_bins tensor mapping each request to adapter index.
+
+        For S-LoRA batched inference, we need to know which adapter each request
+        uses. req_bins[i] contains the adapter index (in adapter_order) for req i.
+
+        Args:
+            adapter_order: List of adapter_ids in the order they appear in the memory pool
+
+        Returns:
+            Tensor of shape [batch_size] with adapter indices
+        """
+        batch_size = len(self.reqs)
+        req_bins = torch.zeros(batch_size, dtype=torch.long, device="cuda")
+
+        # Build index map for O(1) lookup
+        adapter_to_idx = {aid: idx for idx, aid in enumerate(adapter_order)}
+
+        for i, req in enumerate(self.reqs):
+            adapter_id = getattr(req, 'adapter_id', None)
+            if adapter_id is not None and adapter_id in adapter_to_idx:
+                req_bins[i] = adapter_to_idx[adapter_id]
+            else:
+                req_bins[i] = -1  # No adapter / base model
+
+        return req_bins
+
+    def get_adapter_to_req_indices(self) -> Dict[str, List[int]]:
+        """
+        Group request indices by their adapter_id.
+
+        Returns:
+            Dict mapping adapter_id -> list of request indices
+        """
+        adapter_to_reqs = {}
+        for i, req in enumerate(self.reqs):
+            adapter_id = getattr(req, 'adapter_id', None)
+            if adapter_id not in adapter_to_reqs:
+                adapter_to_reqs[adapter_id] = []
+            adapter_to_reqs[adapter_id].append(i)
+        return adapter_to_reqs
+
+    def __len__(self) -> int:
+        return len(self.reqs)
+
+    def __getitem__(self, idx: int) -> "InferReq":
+        return self.reqs[idx]
+
+    def __iter__(self):
+        return iter(self.reqs)
+
+
+def create_batch_from_reqs(reqs: List["InferReq"]) -> Batch:
+    """
+    Create a Batch object from a list of requests.
+
+    This is a convenience function for S-LoRA batched inference.
+    """
+    return Batch(reqs)
+
+
+# Alias for backward compatibility
+InferBatch = Batch

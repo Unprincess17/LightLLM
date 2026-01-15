@@ -24,6 +24,8 @@ class StartArgs:
     select_p_d_node_strategy: str = field(default=None)
     model_name: str = field(default="default_model_name")
     model_dir: Optional[str] = field(default=None)
+    lora_dir: Optional[str] = field(default=None)
+    lora_max_size: int = field(default=1024)  # Max LoRA adapters in memory
     tokenizer_mode: str = field(default="slow")
     load_way: str = field(default="HF")
     max_total_token_num: Optional[int] = field(default=None)
@@ -128,6 +130,10 @@ class StartArgs:
     metric_port: int = field(default=None)
     multinode_httpmanager_port: int = field(default=12345)
     multi_level_kv_cache_port: int = field(default=None)
+    # LoRA serving port
+    lora_port: int = field(default=None)
+    # LoRA compute on CPU (weights stay on CPU, computation on CPU)
+    compute_on_cpu: bool = field(default=False)
     # multi_modal
     enable_multimodal: bool = field(default=False)
     enable_multimodal_audio: bool = field(default=False)
