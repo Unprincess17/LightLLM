@@ -957,13 +957,21 @@ class ModeBackend:
             config = self.model.config
             num_layers = config["num_hidden_layers"]
             num_heads = config.get("num_attention_heads", 32)
+            num_kv_heads = config.get("num_key_value_heads", num_heads)
             head_dim = config.get("head_dim", 128)
             intermediate_dim = config.get("intermediate_size", 512)
-            hidden_size = config["hidden_size"]
+            # For multimodal models, get hidden_size from text_config
+            if "hidden_size" in config:
+                hidden_size = config["hidden_size"]
+            elif hasattr(config, "get_text_config"):
+                text_config = config.get_text_config()
+                hidden_size = getattr(text_config, "hidden_size", 2048)
+            else:
+                hidden_size = 2048
             vocab_size = config.get("vocab_size", 151936)
-            max_rank = 64  # Can be configured
+            max_rank = 16  # Can be configured
 
-            self.logger.info(f"[LoRA Backend] Config values: hidden_size={hidden_size}, intermediate_dim={intermediate_dim}, num_heads={num_heads}, head_dim={head_dim}")
+            self.logger.info(f"[LoRA Backend] Config values: hidden_size={hidden_size}, intermediate_dim={intermediate_dim}, num_heads={num_heads}, num_kv_heads={num_kv_heads}, head_dim={head_dim}")
 
             self.lora_mem_pool = create_lora_mem_pool(
                 num_layers=num_layers,
@@ -974,6 +982,7 @@ class ModeBackend:
                 intermediate_dim=intermediate_dim,
                 hidden_size=hidden_size,
                 vocab_size=vocab_size,
+                num_kv_heads=num_kv_heads,
                 dtype=torch.float16,
                 device="cuda"
             )
@@ -1001,55 +1010,11 @@ class ModeBackend:
 
                 # Convert adapter weights to memory pool format
                 # Format: {layer_id: {target_type: {module_name: {"A": tensor, "B": tensor}}}}
-                rank = adapter.lora_alpha  # Use alpha as rank (or can use specific rank)
-                scaling = 1.0  # Will be set per adapter
+                rank = adapter.max_rank  # Use actual LoRA rank
+                scaling = adapter.lora_alpha / adapter.max_rank  # Proper scaling calculation
 
-                layer_weights = {}
-                for layer_id in range(adapter.num_layers):
-                    weights = adapter.get_layer_weights(layer_id)
-                    if not weights:
-                        continue
-
-                    # Convert to target_type format
-                    target_map = {}
-                    for attr, tensor in weights.items():
-                        # Parse attr like "gate_proj_A" -> "gate_proj" + "_A"
-                        if attr.endswith("_A"):
-                            module_name = attr[:-2]  # "gate_proj"
-                            weight_type = "A"
-                        elif attr.endswith("_B"):
-                            module_name = attr[:-2]  # "gate_proj"
-                            weight_type = "B"
-                        else:
-                            continue
-
-                        # Map module_name to target_type
-                        if module_name == "q_proj":
-                            target_type = LoRATargetType.ATTN_Q_PROJ
-                        elif module_name == "k_proj":
-                            target_type = LoRATargetType.ATTN_K_PROJ
-                        elif module_name == "v_proj":
-                            target_type = LoRATargetType.ATTN_V_PROJ
-                        elif module_name == "o_proj":
-                            target_type = LoRATargetType.ATTN_O_PROJ
-                        elif module_name == "gate_proj":
-                            target_type = LoRATargetType.MOE_GATE_PROJ
-                        elif module_name == "up_proj":
-                            target_type = LoRATargetType.MOE_UP_PROJ
-                        elif module_name == "down_proj":
-                            target_type = LoRATargetType.MOE_DOWN_PROJ
-                        else:
-                            continue
-
-                        if target_type not in target_map:
-                            target_map[target_type] = {}
-                        target_map[target_type][module_name] = {
-                            "A": tensor if weight_type == "A" else None,
-                            "B": tensor if weight_type == "B" else None,
-                        }
-
-                    if target_map:
-                        layer_weights[layer_id] = target_map
+                # Direct assignment - format already matches LoRAMemPool expectation
+                layer_weights = adapter.get_all_weights()
 
                 # Load into memory pool
                 self.lora_mem_pool.load_adapter(
@@ -1072,12 +1037,13 @@ class ModeBackend:
         # Actual weights come from memory pool per adapter, with each adapter
         # using its own rank (adapter.r) as tracked by a_len in the pool
         max_rank = 64  # default
-        if hasattr(self, 'lora_manager') and self.lora_manager is not None:
-            adapters_list = self.lora_manager.list_adapters()
-            for adapter_info in adapters_list:
-                rank = adapter_info.get("lora_rank", 0)
-                if rank and rank > max_rank:
-                    max_rank = rank
+        from lightllm.server.lora.manager import get_lora_manager
+        lora_manager = get_lora_manager()
+        adapters_list = lora_manager.list_adapters()
+        for adapter_info in adapters_list:
+            rank = adapter_info.get("lora_rank", 0)
+            if rank and rank > max_rank:
+                max_rank = rank
 
         num_layers = self.model.config.get("num_hidden_layers", self.model.layers_num)
         for layer_id in range(num_layers):

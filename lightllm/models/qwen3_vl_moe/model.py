@@ -39,6 +39,10 @@ class Qwen3VLMOETpPartModel(Qwen3MOEModel):
             all_config = json.load(json_file)
             self.config = all_config["text_config"]
 
+        # Add vision_config for LoRA adapter (used to count vision layers)
+        if "vision_config" in all_config:
+            self.config["vision_config"] = all_config["vision_config"]
+
         # Add LoRA configuration from the main config or set defaults
         if "lora_rank" in all_config:
             self.config["lora_rank"] = all_config["lora_rank"]

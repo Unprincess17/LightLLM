@@ -45,8 +45,6 @@ class Qwen3VLMOETransformerLayerInfer(Qwen3MOETransformerLayerInfer):
             Logs the req_bins configuration
         """
         self.req_bins_ = req_bins
-        logger.debug(f"[LoRA Infer] Layer {self.layer_num_}: set_req_bins batch_size={req_bins.shape[0]}")
-        logger.debug(f"[LoRA Infer]   req_bins={req_bins.tolist()}")
 
     def _get_qkv(
         self,
@@ -71,8 +69,23 @@ class Qwen3VLMOETransformerLayerInfer(Qwen3MOETransformerLayerInfer):
             lora_results = self.lora_dispatcher_.get_attention_lora(
                 input, self.layer_num_, self.req_bins_
             )
+            logger.debug(f"[LoRA Infer] Layer {self.layer_num_}: q_shape={q.shape}, cache_kv_shape={cache_kv.shape}")
+            logger.debug(f"[LoRA Infer]   q_lora_shape={lora_results['q_lora'].shape}")
+            logger.debug(f"[LoRA Infer]   k_lora_shape={lora_results['k_lora'].shape}")
+            logger.debug(f"[LoRA Infer]   v_lora_shape={lora_results['v_lora'].shape}")
             q = q + lora_results["q_lora"]
-            cache_kv = cache_kv + lora_results["k_lora"] + lora_results["v_lora"]
+            # cache_kv is [batch, (tp_k + tp_v) * head_dim] with K and V concatenated
+            # View to [batch, num_heads, head_dim] to add LoRA to correct heads
+            cache_kv = cache_kv.view(-1, (self.tp_k_head_num_ + self.tp_v_head_num_), self.head_dim_)
+            # Add K-LoRA to first tp_k_head_num heads, V-LoRA to next tp_v_head_num heads
+            cache_kv[:, : self.tp_k_head_num_, :] = cache_kv[:, : self.tp_k_head_num_, :] + lora_results["k_lora"].reshape(
+                -1, self.tp_k_head_num_, self.head_dim_
+            )
+            cache_kv[:, self.tp_k_head_num_ :, :] = cache_kv[:, self.tp_k_head_num_ :, :] + lora_results["v_lora"].reshape(
+                -1, self.tp_v_head_num_, self.head_dim_
+            )
+            # View back to 2D for downstream processing
+            cache_kv = cache_kv.view(-1, (self.tp_k_head_num_ + self.tp_v_head_num_) * self.head_dim_)
 
             logger.debug(f"[LoRA Infer]   q_lora norm={lora_results['q_lora'].norm().item():.4f}")
             logger.debug(f"[LoRA Infer]   k_lora norm={lora_results['k_lora'].norm().item():.4f}")

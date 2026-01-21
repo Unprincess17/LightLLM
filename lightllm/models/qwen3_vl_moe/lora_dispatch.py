@@ -140,10 +140,8 @@ class Qwen3VLMoELoRADispatcher:
         self.req_bins = req_bins
         self.use_batched_mode = True
 
-        batch_size = req_bins.shape[0] if req_bins is not None else 0
-        unique_adapters = len(torch.unique(req_bins)) if req_bins is not None else 0
-        logger.info(f"[LoRA Dispatch] Batched mode initialized: batch_size={batch_size}, unique_adapters={unique_adapters}")
-        logger.debug(f"[LoRA Dispatch]   req_bins={req_bins.tolist() if req_bins is not None else None}")
+        # batch_size = req_bins.shape[0] if req_bins is not None else 0
+        # unique_adapters = len(torch.unique(req_bins)) if req_bins is not None else 0
 
     def use_single_adapter_mode(self):
         """Switch back to single adapter mode (original behavior)."""
@@ -153,8 +151,17 @@ class Qwen3VLMoELoRADispatcher:
         self.req_bins = None
 
     # =====================================================================
-    # S-LoRA Batched Methods (Primary Mode)
+    # S-LoRA Batched Methods (FIXED)
     # =====================================================================
+
+    def _get_output_buffer(self, input_tensor, pool):
+        """Helper to create output buffer with correct dimension (Crucial for GQA/MLP)"""
+        return torch.zeros(
+            input_tensor.shape[0],
+            pool.b_hidden_dim,
+            dtype=input_tensor.dtype,
+            device=input_tensor.device
+        )
 
     def batch_apply_q_lora(
         self,
@@ -162,36 +169,26 @@ class Qwen3VLMoELoRADispatcher:
         layer_id: int,
         req_bins: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """Apply q_proj LoRA to batch with different adapters.
-
-        Debug:
-            Logs batch size, layer_id, and computation details
-        """
+        """Apply q_proj LoRA to batch with different adapters."""
         if self.lora_mem_pool is None or self.lora_mem_pool.attn_q_pool is None:
             return torch.zeros_like(input_tensor)
 
         pool = self.lora_mem_pool.attn_q_pool
         bins = req_bins if req_bins is not None else self.req_bins
 
-        batch_size = input_tensor.shape[0]
-        logger.debug(f"[LoRA Dispatch] batch_apply_q_lora: layer={layer_id}, batch={batch_size}")
-
         if BGMV_AVAILABLE:
-            output = torch.zeros_like(input_tensor)
+            output = self._get_output_buffer(input_tensor, pool)
             batch_lora_get_qkv(
-                output,
-                input_tensor,
+                output, input_tensor,
                 pool.key_buffer,
+                pool.value_buffer,
                 pool.a_start,
                 pool.a_len,
                 pool.a_scaling,
                 bins
             )
-            logger.debug(f"[LoRA Dispatch]   q_lora done (BGMV), output_shape={output.shape}")
             return output
         else:
-            # Fallback: naive computation
-            logger.debug(f"[LoRA Dispatch]   using naive fallback")
             return self._naive_batch_lora(input_tensor, layer_id, pool, bins)
 
     def batch_apply_k_lora(
@@ -200,23 +197,22 @@ class Qwen3VLMoELoRADispatcher:
         layer_id: int,
         req_bins: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """Apply k_proj LoRA to batch with different adapters."""
+        """Apply k_proj LoRA (GQA Aware). Output dim < Input dim."""
         if self.lora_mem_pool is None or self.lora_mem_pool.attn_k_pool is None:
-            return torch.zeros_like(input_tensor)
+            return torch.zeros(input_tensor.shape[0], 0, device=input_tensor.device)
 
         pool = self.lora_mem_pool.attn_k_pool
         bins = req_bins if req_bins is not None else self.req_bins
 
+        output = self._get_output_buffer(input_tensor, pool)
+
         if BGMV_AVAILABLE:
-            output = torch.zeros_like(input_tensor)
             batch_lora_get_qkv(
-                output,
-                input_tensor,
-                pool.key_buffer,
-                pool.a_start,
-                pool.a_len,
-                pool.a_scaling,
-                bins
+                output, input_tensor,
+                pool.key_buffer, pool.value_buffer,
+                pool.a_start, pool.a_len, pool.a_scaling, bins,
+                a_hidden_dim=input_tensor.shape[1],
+                b_hidden_dim=output.shape[1]
             )
             return output
         else:
@@ -228,23 +224,22 @@ class Qwen3VLMoELoRADispatcher:
         layer_id: int,
         req_bins: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """Apply v_proj LoRA to batch with different adapters."""
+        """Apply v_proj LoRA (GQA Aware)."""
         if self.lora_mem_pool is None or self.lora_mem_pool.attn_v_pool is None:
             return torch.zeros_like(input_tensor)
 
         pool = self.lora_mem_pool.attn_v_pool
         bins = req_bins if req_bins is not None else self.req_bins
 
+        output = self._get_output_buffer(input_tensor, pool)
+
         if BGMV_AVAILABLE:
-            output = torch.zeros_like(input_tensor)
             batch_lora_get_qkv(
-                output,
-                input_tensor,
-                pool.key_buffer,
-                pool.a_start,
-                pool.a_len,
-                pool.a_scaling,
-                bins
+                output, input_tensor,
+                pool.key_buffer, pool.value_buffer,
+                pool.a_start, pool.a_len, pool.a_scaling, bins,
+                a_hidden_dim=input_tensor.shape[1],
+                b_hidden_dim=output.shape[1]
             )
             return output
         else:
@@ -268,7 +263,8 @@ class Qwen3VLMoELoRADispatcher:
             batch_lora_get_o(
                 output,
                 input_tensor,
-                pool.value_buffer,
+                pool.key_buffer,  # A matrices
+                pool.value_buffer,  # B matrices
                 pool.a_start,
                 pool.a_len,
                 pool.a_scaling,
@@ -296,7 +292,8 @@ class Qwen3VLMoELoRADispatcher:
             batch_lora_get_mlp(
                 output,
                 input_tensor,
-                pool.value_buffer,
+                pool.key_buffer,  # A matrices
+                pool.value_buffer,  # B matrices
                 pool.a_start,
                 pool.a_len,
                 pool.a_scaling,
@@ -324,7 +321,8 @@ class Qwen3VLMoELoRADispatcher:
             batch_lora_get_mlp(
                 output,
                 input_tensor,
-                pool.value_buffer,
+                pool.key_buffer,  # A matrices
+                pool.value_buffer,  # B matrices
                 pool.a_start,
                 pool.a_len,
                 pool.a_scaling,
@@ -340,23 +338,22 @@ class Qwen3VLMoELoRADispatcher:
         layer_id: int,
         req_bins: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """Apply down_proj LoRA to batch with different adapters."""
+        """Apply down_proj LoRA. Input: Intermediate, Output: Hidden."""
         if self.lora_mem_pool is None or self.lora_mem_pool.moe_down_pool is None:
             return torch.zeros_like(input_tensor)
 
         pool = self.lora_mem_pool.moe_down_pool
         bins = req_bins if req_bins is not None else self.req_bins
 
+        output = self._get_output_buffer(input_tensor, pool)
+
         if BGMV_AVAILABLE:
-            output = torch.zeros_like(input_tensor)
             batch_lora_get_mlp(
-                output,
-                input_tensor,
-                pool.value_buffer,
-                pool.a_start,
-                pool.a_len,
-                pool.a_scaling,
-                bins
+                output, input_tensor,
+                pool.key_buffer, pool.value_buffer,
+                pool.a_start, pool.a_len, pool.a_scaling, bins,
+                a_hidden_dim=input_tensor.shape[1],
+                b_hidden_dim=output.shape[1]
             )
             return output
         else:
@@ -388,16 +385,15 @@ class Qwen3VLMoELoRADispatcher:
 
         bins = req_bins if req_bins is not None else self.req_bins
 
+        output = self._get_output_buffer(input_tensor, pool)
+
         if BGMV_AVAILABLE:
-            output = torch.zeros_like(input_tensor)
             batch_lora_get_vl(
-                output,
-                input_tensor,
-                pool.value_buffer,
-                pool.a_start,
-                pool.a_len,
-                pool.a_scaling,
-                bins
+                output, input_tensor,
+                pool.key_buffer, pool.value_buffer,
+                pool.a_start, pool.a_len, pool.a_scaling, bins,
+                a_hidden_dim=input_tensor.shape[1],
+                b_hidden_dim=output.shape[1]
             )
             return output
         else:

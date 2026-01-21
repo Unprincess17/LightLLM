@@ -18,9 +18,12 @@ Key Design:
 Debugging:
 - Set LIGHTLLM_LOGGING=DEBUG to enable verbose LoRA logging
 """
+import attr
+from networkx import attribute_assortativity_coefficient
 import torch
 import os
 import logging
+import re
 from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass, field
 from safetensors import safe_open
@@ -35,20 +38,24 @@ logger.setLevel(_LOG_LEVEL)
 
 # Module type enumeration for LoRA targets
 class LoRATargetType:
-    VL_Q_PROJ = "vl_q_proj"
-    VL_K_PROJ = "vl_k_proj"
-    VL_V_PROJ = "vl_v_proj"
-    VL_O_PROJ = "vl_o_proj"
-    VL_FC1 = "vl_linear_fc1"
-    VL_FC2 = "vl_linear_fc2"
-    ATTN_Q_PROJ = "self_attn_q_proj"
-    ATTN_K_PROJ = "self_attn_k_proj"
-    ATTN_V_PROJ = "self_attn_v_proj"
-    ATTN_O_PROJ = "self_attn_o_proj"
-    MOE_GATE_PROJ = "moe_gate_proj"
-    MOE_UP_PROJ = "moe_up_proj"
-    MOE_DOWN_PROJ = "moe_down_proj"
-    LM_HEAD = "moe_lm_head"
+    # LLM Attention
+    ATTN_Q_PROJ = "attn_q"
+    ATTN_K_PROJ = "attn_k"
+    ATTN_V_PROJ = "attn_v"
+    ATTN_O_PROJ = "attn_o"
+    # LLM MoE
+    MOE_EXPERT_GATE = "moe_expert_gate"
+    MOE_EXPERT_UP = "moe_expert_up"
+    MOE_EXPERT_DOWN = "moe_expert_down"
+    # LLM Head
+    LM_HEAD = "lm_head"
+    # Vision
+    VL_Q_PROJ = "vl_q"
+    VL_K_PROJ = "vl_k"
+    VL_V_PROJ = "vl_v"
+    VL_O_PROJ = "vl_o"
+    VL_FC1 = "vl_fc1"
+    VL_FC2 = "vl_fc2"
 
 
 @dataclass
@@ -60,9 +67,14 @@ class LoRAModulePool:
     For attention (Q/K/V/O): hidden = num_heads * head_dim
     For MLP (gate/up/down): hidden = intermediate_dim
     For lm_head: hidden = vocab_size
+
+    For GQA models (K/V projections), A and B can have different dimensions:
+    - A (key_buffer): input dim = hidden_size
+    - B (value_buffer): output dim = num_kv_heads * head_dim
     """
-    # Shape: [pool_size, max_rank, hidden_dim]
+    # Shape: [pool_size, max_rank, a_hidden_dim] for A
     key_buffer: torch.Tensor  # LoRA A weights
+    # Shape: [pool_size, max_rank, b_hidden_dim] for B
     value_buffer: torch.Tensor  # LoRA B weights
 
     # Metadata
@@ -70,27 +82,51 @@ class LoRAModulePool:
     a_len: torch.Tensor  # [num_adapters] - length per adapter (rank)
     a_scaling: torch.Tensor  # [num_adapters] - scaling factor per adapter
     max_rank: int
-    hidden_dim: int
+    a_hidden_dim: int  # Input dimension for A matrix
+    b_hidden_dim: int  # Output dimension for B matrix
     pool_size: int
+
+    @property
+    def a_buffer(self) -> torch.Tensor:
+        """Get the A weight buffer."""
+        return self.key_buffer
+
+    @property
+    def b_buffer(self) -> torch.Tensor:
+        """Get the B weight buffer."""
+        return self.value_buffer
 
     @classmethod
     def create(
         cls,
         pool_size: int,
         max_rank: int,
-        hidden_dim: int,
+        input_dim: int,
+        output_dim: int | None = None,
         dtype: torch.dtype = torch.float16,
         device: str = "cuda"
     ) -> "LoRAModulePool":
-        """Create a module pool."""
+        """Create a module pool.
+
+        Args:
+            pool_size: Maximum number of adapters in pool
+            max_rank: Maximum LoRA rank
+            input_dim: Input dimension for A matrix (and x tensor)
+            output_dim: Output dimension for B matrix (and y tensor). If None, uses input_dim.
+            dtype: Data type for weights
+            device: Device for tensors
+        """
+        if output_dim is None:
+            output_dim = input_dim
         return cls(
-            key_buffer=torch.empty((pool_size, max_rank, hidden_dim), dtype=dtype, device=device),
-            value_buffer=torch.empty((pool_size, max_rank, hidden_dim), dtype=dtype, device=device),
+            key_buffer=torch.empty((pool_size, max_rank, input_dim), dtype=dtype, device=device),
+            value_buffer=torch.empty((pool_size, max_rank, output_dim), dtype=dtype, device=device),
             a_start=torch.zeros(0, dtype=torch.long, device=device),
             a_len=torch.zeros(0, dtype=torch.long, device=device),
             a_scaling=torch.zeros(0, dtype=dtype, device=device),
             max_rank=max_rank,
-            hidden_dim=hidden_dim,
+            a_hidden_dim=input_dim,
+            b_hidden_dim=output_dim,
             pool_size=pool_size
         )
 
@@ -110,7 +146,7 @@ class LoRAModulePool:
         adapter_idx: int,
         rank: int,
         scaling: float,
-        layer_weights: Dict[str, torch.Tensor]
+        layer_weights: Dict[int, torch.Tensor]
     ) -> bool:
         """
         Load adapter weights for all layers.
@@ -151,10 +187,10 @@ class LoRAModulePool:
 
             if a_weight is not None:
                 # A matrix: [hidden, rank] -> [rank, hidden]
-                self.key_buffer[loc_start + layer_id, :rank] = a_weight.T.to(self.key_buffer.dtype)
+                self.a_buffer[loc_start + layer_id, :rank] = a_weight.T.to(self.a_buffer.dtype)
             if b_weight is not None:
                 # B matrix: [rank, hidden] -> [hidden, rank] (stored as [rank, hidden])
-                self.value_buffer[loc_start + layer_id, :rank] = b_weight.T.to(self.value_buffer.dtype)
+                self.b_buffer[loc_start + layer_id, :rank] = b_weight.T.to(self.b_buffer.dtype)
 
         return True
 
@@ -226,6 +262,7 @@ class LoRAMemPool:
     # Model config for dimension inference
     num_layers: int = 0
     num_heads: int = 0
+    num_kv_heads: int = 0
     head_dim: int = 0
     intermediate_dim: int = 0
     hidden_size: int = 0
@@ -242,37 +279,50 @@ class LoRAMemPool:
         intermediate_dim: int,
         hidden_size: int,
         vocab_size: int,
+        num_kv_heads: int | None = None,
         dtype: torch.dtype = torch.float16,
         device: str = "cuda"
     ) -> "LoRAMemPool":
-        """Create a complete LoRA memory pool."""
-        attn_hidden = num_heads * head_dim
-        mlp_hidden = intermediate_dim
-        vl_hidden = hidden_size  # Vision adapter typically uses hidden_size
-        head_hidden = vocab_size
+        """Create a complete LoRA memory pool.
 
-        logger.info(f"[LoRA Pool] Creating pool: attn_hidden={attn_hidden}, mlp_hidden={mlp_hidden}, vl_hidden={vl_hidden}, head_hidden={head_hidden}")
+        Args:
+            num_kv_heads: Number of key/value heads (for GQA models). If None, defaults to num_heads.
+        """
+        # Attention dimensions
+        attn_hidden = hidden_size
+        if num_kv_heads is None:
+            num_kv_heads = num_heads
+        # GQA: B matrix output dimension is smaller
+        kv_hidden = num_kv_heads * head_dim
+        mlp_inter = intermediate_dim
+
+        # Vision dimensions (use LLM dims as default)
+        vl_hidden = hidden_size
+        vl_mlp_hidden = intermediate_dim
+
+        logger.info(f"[LoRA Pool] Creating pool: attn_hidden={attn_hidden}, kv_hidden={kv_hidden}, mlp_hidden={mlp_inter}")
 
         pool = cls(
-            # Vision-Language pools
-            vl_q_pool=LoRAModulePool.create(pool_size, max_rank, vl_hidden, dtype, device),
-            vl_k_pool=LoRAModulePool.create(pool_size, max_rank, vl_hidden, dtype, device),
-            vl_v_pool=LoRAModulePool.create(pool_size, max_rank, vl_hidden, dtype, device),
-            vl_o_pool=LoRAModulePool.create(pool_size, max_rank, vl_hidden, dtype, device),
-            vl_fc1_pool=LoRAModulePool.create(pool_size, max_rank, vl_hidden, dtype, device),
-            vl_fc2_pool=LoRAModulePool.create(pool_size, max_rank, mlp_hidden, dtype, device),
+            # Vision-Language pools (Q/K/V/O preserve vl_hidden)
+            vl_q_pool=LoRAModulePool.create(pool_size, max_rank, vl_hidden, vl_hidden, dtype, device),
+            vl_k_pool=LoRAModulePool.create(pool_size, max_rank, vl_hidden, vl_hidden, dtype, device),
+            vl_v_pool=LoRAModulePool.create(pool_size, max_rank, vl_hidden, vl_hidden, dtype, device),
+            vl_o_pool=LoRAModulePool.create(pool_size, max_rank, vl_hidden, vl_hidden, dtype, device),
+            # Vision MLP: FC1 expands, FC2 shrinks
+            vl_fc1_pool=LoRAModulePool.create(pool_size, max_rank, vl_hidden, vl_mlp_hidden, dtype, device),
+            vl_fc2_pool=LoRAModulePool.create(pool_size, max_rank, vl_mlp_hidden, vl_hidden, dtype, device),
 
-            # Attention pools
-            attn_q_pool=LoRAModulePool.create(pool_size, max_rank, attn_hidden, dtype, device),
-            attn_k_pool=LoRAModulePool.create(pool_size, max_rank, attn_hidden, dtype, device),
-            attn_v_pool=LoRAModulePool.create(pool_size, max_rank, attn_hidden, dtype, device),
-            attn_o_pool=LoRAModulePool.create(pool_size, max_rank, attn_hidden, dtype, device),
+            # Attention pools - Q/O use full hidden, K/V use GQA output dim
+            attn_q_pool=LoRAModulePool.create(pool_size, max_rank, attn_hidden, attn_hidden, dtype, device),
+            attn_k_pool=LoRAModulePool.create(pool_size, max_rank, hidden_size, kv_hidden, dtype, device),
+            attn_v_pool=LoRAModulePool.create(pool_size, max_rank, hidden_size, kv_hidden, dtype, device),
+            attn_o_pool=LoRAModulePool.create(pool_size, max_rank, attn_hidden, attn_hidden, dtype, device),
 
-            # MoE MLP pools
-            moe_gate_pool=LoRAModulePool.create(pool_size, max_rank, hidden_size, dtype, device),
-            moe_up_pool=LoRAModulePool.create(pool_size, max_rank, hidden_size, dtype, device),
-            moe_down_pool=LoRAModulePool.create(pool_size, max_rank, hidden_size, dtype, device),
-            lm_head_pool=LoRAModulePool.create(pool_size, max_rank, hidden_size, dtype, device),
+            # MoE MLP pools - Gate/Up expand, Down shrinks
+            moe_gate_pool=LoRAModulePool.create(pool_size, max_rank, hidden_size, mlp_inter, dtype, device),
+            moe_up_pool=LoRAModulePool.create(pool_size, max_rank, hidden_size, mlp_inter, dtype, device),
+            moe_down_pool=LoRAModulePool.create(pool_size, max_rank, mlp_inter, hidden_size, dtype, device),
+            lm_head_pool=LoRAModulePool.create(pool_size, max_rank, hidden_size, vocab_size, dtype, device),
 
             adapter_dirs=[],
             idx_map={},
@@ -280,6 +330,7 @@ class LoRAMemPool:
             pool_size=pool_size,
             num_layers=num_layers,
             num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
             head_dim=head_dim,
             intermediate_dim=intermediate_dim,
             hidden_size=hidden_size,
@@ -300,9 +351,9 @@ class LoRAMemPool:
             LoRATargetType.ATTN_K_PROJ: self.attn_k_pool,
             LoRATargetType.ATTN_V_PROJ: self.attn_v_pool,
             LoRATargetType.ATTN_O_PROJ: self.attn_o_pool,
-            LoRATargetType.MOE_GATE_PROJ: self.moe_gate_pool,
-            LoRATargetType.MOE_UP_PROJ: self.moe_up_pool,
-            LoRATargetType.MOE_DOWN_PROJ: self.moe_down_pool,
+            LoRATargetType.MOE_EXPERT_GATE: self.moe_gate_pool,
+            LoRATargetType.MOE_EXPERT_UP: self.moe_up_pool,
+            LoRATargetType.MOE_EXPERT_DOWN: self.moe_down_pool,
             LoRATargetType.LM_HEAD: self.lm_head_pool,
         }
         return pool_map.get(target_type)
@@ -338,7 +389,14 @@ class LoRAMemPool:
 
         # Load weights for each target type
         for layer_id, target_weights in layer_weights.items():
-            if layer_id >= self.num_layers:
+            # Handle vision layer offset (10000+) - strip offset for buffer indexing
+            # Vision and text layers use different pools, so no conflict
+            if layer_id >= 10000:
+                buffer_layer_id = layer_id - 10000
+            else:
+                buffer_layer_id = layer_id
+
+            if buffer_layer_id >= self.num_layers:
                 continue
 
             for target_type, module_weights in target_weights.items():
@@ -346,11 +404,15 @@ class LoRAMemPool:
                 if pool is None:
                     continue
 
+                # Strip module_name level - pool expects {layer_id: {"A": tensor, "B": tensor}}
+                # module_weights is {module_name: {"A": tensor, "B": tensor}}, take first value
+                weight_dict = next(iter(module_weights.values())) if module_weights else {}
+
                 pool.load_adapter(
                     adapter_idx=adapter_idx,
                     rank=rank,
                     scaling=scaling,
-                    layer_weights={layer_id: module_weights}
+                    layer_weights={buffer_layer_id: weight_dict}
                 )
                 logger.debug(f"[LoRA]   Loaded {target_type} for layer {layer_id}")
 
@@ -422,6 +484,12 @@ class LoRAAdapterLoader:
         """
         Load all weights from an adapter directory.
 
+        Args:
+            adapter_dir: Path to adapter directory
+            network_config: (unused) kept for API compatibility
+            dtype: Data type for weights
+            device: Device for tensors
+
         Returns:
             Dict mapping layer_id -> target_type -> module_weights
         """
@@ -435,91 +503,129 @@ class LoRAAdapterLoader:
                 for k in sf.keys():
                     all_weights[k] = sf.get_tensor(k)
 
-        num_layers = network_config["num_hidden_layers"]
         result = {}
 
-        # Mapping of safetensor keys to target types
-        # Structure varies by adapter format, this is a flexible mapper
-        for layer_id in range(num_layers):
-            layer_result = {}
+        # Pre-compiled regex patterns for speed
+        # 1. Language Model Layers (e.g. model.language_model.layers.9...)
+        re_llm_layer = re.compile(r"model\.language_model\.layers\.(\d+)\.(.+)")
 
-            # Try different key patterns
-            patterns = {
-                # Vision adapter
-                "vision": f"base_model.model.model.vision_tower.layers.{layer_id}.",
+        # 2. LM Head (e.g. model.language_model.lm_head...)
+        re_lm_head = re.compile(r"model\.language_model\.lm_head")
+
+        # 3. Vision Blocks (e.g. model.visual.blocks.0...)
+        re_vis_block = re.compile(r"model\.visual\.blocks\.(\d+)\.(.+)")
+
+        # 4. Deepstack Merger (e.g. model.visual.deepstack_merger_list.0...)
+        re_vis_deepstack = re.compile(r"model\.visual\.deepstack_merger_list\.(\d+)\.(.+)")
+
+        # 5. Simple Merger (e.g. model.visual.merger...)
+        re_vis_merger = re.compile(r"model\.visual\.merger\.(.+)")
+
+        # Expert ID Pattern (nested inside layer suffix)
+        re_expert_id = re.compile(r"experts\.(\d+)\.")
+
+        for key, tensor in all_weights.items():
+            if "lora_A" not in key and "lora_B" not in key:
+                continue
+
+            matrix_type = "A" if "lora_A" in key else "B"
+            layer_id = None
+            target_type = None
+            expert_id = None
+
+            # 1. Language Model Layers
+            match = re_llm_layer.search(key)
+            if match:
+                layer_id = int(match.group(1))
+                suffix = match.group(2)
+
                 # Attention
-                "self_attn": f"base_model.model.model.language_model.layers.{layer_id}.self_attn.",
-                # MoE MLP
-                "mlp": f"base_model.model.model.language_model.layers.{layer_id}.mlp.",
-            }
+                if "self_attn.q_proj" in suffix:
+                    target_type = LoRATargetType.ATTN_Q_PROJ
+                elif "self_attn.k_proj" in suffix:
+                    target_type = LoRATargetType.ATTN_K_PROJ
+                elif "self_attn.v_proj" in suffix:
+                    target_type = LoRATargetType.ATTN_V_PROJ
+                elif "self_attn.o_proj" in suffix:
+                    target_type = LoRATargetType.ATTN_O_PROJ
 
-            for proj_type, prefix in [("q_proj", "q_proj"), ("k_proj", "k_proj"),
-                                       ("v_proj", "v_proj"), ("o_proj", "o_proj")]:
-                for key_prefix, target_prefix in [
-                    (f"{prefixes['self_attn']}", f"self_attn_{proj_type}"),
-                    (f"{prefixes['vision']}", f"vl_{proj_type}")
-                ]:
-                    pass  # Placeholder
+                # MoE Experts (e.g. mlp.experts.0.down_proj)
+                elif "mlp.experts" in suffix:
+                    expert_match = re_expert_id.search(suffix)
+                    if expert_match:
+                        expert_id = int(expert_match.group(1))
 
-            # Generic key matching
-            for key, tensor in all_weights.items():
-                # Match layer
-                if f".layers.{layer_id}." not in key:
-                    continue
+                        if "gate_proj" in suffix:
+                            target_type = LoRATargetType.MOE_EXPERT_GATE
+                        elif "up_proj" in suffix:
+                            target_type = LoRATargetType.MOE_EXPERT_UP
+                        elif "down_proj" in suffix:
+                            target_type = LoRATargetType.MOE_EXPERT_DOWN
 
-                # Identify target type
-                if "vision_tower" in key:
-                    if "q_proj" in key:
-                        target_type = LoRATargetType.VL_Q_PROJ
-                    elif "k_proj" in key:
-                        target_type = LoRATargetType.VL_K_PROJ
-                    elif "v_proj" in key:
-                        target_type = LoRATargetType.VL_V_PROJ
-                    elif "o_proj" in key:
-                        target_type = LoRATargetType.VL_O_PROJ
-                    elif "fc1" in key or "linear_fc1" in key:
-                        target_type = LoRATargetType.VL_FC1
-                    elif "fc2" in key or "linear_fc2" in key:
-                        target_type = LoRATargetType.VL_FC2
-                    else:
-                        continue
-                elif "self_attn" in key:
-                    if "q_proj" in key:
-                        target_type = LoRATargetType.ATTN_Q_PROJ
-                    elif "k_proj" in key:
-                        target_type = LoRATargetType.ATTN_K_PROJ
-                    elif "v_proj" in key:
-                        target_type = LoRATargetType.ATTN_V_PROJ
-                    elif "o_proj" in key:
-                        target_type = LoRATargetType.ATTN_O_PROJ
-                    else:
-                        continue
-                elif "mlp" in key or "moe" in key:
-                    if "gate_proj" in key:
-                        target_type = LoRATargetType.MOE_GATE_PROJ
-                    elif "up_proj" in key:
-                        target_type = LoRATargetType.MOE_UP_PROJ
-                    elif "down_proj" in key:
-                        target_type = LoRATargetType.MOE_DOWN_PROJ
-                    elif "lm_head" in key:
-                        target_type = LoRATargetType.LM_HEAD
-                    else:
-                        continue
+            # 2. LM Head (Special Layer -1)
+            elif re_lm_head.search(key):
+                layer_id = -1
+                target_type = LoRATargetType.LM_HEAD
+
+            # 3. Vision Blocks (Offset +10000)
+            elif (match := re_vis_block.search(key)):
+                layer_id = 10000 + int(match.group(1))
+                suffix = match.group(2)
+
+                if "attn.q_proj" in suffix:
+                    target_type = LoRATargetType.VL_Q_PROJ
+                elif "attn.k_proj" in suffix:
+                    target_type = LoRATargetType.VL_K_PROJ
+                elif "attn.v_proj" in suffix:
+                    target_type = LoRATargetType.VL_V_PROJ
+                elif "attn.o_proj" in suffix:
+                    target_type = LoRATargetType.VL_O_PROJ
+                elif "mlp.linear_fc1" in suffix:
+                    target_type = LoRATargetType.VL_FC1
+                elif "mlp.linear_fc2" in suffix:
+                    target_type = LoRATargetType.VL_FC2
+
+            # 4. Deepstack Mergers (Offset +20000)
+            elif (match := re_vis_deepstack.search(key)):
+                layer_id = 20000 + int(match.group(1))
+                suffix = match.group(2)
+
+                if "linear_fc1" in suffix:
+                    target_type = LoRATargetType.VL_FC1
+                elif "linear_fc2" in suffix:
+                    target_type = LoRATargetType.VL_FC2
+
+            # 5. Simple Merger (Offset +29999)
+            elif (match := re_vis_merger.search(key)):
+                layer_id = 29999
+                suffix = match.group(1)
+
+                if "linear_fc1" in suffix:
+                    target_type = LoRATargetType.VL_FC1
+                elif "linear_fc2" in suffix:
+                    target_type = LoRATargetType.VL_FC2
+
+            # Storage Logic
+            if layer_id is not None and target_type is not None:
+                if layer_id not in result:
+                    result[layer_id] = {}
+
+                # Handle Experts separately if expert_id exists
+                if expert_id is not None:
+                    # Structure: result[layer][target_type][expert_id][A/B]
+                    if target_type not in result[layer_id]:
+                        result[layer_id][target_type] = {}
+
+                    if expert_id not in result[layer_id][target_type]:
+                        result[layer_id][target_type][expert_id] = {}
+
+                    result[layer_id][target_type][expert_id][matrix_type] = tensor.to(dtype=dtype, device=device)
                 else:
-                    continue
+                    # Structure: result[layer][target_type][A/B]
+                    if target_type not in result[layer_id]:
+                        result[layer_id][target_type] = {}
 
-                # Extract A or B matrix
-                if "lora_A" in key or "lora_B" in key:
-                    if target_type not in layer_result:
-                        layer_result[target_type] = {}
-
-                    if "lora_A" in key:
-                        layer_result[target_type]["A"] = tensor.to(dtype=dtype, device=device)
-                    elif "lora_B" in key:
-                        layer_result[target_type]["B"] = tensor.to(dtype=dtype, device=device)
-
-            if layer_result:
-                result[layer_id] = layer_result
+                    result[layer_id][target_type][matrix_type] = tensor.to(dtype=dtype, device=device)
 
         return result
 
@@ -533,10 +639,15 @@ def create_lora_mem_pool(
     intermediate_dim: int = 512,
     hidden_size: int = 4096,
     vocab_size: int = 151936,
+    num_kv_heads: int | None = None,
     dtype: torch.dtype = torch.float16,
     device: str = "cuda"
 ) -> LoRAMemPool:
-    """Create a complete LoRA memory pool."""
+    """Create a complete LoRA memory pool.
+
+    Args:
+        num_kv_heads: Number of key/value heads (for GQA models). If None, defaults to num_heads.
+    """
     return LoRAMemPool.create(
         num_layers=num_layers,
         pool_size=pool_size,
@@ -546,6 +657,7 @@ def create_lora_mem_pool(
         intermediate_dim=intermediate_dim,
         hidden_size=hidden_size,
         vocab_size=vocab_size,
+        num_kv_heads=num_kv_heads,
         dtype=dtype,
         device=device
     )

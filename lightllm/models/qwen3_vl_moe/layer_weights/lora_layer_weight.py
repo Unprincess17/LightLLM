@@ -6,32 +6,49 @@ LoRA weights are stored separately from base model weights and can be
 loaded/unloaded dynamically for detached serving.
 
 LoRA is applied to:
-- MLP layers: gate_proj, up_proj, down_proj (6 matrices)
-- Attention layers: q_proj, k_proj, v_proj, o_proj (8 matrices)
-
-Each attention LoRA is optional and can be enabled independently:
-- q_lora_rank: LoRA rank for q_proj (0 = disabled)
-- k_lora_rank: LoRA rank for k_proj (0 = disabled)
-- v_lora_rank: LoRA rank for v_proj (0 = disabled)
-- o_lora_rank: LoRA rank for o_proj (0 = disabled)
-
-Total: 14 LoRA matrices per layer (6 MLP + 8 Attention)
+- MLP layers: gate_proj, up_proj, down_proj (MoE experts)
+- Attention layers: q_proj, k_proj, v_proj, o_proj
+- Vision adapter: vl.q_proj, vl.k_proj, vl.v_proj, vl.o_proj, vl.linear_fc1, vl.linear_fc2
 """
+import json
 import torch
 import os
+import re
 from typing import Optional, Dict, Any
 from safetensors import safe_open
 
+# Define target type strings directly (matching lora_mem_pool.py)
+TARGET_TYPE = {
+    # LLM Attention
+    "ATTN_Q_PROJ": "attn_q",
+    "ATTN_K_PROJ": "attn_k",
+    "ATTN_V_PROJ": "attn_v",
+    "ATTN_O_PROJ": "attn_o",
+    # LLM MoE
+    "MOE_EXPERT_GATE": "moe_expert_gate",
+    "MOE_EXPERT_UP": "moe_expert_up",
+    "MOE_EXPERT_DOWN": "moe_expert_down",
+    # LLM Head
+    "LM_HEAD": "lm_head",
+    # Vision
+    "VL_Q_PROJ": "vl_q",
+    "VL_K_PROJ": "vl_k",
+    "VL_V_PROJ": "vl_v",
+    "VL_O_PROJ": "vl_o",
+    "VL_FC1": "vl_fc1",
+    "VL_FC2": "vl_fc2",
+}
+
 
 class Qwen3VLMoELoRALayerWeight:
-    """LoRA layer weights for Qwen3-VL-MoE MLP and Attention projections.
+    """LoRA layer weights for Qwen3-VL-MoE.
 
     Stores LoRA A and B matrices for:
-    - MLP: gate_proj, up_proj, down_proj (6 matrices)
-    - Attention: q_proj, k_proj, v_proj, o_proj (8 matrices, each optional)
+    - MLP: gate_proj, up_proj, down_proj (MoE experts)
+    - Attention: q_proj, k_proj, v_proj, o_proj
+    - Vision: vl.q_proj, vl.k_proj, vl.v_proj, vl.o_proj, vl.linear_fc1, vl.linear_fc2
 
-    Each attention LoRA can be enabled independently by setting its rank > 0.
-    Supports CPU/GPU swapping for memory efficiency.
+    Uses regex-based key matching for flexible safetensor parsing.
     """
 
     def __init__(
@@ -46,65 +63,22 @@ class Qwen3VLMoELoRALayerWeight:
         self.data_type_ = data_type
         self.device_ = device
 
-        # LoRA ranks from config (each optional, 0 = disabled)
+        # LoRA config
+        self.lora_alpha = network_config.get("lora_alpha", 1.0)
         self.q_lora_rank = network_config.get("q_lora_rank", 0)
         self.k_lora_rank = network_config.get("k_lora_rank", 0)
         self.v_lora_rank = network_config.get("v_lora_rank", 0)
         self.o_lora_rank = network_config.get("o_lora_rank", 0)
-        self.lora_alpha = network_config.get("lora_alpha", 1.0)
+        self.vl_lora_rank = network_config.get("vl_lora_rank", 0)
 
-        # Scaling factors (each optional)
-        self.q_scaling = self.lora_alpha / self.q_lora_rank if self.q_lora_rank > 0 else 1.0
-        self.k_scaling = self.lora_alpha / self.k_lora_rank if self.k_lora_rank > 0 else 1.0
-        self.v_scaling = self.lora_alpha / self.v_lora_rank if self.v_lora_rank > 0 else 1.0
-        self.o_scaling = self.lora_alpha / self.o_lora_rank if self.o_lora_rank > 0 else 1.0
-
-        # Check if any attention LoRA is enabled
-        self.has_attn_lora = (
-            self.q_lora_rank > 0 or self.k_lora_rank > 0 or
-            self.v_lora_rank > 0 or self.o_lora_rank > 0
-        )
-
-        # Hidden size per head for TP
-        self.hidden_size = network_config["hidden_size"]
+        # Hidden size
+        self.hidden_size = network_config.get("hidden_size", 4096)
         self.tp_size = 1  # Single GPU for now
         self.split_hidden_size = self.hidden_size // self.tp_size
 
-        # MLP LoRA matrices (lazy loading)
-        self.gate_proj_A: Optional[torch.Tensor] = None
-        self.gate_proj_B: Optional[torch.Tensor] = None
-        self.up_proj_A: Optional[torch.Tensor] = None
-        self.up_proj_B: Optional[torch.Tensor] = None
-        self.down_proj_A: Optional[torch.Tensor] = None
-        self.down_proj_B: Optional[torch.Tensor] = None
-
-        # Attention LoRA matrices (q, k, v, o for MoE - each optional)
-        self.q_proj_A: Optional[torch.Tensor] = None
-        self.q_proj_B: Optional[torch.Tensor] = None
-        self.k_proj_A: Optional[torch.Tensor] = None
-        self.k_proj_B: Optional[torch.Tensor] = None
-        self.v_proj_A: Optional[torch.Tensor] = None
-        self.v_proj_B: Optional[torch.Tensor] = None
-        self.o_proj_A: Optional[torch.Tensor] = None
-        self.o_proj_B: Optional[torch.Tensor] = None
-
-        # CPU storage for swap mode - MLP
-        self.gate_proj_A_home: Optional[torch.Tensor] = None
-        self.gate_proj_B_home: Optional[torch.Tensor] = None
-        self.up_proj_A_home: Optional[torch.Tensor] = None
-        self.up_proj_B_home: Optional[torch.Tensor] = None
-        self.down_proj_A_home: Optional[torch.Tensor] = None
-        self.down_proj_B_home: Optional[torch.Tensor] = None
-
-        # CPU storage for swap mode - Attention (separate k, v, o)
-        self.q_proj_A_home: Optional[torch.Tensor] = None
-        self.q_proj_B_home: Optional[torch.Tensor] = None
-        self.k_proj_A_home: Optional[torch.Tensor] = None
-        self.k_proj_B_home: Optional[torch.Tensor] = None
-        self.v_proj_A_home: Optional[torch.Tensor] = None
-        self.v_proj_B_home: Optional[torch.Tensor] = None
-        self.o_proj_A_home: Optional[torch.Tensor] = None
-        self.o_proj_B_home: Optional[torch.Tensor] = None
+        # Storage for weights
+        # Format: {target_type: {module_name: {"A": tensor, "B": tensor}}}
+        self.weights: Dict[str, Dict[str, Dict[str, Optional[torch.Tensor]]]] = {}
 
         # State tracking
         self.is_loaded_ = False
@@ -117,185 +91,187 @@ class Qwen3VLMoELoRALayerWeight:
             weights: Dictionary of weight tensors from safetensors
             swap: If True, keep weights on CPU (pinned memory)
         """
-        if not self.has_attn_lora:
-            return  # No attention LoRA to load
+        # Pre-compiled regex patterns
+        re_llm_layer = re.compile(r"model\.language_model\.layers\.(\d+)\.(.+)")
+        re_vis_block = re.compile(r"model\.visual\.blocks\.(\d+)\.(.+)")
+        re_lm_head = re.compile(r"model\.language_model\.lm_head")
+        re_expert = re.compile(r"experts\.(\d+)\.")
 
-        mlp_prefix = f"base_model.model.model.language_model.layers.{self.layer_num_}.mlp"
-        attn_prefix = f"base_model.model.model.language_model.layers.{self.layer_num_}.self_attn"
+        # Get this layer number
+        current_layer = self.layer_num_
 
-        # Get TP slice indices
-        tp_idx_start = 0
-        tp_idx_end = self.split_hidden_size
+        for key, tensor in weights.items():
+            if "lora_A" not in key and "lora_B" not in key:
+                continue
 
-        # ========== Load MLP LoRA weights ==========
-        gate_a_key = f"{mlp_prefix}.gate_proj.lora_A.weight"
-        gate_b_key = f"{mlp_prefix}.gate_proj.lora_B.weight"
-        if gate_a_key in weights:
-            self._load_weight(gate_a_key, weights, "gate_proj_A", swap, tp_idx_start, tp_idx_end)
-        if gate_b_key in weights:
-            self._load_weight(gate_b_key, weights, "gate_proj_B", swap, tp_idx_start, tp_idx_end)
+            matrix_type = "A" if "lora_A" in key else "B"
+            target_type: Optional[str] = None
+            module_name: Optional[str] = None
 
-        up_a_key = f"{mlp_prefix}.up_proj.lora_A.weight"
-        up_b_key = f"{mlp_prefix}.up_proj.lora_B.weight"
-        if up_a_key in weights:
-            self._load_weight(up_a_key, weights, "up_proj_A", swap, tp_idx_start, tp_idx_end)
-        if up_b_key in weights:
-            self._load_weight(up_b_key, weights, "up_proj_B", swap, tp_idx_start, tp_idx_end)
+            # Check LLM layers
+            match = re_llm_layer.search(key)
+            if match and int(match.group(1)) == current_layer:
+                suffix = match.group(2)
 
-        down_a_key = f"{mlp_prefix}.down_proj.lora_A.weight"
-        down_b_key = f"{mlp_prefix}.down_proj.lora_B.weight"
-        if down_a_key in weights:
-            self._load_weight(down_a_key, weights, "down_proj_A", swap, tp_idx_start, tp_idx_end)
-        if down_b_key in weights:
-            self._load_weight(down_b_key, weights, "down_proj_B", swap, tp_idx_start, tp_idx_end)
+                # Attention: self_attn.q_proj, self_attn.k_proj, etc.
+                if "self_attn.q_proj" in suffix:
+                    if self.q_lora_rank <= 0:
+                        continue
+                    target_type = TARGET_TYPE["ATTN_Q_PROJ"]
+                    module_name = "q_proj"
+                elif "self_attn.k_proj" in suffix:
+                    if self.k_lora_rank <= 0:
+                        continue
+                    target_type = TARGET_TYPE["ATTN_K_PROJ"]
+                    module_name = "k_proj"
+                elif "self_attn.v_proj" in suffix:
+                    if self.v_lora_rank <= 0:
+                        continue
+                    target_type = TARGET_TYPE["ATTN_V_PROJ"]
+                    module_name = "v_proj"
+                elif "self_attn.o_proj" in suffix:
+                    if self.o_lora_rank <= 0:
+                        continue
+                    target_type = TARGET_TYPE["ATTN_O_PROJ"]
+                    module_name = "o_proj"
 
-        # ========== Load Attention LoRA weights (MoE: q, k, v, o) ==========
-        if self.q_lora_rank > 0:
-            q_a_key = f"{attn_prefix}.q_proj.lora_A.weight"
-            q_b_key = f"{attn_prefix}.q_proj.lora_B.weight"
-            if q_a_key in weights:
-                self._load_weight(q_a_key, weights, "q_proj_A", swap, tp_idx_start, tp_idx_end)
-            if q_b_key in weights:
-                self._load_weight(q_b_key, weights, "q_proj_B", swap, tp_idx_start, tp_idx_end)
+                # MoE MLP: mlp.gate_proj, mlp.experts.0.gate_proj, etc.
+                elif "mlp.gate_proj" in suffix:
+                    target_type = TARGET_TYPE["MOE_EXPERT_GATE"]
+                    module_name = "gate_proj"
+                elif "mlp.experts" in suffix:
+                    # mlp.experts.0.gate_proj, mlp.experts.0.up_proj, etc.
+                    expert_match = re_expert.search(suffix)
+                    if expert_match:
+                        # For MoE, we use shared weights across experts
+                        if "gate_proj" in suffix:
+                            target_type = TARGET_TYPE["MOE_EXPERT_GATE"]
+                            module_name = "gate_proj"
+                        elif "up_proj" in suffix:
+                            target_type = TARGET_TYPE["MOE_EXPERT_UP"]
+                            module_name = "up_proj"
+                        elif "down_proj" in suffix:
+                            target_type = TARGET_TYPE["MOE_EXPERT_DOWN"]
+                            module_name = "down_proj"
 
-        if self.k_lora_rank > 0:
-            k_a_key = f"{attn_prefix}.k_proj.lora_A.weight"
-            k_b_key = f"{attn_prefix}.k_proj.lora_B.weight"
-            if k_a_key in weights:
-                self._load_weight(k_a_key, weights, "k_proj_A", swap, tp_idx_start, tp_idx_end)
-            if k_b_key in weights:
-                self._load_weight(k_b_key, weights, "k_proj_B", swap, tp_idx_start, tp_idx_end)
+                elif "mlp.up_proj" in suffix:
+                    target_type = TARGET_TYPE["MOE_EXPERT_UP"]
+                    module_name = "up_proj"
+                elif "mlp.down_proj" in suffix:
+                    target_type = TARGET_TYPE["MOE_EXPERT_DOWN"]
+                    module_name = "down_proj"
 
-        if self.v_lora_rank > 0:
-            v_a_key = f"{attn_prefix}.v_proj.lora_A.weight"
-            v_b_key = f"{attn_prefix}.v_proj.lora_B.weight"
-            if v_a_key in weights:
-                self._load_weight(v_a_key, weights, "v_proj_A", swap, tp_idx_start, tp_idx_end)
-            if v_b_key in weights:
-                self._load_weight(v_b_key, weights, "v_proj_B", swap, tp_idx_start, tp_idx_end)
+            # Check Vision blocks (offset by 10000)
+            vis_layer = current_layer - 10000
+            if vis_layer >= 0:
+                match = re_vis_block.search(key)
+                if match and int(match.group(1)) == vis_layer:
+                    suffix = match.group(2)
+                    if self.vl_lora_rank <= 0:
+                        continue
 
-        if self.o_lora_rank > 0:
-            o_a_key = f"{attn_prefix}.o_proj.lora_A.weight"
-            o_b_key = f"{attn_prefix}.o_proj.lora_B.weight"
-            if o_a_key in weights:
-                self._load_weight(o_a_key, weights, "o_proj_A", swap, tp_idx_start, tp_idx_end)
-            if o_b_key in weights:
-                self._load_weight(o_b_key, weights, "o_proj_B", swap, tp_idx_start, tp_idx_end)
+                    if "attn.q_proj" in suffix:
+                        target_type = TARGET_TYPE["VL_Q_PROJ"]
+                        module_name = "vl_q"
+                    elif "attn.k_proj" in suffix:
+                        target_type = TARGET_TYPE["VL_K_PROJ"]
+                        module_name = "vl_k"
+                    elif "attn.v_proj" in suffix:
+                        target_type = TARGET_TYPE["VL_V_PROJ"]
+                        module_name = "vl_v"
+                    elif "attn.o_proj" in suffix:
+                        target_type = TARGET_TYPE["VL_O_PROJ"]
+                        module_name = "vl_o"
+                    elif "mlp.linear_fc1" in suffix:
+                        target_type = TARGET_TYPE["VL_FC1"]
+                        module_name = "vl_fc1"
+                    elif "mlp.linear_fc2" in suffix:
+                        target_type = TARGET_TYPE["VL_FC2"]
+                        module_name = "vl_fc2"
+
+            # LM Head (layer -1)
+            elif re_lm_head.search(key):
+                target_type = TARGET_TYPE["LM_HEAD"]
+                module_name = "lm_head"
+
+            if target_type is None or module_name is None:
+                continue
+
+            # Convert tensor
+            tensor = tensor.to(dtype=self.data_type_)
+
+            # A matrices need transpose to [hidden, rank]
+            if matrix_type == "A":
+                if tensor.dim() == 2:
+                    tensor = tensor.transpose(0, 1).contiguous()
+
+            # TP slicing (if needed)
+            tp_start = 0
+            tp_end = self.split_hidden_size
+            if tensor.shape[0] > tp_end:
+                tensor = tensor[tp_start:tp_end]
+
+            # Handle CPU swap
+            if swap:
+                tensor = tensor.pin_memory()
+
+            # Store weight
+            if target_type not in self.weights:
+                self.weights[target_type] = {}
+            if module_name not in self.weights[target_type]:
+                self.weights[target_type][module_name] = {"A": None, "B": None}
+
+            self.weights[target_type][module_name][matrix_type] = tensor
 
         self.is_loaded_ = True
         self.is_on_gpu_ = not swap
 
-    def _load_weight(
-        self,
-        key: str,
-        weights: Dict[str, torch.Tensor],
-        attr_name: str,
-        swap: bool,
-        tp_start: int,
-        tp_end: int
-    ):
-        """Load a single LoRA weight matrix."""
-        if key not in weights:
-            return
+    def get_weights(self) -> Dict[str, Dict[str, Dict[str, Optional[torch.Tensor]]]]:
+        """Get all LoRA weights.
 
-        weight = weights[key]
-
-        if weight.dim() == 2:
-            pass
-        elif weight.dim() == 1:
-            return  # Bias vector - skip
-
-        weight = weight.to(dtype=self.data_type_)
-
-        # A matrices need to be transposed to [hidden, rank] for input @ A
-        if attr_name.endswith("_A"):
-            weight = weight.transpose(0, 1).contiguous()
-
-        if swap:
-            setattr(self, f"{attr_name}_home", weight.pin_memory())
-            setattr(self, attr_name, None)
-        else:
-            setattr(self, attr_name, weight.to(self.device_))
+        Returns:
+            Dict mapping target_type -> module_name -> {"A": tensor, "B": tensor}
+        """
+        return self.weights
 
     def load_to_gpu(self, non_blocking: bool = True):
         """Load weights from CPU to GPU."""
-        if self.is_on_gpu_ or not self.has_attn_lora:
+        if self.is_on_gpu_:
             return
 
-        # MLP LoRA weights
-        for attr in ["gate_proj_A", "gate_proj_B", "up_proj_A", "up_proj_B", "down_proj_A", "down_proj_B"]:
-            home_attr = f"{attr}_home"
-            home = getattr(self, home_attr, None)
-            if home is not None:
-                setattr(self, attr, home.to(self.device_, non_blocking=non_blocking))
-                setattr(self, home_attr, None)
-
-        # Attention LoRA weights (q, k, v, o)
-        for attr in ["q_proj_A", "q_proj_B", "k_proj_A", "k_proj_B", "v_proj_A", "v_proj_B", "o_proj_A", "o_proj_B"]:
-            home_attr = f"{attr}_home"
-            home = getattr(self, home_attr, None)
-            if home is not None:
-                setattr(self, attr, home.to(self.device_, non_blocking=non_blocking))
-                setattr(self, home_attr, None)
+        for target_type in self.weights:
+            for module_name in self.weights[target_type]:
+                for matrix_type in ["A", "B"]:
+                    tensor = self.weights[target_type][module_name].get(matrix_type)
+                    if tensor is not None and tensor.device.type == "cpu":
+                        self.weights[target_type][module_name][matrix_type] = tensor.to(
+                            self.device_, non_blocking=non_blocking
+                        )
 
         self.is_on_gpu_ = True
 
     def offload_from_gpu(self):
         """Offload weights from GPU to CPU."""
-        if not self.is_on_gpu_ or not self.has_attn_lora:
+        if not self.is_on_gpu_:
             return
 
-        # MLP LoRA weights
-        for attr in ["gate_proj_A", "gate_proj_B", "up_proj_A", "up_proj_B", "down_proj_A", "down_proj_B"]:
-            gpu_attr = getattr(self, attr, None)
-            if gpu_attr is not None:
-                setattr(self, f"{attr}_home", gpu_attr.cpu().pin_memory())
-                setattr(self, attr, None)
-
-        # Attention LoRA weights (q, k, v, o)
-        for attr in ["q_proj_A", "q_proj_B", "k_proj_A", "k_proj_B", "v_proj_A", "v_proj_B", "o_proj_A", "o_proj_B"]:
-            gpu_attr = getattr(self, attr, None)
-            if gpu_attr is not None:
-                setattr(self, f"{attr}_home", gpu_attr.cpu().pin_memory())
-                setattr(self, attr, None)
+        for target_type in self.weights:
+            for module_name in self.weights[target_type]:
+                for matrix_type in ["A", "B"]:
+                    tensor = self.weights[target_type][module_name].get(matrix_type)
+                    if tensor is not None and tensor.device.type == "cuda":
+                        self.weights[target_type][module_name][matrix_type] = tensor.cpu().pin_memory()
 
         self.is_on_gpu_ = False
 
-    def get_weights(self) -> Dict[str, torch.Tensor]:
-        """Get all LoRA weights on GPU (both MLP and Attention)."""
-        result = {}
-        # MLP LoRA weights
-        for attr in ["gate_proj_A", "gate_proj_B", "up_proj_A", "up_proj_B", "down_proj_A", "down_proj_B"]:
-            w = getattr(self, attr, None)
-            if w is not None:
-                result[attr] = w
-        # Attention LoRA weights (q, k, v, o)
-        for attr in ["q_proj_A", "q_proj_B", "k_proj_A", "k_proj_B", "v_proj_A", "v_proj_B", "o_proj_A", "o_proj_B"]:
-            w = getattr(self, attr, None)
-            if w is not None:
-                result[attr] = w
-        return result
-
     def verify(self) -> bool:
         """Verify all weights are loaded."""
-        if not self.has_attn_lora:
-            return True
-
-        # MLP LoRA weights
-        for attr in ["gate_proj_A", "gate_proj_B", "up_proj_A", "up_proj_B", "down_proj_A", "down_proj_B"]:
-            w_gpu = getattr(self, attr, None)
-            w_cpu = getattr(self, f"{attr}_home", None)
-            if w_gpu is None and w_cpu is None:
-                print(f"Warning: {attr} not loaded for layer {self.layer_num_}")
-                return False
-
-        # Attention LoRA weights (q, k, v, o)
-        for attr in ["q_proj_A", "q_proj_B", "k_proj_A", "k_proj_B", "v_proj_A", "v_proj_B", "o_proj_A", "o_proj_B"]:
-            w_gpu = getattr(self, attr, None)
-            w_cpu = getattr(self, f"{attr}_home", None)
-            if w_gpu is None and w_cpu is None:
-                print(f"Warning: {attr} not loaded for layer {self.layer_num_}")
-                return False
+        for target_type in self.weights:
+            for module_name in self.weights[target_type]:
+                if self.weights[target_type][module_name]["A"] is None:
+                    return False
+                if self.weights[target_type][module_name]["B"] is None:
+                    return False
         return True
 
 
@@ -316,48 +292,111 @@ class Qwen3VLMoELoRAAdapter:
         self.device = device
         self.swap = swap
 
-        # Extract LoRA config from adapter
-        self.q_lora_rank = network_config.get("q_lora_rank", 0)
-        self.k_lora_rank = network_config.get("k_lora_rank", 0)
-        self.v_lora_rank = network_config.get("v_lora_rank", 0)
-        self.o_lora_rank = network_config.get("o_lora_rank", 0)
-        self.lora_alpha = network_config.get("lora_alpha", 1.0)
+        # Read adapter_config.json for LoRA configuration
+        adapter_config = {}
+        config_path = os.path.join(self.adapter_dir, "adapter_config.json")
+        if os.path.exists(config_path):
+            with open(config_path, "r") as f:
+                adapter_config = json.load(f)
 
-        # Check if any attention LoRA is enabled
-        self.has_attn_lora = (
-            self.q_lora_rank > 0 or self.k_lora_rank > 0 or
-            self.v_lora_rank > 0 or self.o_lora_rank > 0
-        )
+        lora_r = adapter_config.get("r", 64)  # Default to 64
+        assert lora_r > 0, "LoRA rank must be positive"
 
-        # Create layer weights
-        self.num_layers = network_config["num_hidden_layers"]
-        self.layers = [
+        self.lora_alpha = adapter_config.get("lora_alpha", 1.0)
+        self.q_lora_rank = lora_r
+        self.k_lora_rank = lora_r
+        self.v_lora_rank = lora_r
+        self.o_lora_rank = lora_r
+        self.vl_lora_rank = lora_r
+        self.max_rank = lora_r
+
+
+        # Count layers (including vision layers at offset)
+        num_llm_layers = network_config.get("num_hidden_layers", 0)
+        vision_config = network_config.get("vision_config", {})
+        num_vision_layers = vision_config.get("depth", network_config.get("vision_num_layers", 0))
+        self.num_layers = num_llm_layers + num_vision_layers
+
+        # Create layer weights for LLM layers
+        self.llm_layers = [
             Qwen3VLMoELoRALayerWeight(i, network_config, data_type, device)
-            for i in range(self.num_layers)
+            for i in range(num_llm_layers)
         ]
+
+        # Create layer weights for Vision layers (offset by 10000)
+        self.vision_layers = [
+            Qwen3VLMoELoRALayerWeight(10000 + i, network_config, data_type, device)
+            for i in range(num_vision_layers)
+        ]
+
+        # All layers combined
+        self.layers = self.llm_layers + self.vision_layers
 
         # Load weights
         self._load_weights()
 
     def _load_weights(self):
-        """Load LoRA weights from adapter directory."""
-        if not self.has_attn_lora:
-            return
+        """Load LoRA weights from adapter directory.
 
-        # Find safetensor files
+        Optimized to filter weights once and distribute to layers efficiently.
+        """
         import glob
-        safetensor_files = glob.glob(os.path.join(self.adapter_dir, "*.safetensors"))
 
-        # Load all weights
-        all_weights = {}
+        safetensor_files = glob.glob(os.path.join(self.adapter_dir, "*.safetensors"))
+        if not safetensor_files:
+            raise ValueError(f"No safetensors found in {self.adapter_dir}")
+
+        # Pre-compiled regex patterns for layer matching
+        re_llm_layer = re.compile(r"model\.language_model\.layers\.(\d+)\.")
+        re_vis_block = re.compile(r"model\.visual\.blocks\.(\d+)\.")
+        re_lm_head = re.compile(r"model\.language_model\.lm_head")
+
+        # Build layer index sets for O(1) lookup
+        llm_layer_nums = {layer.layer_num_ for layer in self.llm_layers}
+        vis_layer_nums = {layer.layer_num_ - 10000 for layer in self.vision_layers}
+
+        # Pre-filter weights per layer to avoid repeated iteration
+        # Dict[layer_num] -> Dict[key, tensor]
+        llm_layer_weights: dict[int, dict[str, torch.Tensor]] = {i: {} for i in llm_layer_nums}
+        vis_layer_weights: dict[int, dict[str, torch.Tensor]] = {i: {} for i in vis_layer_nums}
+        lm_head_weights: dict[str, torch.Tensor] = {}
+
         for f in safetensor_files:
             with safe_open(f, "pt", "cpu") as sf:
                 for k in sf.keys():
-                    all_weights[k] = sf.get_tensor(k)
+                    if "lora_A" not in k and "lora_B" not in k:
+                        continue
 
-        # Distribute to layers
-        for layer in self.layers:
-            layer.load_hf_weights(all_weights, swap=self.swap)
+                    tensor = sf.get_tensor(k)
+
+                    # Check LM head first (no layer number)
+                    if re_lm_head.search(k):
+                        lm_head_weights[k] = tensor
+                        continue
+
+                    # Check LLM layers
+                    llm_match = re_llm_layer.search(k)
+                    if llm_match:
+                        layer_num = int(llm_match.group(1))
+                        if layer_num in llm_layer_nums:
+                            llm_layer_weights[layer_num][k] = tensor
+                            continue
+
+                    # Check Vision layers
+                    vis_match = re_vis_block.search(k)
+                    if vis_match:
+                        vis_layer = int(vis_match.group(1))
+                        if vis_layer in vis_layer_nums:
+                            vis_layer_weights[vis_layer][k] = tensor
+                            continue
+
+        # Distribute to LLM layers
+        for layer in self.llm_layers:
+            layer.load_hf_weights(llm_layer_weights[layer.layer_num_], swap=self.swap)
+
+        # Distribute to Vision layers
+        for layer in self.vision_layers:
+            layer.load_hf_weights(vis_layer_weights[layer.layer_num_ - 10000], swap=self.swap)
 
         # Move to GPU if not swapping
         if not self.swap:
@@ -377,11 +416,32 @@ class Qwen3VLMoELoRAAdapter:
         """Check if adapter is on GPU."""
         return self.layers[0].is_on_gpu_ if self.layers else False
 
-    def get_layer_weights(self, layer_id: int) -> Dict[str, torch.Tensor]:
-        """Get LoRA weights for a specific layer."""
-        if 0 <= layer_id < len(self.layers):
-            return self.layers[layer_id].get_weights()
+    def get_layer_weights(self, layer_id: int) -> Dict[str, Dict[str, Dict[str, Optional[torch.Tensor]]]]:
+        """Get LoRA weights for a specific layer.
+
+        Args:
+            layer_id: Layer index (0-N for LLM, 10000+ for vision)
+
+        Returns:
+            Dict mapping target_type -> module_name -> {"A": tensor, "B": tensor}
+        """
+        for layer in self.layers:
+            if layer.layer_num_ == layer_id:
+                return layer.get_weights()
         return {}
+
+    def get_all_weights(self) -> Dict[int, Dict[str, Dict[str, Dict[str, Optional[torch.Tensor]]]]]:
+        """Get all weights across all layers.
+
+        Returns:
+            Dict mapping layer_id -> target_type -> module_name -> {"A": tensor, "B": tensor}
+        """
+        result = {}
+        for layer in self.layers:
+            weights = layer.get_weights()
+            if weights:
+                result[layer.layer_num_] = weights
+        return result
 
     def verify(self) -> bool:
         """Verify all weights are loaded correctly."""

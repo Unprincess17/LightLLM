@@ -28,14 +28,15 @@
 set -e
 
 # Default values
-MODEL_DIR="/home/shufan/.cache/huggingface/hub/models--Qwen--Qwen3-VL-2B-Instruct/snapshots/89644892e4d85e24eaac8bacfd4f463576704203/"
-LORA_DIR="/home/shufan/Qwen-VL-FT/work/lora_model"
-PORT=8180
-TP=1
-HOST="127.0.0.1"
+MODEL_DIR="/home/shufan/.cache/huggingface/hub/models--Qwen--Qwen3-VL-30B-A3B-Instruct/snapshots/9c4b90e1e4ba969fd3b5378b57d966d725f1b86c"
+MODEL_NAME="Qwen3-VL-30B-A3B-Instruct"
+LORA_DIR="/home/shufan/Qwen-VL-FT/work/lora_dummy"
+PORT=8040
+TP=2
+HOST="0.0.0.0"
 ENABLE_MULTIMODAL=true
 LORA_MAX_SIZE=1024
-COMPUTE_ON_CPU=false
+COMPUTE_ON_CPU=true
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -135,8 +136,8 @@ if [[ "$COMPUTE_ON_CPU" == "true" ]]; then
     CMD="$CMD --compute_on_cpu"
 fi
 
-# Add common optimizations
-CMD="$CMD --mem_fraction 0.9 --batch_max_tokens 4096"
+# Add common optimizations and disable cudagraph (requires cupy)
+CMD="$CMD --mem_fraction 0.7 --batch_max_tokens 4096 --disable_cudagraph"
 
 echo ""
 echo "Starting server..."
