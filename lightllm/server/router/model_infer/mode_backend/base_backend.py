@@ -973,6 +973,16 @@ class ModeBackend:
 
             self.logger.info(f"[LoRA Backend] Config values: hidden_size={hidden_size}, intermediate_dim={intermediate_dim}, num_heads={num_heads}, num_kv_heads={num_kv_heads}, head_dim={head_dim}")
 
+            # Extract vision config for multimodal models
+            vision_config = config.get("vision_config", None)
+            vl_hidden_size = vision_config.get("hidden_size") if vision_config else None
+            vl_intermediate_size = vision_config.get("intermediate_size") if vision_config else None
+            vl_out_hidden_size = vision_config.get("out_hidden_size") if vision_config else None
+            vl_depth = vision_config.get("depth") if vision_config else None
+
+            if vl_hidden_size:
+                self.logger.info(f"[LoRA Backend] Vision config: vl_hidden_size={vl_hidden_size}, vl_intermediate_size={vl_intermediate_size}, vl_out_hidden_size={vl_out_hidden_size}, vl_depth={vl_depth}")
+
             self.lora_mem_pool = create_lora_mem_pool(
                 num_layers=num_layers,
                 pool_size=1024,  # Can hold 1024 adapters
@@ -984,7 +994,11 @@ class ModeBackend:
                 vocab_size=vocab_size,
                 num_kv_heads=num_kv_heads,
                 dtype=torch.float16,
-                device="cuda"
+                device="cuda",
+                vl_hidden_size=vl_hidden_size,
+                vl_intermediate_size=vl_intermediate_size,
+                vl_out_hidden_size=vl_out_hidden_size,
+                vl_depth=vl_depth,
             )
 
             self.logger.info(f"[LoRA Backend] Created LoRA memory pool for {num_layers} layers, max_rank={max_rank}")

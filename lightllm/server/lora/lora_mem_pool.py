@@ -96,6 +96,14 @@ class LoRAModulePool:
         """Get the B weight buffer."""
         return self.value_buffer
 
+    def __repr__(self) -> str:
+        return (
+            f"LoRAModulePool(a_hidden_dim={self.a_hidden_dim}, "
+            f"b_hidden_dim={self.b_hidden_dim}, "
+            f"key_buffer.shape={self.key_buffer.shape}, "
+            f"value_buffer.shape={self.value_buffer.shape})"
+        )
+
     @classmethod
     def create(
         cls,
@@ -186,11 +194,11 @@ class LoRAModulePool:
             b_weight = weights.get("B")
 
             if a_weight is not None:
-                # A matrix: [hidden, rank] -> [rank, hidden]
-                self.a_buffer[loc_start + layer_id, :rank] = a_weight.T.to(self.a_buffer.dtype)
+                # A weight matrix: [rank, hidden]
+                self.a_buffer[loc_start + layer_id, :rank] = a_weight.to(self.a_buffer.dtype)
             if b_weight is not None:
-                # B matrix: [rank, hidden] -> [hidden, rank] (stored as [rank, hidden])
-                self.b_buffer[loc_start + layer_id, :rank] = b_weight.T.to(self.b_buffer.dtype)
+                # B weight matrix: [rank, hidden] -> [hidden, rank] (stored as [rank, hidden])
+                self.b_buffer[loc_start + layer_id, :rank] = b_weight.to(self.b_buffer.dtype)
 
         return True
 
@@ -281,13 +289,32 @@ class LoRAMemPool:
         vocab_size: int,
         num_kv_heads: int | None = None,
         dtype: torch.dtype = torch.float16,
-        device: str = "cuda"
+        device: str = "cuda",
+        # Vision config parameters (optional)
+        vl_hidden_size: int | None = None,
+        vl_intermediate_size: int | None = None,
+        vl_out_hidden_size: int | None = None,
+        vl_depth: int | None = None,
     ) -> "LoRAMemPool":
         """Create a complete LoRA memory pool.
 
         Args:
             num_kv_heads: Number of key/value heads (for GQA models). If None, defaults to num_heads.
+            vl_hidden_size: Vision model hidden size. If None, uses hidden_size.
+            vl_intermediate_size: Vision MLP intermediate size. If None, uses intermediate_dim.
+            vl_out_hidden_size: Vision output hidden size. If None, uses vl_hidden_size.
+            vl_depth: Vision model depth for pool layer capacity. If None, uses num_layers.
         """
+        # Use vision dimensions if provided, otherwise fall back to text model dimensions
+        if vl_hidden_size is None:
+            vl_hidden_size = hidden_size
+        if vl_intermediate_size is None:
+            vl_intermediate_size = intermediate_dim
+        if vl_out_hidden_size is None:
+            vl_out_hidden_size = vl_hidden_size
+        if vl_depth is None:
+            vl_depth = num_layers
+
         # Attention dimensions
         attn_hidden = hidden_size
         if num_kv_heads is None:
@@ -296,21 +323,22 @@ class LoRAMemPool:
         kv_hidden = num_kv_heads * head_dim
         mlp_inter = intermediate_dim
 
-        # Vision dimensions (use LLM dims as default)
-        vl_hidden = hidden_size
-        vl_mlp_hidden = intermediate_dim
+        # Vision dimensions - use provided values
+        vl_hidden = vl_hidden_size
+        vl_mlp_hidden = vl_intermediate_size
+        vl_out_hidden = vl_out_hidden_size
 
-        logger.info(f"[LoRA Pool] Creating pool: attn_hidden={attn_hidden}, kv_hidden={kv_hidden}, mlp_hidden={mlp_inter}")
+        logger.info(f"[LoRA Pool] Creating pool: attn_hidden={attn_hidden}, kv_hidden={kv_hidden}, mlp_hidden={mlp_inter}, vl_hidden={vl_hidden}, vl_mlp_hidden={vl_mlp_hidden}, vl_out_hidden={vl_out_hidden}, vl_depth={vl_depth}")
 
         pool = cls(
-            # Vision-Language pools (Q/K/V/O preserve vl_hidden)
+            # Vision-Language pools (Q/K/V/O use vl_hidden, FC1/FC2 use vl_hidden/vl_mlp_hidden)
             vl_q_pool=LoRAModulePool.create(pool_size, max_rank, vl_hidden, vl_hidden, dtype, device),
             vl_k_pool=LoRAModulePool.create(pool_size, max_rank, vl_hidden, vl_hidden, dtype, device),
             vl_v_pool=LoRAModulePool.create(pool_size, max_rank, vl_hidden, vl_hidden, dtype, device),
             vl_o_pool=LoRAModulePool.create(pool_size, max_rank, vl_hidden, vl_hidden, dtype, device),
-            # Vision MLP: FC1 expands, FC2 shrinks
+            # Vision MLP: FC1 expands from vl_hidden to vl_mlp_hidden, FC2 shrinks from vl_mlp_hidden to vl_out_hidden
             vl_fc1_pool=LoRAModulePool.create(pool_size, max_rank, vl_hidden, vl_mlp_hidden, dtype, device),
-            vl_fc2_pool=LoRAModulePool.create(pool_size, max_rank, vl_mlp_hidden, vl_hidden, dtype, device),
+            vl_fc2_pool=LoRAModulePool.create(pool_size, max_rank, vl_mlp_hidden, vl_out_hidden, dtype, device),
 
             # Attention pools - Q/O use full hidden, K/V use GQA output dim
             attn_q_pool=LoRAModulePool.create(pool_size, max_rank, attn_hidden, attn_hidden, dtype, device),
@@ -641,12 +669,21 @@ def create_lora_mem_pool(
     vocab_size: int = 151936,
     num_kv_heads: int | None = None,
     dtype: torch.dtype = torch.float16,
-    device: str = "cuda"
+    device: str = "cuda",
+    # Vision config parameters (optional)
+    vl_hidden_size: int | None = None,
+    vl_intermediate_size: int | None = None,
+    vl_out_hidden_size: int | None = None,
+    vl_depth: int | None = None,
 ) -> LoRAMemPool:
     """Create a complete LoRA memory pool.
 
     Args:
         num_kv_heads: Number of key/value heads (for GQA models). If None, defaults to num_heads.
+        vl_hidden_size: Vision model hidden size. If None, uses hidden_size.
+        vl_intermediate_size: Vision MLP intermediate size. If None, uses intermediate_dim.
+        vl_out_hidden_size: Vision output hidden size. If None, uses vl_hidden_size.
+        vl_depth: Vision model depth for pool layer capacity. If None, uses num_layers.
     """
     return LoRAMemPool.create(
         num_layers=num_layers,
@@ -659,5 +696,9 @@ def create_lora_mem_pool(
         vocab_size=vocab_size,
         num_kv_heads=num_kv_heads,
         dtype=dtype,
-        device=device
+        device=device,
+        vl_hidden_size=vl_hidden_size,
+        vl_intermediate_size=vl_intermediate_size,
+        vl_out_hidden_size=vl_out_hidden_size,
+        vl_depth=vl_depth,
     )

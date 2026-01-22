@@ -7,3 +7,14 @@ dist
 .vscode
 tmp/
 S-LoRA
+test/lora/awkprof.out
+test/lora/avx/benchmark_roundtrip.py
+test/lora/avx/benchmark.py
+test/lora/avx/lora_avx
+test/lora/avx/lora_avx512.cpp
+test/lora/avx/lora_omp
+test/lora/avx/lora_omp.cpp
+test/lora/avx/Makefile
+test/lora/avx/pcie_bench
+test/lora/avx/pcie_benchmark.cu
+test/lora/avx/results.csv
