@@ -960,6 +960,8 @@ class ModeBackend:
             num_kv_heads = config.get("num_key_value_heads", num_heads)
             head_dim = config.get("head_dim", 128)
             intermediate_dim = config.get("intermediate_size", 512)
+            # For MoE models, use moe_intermediate_size for LoRA
+            moe_intermediate_dim = config.get("moe_intermediate_size", intermediate_dim)
             # For multimodal models, get hidden_size from text_config
             if "hidden_size" in config:
                 hidden_size = config["hidden_size"]
@@ -971,7 +973,7 @@ class ModeBackend:
             vocab_size = config.get("vocab_size", 151936)
             max_rank = 16  # Can be configured
 
-            self.logger.info(f"[LoRA Backend] Config values: hidden_size={hidden_size}, intermediate_dim={intermediate_dim}, num_heads={num_heads}, num_kv_heads={num_kv_heads}, head_dim={head_dim}")
+            self.logger.info(f"[LoRA Backend] Config values: hidden_size={hidden_size}, intermediate_dim={intermediate_dim}, moe_intermediate_dim={moe_intermediate_dim}, num_heads={num_heads}, num_kv_heads={num_kv_heads}, head_dim={head_dim}")
 
             # Extract vision config for multimodal models
             vision_config = config.get("vision_config", None)
@@ -999,6 +1001,7 @@ class ModeBackend:
                 vl_intermediate_size=vl_intermediate_size,
                 vl_out_hidden_size=vl_out_hidden_size,
                 vl_depth=vl_depth,
+                moe_intermediate_dim=moe_intermediate_dim,
             )
 
             self.logger.info(f"[LoRA Backend] Created LoRA memory pool for {num_layers} layers, max_rank={max_rank}")

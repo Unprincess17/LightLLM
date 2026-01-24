@@ -273,6 +273,7 @@ class LoRAMemPool:
     num_kv_heads: int = 0
     head_dim: int = 0
     intermediate_dim: int = 0
+    moe_intermediate_dim: int = 0  # For MoE models (gate/up/down projection size)
     hidden_size: int = 0
     vocab_size: int = 0
 
@@ -295,6 +296,8 @@ class LoRAMemPool:
         vl_intermediate_size: int | None = None,
         vl_out_hidden_size: int | None = None,
         vl_depth: int | None = None,
+        # MoE config parameter (optional)
+        moe_intermediate_dim: int | None = None,
     ) -> "LoRAMemPool":
         """Create a complete LoRA memory pool.
 
@@ -315,13 +318,17 @@ class LoRAMemPool:
         if vl_depth is None:
             vl_depth = num_layers
 
+        # For MoE models, use moe_intermediate_dim if provided, otherwise fall back to intermediate_dim
+        if moe_intermediate_dim is None:
+            moe_intermediate_dim = intermediate_dim
+        mlp_inter = moe_intermediate_dim  # Use MoE intermediate size for MoE pools
+
         # Attention dimensions
         attn_hidden = hidden_size
         if num_kv_heads is None:
             num_kv_heads = num_heads
         # GQA: B matrix output dimension is smaller
         kv_hidden = num_kv_heads * head_dim
-        mlp_inter = intermediate_dim
 
         # Vision dimensions - use provided values
         vl_hidden = vl_hidden_size
@@ -675,6 +682,8 @@ def create_lora_mem_pool(
     vl_intermediate_size: int | None = None,
     vl_out_hidden_size: int | None = None,
     vl_depth: int | None = None,
+    # MoE config parameter (optional)
+    moe_intermediate_dim: int | None = None,
 ) -> LoRAMemPool:
     """Create a complete LoRA memory pool.
 
@@ -684,6 +693,7 @@ def create_lora_mem_pool(
         vl_intermediate_size: Vision MLP intermediate size. If None, uses intermediate_dim.
         vl_out_hidden_size: Vision output hidden size. If None, uses vl_hidden_size.
         vl_depth: Vision model depth for pool layer capacity. If None, uses num_layers.
+        moe_intermediate_dim: MoE intermediate size. If None, uses intermediate_dim.
     """
     return LoRAMemPool.create(
         num_layers=num_layers,
@@ -701,4 +711,5 @@ def create_lora_mem_pool(
         vl_intermediate_size=vl_intermediate_size,
         vl_out_hidden_size=vl_out_hidden_size,
         vl_depth=vl_depth,
+        moe_intermediate_dim=moe_intermediate_dim,
     )

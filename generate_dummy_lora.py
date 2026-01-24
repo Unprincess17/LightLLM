@@ -17,9 +17,9 @@ from safetensors.torch import save_file
 # Configuration
 OUTPUT_DIR = "/home/shufan/Qwen-VL-FT/work/lora_dummy"
 LORA_RANK = 16
-LORA_ALPHA = 32.0
+LORA_ALPHA = 16.0
 
-# Qwen3-VL-30B-A3B architecture parameters
+# Qwen3-VL-30B-A3B architecture parameters (from config.json)
 # Vision encoder
 VISION_HIDDEN_SIZE = 1152
 VISION_INTERMEDIATE_SIZE = 4304
@@ -27,14 +27,14 @@ VISION_NUM_HEADS = 16
 VISION_DEPTH = 27
 
 # Language model (MoE)
-LM_HIDDEN_SIZE = 4096
+LM_HIDDEN_SIZE = 2048
 LM_NUM_ATTENTION_HEADS = 32
 LM_ATTENTION_HEAD_DIM = 128
-LM_INTERMEDIATE_SIZE = 53248
-LM_NUM_EXPERTS = 64
-LM_NUM_ACTIVE_EXPERTS = 6
-LM_DEPTH = 48
-LM_NUM_KEY_VALUE_HEADS = 8  # GQA: 8 key-value heads, 32 query heads
+LM_INTERMEDIATE_SIZE = 768  # moe_intermediate_size
+LM_NUM_EXPERTS = 128
+LM_NUM_ACTIVE_EXPERTS = 8  # num_experts_per_tok
+LM_DEPTH = 48  # num_hidden_layers
+LM_NUM_KEY_VALUE_HEADS = 4  # GQA: 4 key-value heads, 32 query heads
 
 def generate_lora_weight_dict():
     """Generate dummy LoRA weights for both vision and language model."""
