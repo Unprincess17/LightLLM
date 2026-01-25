@@ -56,20 +56,26 @@ class Qwen3VLMoELoRALayerWeight:
         layer_num: int,
         network_config: Dict[str, Any],
         data_type: torch.dtype = torch.bfloat16,
-        device: str = "cuda"
+        device: str = "cuda",
+        lora_alpha: float = 1.0,
+        q_lora_rank: int = 0,
+        k_lora_rank: int = 0,
+        v_lora_rank: int = 0,
+        o_lora_rank: int = 0,
+        vl_lora_rank: int = 0,
     ):
         self.layer_num_ = layer_num
         self.network_config = network_config
         self.data_type_ = data_type
         self.device_ = device
 
-        # LoRA config
-        self.lora_alpha = network_config.get("lora_alpha", 1.0)
-        self.q_lora_rank = network_config.get("q_lora_rank", 0)
-        self.k_lora_rank = network_config.get("k_lora_rank", 0)
-        self.v_lora_rank = network_config.get("v_lora_rank", 0)
-        self.o_lora_rank = network_config.get("o_lora_rank", 0)
-        self.vl_lora_rank = network_config.get("vl_lora_rank", 0)
+        # LoRA config (passed from adapter, not parsed from network_config)
+        self.lora_alpha = lora_alpha
+        self.q_lora_rank = q_lora_rank
+        self.k_lora_rank = k_lora_rank
+        self.v_lora_rank = v_lora_rank
+        self.o_lora_rank = o_lora_rank
+        self.vl_lora_rank = vl_lora_rank
 
         # Hidden size
         self.hidden_size = network_config.get("hidden_size", 4096)
@@ -207,6 +213,7 @@ class Qwen3VLMoELoRALayerWeight:
 
             # TP slicing (if needed)
             tp_start = 0
+            # TODO(FIX): the split hidden size is 2048 here. Is it correct?
             tp_end = self.split_hidden_size
             if tensor.shape[0] > tp_end:
                 tensor = tensor[tp_start:tp_end]
@@ -319,13 +326,29 @@ class Qwen3VLMoELoRAAdapter:
 
         # Create layer weights for LLM layers
         self.llm_layers = [
-            Qwen3VLMoELoRALayerWeight(i, network_config, data_type, device)
+            Qwen3VLMoELoRALayerWeight(
+                i, network_config, data_type, device,
+                lora_alpha=self.lora_alpha,
+                q_lora_rank=self.q_lora_rank,
+                k_lora_rank=self.k_lora_rank,
+                v_lora_rank=self.v_lora_rank,
+                o_lora_rank=self.o_lora_rank,
+                vl_lora_rank=self.vl_lora_rank,
+            )
             for i in range(num_llm_layers)
         ]
 
         # Create layer weights for Vision layers (offset by 10000)
         self.vision_layers = [
-            Qwen3VLMoELoRALayerWeight(10000 + i, network_config, data_type, device)
+            Qwen3VLMoELoRALayerWeight(
+                10000 + i, network_config, data_type, device,
+                lora_alpha=self.lora_alpha,
+                q_lora_rank=self.q_lora_rank,
+                k_lora_rank=self.k_lora_rank,
+                v_lora_rank=self.v_lora_rank,
+                o_lora_rank=self.o_lora_rank,
+                vl_lora_rank=self.vl_lora_rank,
+            )
             for i in range(num_vision_layers)
         ]
 

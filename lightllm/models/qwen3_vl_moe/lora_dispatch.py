@@ -185,7 +185,8 @@ class Qwen3VLMoELoRADispatcher:
                 pool.a_start,
                 pool.a_len,
                 pool.a_scaling,
-                bins
+                bins,
+                layer_id=layer_id
             )
             return output
         else:
@@ -212,7 +213,8 @@ class Qwen3VLMoELoRADispatcher:
                 pool.key_buffer, pool.value_buffer,
                 pool.a_start, pool.a_len, pool.a_scaling, bins,
                 a_hidden_dim=input_tensor.shape[1],
-                b_hidden_dim=output.shape[1]
+                b_hidden_dim=output.shape[1],
+                layer_id=layer_id
             )
             return output
         else:
@@ -239,7 +241,8 @@ class Qwen3VLMoELoRADispatcher:
                 pool.key_buffer, pool.value_buffer,
                 pool.a_start, pool.a_len, pool.a_scaling, bins,
                 a_hidden_dim=input_tensor.shape[1],
-                b_hidden_dim=output.shape[1]
+                b_hidden_dim=output.shape[1],
+                layer_id=layer_id
             )
             return output
         else:
@@ -268,7 +271,8 @@ class Qwen3VLMoELoRADispatcher:
                 pool.a_start,
                 pool.a_len,
                 pool.a_scaling,
-                bins
+                bins,
+                layer_id=layer_id
             )
             return output
         else:
@@ -297,7 +301,8 @@ class Qwen3VLMoELoRADispatcher:
                 pool.a_start,
                 pool.a_len,
                 pool.a_scaling,
-                bins
+                bins,
+                layer_id=layer_id
             )
             return output
         else:
@@ -326,7 +331,8 @@ class Qwen3VLMoELoRADispatcher:
                 pool.a_start,
                 pool.a_len,
                 pool.a_scaling,
-                bins
+                bins,
+                layer_id=layer_id
             )
             return output
         else:
@@ -353,7 +359,8 @@ class Qwen3VLMoELoRADispatcher:
                 pool.key_buffer, pool.value_buffer,
                 pool.a_start, pool.a_len, pool.a_scaling, bins,
                 a_hidden_dim=input_tensor.shape[1],
-                b_hidden_dim=output.shape[1]
+                b_hidden_dim=output.shape[1],
+                layer_id=layer_id
             )
             return output
         else:
@@ -393,7 +400,8 @@ class Qwen3VLMoELoRADispatcher:
                 pool.key_buffer, pool.value_buffer,
                 pool.a_start, pool.a_len, pool.a_scaling, bins,
                 a_hidden_dim=input_tensor.shape[1],
-                b_hidden_dim=output.shape[1]
+                b_hidden_dim=output.shape[1],
+                layer_id=layer_id
             )
             return output
         else:

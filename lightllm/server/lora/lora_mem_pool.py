@@ -71,6 +71,11 @@ class LoRAModulePool:
     For GQA models (K/V projections), A and B can have different dimensions:
     - A (key_buffer): input dim = hidden_size
     - B (value_buffer): output dim = num_kv_heads * head_dim
+
+    Memory Layout:
+    - Each adapter needs num_layers slots (one per layer the adapter applies to)
+    - Each slot stores [rank, hidden_dim] weights
+    - a_len stores the number of slots (layers) the adapter occupies
     """
     # Shape: [pool_size, max_rank, a_hidden_dim] for A
     key_buffer: torch.Tensor  # LoRA A weights
@@ -78,13 +83,14 @@ class LoRAModulePool:
     value_buffer: torch.Tensor  # LoRA B weights
 
     # Metadata
-    a_start: torch.Tensor  # [num_adapters] - start offset per adapter
-    a_len: torch.Tensor  # [num_adapters] - length per adapter (rank)
+    a_start: torch.Tensor  # [num_adapters] - start slot offset per adapter
+    a_len: torch.Tensor  # [num_adapters] - number of slots (layers) per adapter
     a_scaling: torch.Tensor  # [num_adapters] - scaling factor per adapter
     max_rank: int
     a_hidden_dim: int  # Input dimension for A matrix
     b_hidden_dim: int  # Output dimension for B matrix
     pool_size: int
+    num_layers: int = 1  # Number of layers this pool handles (for slot calculation)
 
     @property
     def a_buffer(self) -> torch.Tensor:
@@ -101,7 +107,8 @@ class LoRAModulePool:
             f"LoRAModulePool(a_hidden_dim={self.a_hidden_dim}, "
             f"b_hidden_dim={self.b_hidden_dim}, "
             f"key_buffer.shape={self.key_buffer.shape}, "
-            f"value_buffer.shape={self.value_buffer.shape})"
+            f"value_buffer.shape={self.value_buffer.shape}, "
+            f"num_layers={self.num_layers})"
         )
 
     @classmethod
@@ -112,17 +119,19 @@ class LoRAModulePool:
         input_dim: int,
         output_dim: int | None = None,
         dtype: torch.dtype = torch.float16,
-        device: str = "cuda"
+        device: str = "cuda",
+        num_layers: int = 1,
     ) -> "LoRAModulePool":
         """Create a module pool.
 
         Args:
-            pool_size: Maximum number of adapters in pool
+            pool_size: Maximum number of adapters in pool (in slots)
             max_rank: Maximum LoRA rank
             input_dim: Input dimension for A matrix (and x tensor)
             output_dim: Output dimension for B matrix (and y tensor). If None, uses input_dim.
             dtype: Data type for weights
             device: Device for tensors
+            num_layers: Number of layers this pool handles (for slot calculation)
         """
         if output_dim is None:
             output_dim = input_dim
@@ -135,18 +144,25 @@ class LoRAModulePool:
             max_rank=max_rank,
             a_hidden_dim=input_dim,
             b_hidden_dim=output_dim,
-            pool_size=pool_size
+            pool_size=pool_size,
+            num_layers=num_layers,
         )
 
     def can_fit(self, rank: int) -> bool:
-        """Check if an adapter with given rank can fit."""
+        """Check if an adapter with given rank can fit.
+
+        Each adapter needs num_layers slots (one per layer).
+        The rank only affects the per-slot memory, not the slot count.
+        """
         used_slots = self.a_len.sum().item() if len(self.a_len) > 0 else 0
-        return (used_slots + rank) <= self.pool_size
+        slots_needed = self.num_layers  # Each adapter needs num_layers slots
+        return (used_slots + slots_needed) <= self.pool_size
 
     def _compute_location(self) -> int:
-        """Compute next available location."""
+        """Compute next available slot location."""
         if len(self.a_len) == 0:
             return 0
+        # a_len stores slots consumed per adapter, not rank
         return (self.a_start[-1] + self.a_len[-1]).item()
 
     def load_adapter(
@@ -170,14 +186,30 @@ class LoRAModulePool:
 
         loc_start = self._compute_location()
 
-        # Extend metadata
+        # Count how many valid layers this adapter has (for slot calculation)
+        # A layer is valid if 0 <= buffer_layer_id < num_layers
+        valid_layers = 0
+        for layer_id in layer_weights.keys():
+            if layer_id >= 10000:
+                buffer_layer_id = layer_id - 10000
+            else:
+                buffer_layer_id = layer_id
+            if 0 <= buffer_layer_id < self.num_layers:
+                valid_layers += 1
+
+        # If no valid layers, skip loading
+        if valid_layers == 0:
+            logger.warning(f"[LoRA] No valid layers for adapter in pool (num_layers={self.num_layers})")
+            return False
+
+        # Extend metadata - a_len stores number of slots (layers) this adapter occupies
         self.a_start = torch.cat([
             self.a_start,
             torch.tensor([loc_start], dtype=torch.long, device=self.a_start.device)
         ])
         self.a_len = torch.cat([
             self.a_len,
-            torch.tensor([rank], dtype=torch.long, device=self.a_len.device)
+            torch.tensor([valid_layers], dtype=torch.long, device=self.a_len.device)
         ])
         self.a_scaling = torch.cat([
             self.a_scaling,
@@ -189,16 +221,27 @@ class LoRAModulePool:
             if weights is None or not weights:
                 continue
 
-            # weights is a dict with "proj_A" and "proj_B" keys
+            # Convert layer_id to buffer index
+            # Vision layers use offset 10000, LLM layers don't
+            if layer_id >= 10000:
+                buffer_layer_id = layer_id - 10000
+            else:
+                buffer_layer_id = layer_id
+
+            # Skip if out of range
+            if buffer_layer_id < 0 or buffer_layer_id >= self.num_layers:
+                continue
+
+            # weights is a dict with "A" and "B" keys
             a_weight = weights.get("A")
             b_weight = weights.get("B")
 
             if a_weight is not None:
                 # A weight matrix: [rank, hidden]
-                self.a_buffer[loc_start + layer_id, :rank] = a_weight.to(self.a_buffer.dtype)
+                self.a_buffer[loc_start + buffer_layer_id, :rank] = a_weight.to(self.a_buffer.dtype)
             if b_weight is not None:
                 # B weight matrix: [rank, hidden] -> [hidden, rank] (stored as [rank, hidden])
-                self.b_buffer[loc_start + layer_id, :rank] = b_weight.to(self.b_buffer.dtype)
+                self.b_buffer[loc_start + buffer_layer_id, :rank] = b_weight.to(self.b_buffer.dtype)
 
         return True
 
@@ -339,25 +382,27 @@ class LoRAMemPool:
 
         pool = cls(
             # Vision-Language pools (Q/K/V/O use vl_hidden, FC1/FC2 use vl_hidden/vl_mlp_hidden)
-            vl_q_pool=LoRAModulePool.create(pool_size, max_rank, vl_hidden, vl_hidden, dtype, device),
-            vl_k_pool=LoRAModulePool.create(pool_size, max_rank, vl_hidden, vl_hidden, dtype, device),
-            vl_v_pool=LoRAModulePool.create(pool_size, max_rank, vl_hidden, vl_hidden, dtype, device),
-            vl_o_pool=LoRAModulePool.create(pool_size, max_rank, vl_hidden, vl_hidden, dtype, device),
+            # Vision pools use vl_depth for num_layers
+            vl_q_pool=LoRAModulePool.create(pool_size, max_rank, vl_hidden, vl_hidden, dtype, device, num_layers=vl_depth),
+            vl_k_pool=LoRAModulePool.create(pool_size, max_rank, vl_hidden, vl_hidden, dtype, device, num_layers=vl_depth),
+            vl_v_pool=LoRAModulePool.create(pool_size, max_rank, vl_hidden, vl_hidden, dtype, device, num_layers=vl_depth),
+            vl_o_pool=LoRAModulePool.create(pool_size, max_rank, vl_hidden, vl_hidden, dtype, device, num_layers=vl_depth),
             # Vision MLP: FC1 expands from vl_hidden to vl_mlp_hidden, FC2 shrinks from vl_mlp_hidden to vl_out_hidden
-            vl_fc1_pool=LoRAModulePool.create(pool_size, max_rank, vl_hidden, vl_mlp_hidden, dtype, device),
-            vl_fc2_pool=LoRAModulePool.create(pool_size, max_rank, vl_mlp_hidden, vl_out_hidden, dtype, device),
+            vl_fc1_pool=LoRAModulePool.create(pool_size, max_rank, vl_hidden, vl_mlp_hidden, dtype, device, num_layers=vl_depth),
+            vl_fc2_pool=LoRAModulePool.create(pool_size, max_rank, vl_mlp_hidden, vl_out_hidden, dtype, device, num_layers=vl_depth),
 
             # Attention pools - Q/O use full hidden, K/V use GQA output dim
-            attn_q_pool=LoRAModulePool.create(pool_size, max_rank, attn_hidden, attn_hidden, dtype, device),
-            attn_k_pool=LoRAModulePool.create(pool_size, max_rank, hidden_size, kv_hidden, dtype, device),
-            attn_v_pool=LoRAModulePool.create(pool_size, max_rank, hidden_size, kv_hidden, dtype, device),
-            attn_o_pool=LoRAModulePool.create(pool_size, max_rank, attn_hidden, attn_hidden, dtype, device),
+            # LLM pools use num_layers for num_layers
+            attn_q_pool=LoRAModulePool.create(pool_size, max_rank, attn_hidden, attn_hidden, dtype, device, num_layers=num_layers),
+            attn_k_pool=LoRAModulePool.create(pool_size, max_rank, hidden_size, kv_hidden, dtype, device, num_layers=num_layers),
+            attn_v_pool=LoRAModulePool.create(pool_size, max_rank, hidden_size, kv_hidden, dtype, device, num_layers=num_layers),
+            attn_o_pool=LoRAModulePool.create(pool_size, max_rank, attn_hidden, attn_hidden, dtype, device, num_layers=num_layers),
 
             # MoE MLP pools - Gate/Up expand, Down shrinks
-            moe_gate_pool=LoRAModulePool.create(pool_size, max_rank, hidden_size, mlp_inter, dtype, device),
-            moe_up_pool=LoRAModulePool.create(pool_size, max_rank, hidden_size, mlp_inter, dtype, device),
-            moe_down_pool=LoRAModulePool.create(pool_size, max_rank, mlp_inter, hidden_size, dtype, device),
-            lm_head_pool=LoRAModulePool.create(pool_size, max_rank, hidden_size, vocab_size, dtype, device),
+            moe_gate_pool=LoRAModulePool.create(pool_size, max_rank, hidden_size, mlp_inter, dtype, device, num_layers=num_layers),
+            moe_up_pool=LoRAModulePool.create(pool_size, max_rank, hidden_size, mlp_inter, dtype, device, num_layers=num_layers),
+            moe_down_pool=LoRAModulePool.create(pool_size, max_rank, mlp_inter, hidden_size, dtype, device, num_layers=num_layers),
+            lm_head_pool=LoRAModulePool.create(pool_size, max_rank, hidden_size, vocab_size, dtype, device, num_layers=1),  # lm_head is layer -1
 
             adapter_dirs=[],
             idx_map={},
@@ -422,10 +467,11 @@ class LoRAMemPool:
 
         adapter_idx = len(self.adapter_dirs)
 
-        # Load weights for each target type
+        # Collect weights per pool type: {target_type: {buffer_layer_id: weight_dict}}
+        pool_weights: Dict[str, Dict[int, Dict]] = {}
+
         for layer_id, target_weights in layer_weights.items():
             # Handle vision layer offset (10000+) - strip offset for buffer indexing
-            # Vision and text layers use different pools, so no conflict
             if layer_id >= 10000:
                 buffer_layer_id = layer_id - 10000
             else:
@@ -439,17 +485,28 @@ class LoRAMemPool:
                 if pool is None:
                     continue
 
+                # Initialize pool_weights entry if needed
+                if target_type not in pool_weights:
+                    pool_weights[target_type] = {}
+
                 # Strip module_name level - pool expects {layer_id: {"A": tensor, "B": tensor}}
                 # module_weights is {module_name: {"A": tensor, "B": tensor}}, take first value
                 weight_dict = next(iter(module_weights.values())) if module_weights else {}
 
+                # Add to pool's weight collection
+                pool_weights[target_type][buffer_layer_id] = weight_dict
+
+        # Now load all weights for each pool in a single call
+        for target_type, weights_by_layer in pool_weights.items():
+            pool = self.get_pool(target_type)
+            if pool is not None:
                 pool.load_adapter(
                     adapter_idx=adapter_idx,
                     rank=rank,
                     scaling=scaling,
-                    layer_weights={buffer_layer_id: weight_dict}
+                    layer_weights=weights_by_layer
                 )
-                logger.debug(f"[LoRA]   Loaded {target_type} for layer {layer_id}")
+                logger.debug(f"[LoRA]   Loaded {target_type} with {len(weights_by_layer)} layers")
 
         self.adapter_dirs.append(adapter_dir)
         self.idx_map[adapter_dir] = adapter_idx

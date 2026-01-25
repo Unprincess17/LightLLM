@@ -29,6 +29,7 @@ def bgmv_kernel(
     batch_size,
     h_in, h_out,      # CHANGED: Separate input and output dimensions
     max_rank,
+    layer_id,         # NEW: Current layer ID for slot offset
     BLOCK_N_IN: tl.constexpr,  # CHANGED: Block size for input dim
     BLOCK_N_OUT: tl.constexpr, # CHANGED: Block size for output dim
     BLOCK_K: tl.constexpr,
@@ -37,6 +38,7 @@ def bgmv_kernel(
     Batched GPU Memory View (BGMV) kernel for LoRA with decoupled Input/Output dimensions.
 
     Supports GQA where Input Dim (Hidden Size) != Output Dim (KV Size).
+    Each adapter needs num_layers slots; we access slot = a_start + layer_id.
     """
     req_idx = tl.program_id(0)
 
@@ -63,6 +65,9 @@ def bgmv_kernel(
     a_len = tl.load(a_len_ptr + adapter_idx)
     a_scaling = tl.load(a_scaling_ptr + adapter_idx)
 
+    # Compute actual slot location: a_start + layer_id
+    slot_loc = a_start + layer_id
+
     # Initialize accumulator for output [BLOCK_N_OUT]
     acc = tl.zeros((BLOCK_N_OUT,), dtype=tl.float32)
 
@@ -78,8 +83,8 @@ def bgmv_kernel(
 
         # --- Load A (Down Proj) ---
         # A matrix shape: [max_rank, h_in]
-        a_loc = a_start
-        a_ptr = a_buffer_ptr + stride_ab * a_loc + stride_ar * k_base + stride_ah * 0
+        # Load from slot_loc (a_start + layer_id), not just a_start
+        a_ptr = a_buffer_ptr + stride_ab * slot_loc + stride_ar * k_base + stride_ah * 0
 
         # Load A using offs_n_in
         a_vals = tl.load(
@@ -105,8 +110,8 @@ def bgmv_kernel(
 
         # --- Load B (Up Proj) ---
         # B matrix shape: [max_rank, h_out] - Uses h_out and BLOCK_N_OUT
-        b_loc = a_start
-        b_ptr = b_buffer_ptr + stride_bb * b_loc + stride_br * k_base + stride_bh * 0
+        # Load from same slot_loc
+        b_ptr = b_buffer_ptr + stride_bb * slot_loc + stride_br * k_base + stride_bh * 0
 
         # Load B using offs_n_out
         b_vals = tl.load(
@@ -140,6 +145,7 @@ def dispatch_bgmv(
     # Added optional dims to support asymmetry
     a_hidden_dim: int | None = None,
     b_hidden_dim: int | None = None,
+    layer_id: int = 0,  # NEW: Layer ID for slot offset
 ):
     """
     Batched GPU Memory View (BGMV) dispatch.
@@ -147,19 +153,13 @@ def dispatch_bgmv(
     Args:
         a_hidden_dim: The hidden dimension of A matrix (input dim). If None, inferred from x.
         b_hidden_dim: The hidden dimension of B matrix (output dim). If None, inferred from y.
+        layer_id: The current layer ID for computing slot location (slot = a_start + layer_id).
     """
     batch_size = x.shape[0]
 
     # Infer dimensions if not provided
     h_in = a_hidden_dim if a_hidden_dim is not None else x.shape[1]
     h_out = b_hidden_dim if b_hidden_dim is not None else y.shape[1]
-    
-    # 检查是否有 NaN/Inf
-    assert not torch.isnan(x).any(), "x has NaN"
-    assert not torch.isnan(y).any(), "y has NaN"
-    
-    # 确认 req_bins 有效
-    logger.debug(f"req_bins max={req_bins.max()}, a_buffer.shape={a_buffer.shape}")
 
     # Validation
     pool_size, max_rank, buf_h_in = a_buffer.shape
@@ -174,7 +174,7 @@ def dispatch_bgmv(
         if dim <= 1024: return 1024
         if dim <= 2048: return 2048
         if dim <= 4096: return 4096
-        return 4096 # Cap at 4096 for now, or next_power_of_2(dim)
+        return 4096
 
     BLOCK_N_IN = get_block_n(h_in)
     BLOCK_N_OUT = get_block_n(h_out)
@@ -193,21 +193,23 @@ def dispatch_bgmv(
         batch_size,
         h_in, h_out,
         max_rank,
+        layer_id,  # NEW: Pass layer_id to kernel
         BLOCK_N_IN, BLOCK_N_OUT, BLOCK_K
     )
     return
 
-# --- Updated Wrappers ---
+# --- Updated Wrappers with layer_id support ---
 
 def batch_lora_get_qkv(
-    y: torch.Tensor, 
-    x: torch.Tensor, 
-    a_buffer: torch.Tensor, 
+    y: torch.Tensor,
+    x: torch.Tensor,
+    a_buffer: torch.Tensor,
     b_buffer: torch.Tensor,
     a_start: torch.Tensor, a_len: torch.Tensor,
     a_scaling: torch.Tensor, req_bins: torch.Tensor,
     a_hidden_dim: int = None,
-    b_hidden_dim: int = None
+    b_hidden_dim: int = None,
+    layer_id: int = 0,  # NEW: Layer ID for slot offset
 ):
     """
     Supports separate dimensions for GQA K/V projections.
@@ -215,19 +217,21 @@ def batch_lora_get_qkv(
     """
     dispatch_bgmv(
         y, x, a_buffer, b_buffer, a_start, a_len, a_scaling, req_bins,
-        a_hidden_dim=a_hidden_dim, b_hidden_dim=b_hidden_dim
+        a_hidden_dim=a_hidden_dim, b_hidden_dim=b_hidden_dim,
+        layer_id=layer_id
     )
 
-# Other wrappers remain the same, relying on default None behavior (infer from x/y)
 def batch_lora_get_o(
     y: torch.Tensor, x: torch.Tensor, a_buffer: torch.Tensor, b_buffer: torch.Tensor,
     a_start: torch.Tensor, a_len: torch.Tensor,
     a_scaling: torch.Tensor, req_bins: torch.Tensor,
     a_hidden_dim: int = None,
     b_hidden_dim: int = None,
+    layer_id: int = 0,  # NEW
 ):
     dispatch_bgmv(y, x, a_buffer, b_buffer, a_start, a_len, a_scaling, req_bins,
-                  a_hidden_dim=a_hidden_dim, b_hidden_dim=b_hidden_dim)
+                  a_hidden_dim=a_hidden_dim, b_hidden_dim=b_hidden_dim,
+                  layer_id=layer_id)
 
 def batch_lora_get_mlp(
     y: torch.Tensor, x: torch.Tensor, a_buffer: torch.Tensor, b_buffer: torch.Tensor,
@@ -235,9 +239,11 @@ def batch_lora_get_mlp(
     a_scaling: torch.Tensor, req_bins: torch.Tensor,
     a_hidden_dim: int = None,
     b_hidden_dim: int = None,
+    layer_id: int = 0,  # NEW
 ):
     dispatch_bgmv(y, x, a_buffer, b_buffer, a_start, a_len, a_scaling, req_bins,
-                  a_hidden_dim=a_hidden_dim, b_hidden_dim=b_hidden_dim)
+                  a_hidden_dim=a_hidden_dim, b_hidden_dim=b_hidden_dim,
+                  layer_id=layer_id)
 
 def batch_lora_get_vl(
     y: torch.Tensor, x: torch.Tensor, a_buffer: torch.Tensor, b_buffer: torch.Tensor,
@@ -245,6 +251,8 @@ def batch_lora_get_vl(
     a_scaling: torch.Tensor, req_bins: torch.Tensor,
     a_hidden_dim: int = None,
     b_hidden_dim: int = None,
+    layer_id: int = 0,  # NEW
 ):
     dispatch_bgmv(y, x, a_buffer, b_buffer, a_start, a_len, a_scaling, req_bins,
-                  a_hidden_dim=a_hidden_dim, b_hidden_dim=b_hidden_dim)
+                  a_hidden_dim=a_hidden_dim, b_hidden_dim=b_hidden_dim,
+                  layer_id=layer_id)
