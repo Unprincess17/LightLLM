@@ -1002,6 +1002,7 @@ class ModeBackend:
                 vl_out_hidden_size=vl_out_hidden_size,
                 vl_depth=vl_depth,
                 moe_intermediate_dim=moe_intermediate_dim,
+                tp_world_size=get_global_world_size(),
             )
 
             self.logger.info(f"[LoRA Backend] Created LoRA memory pool for {num_layers} layers, max_rank={max_rank}")
@@ -1111,10 +1112,25 @@ class ModeBackend:
 
         self.logger.info(f"[LoRA Backend] Preparing batch: batch_size={len(batch.reqs)}, adapters={adapter_order}")
 
-        # Create req_bins tensor
+        # Create req_bins tensor mapping request index -> adapter index
         req_bins = batch.get_req_bins(adapter_order)
 
-        self.logger.debug(f"[LoRA Backend]   req_bins={req_bins.tolist()}")
+        self.logger.debug(f"[LoRA Backend]   req_bins (per request)={req_bins.tolist()}")
+
+        # EXPAND req_bins to per-token: each token gets its request's adapter index
+        # This is required because input tensor has shape [total_tokens, hidden_dim]
+        # and batch_lora_get_qkv expects bins to have one element per token
+        token_counts = [req.get_cur_total_len() for req in batch.reqs]
+        expanded_bins = []
+        for req_idx, adapter_idx in enumerate(req_bins.tolist()):
+            expanded_bins.extend([adapter_idx] * token_counts[req_idx])
+        expanded_bins = torch.tensor(expanded_bins, dtype=torch.long, device="cuda")
+
+        self.logger.debug(f"[LoRA Backend]   token_counts={token_counts}, total_tokens={sum(token_counts)}")
+        self.logger.debug(f"[LoRA Backend]   expanded_bins={expanded_bins.tolist()}")
+
+        # Use expanded_bins for batched mode (per-token adapter indices)
+        req_bins = expanded_bins
 
         # Initialize batched mode for all dispatchers
         for dispatcher in self.lora_dispatchers:

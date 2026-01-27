@@ -170,7 +170,9 @@ class LoRAModulePool:
         adapter_idx: int,
         rank: int,
         scaling: float,
-        layer_weights: Dict[int, torch.Tensor]
+        layer_weights: Dict[int, torch.Tensor],
+        tp_rank: int = 0,
+        tp_world_size: int = 1
     ) -> bool:
         """
         Load adapter weights for all layers.
@@ -180,6 +182,8 @@ class LoRAModulePool:
             rank: LoRA rank
             scaling: Scaling factor
             layer_weights: Dict mapping layer_id -> {proj_A, proj_B} for this module type
+            tp_rank: Tensor parallel rank for sharded weight loading
+            tp_world_size: Tensor parallel world size for sharded weight loading
         """
         if not self.can_fit(rank):
             return False
@@ -235,14 +239,18 @@ class LoRAModulePool:
             # weights is a dict with "A" and "B" keys
             a_weight = weights.get("A")
             b_weight = weights.get("B")
-
-            if a_weight is not None:
-                # A weight matrix: [rank, hidden]
-                self.a_buffer[loc_start + buffer_layer_id, :rank] = a_weight.to(self.a_buffer.dtype)
-            if b_weight is not None:
-                # B weight matrix: [rank, hidden] -> [hidden, rank] (stored as [rank, hidden])
-                self.b_buffer[loc_start + buffer_layer_id, :rank] = b_weight.to(self.b_buffer.dtype)
-
+            try:
+                if a_weight is not None:
+                    # A weight matrix: [rank, hidden]
+                    self.a_buffer[loc_start + buffer_layer_id, :rank] = a_weight.to(self.a_buffer.dtype)
+                if b_weight is not None:
+                    # B weight matrix: [rank, hidden] -> [hidden, rank] (stored as [rank, hidden])
+                    self.b_buffer[loc_start + buffer_layer_id, :rank] = b_weight.to(self.b_buffer.dtype)
+            except Exception as e:
+                logger.error(f"Error loading adapter weights for layer {buffer_layer_id}: {e}")
+                logger.error(f"a_buffer shape: {self.a_buffer.shape}; b_buffer shape: {self.b_buffer.shape}")
+                logger.error(f"a_weight shape: {a_weight.shape}; b_weight shape: {b_weight.shape}")
+                return False
         return True
 
     def unload_adapter(self, adapter_idx: int) -> bool:
@@ -320,6 +328,10 @@ class LoRAMemPool:
     hidden_size: int = 0
     vocab_size: int = 0
 
+    # TP world info for sharded weight loading
+    tp_rank_: int = 0
+    tp_world_size_: int = 1
+
     @classmethod
     def create(
         cls,
@@ -341,6 +353,8 @@ class LoRAMemPool:
         vl_depth: int | None = None,
         # MoE config parameter (optional)
         moe_intermediate_dim: int | None = None,
+        # TP world size for sharded dimensions
+        tp_world_size: int = 1,
     ) -> "LoRAMemPool":
         """Create a complete LoRA memory pool.
 
@@ -350,6 +364,7 @@ class LoRAMemPool:
             vl_intermediate_size: Vision MLP intermediate size. If None, uses intermediate_dim.
             vl_out_hidden_size: Vision output hidden size. If None, uses vl_hidden_size.
             vl_depth: Vision model depth for pool layer capacity. If None, uses num_layers.
+            tp_world_size: Tensor parallel world size for sharded dimensions (default: 1).
         """
         # Use vision dimensions if provided, otherwise fall back to text model dimensions
         if vl_hidden_size is None:
@@ -367,18 +382,28 @@ class LoRAMemPool:
         mlp_inter = moe_intermediate_dim  # Use MoE intermediate size for MoE pools
 
         # Attention dimensions
-        attn_hidden = hidden_size
+        
+        # 1. Input Dimension (From Residual Stream)
+        attn_in_hidden = hidden_size
+        
+        # 2. Internal Attention Dimension (Q output / O input)
+        attn_internal_dim = num_heads * head_dim 
+
         if num_kv_heads is None:
             num_kv_heads = num_heads
-        # GQA: B matrix output dimension is smaller
-        kv_hidden = num_kv_heads * head_dim
 
-        # Vision dimensions - use provided values
+        # 3. KV Dimension (K/V output)
+        # GQA: B matrix output dimension
+        kv_internal_dim = num_kv_heads * head_dim
+
+
+
+        # Vision dimensions
         vl_hidden = vl_hidden_size
         vl_mlp_hidden = vl_intermediate_size
         vl_out_hidden = vl_out_hidden_size
 
-        logger.info(f"[LoRA Pool] Creating pool: attn_hidden={attn_hidden}, kv_hidden={kv_hidden}, mlp_hidden={mlp_inter}, vl_hidden={vl_hidden}, vl_mlp_hidden={vl_mlp_hidden}, vl_out_hidden={vl_out_hidden}, vl_depth={vl_depth}")
+        logger.info(f"[LoRA Pool] Creating pool: attn_in={attn_in_hidden}, attn_internal={attn_internal_dim}, kv_internal={kv_internal_dim}, mlp_hidden={mlp_inter}, vl_hidden={vl_hidden}, vl_mlp_hidden={vl_mlp_hidden}, vl_out_hidden={vl_out_hidden}, vl_depth={vl_depth}, tp_world_size={tp_world_size}")
 
         pool = cls(
             # Vision-Language pools (Q/K/V/O use vl_hidden, FC1/FC2 use vl_hidden/vl_mlp_hidden)
@@ -389,20 +414,49 @@ class LoRAMemPool:
             vl_o_pool=LoRAModulePool.create(pool_size, max_rank, vl_hidden, vl_hidden, dtype, device, num_layers=vl_depth),
             # Vision MLP: FC1 expands from vl_hidden to vl_mlp_hidden, FC2 shrinks from vl_mlp_hidden to vl_out_hidden
             vl_fc1_pool=LoRAModulePool.create(pool_size, max_rank, vl_hidden, vl_mlp_hidden, dtype, device, num_layers=vl_depth),
-            vl_fc2_pool=LoRAModulePool.create(pool_size, max_rank, vl_mlp_hidden, vl_out_hidden, dtype, device, num_layers=vl_depth),
+            vl_fc2_pool=LoRAModulePool.create(pool_size, max_rank, vl_mlp_hidden, vl_hidden, dtype, device, num_layers=vl_depth),
 
-            # Attention pools - Q/O use full hidden, K/V use GQA output dim
-            # LLM pools use num_layers for num_layers
-            attn_q_pool=LoRAModulePool.create(pool_size, max_rank, attn_hidden, attn_hidden, dtype, device, num_layers=num_layers),
-            attn_k_pool=LoRAModulePool.create(pool_size, max_rank, hidden_size, kv_hidden, dtype, device, num_layers=num_layers),
-            attn_v_pool=LoRAModulePool.create(pool_size, max_rank, hidden_size, kv_hidden, dtype, device, num_layers=num_layers),
-            attn_o_pool=LoRAModulePool.create(pool_size, max_rank, attn_hidden, attn_hidden, dtype, device, num_layers=num_layers),
+            # Q Pool: Column Parallel -> Output is SPLIT
+            # b_hidden_dim must be 4096 // 2 = 2048
+            attn_q_pool = LoRAModulePool.create(
+                pool_size, max_rank, 
+                attn_in_hidden, 
+                attn_internal_dim // tp_world_size,  # <--- DIVIDE BY TP
+                dtype, device, num_layers=num_layers
+            ),
+
+            # K Pool: Column Parallel -> Output is SPLIT
+            # b_hidden_dim must be 512 // 2 = 256
+            attn_k_pool = LoRAModulePool.create(
+                pool_size, max_rank, 
+                attn_in_hidden, 
+                kv_internal_dim // tp_world_size,    # <--- DIVIDE BY TP
+                dtype, device, num_layers=num_layers
+            ),
+
+            # V Pool: Column Parallel -> Output is SPLIT
+            # b_hidden_dim must be 512 // 2 = 256
+            attn_v_pool = LoRAModulePool.create(
+                pool_size, max_rank, 
+                attn_in_hidden, 
+                kv_internal_dim // tp_world_size,    # <--- DIVIDE BY TP
+                dtype, device, num_layers=num_layers
+            ),
+
+            # O Pool: Row Parallel -> Input is SPLIT (Correct in your code)
+            # a_hidden_dim must be 2048 (which is 4096 // 2)
+            attn_o_pool = LoRAModulePool.create(
+                pool_size, max_rank, 
+                attn_internal_dim // tp_world_size,  # <--- DIVIDE BY TP
+                attn_in_hidden, 
+                dtype, device, num_layers=num_layers
+            ),
 
             # MoE MLP pools - Gate/Up expand, Down shrinks
             moe_gate_pool=LoRAModulePool.create(pool_size, max_rank, hidden_size, mlp_inter, dtype, device, num_layers=num_layers),
             moe_up_pool=LoRAModulePool.create(pool_size, max_rank, hidden_size, mlp_inter, dtype, device, num_layers=num_layers),
             moe_down_pool=LoRAModulePool.create(pool_size, max_rank, mlp_inter, hidden_size, dtype, device, num_layers=num_layers),
-            lm_head_pool=LoRAModulePool.create(pool_size, max_rank, hidden_size, vocab_size, dtype, device, num_layers=1),  # lm_head is layer -1
+            lm_head_pool=LoRAModulePool.create(pool_size, max_rank, hidden_size, vocab_size, dtype, device, num_layers=1),
 
             adapter_dirs=[],
             idx_map={},
@@ -741,6 +795,8 @@ def create_lora_mem_pool(
     vl_depth: int | None = None,
     # MoE config parameter (optional)
     moe_intermediate_dim: int | None = None,
+    # TP world size for sharded dimensions
+    tp_world_size: int = 1,
 ) -> LoRAMemPool:
     """Create a complete LoRA memory pool.
 
@@ -751,6 +807,7 @@ def create_lora_mem_pool(
         vl_out_hidden_size: Vision output hidden size. If None, uses vl_hidden_size.
         vl_depth: Vision model depth for pool layer capacity. If None, uses num_layers.
         moe_intermediate_dim: MoE intermediate size. If None, uses intermediate_dim.
+        tp_world_size: Tensor parallel world size for sharded dimensions (default: 1).
     """
     return LoRAMemPool.create(
         num_layers=num_layers,
@@ -769,4 +826,5 @@ def create_lora_mem_pool(
         vl_out_hidden_size=vl_out_hidden_size,
         vl_depth=vl_depth,
         moe_intermediate_dim=moe_intermediate_dim,
+        tp_world_size=tp_world_size,
     )

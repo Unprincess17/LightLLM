@@ -27,37 +27,29 @@ def bgmv_kernel(
     stride_bb, stride_br, stride_bh,  # b_buffer: [pool_size, max_rank, h_out]
     stride_ab_meta,  # a_start, a_len, a_scaling: [num_adapters]
     batch_size,
-    h_in, h_out,      # CHANGED: Separate input and output dimensions
+    h_in, h_out,      # Separate input and output dimensions
     max_rank,
-    layer_id,         # NEW: Current layer ID for slot offset
-    BLOCK_N_IN: tl.constexpr,  # CHANGED: Block size for input dim
-    BLOCK_N_OUT: tl.constexpr, # CHANGED: Block size for output dim
+    layer_id,         # Current layer ID for slot offset
+    BLOCK_N_IN: tl.constexpr,  # Block size for input dim
+    BLOCK_N_OUT: tl.constexpr, # Block size for output dim
     BLOCK_K: tl.constexpr,
+    pool_size = 0, # TODO: for debug only
 ):
     """
     Batched GPU Memory View (BGMV) kernel for LoRA with decoupled Input/Output dimensions.
 
     Supports GQA where Input Dim (Hidden Size) != Output Dim (KV Size).
-    Each adapter needs num_layers slots; we access slot = a_start + layer_id.
+    Each adapter occupies consecutive slots in the buffer; we access slot = a_start + layer_id.
+
+    Handles input/output dimensions larger than BLOCK_N_IN/BLOCK_N_OUT by iterating over blocks.
     """
     req_idx = tl.program_id(0)
 
     if req_idx >= batch_size:
         return
 
-    # 1. Define separate offsets for Input (A/X) and Output (B/Y)
-    offs_n_in = tl.arange(0, BLOCK_N_IN)
-    offs_n_out = tl.arange(0, BLOCK_N_OUT)
+    # Offsets for blocks
     offs_k = tl.arange(0, BLOCK_K)
-
-    # -----------------------------------------------------------
-    # Phase 1: Input Processing (Reading X and A, Reduction over h_in)
-    # -----------------------------------------------------------
-
-    # Load input x[req_idx, :] - [h_in] using BLOCK_N_IN
-    x_ptrs = x_ptr + stride_xb * req_idx + stride_xh * offs_n_in
-    x_mask = offs_n_in < h_in
-    x_vals = tl.load(x_ptrs, mask=x_mask, other=0.0)
 
     # Get adapter index and metadata
     adapter_idx = tl.load(req_bins_ptr + req_idx)
@@ -68,69 +60,82 @@ def bgmv_kernel(
     # Compute actual slot location: a_start + layer_id
     slot_loc = a_start + layer_id
 
-    # Initialize accumulator for output [BLOCK_N_OUT]
-    acc = tl.zeros((BLOCK_N_OUT,), dtype=tl.float32)
+    # Compute number of input and output blocks
+    num_in_blocks = (h_in + BLOCK_N_IN - 1) // BLOCK_N_IN
+    num_out_blocks = (h_out + BLOCK_N_OUT - 1) // BLOCK_N_OUT
 
-    # Compute number of complete rank chunks
-    num_chunks = (max_rank + BLOCK_K - 1) // BLOCK_K
+    # Iterate over output blocks
+    for out_block_idx in range(num_out_blocks):
+        out_base = out_block_idx * BLOCK_N_OUT
+        offs_n_out = tl.arange(0, BLOCK_N_OUT)
 
-    for chunk_idx in range(num_chunks):
-        k_base = chunk_idx * BLOCK_K
+        # Initialize accumulator for this output block
+        acc_block = tl.zeros((BLOCK_N_OUT,), dtype=tl.float32)
 
-        # Compute actual valid rank offsets for this chunk
-        rank_offsets = k_base + offs_k
-        rank_valid = rank_offsets < a_len
+        # Iterate over input blocks
+        for in_block_idx in range(num_in_blocks):
+            in_base = in_block_idx * BLOCK_N_IN
+            offs_n_in = tl.arange(0, BLOCK_N_IN)
 
-        # --- Load A (Down Proj) ---
-        # A matrix shape: [max_rank, h_in]
-        # Load from slot_loc (a_start + layer_id), not just a_start
-        a_ptr = a_buffer_ptr + stride_ab * slot_loc + stride_ar * k_base + stride_ah * 0
+            # Load input x[req_idx, in_block] - [BLOCK_N_IN]
+            x_ptrs = x_ptr + stride_xb * req_idx + stride_xh * (offs_n_in + in_base)
+            x_mask = (offs_n_in + in_base) < h_in
+            x_vals = tl.load(x_ptrs, mask=x_mask, other=0.0)
 
-        # Load A using offs_n_in
-        a_vals = tl.load(
-            a_ptr + stride_ar * offs_k[:, None] + stride_ah * offs_n_in[None, :],
-            mask=rank_valid[:, None] & (offs_n_in[None, :] < h_in), # Safety mask
-            other=0.0
-        )
+            # Compute number of rank chunks
+            num_chunks = (max_rank + BLOCK_K - 1) // BLOCK_K
 
-        # Cast to float32
-        x_fp32 = tl.cast(x_vals, tl.float32)
-        a_fp32 = tl.cast(a_vals, tl.float32)
+            for chunk_idx in range(num_chunks):
+                k_base = chunk_idx * BLOCK_K
 
-        # Compute h_chunk = x @ A.T
-        # Sum over dimension N_IN: [1, N_IN] * [K, N_IN] -> [K]
-        h_chunk = tl.sum(x_fp32[None, :] * a_fp32, axis=1)
+                # Valid rank offsets for this chunk
+                rank_offsets = k_base + offs_k
+                rank_valid = rank_offsets < max_rank
 
-        # Zero out invalid ranks
-        h_chunk = tl.where(rank_valid, h_chunk, 0.0)
+                # --- Load A (Down Proj) ---
+                # A matrix: [max_rank, h_in]
+                # Load from slot_loc with proper input block offset
+                a_ptr = a_buffer_ptr + stride_ab * slot_loc + stride_ar * k_base + stride_ah * in_base
 
-        # -----------------------------------------------------------
-        # Phase 2: Output Processing (Reading B, Writing Y)
-        # -----------------------------------------------------------
+                a_vals = tl.load(
+                    a_ptr + stride_ar * offs_k[:, None] + stride_ah * offs_n_in[None, :],
+                    mask=rank_valid[:, None] & ((offs_n_in[None, :] + in_base) < h_in),
+                    other=0.0
+                )
 
-        # --- Load B (Up Proj) ---
-        # B matrix shape: [max_rank, h_out] - Uses h_out and BLOCK_N_OUT
-        # Load from same slot_loc
-        b_ptr = b_buffer_ptr + stride_bb * slot_loc + stride_br * k_base + stride_bh * 0
+                # Cast to float32
+                x_fp32 = tl.cast(x_vals, tl.float32)
+                a_fp32 = tl.cast(a_vals, tl.float32)
 
-        # Load B using offs_n_out
-        b_vals = tl.load(
-            b_ptr + stride_br * offs_k[:, None] + stride_bh * offs_n_out[None, :],
-            mask=rank_valid[:, None] & (offs_n_out[None, :] < h_out), # Safety mask
-            other=0.0
-        )
+                # Compute h_chunk = x[in_block] @ A.T for this chunk
+                # Sum over dimension N_IN: [N_IN] * [K, N_IN] -> [K]
+                h_chunk = tl.sum(x_fp32[None, :] * a_fp32, axis=1)
 
-        b_fp32 = tl.cast(b_vals, tl.float32)
+                # Zero out invalid ranks
+                h_chunk = tl.where(rank_valid, h_chunk, 0.0)
 
-        # Compute acc += h_chunk @ B
-        # Broadcast h_chunk [K] against B [K, N_OUT] -> Sum over K -> [N_OUT]
-        chunk_contrib = tl.sum(h_chunk[:, None] * b_fp32, axis=0)
-        acc = acc + chunk_contrib * a_scaling
+                # --- Load B (Up Proj) ---
+                # B matrix: [max_rank, h_out]
+                # Load from same slot_loc with proper output block offset
+                b_ptr = b_buffer_ptr + stride_bb * slot_loc + stride_br * k_base + stride_bh * out_base
 
-    # Store output y[req_idx, :] - [h_out] using BLOCK_N_OUT
-    y_ptrs = y_ptr + stride_yb * req_idx + stride_yh * offs_n_out
-    y_mask = offs_n_out < h_out
-    tl.store(y_ptrs, acc, mask=y_mask)
+                b_vals = tl.load(
+                    b_ptr + stride_br * offs_k[:, None] + stride_bh * offs_n_out[None, :],
+                    mask=rank_valid[:, None] & ((offs_n_out[None, :] + out_base) < h_out),
+                    other=0.0
+                )
+
+                b_fp32 = tl.cast(b_vals, tl.float32)
+
+                # Compute acc_block += h_chunk @ B
+                # Broadcast h_chunk [K] against B [K, N_OUT] -> Sum over K -> [N_OUT]
+                chunk_contrib = tl.sum(h_chunk[:, None] * b_fp32, axis=0)
+                acc_block = acc_block + chunk_contrib * a_scaling
+
+        # Store output for this block
+        y_ptrs = y_ptr + stride_yb * req_idx + stride_yh * (offs_n_out + out_base)
+        y_mask = (offs_n_out + out_base) < h_out
+        tl.store(y_ptrs, acc_block, mask=y_mask)
 
 
 def dispatch_bgmv(
@@ -145,7 +150,7 @@ def dispatch_bgmv(
     # Added optional dims to support asymmetry
     a_hidden_dim: int | None = None,
     b_hidden_dim: int | None = None,
-    layer_id: int = 0,  # NEW: Layer ID for slot offset
+    layer_id: int = 0,  # Layer ID for slot offset
 ):
     """
     Batched GPU Memory View (BGMV) dispatch.
@@ -167,6 +172,8 @@ def dispatch_bgmv(
 
     assert h_in == buf_h_in, f"Input dim mismatch: x({h_in}) vs a_buffer({buf_h_in})"
     assert h_out == buf_h_out, f"Output dim mismatch: y({h_out}) vs b_buffer({buf_h_out})"
+    
+    assert a_len.shape[0] != 0, f"a_len tensor is empty, cannot proceed with dispatch_bgmv"
 
     # Helper to pick block size
     def get_block_n(dim):
@@ -193,12 +200,11 @@ def dispatch_bgmv(
         batch_size,
         h_in, h_out,
         max_rank,
-        layer_id,  # NEW: Pass layer_id to kernel
-        BLOCK_N_IN, BLOCK_N_OUT, BLOCK_K
+        layer_id,
+        BLOCK_N_IN, BLOCK_N_OUT, BLOCK_K,
+        a_buffer.shape[0]
     )
     return
-
-# --- Updated Wrappers with layer_id support ---
 
 def batch_lora_get_qkv(
     y: torch.Tensor,
@@ -209,7 +215,7 @@ def batch_lora_get_qkv(
     a_scaling: torch.Tensor, req_bins: torch.Tensor,
     a_hidden_dim: int = None,
     b_hidden_dim: int = None,
-    layer_id: int = 0,  # NEW: Layer ID for slot offset
+    layer_id: int = 0,
 ):
     """
     Supports separate dimensions for GQA K/V projections.
@@ -227,7 +233,7 @@ def batch_lora_get_o(
     a_scaling: torch.Tensor, req_bins: torch.Tensor,
     a_hidden_dim: int = None,
     b_hidden_dim: int = None,
-    layer_id: int = 0,  # NEW
+    layer_id: int = 0,
 ):
     dispatch_bgmv(y, x, a_buffer, b_buffer, a_start, a_len, a_scaling, req_bins,
                   a_hidden_dim=a_hidden_dim, b_hidden_dim=b_hidden_dim,
@@ -239,7 +245,7 @@ def batch_lora_get_mlp(
     a_scaling: torch.Tensor, req_bins: torch.Tensor,
     a_hidden_dim: int = None,
     b_hidden_dim: int = None,
-    layer_id: int = 0,  # NEW
+    layer_id: int = 0,
 ):
     dispatch_bgmv(y, x, a_buffer, b_buffer, a_start, a_len, a_scaling, req_bins,
                   a_hidden_dim=a_hidden_dim, b_hidden_dim=b_hidden_dim,
@@ -251,7 +257,7 @@ def batch_lora_get_vl(
     a_scaling: torch.Tensor, req_bins: torch.Tensor,
     a_hidden_dim: int = None,
     b_hidden_dim: int = None,
-    layer_id: int = 0,  # NEW
+    layer_id: int = 0,
 ):
     dispatch_bgmv(y, x, a_buffer, b_buffer, a_start, a_len, a_scaling, req_bins,
                   a_hidden_dim=a_hidden_dim, b_hidden_dim=b_hidden_dim,

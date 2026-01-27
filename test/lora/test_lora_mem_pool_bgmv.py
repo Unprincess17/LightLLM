@@ -379,6 +379,455 @@ def test_bgmv_kernel_with_different_layers():
         print("FAILURE: layer_id is not being used correctly!")
 
 
+def test_bgmv_kernel_asymmetric_kv_projection():
+    """Test 5c: BGMV with Asymmetric K/V Projection (GQA)
+
+    Tests the case where:
+    - Input dimension (hidden_size) != Output dimension (num_kv_heads * head_dim)
+
+    For example with Qwen3-VL:
+    - hidden_size = 2048
+    - num_kv_heads = 4, head_dim = 64
+    - h_in = 2048, h_out = 256
+    """
+    print("\n=== Test 5c: BGMV with Asymmetric K/V Projection (GQA) ===")
+
+    # Simulate GQA config
+    hidden_size = 2048
+    num_kv_heads = 4
+    head_dim = 64
+    kv_dim = num_kv_heads * head_dim  # 256
+
+    rank = 16
+    pool_size = 64  # Must fit at least 2 adapters * 28 layers = 56 slots
+
+    # Create pool with asymmetric dimensions
+    pool = create_lora_mem_pool(
+        num_layers=28,
+        pool_size=pool_size,
+        max_rank=rank,
+        num_heads=32,
+        head_dim=head_dim,
+        intermediate_dim=10240,
+        hidden_size=hidden_size,
+        vocab_size=151936,
+        num_kv_heads=num_kv_heads,  # GQA: 4 KV heads
+        dtype=torch.float16,
+        device="cuda",
+    )
+
+    print(f"Pool created:")
+    print(f"  attn_k_pool: a_hidden_dim={pool.attn_k_pool.a_hidden_dim}, b_hidden_dim={pool.attn_k_pool.b_hidden_dim}")
+    print(f"  attn_k_pool.a_buffer.shape: {pool.attn_k_pool.a_buffer.shape}")
+    print(f"  attn_k_pool.b_buffer.shape: {pool.attn_k_pool.b_buffer.shape}")
+
+    # Create synthetic weights with correct dimensions
+    # A: [rank, hidden_size] = [16, 2048]
+    # B: [rank, kv_dim] = [16, 256]
+    # Use fixed seed for reproducibility
+    torch.manual_seed(42)
+    layer_weights = {}
+    for layer_id in range(pool.num_layers):
+        layer_weights[layer_id] = {
+            LoRATargetType.ATTN_K_PROJ: {
+                "k_proj": {
+                    "A": torch.randn(rank, hidden_size, dtype=torch.float16, device="cuda"),
+                    "B": torch.randn(rank, kv_dim, dtype=torch.float16, device="cuda"),
+                }
+            }
+        }
+
+    result = pool.load_adapter(
+        adapter_dir="/fake/k_adapter",
+        rank=rank,
+        scaling=1.0,
+        layer_weights=layer_weights
+    )
+    print(f"Adapter loaded: {result}")
+
+    if not result:
+        print("ERROR: Adapter not loaded!")
+        return
+
+    # Test BGMV with asymmetric dimensions
+    batch_size = 2
+    x = torch.randn(batch_size, hidden_size, dtype=torch.float16, device="cuda")  # [2, 2048]
+    y = torch.zeros(batch_size, kv_dim, dtype=torch.float16, device="cuda")  # [2, 256]
+    req_bins = torch.zeros(batch_size, dtype=torch.long, device="cuda")
+
+    print(f"\nRunning BGMV kernel:")
+    print(f"  x.shape: {x.shape} (h_in={hidden_size})")
+    print(f"  y.shape: {y.shape} (h_out={kv_dim})")
+
+    # Call with explicit dimensions
+    batch_lora_get_qkv(
+        y, x,
+        pool.attn_k_pool.a_buffer,
+        pool.attn_k_pool.b_buffer,
+        pool.attn_k_pool.a_start,
+        pool.attn_k_pool.a_len,
+        pool.attn_k_pool.a_scaling,
+        req_bins,
+        a_hidden_dim=hidden_size,
+        b_hidden_dim=kv_dim,
+        layer_id=0,
+    )
+
+    print(f"Output shape: {y.shape}")
+    print(f"Output[0, :5]: {y[0, :5].cpu()}")
+
+    # Verify by computing expected output manually
+    print("\nVerifying against manual computation...")
+
+    # Get the loaded weights
+    a_loaded = pool.attn_k_pool.a_buffer[0, :rank]  # [rank, hidden_size]
+    b_loaded = pool.attn_k_pool.b_buffer[0, :rank]  # [rank, kv_dim]
+
+    expected = x @ a_loaded.T @ b_loaded  # [batch, hidden] @ [hidden, rank] @ [rank, kv] = [batch, kv]
+    expected = expected * 1.0  # scaling
+
+    print(f"Expected[0, :5]: {expected[0, :5].cpu()}")
+
+    # Float16 has limited precision, use appropriate tolerance
+    # Max diff of 0.5-1.0 is typical for float16 accumulation
+    if torch.allclose(y, expected, atol=2.0):
+        print("SUCCESS: BGMV with asymmetric K/V projection is correct!")
+    else:
+        diff = (y - expected).abs().max().item()
+        print(f"FAILURE: Max diff = {diff}")
+        print(f"y[0, :5]: {y[0, :5].cpu()}")
+        print(f"expected[0, :5]: {expected[0, :5].cpu()}")
+
+
+def test_bgmv_kernel_asymmetric_o_projection():
+    """Test 5d: BGMV with Asymmetric O Projection
+
+    Tests the case where:
+    - Input dimension (num_heads * head_dim) != Output dimension (hidden_size)
+
+    For Qwen3-VL-MoE:
+    - num_heads = 32, head_dim = 64
+    - h_in = 2048, h_out = 2048  (same)
+    - BUT for Qwen3-VL (non-MoE variant with different config):
+    - num_heads = 32, head_dim = 128 -> h_in = 4096, h_out = 2048
+    """
+    print("\n=== Test 5d: BGMV with Asymmetric O Projection ===")
+
+    # Simulate config where o_proj is asymmetric
+    hidden_size = 2048
+    num_heads = 32
+    head_dim = 128
+    qk_dim = num_heads * head_dim  # 4096 (Q dimension)
+
+    rank = 16
+    pool_size = 64
+
+    pool = create_lora_mem_pool(
+        num_layers=28,
+        pool_size=pool_size,
+        max_rank=rank,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        intermediate_dim=10240,
+        hidden_size=hidden_size,
+        vocab_size=151936,
+        num_kv_heads=8,
+        dtype=torch.float16,
+        device="cuda",
+    )
+
+    print(f"Pool created:")
+    print(f"  attn_o_pool: a_hidden_dim={pool.attn_o_pool.a_hidden_dim}, b_hidden_dim={pool.attn_o_pool.b_hidden_dim}")
+    print(f"  attn_o_pool.a_buffer.shape: {pool.attn_o_pool.a_buffer.shape}")
+    print(f"  attn_o_pool.b_buffer.shape: {pool.attn_o_pool.b_buffer.shape}")
+
+    # Verify the asymmetry is correct
+    assert pool.attn_o_pool.a_hidden_dim == qk_dim, f"Expected a_hidden_dim={qk_dim}, got {pool.attn_o_pool.a_hidden_dim}"
+    assert pool.attn_o_pool.b_hidden_dim == hidden_size, f"Expected b_hidden_dim={hidden_size}, got {pool.attn_o_pool.b_hidden_dim}"
+    print(f"  Verified: a_hidden_dim={qk_dim}, b_hidden_dim={hidden_size}")
+
+    # Create synthetic weights with fixed seed for reproducibility
+    torch.manual_seed(42)
+    layer_weights = {}
+    for layer_id in range(pool.num_layers):
+        layer_weights[layer_id] = {
+            LoRATargetType.ATTN_O_PROJ: {
+                "o_proj": {
+                    "A": torch.randn(rank, qk_dim, dtype=torch.float16, device="cuda"),
+                    "B": torch.randn(rank, hidden_size, dtype=torch.float16, device="cuda"),
+                }
+            }
+        }
+
+    result = pool.load_adapter(
+        adapter_dir="/fake/o_adapter",
+        rank=rank,
+        scaling=1.0,
+        layer_weights=layer_weights
+    )
+    print(f"Adapter loaded: {result}")
+
+    # Test BGMV
+    batch_size = 2
+    x = torch.randn(batch_size, qk_dim, dtype=torch.float16, device="cuda")  # [2, 4096]
+    y = torch.zeros(batch_size, hidden_size, dtype=torch.float16, device="cuda")  # [2, 2048]
+    req_bins = torch.zeros(batch_size, dtype=torch.long, device="cuda")
+
+    print(f"\nRunning BGMV kernel:")
+    print(f"  x.shape: {x.shape} (h_in={qk_dim})")
+    print(f"  y.shape: {y.shape} (h_out={hidden_size})")
+
+    batch_lora_get_o(
+        y, x,
+        pool.attn_o_pool.a_buffer,
+        pool.attn_o_pool.b_buffer,
+        pool.attn_o_pool.a_start,
+        pool.attn_o_pool.a_len,
+        pool.attn_o_pool.a_scaling,
+        req_bins,
+        a_hidden_dim=qk_dim,
+        b_hidden_dim=hidden_size,
+        layer_id=0
+    )
+
+    print(f"Output shape: {y.shape}")
+
+    # Verify
+    print("\nVerifying against manual computation...")
+    a_loaded = pool.attn_o_pool.a_buffer[0, :rank]
+    b_loaded = pool.attn_o_pool.b_buffer[0, :rank]
+    expected = x @ a_loaded.T @ b_loaded
+
+    # Float16 has limited precision, use appropriate tolerance
+    if torch.allclose(y, expected, atol=2.0):
+        print("SUCCESS: BGMV with asymmetric O projection is correct!")
+    else:
+        diff = (y - expected).abs().max().item()
+        print(f"FAILURE: Max diff = {diff}")
+
+
+def test_bgmv_kernel_asymmetric_mlp():
+    """Test 5e: BGMV with Asymmetric MLP Projections
+
+    Tests gate/up (expand) and down (shrink) projections.
+    - gate/up: h_in=hidden_size, h_out=intermediate_dim
+    - down: h_in=intermediate_dim, h_out=hidden_size
+
+    Note: For S-LoRA, each adapter typically has weights for ALL projection types
+    (gate, up, down) for each layer. We load one adapter with all three.
+    """
+    print("\n=== Test 5e: BGMV with Asymmetric MLP Projections ===")
+
+    hidden_size = 2048
+    intermediate_dim = 11008
+
+    rank = 16
+    pool_size = 64
+
+    pool = create_lora_mem_pool(
+        num_layers=28,
+        pool_size=pool_size,
+        max_rank=rank,
+        num_heads=32,
+        head_dim=64,
+        intermediate_dim=intermediate_dim,
+        hidden_size=hidden_size,
+        vocab_size=151936,
+        dtype=torch.float16,
+        device="cuda",
+    )
+
+    print(f"MLP Pool dimensions:")
+    print(f"  gate_pool: a_hidden_dim={pool.moe_gate_pool.a_hidden_dim}, b_hidden_dim={pool.moe_gate_pool.b_hidden_dim}")
+    print(f"  down_pool: a_hidden_dim={pool.moe_down_pool.a_hidden_dim}, b_hidden_dim={pool.moe_down_pool.b_hidden_dim}")
+
+    # Verify gate is expanding
+    assert pool.moe_gate_pool.a_hidden_dim == hidden_size
+    assert pool.moe_gate_pool.b_hidden_dim == intermediate_dim
+    # Verify down is shrinking
+    assert pool.moe_down_pool.a_hidden_dim == intermediate_dim
+    assert pool.moe_down_pool.b_hidden_dim == hidden_size
+
+    # Create ONE adapter with ALL MLP projection weights (gate, up, down)
+    # This is how real adapters are structured
+    # Use fixed seed for reproducibility
+    torch.manual_seed(42)
+    layer_weights = {}
+    for layer_id in range(pool.num_layers):
+        layer_weights[layer_id] = {
+            LoRATargetType.MOE_EXPERT_GATE: {
+                "gate_proj": {
+                    "A": torch.randn(rank, hidden_size, dtype=torch.float16, device="cuda"),
+                    "B": torch.randn(rank, intermediate_dim, dtype=torch.float16, device="cuda"),
+                }
+            },
+            LoRATargetType.MOE_EXPERT_UP: {
+                "up_proj": {
+                    "A": torch.randn(rank, hidden_size, dtype=torch.float16, device="cuda"),
+                    "B": torch.randn(rank, intermediate_dim, dtype=torch.float16, device="cuda"),
+                }
+            },
+            LoRATargetType.MOE_EXPERT_DOWN: {
+                "down_proj": {
+                    "A": torch.randn(rank, intermediate_dim, dtype=torch.float16, device="cuda"),
+                    "B": torch.randn(rank, hidden_size, dtype=torch.float16, device="cuda"),
+                }
+            }
+        }
+
+    result = pool.load_adapter(
+        adapter_dir="/fake/mlp_adapter",
+        rank=rank,
+        scaling=1.0,
+        layer_weights=layer_weights
+    )
+    print(f"MLP adapter loaded: {result}")
+
+    # Use fixed input values for testing (not random)
+    # This ensures BGMV and expected computation use the same input
+    batch_size = 2
+    x_gate = torch.ones(batch_size, hidden_size, dtype=torch.float16, device="cuda") * 0.1  # [2, 2048]
+    y_gate = torch.zeros(batch_size, intermediate_dim, dtype=torch.float16, device="cuda")  # [2, 11008]
+    req_bins = torch.zeros(batch_size, dtype=torch.long, device="cuda")  # Use adapter 0
+
+    from lightllm._kernels.lora.bgmv import batch_lora_get_mlp
+
+    print(f"\nRunning gate_proj BGMV:")
+    print(f"  x.shape: {x_gate.shape} -> y.shape: {y_gate.shape}")
+
+    batch_lora_get_mlp(
+        y_gate, x_gate,
+        pool.moe_gate_pool.a_buffer,
+        pool.moe_gate_pool.b_buffer,
+        pool.moe_gate_pool.a_start,
+        pool.moe_gate_pool.a_len,
+        pool.moe_gate_pool.a_scaling,
+        req_bins,
+        a_hidden_dim=hidden_size,
+        b_hidden_dim=intermediate_dim,
+        layer_id=0
+    )
+
+    # Verify gate
+    a_loaded = pool.moe_gate_pool.a_buffer[0, :rank]
+    b_loaded = pool.moe_gate_pool.b_buffer[0, :rank]
+    expected_gate = x_gate @ a_loaded.T @ b_loaded
+
+    if torch.allclose(y_gate, expected_gate, atol=2.0):
+        print("SUCCESS: Gate projection BGMV is correct!")
+    else:
+        diff = (y_gate - expected_gate).abs().max().item()
+        print(f"FAILURE: Gate max diff = {diff}")
+        print(f"  y_gate mean: {y_gate.mean().item()}, expected mean: {expected_gate.mean().item()}")
+
+    # Test down BGMV (shrink) - same adapter, different pool
+    # Use fixed input values
+    x_down = torch.ones(batch_size, intermediate_dim, dtype=torch.float16, device="cuda") * 0.05  # [2, 11008]
+    y_down = torch.zeros(batch_size, hidden_size, dtype=torch.float16, device="cuda")  # [2, 2048]
+
+    print(f"\nRunning down_proj BGMV:")
+    print(f"  x.shape: {x_down.shape} -> y.shape: {y_down.shape}")
+
+    batch_lora_get_mlp(
+        y_down, x_down,
+        pool.moe_down_pool.a_buffer,
+        pool.moe_down_pool.b_buffer,
+        pool.moe_down_pool.a_start,
+        pool.moe_down_pool.a_len,
+        pool.moe_down_pool.a_scaling,
+        req_bins,  # Same adapter index 0
+        a_hidden_dim=intermediate_dim,
+        b_hidden_dim=hidden_size,
+        layer_id=0
+    )
+
+    # Verify down
+    a_loaded = pool.moe_down_pool.a_buffer[0, :rank]
+    b_loaded = pool.moe_down_pool.b_buffer[0, :rank]
+    expected_down = x_down @ a_loaded.T @ b_loaded
+
+    if torch.allclose(y_down, expected_down, atol=2.0):
+        print("SUCCESS: Down projection BGMV is correct!")
+    else:
+        diff = (y_down - expected_down).abs().max().item()
+        print(f"FAILURE: Down max diff = {diff}")
+        print(f"  y_down mean: {y_down.mean().item()}, expected mean: {expected_down.mean().item()}")
+
+
+def test_bgmv_kernel_symmetric_case():
+    """Test 5f: BGMV with Symmetric Projection (baseline test)
+
+    Verifies that symmetric case (h_in == h_out) still works correctly.
+    """
+    print("\n=== Test 5f: BGMV with Symmetric Projection (baseline) ===")
+
+    hidden_size = 512
+    rank = 16
+    pool_size = 32
+
+    pool = create_lora_mem_pool(
+        num_layers=28,
+        pool_size=pool_size,
+        max_rank=rank,
+        num_heads=8,
+        head_dim=64,
+        intermediate_dim=128,
+        hidden_size=hidden_size,
+        vocab_size=1000,
+        dtype=torch.float16,
+        device="cuda",
+    )
+
+    # Load adapter with fixed seed for reproducibility
+    torch.manual_seed(42)
+    layer_weights = {}
+    for layer_id in range(pool.num_layers):
+        layer_weights[layer_id] = {
+            LoRATargetType.ATTN_Q_PROJ: {
+                "q_proj": {
+                    "A": torch.randn(rank, hidden_size, dtype=torch.float16, device="cuda"),
+                    "B": torch.randn(rank, hidden_size, dtype=torch.float16, device="cuda"),
+                }
+            }
+        }
+
+    result = pool.load_adapter(
+        adapter_dir="/fake/q_adapter",
+        rank=rank,
+        scaling=1.0,
+        layer_weights=layer_weights
+    )
+    print(f"Adapter loaded: {result}")
+
+    # Test symmetric BGMV
+    batch_size = 2
+    x = torch.randn(batch_size, hidden_size, dtype=torch.float16, device="cuda")
+    y = torch.zeros(batch_size, hidden_size, dtype=torch.float16, device="cuda")
+    req_bins = torch.zeros(batch_size, dtype=torch.long, device="cuda")
+
+    batch_lora_get_qkv(
+        y, x,
+        pool.attn_q_pool.a_buffer,
+        pool.attn_q_pool.b_buffer,
+        pool.attn_q_pool.a_start,
+        pool.attn_q_pool.a_len,
+        pool.attn_q_pool.a_scaling,
+        req_bins,
+        layer_id=0
+    )
+
+    # Verify
+    a_loaded = pool.attn_q_pool.a_buffer[0, :rank]
+    b_loaded = pool.attn_q_pool.b_buffer[0, :rank]
+    expected = x @ a_loaded.T @ b_loaded
+
+    # Float16 has limited precision, use appropriate tolerance
+    if torch.allclose(y, expected, atol=2.0):
+        print("SUCCESS: Symmetric BGMV is correct!")
+    else:
+        print(f"FAILURE: Max diff = {(y - expected).abs().max().item()}")
+
+
 def test_lora_mem_pool_debug():
     """Test 6: Memory Pool Debug - Show a_len meaning"""
     print("\n=== Test 6: Memory Pool Debug ===")
@@ -705,7 +1154,7 @@ def test_real_lora_with_bgmv():
                 pool.attn_o_pool.a_scaling,
                 req_bins,
                 layer_id=0
-            )
+    )
 
             print(f"SUCCESS: BGMV kernel executed with synthetic LoRA weights!")
             print(f"Output shape: {y.shape}")
@@ -722,7 +1171,7 @@ def test_real_lora_with_bgmv():
                 pool.attn_o_pool.a_scaling,
                 req_bins,
                 layer_id=10
-            )
+    )
             print(f"\nWith layer_id=10, output[0, :5]: {y1[0, :5].cpu()}")
 
             # Verify outputs are different (different slots)
@@ -770,7 +1219,7 @@ def test_real_lora_with_bgmv():
                     pool.attn_o_pool.a_scaling,
                     req_bins_batch,
                     layer_id=5
-                )
+    )
 
                 print(f"Batched output shape: {y_batch.shape}")
                 print(f"Adapter 0 (req 0,1) output[0, :3]: {y_batch[0, :3].cpu()}")
@@ -797,6 +1246,10 @@ def main():
     test_bgmv_kernel_basic()
     test_bgmv_kernel_with_lora_mem_pool()
     test_bgmv_kernel_with_different_layers()
+    test_bgmv_kernel_asymmetric_kv_projection()  # GQA: hidden_size -> num_kv_heads*head_dim
+    test_bgmv_kernel_asymmetric_o_projection()   # O proj: num_heads*head_dim -> hidden_size
+    test_bgmv_kernel_asymmetric_mlp()            # MLP: hidden_size <-> intermediate_dim
+    test_bgmv_kernel_symmetric_case()            # Baseline: h_in == h_out
     test_lora_mem_pool_debug()
     test_lora_mem_pool_vision_layers()
     test_real_lora_adapter()        # Test real LoRA structure
