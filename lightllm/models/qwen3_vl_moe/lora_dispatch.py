@@ -469,7 +469,7 @@ class Qwen3VLMoELoRADispatcher:
     # Utility Methods
     # =====================================================================
 
-    def get_attention_lora(
+    def get_attn_qkv_lora(
         self,
         input_tensor: torch.Tensor,
         layer_id: int,
@@ -484,7 +484,6 @@ class Qwen3VLMoELoRADispatcher:
             "q_lora": self.batch_apply_q_lora(input_tensor, layer_id, req_bins),
             "k_lora": self.batch_apply_k_lora(input_tensor, layer_id, req_bins),
             "v_lora": self.batch_apply_v_lora(input_tensor, layer_id, req_bins),
-            "o_lora": self.batch_apply_o_lora(input_tensor, layer_id, req_bins),
         }
 
     def get_mlp_lora(

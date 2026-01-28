@@ -1005,6 +1005,9 @@ class ModeBackend:
                 tp_world_size=get_global_world_size(),
             )
 
+            # Set TP rank for sharded weight loading
+            self.lora_mem_pool.tp_rank_ = self.rank_in_node
+
             self.logger.info(f"[LoRA Backend] Created LoRA memory pool for {num_layers} layers, max_rank={max_rank}")
 
         except ImportError as e:

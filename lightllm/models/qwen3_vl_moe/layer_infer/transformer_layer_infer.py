@@ -66,7 +66,7 @@ class Qwen3VLMOETransformerLayerInfer(Qwen3MOETransformerLayerInfer):
             batch_size = input.shape[0]
             logger.debug(f"[LoRA Infer] Layer {self.layer_num_}: apply_qkv_lora batch={batch_size}")
 
-            lora_results = self.lora_dispatcher_.get_attention_lora(
+            lora_results = self.lora_dispatcher_.get_attn_qkv_lora(
                 input, self.layer_num_, self.req_bins_
             )
             logger.debug(f"[LoRA Infer] Layer {self.layer_num_}: q_shape={q.shape}, cache_kv_shape={cache_kv.shape}")

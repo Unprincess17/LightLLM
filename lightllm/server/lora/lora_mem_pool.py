@@ -242,10 +242,54 @@ class LoRAModulePool:
             try:
                 if a_weight is not None:
                     # A weight matrix: [rank, hidden]
-                    self.a_buffer[loc_start + buffer_layer_id, :rank] = a_weight.to(self.a_buffer.dtype)
+                    # Case 1: Perfect match (TP=1 or pre-sharded weights)
+                    if self.a_buffer.shape[-1] == a_weight.shape[-1]:
+                        self.a_buffer[loc_start + buffer_layer_id, :rank] = a_weight.to(self.a_buffer.dtype)
+                    # Case 2: TP sharding needed - validate math is consistent
+                    elif (self.a_buffer.shape[-1] < a_weight.shape[-1] and
+                          a_weight.shape[-1] == self.a_buffer.shape[-1] * tp_world_size):
+                        split_size = self.a_buffer.shape[-1]
+                        start_idx = tp_rank * split_size
+                        end_idx = (tp_rank + 1) * split_size
+                        # Validate range
+                        if end_idx <= a_weight.shape[-1]:
+                            a_weight_sharded = a_weight[:, start_idx:end_idx]
+                            self.a_buffer[loc_start + buffer_layer_id, :rank] = a_weight_sharded.to(self.a_buffer.dtype)
+                        else:
+                            logger.error(f"TP slicing out of bounds! rank={tp_rank}, size={split_size}, w_shape={a_weight.shape}")
+                            return False
+                    # Case 3: Invalid mismatch
+                    else:
+                        logger.error(
+                            f"Shape Mismatch Error: Buffer {self.a_buffer.shape[-1]} vs Weight {a_weight.shape[-1]}. "
+                            f"TP_Size={tp_world_size}. This is not a valid TP split."
+                        )
+                        return False
                 if b_weight is not None:
-                    # B weight matrix: [rank, hidden] -> [hidden, rank] (stored as [rank, hidden])
-                    self.b_buffer[loc_start + buffer_layer_id, :rank] = b_weight.to(self.b_buffer.dtype)
+                    # B weight matrix: [rank, hidden]
+                    # Case 1: Perfect match (TP=1 or pre-sharded weights)
+                    if self.b_buffer.shape[-1] == b_weight.shape[-1]:
+                        self.b_buffer[loc_start + buffer_layer_id, :rank] = b_weight.to(self.b_buffer.dtype)
+                    # Case 2: TP sharding needed - validate math is consistent
+                    elif (self.b_buffer.shape[-1] < b_weight.shape[-1] and
+                          b_weight.shape[-1] == self.b_buffer.shape[-1] * tp_world_size):
+                        split_size = self.b_buffer.shape[-1]
+                        start_idx = tp_rank * split_size
+                        end_idx = (tp_rank + 1) * split_size
+                        # Validate range
+                        if end_idx <= b_weight.shape[-1]:
+                            b_weight_sharded = b_weight[:, start_idx:end_idx]
+                            self.b_buffer[loc_start + buffer_layer_id, :rank] = b_weight_sharded.to(self.b_buffer.dtype)
+                        else:
+                            logger.error(f"TP slicing out of bounds! rank={tp_rank}, size={split_size}, w_shape={b_weight.shape}")
+                            return False
+                    # Case 3: Invalid mismatch
+                    else:
+                        logger.error(
+                            f"Shape Mismatch Error: Buffer {self.b_buffer.shape[-1]} vs Weight {b_weight.shape[-1]}. "
+                            f"TP_Size={tp_world_size}. This is not a valid TP split."
+                        )
+                        return False
             except Exception as e:
                 logger.error(f"Error loading adapter weights for layer {buffer_layer_id}: {e}")
                 logger.error(f"a_buffer shape: {self.a_buffer.shape}; b_buffer shape: {self.b_buffer.shape}")
@@ -468,7 +512,8 @@ class LoRAMemPool:
             head_dim=head_dim,
             intermediate_dim=intermediate_dim,
             hidden_size=hidden_size,
-            vocab_size=vocab_size
+            vocab_size=vocab_size,
+            tp_world_size_=tp_world_size
         )
         return pool
 
@@ -558,7 +603,9 @@ class LoRAMemPool:
                     adapter_idx=adapter_idx,
                     rank=rank,
                     scaling=scaling,
-                    layer_weights=weights_by_layer
+                    layer_weights=weights_by_layer,
+                    tp_rank=self.tp_rank_,
+                    tp_world_size=self.tp_world_size_
                 )
                 logger.debug(f"[LoRA]   Loaded {target_type} with {len(weights_by_layer)} layers")
 
