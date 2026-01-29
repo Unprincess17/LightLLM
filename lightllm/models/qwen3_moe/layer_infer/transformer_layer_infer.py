@@ -158,8 +158,8 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
         # Apply moe_gate LoRA if using detached mode
         # This modifies routing decisions
         if self.use_detached_lora_ and self.lora_dispatcher_ is not None:
-            gate_lora = self.lora_dispatcher_.apply_moe_gate_lora(
-                hidden_states, layer_weight.layer_num_, infer_state
+            gate_lora = self.lora_dispatcher_.batch_apply_gate_lora(
+                hidden_states, layer_weight.layer_num_
             )
             router_logits = router_logits + gate_lora
 
@@ -173,12 +173,12 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
             num_expert_group=None,
         )
 
-        # Apply w2 LoRA to final output (applied after moe_sum_reduce)
+        # Apply w2 (down_proj) LoRA using batched S-LoRA API
         if self.use_detached_lora_ and self.lora_dispatcher_ is not None:
-            w2_lora = self.lora_dispatcher_.apply_w2_lora(
-                hidden_states, layer_weight.layer_num_, infer_state
+            down_lora = self.lora_dispatcher_.batch_apply_down_lora(
+                hidden_states, layer_weight.layer_num_
             )
-            hidden_states = hidden_states + w2_lora
+            hidden_states = hidden_states + down_lora
 
         return hidden_states.view(num_tokens, hidden_dim)
 
@@ -191,10 +191,10 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
 
         router_logits = layer_weight.moe_gate.mm(hidden_states)
 
-        # Apply moe_gate LoRA if using detached mode
+        # Apply moe_gate LoRA using batched S-LoRA API
         if self.use_detached_lora_ and self.lora_dispatcher_ is not None:
-            gate_lora = self.lora_dispatcher_.apply_moe_gate_lora(
-                hidden_states, layer_weight.layer_num_, infer_state
+            gate_lora = self.lora_dispatcher_.batch_apply_gate_lora(
+                hidden_states, layer_weight.layer_num_
             )
             router_logits = router_logits + gate_lora
 
@@ -209,12 +209,12 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
             is_prefill=infer_state.is_prefill,
         )
 
-        # Apply w2 LoRA to final output
+        # Apply w2 (down_proj) LoRA using batched S-LoRA API
         if self.use_detached_lora_ and self.lora_dispatcher_ is not None:
-            w2_lora = self.lora_dispatcher_.apply_w2_lora(
-                ep_output, layer_weight.layer_num_, infer_state
+            down_lora = self.lora_dispatcher_.batch_apply_down_lora(
+                ep_output, layer_weight.layer_num_
             )
-            ep_output = ep_output + w2_lora
+            ep_output = ep_output + down_lora
 
         ep_output = ep_output.view(token_num, hidden_dim)
         return ep_output

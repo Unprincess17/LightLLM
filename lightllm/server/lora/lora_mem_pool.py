@@ -440,8 +440,6 @@ class LoRAMemPool:
         # GQA: B matrix output dimension
         kv_internal_dim = num_kv_heads * head_dim
 
-
-
         # Vision dimensions
         vl_hidden = vl_hidden_size
         vl_mlp_hidden = vl_intermediate_size
@@ -500,6 +498,8 @@ class LoRAMemPool:
             moe_gate_pool=LoRAModulePool.create(pool_size, max_rank, hidden_size, mlp_inter, dtype, device, num_layers=num_layers),
             moe_up_pool=LoRAModulePool.create(pool_size, max_rank, hidden_size, mlp_inter, dtype, device, num_layers=num_layers),
             moe_down_pool=LoRAModulePool.create(pool_size, max_rank, mlp_inter, hidden_size, dtype, device, num_layers=num_layers),
+            
+            # LM Head pool
             lm_head_pool=LoRAModulePool.create(pool_size, max_rank, hidden_size, vocab_size, dtype, device, num_layers=1),
 
             adapter_dirs=[],
@@ -512,6 +512,7 @@ class LoRAMemPool:
             head_dim=head_dim,
             intermediate_dim=intermediate_dim,
             hidden_size=hidden_size,
+            moe_intermediate_dim=moe_intermediate_dim,
             vocab_size=vocab_size,
             tp_world_size_=tp_world_size
         )
