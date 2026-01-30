@@ -232,9 +232,10 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
             expert_req_bins = self.req_bins_[batch_indices]
 
             # 4.3 Get Weights
-            w1 = experts.experts_gate_projs[expert_idx]
-            w3 = experts.experts_up_projs[expert_idx]
-            w2 = experts.w2_list[expert_idx]
+            # TODO(FIX): offload here
+            w1 = experts.experts_gate_projs[expert_idx].cuda()
+            w3 = experts.experts_up_projs[expert_idx].cuda()
+            w2 = experts.w2_list[expert_idx].cuda()
 
             # 4.4 Compute Base
             # input: [N, hidden], w.T: [hidden, inter] -> output: [N, inter]
