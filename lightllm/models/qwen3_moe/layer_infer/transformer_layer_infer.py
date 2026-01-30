@@ -37,8 +37,17 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
         # LoRA dispatcher for MoE (set externally for detached mode)
         self.lora_dispatcher_: Optional[Any] = None
         self.use_detached_lora_: bool = False
+        self.req_bins_: Optional[torch.Tensor] = None  # Per-request adapter indices for batched LoRA
 
         return
+
+    def set_req_bins(self, req_bins: torch.Tensor):
+        """Set the req_bins tensor for batched mode.
+
+        Args:
+            req_bins: Tensor of shape [batch_size] containing per-request adapter indices
+        """
+        self.req_bins_ = req_bins
 
     def _bind_func(self):
         super()._bind_func()
@@ -150,37 +159,121 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
     def _moe_ffn(
         self, input, infer_state: LlamaInferStateInfo, layer_weight: Qwen3MOETransformerLayerWeight
     ) -> torch.Tensor:
-
+        """Per-Expert LoRA Baseline implementation."""
         hidden_states = input.view(-1, self.embed_dim_)
         num_tokens, hidden_dim = hidden_states.shape
+
+        # Check if we need per-expert LoRA
+        # 确保 dispatcher 存在且开启了 detached lora 模式
+        use_per_expert_lora = self.use_detached_lora_ and self.lora_dispatcher_ is not None
+
+        # ----------------------------------------------------------------
+        # Fast Path: 使用 Fused Kernel (无 LoRA)
+        # ----------------------------------------------------------------
+        if not use_per_expert_lora:
+            router_logits = layer_weight.moe_gate.mm(hidden_states)
+            layer_weight.experts.experts(
+                hidden_states,
+                router_logits=router_logits,
+                top_k=self.num_experts_per_tok,
+                renormalize=self.norm_topk_prob,
+                use_grouped_topk=False,
+                topk_group=None,
+                num_expert_group=None,
+            )
+            return hidden_states.view(num_tokens, hidden_dim)
+
+        # ----------------------------------------------------------------
+        # Slow Path: Per-Expert LoRA Baseline (Explicit Loop, Research purpose)
+        # ----------------------------------------------------------------
+        from lightllm.common.fused_moe.topk_select import select_experts
+
+        # 1. Router computation
         router_logits = layer_weight.moe_gate.mm(hidden_states)
 
-        # Apply moe_gate LoRA if using detached mode
-        # This modifies routing decisions
-        if self.use_detached_lora_ and self.lora_dispatcher_ is not None:
-            gate_lora = self.lora_dispatcher_.batch_apply_gate_lora(
-                hidden_states, layer_weight.layer_num_
-            )
-            router_logits = router_logits + gate_lora
-
-        layer_weight.experts.experts(
-            hidden_states,
+        # 2. Explicit routing
+        topk_weights, topk_ids = select_experts(
+            hidden_states=hidden_states,
             router_logits=router_logits,
+            correction_bias=getattr(layer_weight.experts, "e_score_correction_bias", None),
             top_k=self.num_experts_per_tok,
             renormalize=self.norm_topk_prob,
             use_grouped_topk=False,
             topk_group=None,
             num_expert_group=None,
+            scoring_func=getattr(layer_weight.experts, "scoring_func", "softmax"),
         )
 
-        # Apply w2 (down_proj) LoRA using batched S-LoRA API
-        if self.use_detached_lora_ and self.lora_dispatcher_ is not None:
-            down_lora = self.lora_dispatcher_.batch_apply_down_lora(
-                hidden_states, layer_weight.layer_num_
-            )
-            hidden_states = hidden_states + down_lora
+        if hasattr(layer_weight.experts, "routed_scaling_factor"):
+            topk_weights = topk_weights * layer_weight.experts.routed_scaling_factor
 
-        return hidden_states.view(num_tokens, hidden_dim)
+        # 3. Check weights availability
+        experts = layer_weight.experts
+        # 必须确保使用了 keep_expert_lists=True
+        if not hasattr(experts, "experts_gate_projs") or experts.experts_gate_projs[0] is None:
+            raise RuntimeError(
+                "Per-Expert Baseline requires 'keep_expert_lists=True' in FusedMoeWeightTP."
+            )
+
+        final_output = torch.zeros_like(hidden_states)
+        total_experts = experts.n_routed_experts
+
+        # 4. Expert Loop
+        for expert_idx in range(total_experts):
+            # 4.1 Filter tokens
+            mask = topk_ids == expert_idx
+            batch_indices, k_indices = torch.where(mask)
+
+            if batch_indices.shape[0] == 0:
+                continue
+
+            # 4.2 Slice Input
+            expert_input = hidden_states[batch_indices]
+            expert_req_bins = self.req_bins_[batch_indices]
+
+            # 4.3 Get Weights
+            w1 = experts.experts_gate_projs[expert_idx]
+            w3 = experts.experts_up_projs[expert_idx]
+            w2 = experts.w2_list[expert_idx]
+
+            # 4.4 Compute Base
+            # input: [N, hidden], w.T: [hidden, inter] -> output: [N, inter]
+            gate_out = torch.mm(expert_input, w1.T)
+            up_out = torch.mm(expert_input, w3.T)
+
+            # 4.5 Apply Per-Expert LoRA (Gate/Up)
+            # 关键：传入 expert_id
+            gate_lora = self.lora_dispatcher_.batch_apply_gate_lora(
+                expert_input, layer_weight.layer_num_, expert_req_bins, expert_id=expert_idx
+            )
+            up_lora = self.lora_dispatcher_.batch_apply_up_lora(
+                expert_input, layer_weight.layer_num_, expert_req_bins, expert_id=expert_idx
+            )
+
+            gate_out += gate_lora
+            up_out += up_lora
+
+            # 4.6 Activation
+            current_hidden = torch.nn.functional.silu(gate_out) * up_out
+
+            # 4.7 Down Projection Base
+            down_out = torch.mm(current_hidden, w2.T)
+
+            # 4.8 Apply Per-Expert LoRA (Down)
+            down_lora = self.lora_dispatcher_.batch_apply_down_lora(
+                current_hidden, layer_weight.layer_num_, expert_req_bins, expert_id=expert_idx
+            )
+            down_out += down_lora
+
+            # 4.9 Weighted Aggregation (Corrected)
+            # routing_weights: [num_selected, 1]
+            routing_weights = topk_weights[batch_indices, k_indices].view(-1, 1)
+            weighted_output = down_out * routing_weights
+
+            # 使用 index_add_ 在 final_output 上原地累加
+            final_output.index_add_(0, batch_indices, weighted_output)
+
+        return final_output.view(num_tokens, hidden_dim)
 
     def _moe_ffn_edp(
         self, input, infer_state: LlamaInferStateInfo, layer_weight: Qwen3MOETransformerLayerWeight
@@ -194,7 +287,7 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
         # Apply moe_gate LoRA using batched S-LoRA API
         if self.use_detached_lora_ and self.lora_dispatcher_ is not None:
             gate_lora = self.lora_dispatcher_.batch_apply_gate_lora(
-                hidden_states, layer_weight.layer_num_
+                hidden_states, layer_weight.layer_num_, self.req_bins_
             )
             router_logits = router_logits + gate_lora
 
@@ -212,7 +305,7 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
         # Apply w2 (down_proj) LoRA using batched S-LoRA API
         if self.use_detached_lora_ and self.lora_dispatcher_ is not None:
             down_lora = self.lora_dispatcher_.batch_apply_down_lora(
-                ep_output, layer_weight.layer_num_
+                ep_output, layer_weight.layer_num_, self.req_bins_
             )
             ep_output = ep_output + down_lora
 

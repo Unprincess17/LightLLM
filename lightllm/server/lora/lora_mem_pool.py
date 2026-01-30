@@ -91,6 +91,7 @@ class LoRAModulePool:
     b_hidden_dim: int  # Output dimension for B matrix
     pool_size: int
     num_layers: int = 1  # Number of layers this pool handles (for slot calculation)
+    num_experts: int = 1  # Number of experts per layer (for MoE models)
 
     @property
     def a_buffer(self) -> torch.Tensor:
@@ -121,6 +122,7 @@ class LoRAModulePool:
         dtype: torch.dtype = torch.float16,
         device: str = "cuda",
         num_layers: int = 1,
+        num_experts: int = 1,
     ) -> "LoRAModulePool":
         """Create a module pool.
 
@@ -132,6 +134,7 @@ class LoRAModulePool:
             dtype: Data type for weights
             device: Device for tensors
             num_layers: Number of layers this pool handles (for slot calculation)
+            num_experts: Number of experts per layer (for MoE models). num_experts=1 for non-MoE.
         """
         if output_dim is None:
             output_dim = input_dim
@@ -146,16 +149,17 @@ class LoRAModulePool:
             b_hidden_dim=output_dim,
             pool_size=pool_size,
             num_layers=num_layers,
+            num_experts=num_experts,
         )
 
     def can_fit(self, rank: int) -> bool:
         """Check if an adapter with given rank can fit.
 
-        Each adapter needs num_layers slots (one per layer).
+        Each adapter needs num_layers * num_experts slots (one per layer/expert).
         The rank only affects the per-slot memory, not the slot count.
         """
         used_slots = self.a_len.sum().item() if len(self.a_len) > 0 else 0
-        slots_needed = self.num_layers  # Each adapter needs num_layers slots
+        slots_needed = self.num_layers * self.num_experts  # Each adapter needs num_layers * num_experts slots
         return (used_slots + slots_needed) <= self.pool_size
 
     def _compute_location(self) -> int:
@@ -165,23 +169,103 @@ class LoRAModulePool:
         # a_len stores slots consumed per adapter, not rank
         return (self.a_start[-1] + self.a_len[-1]).item()
 
+    def _write_weights(
+        self,
+        loc: int,
+        rank: int,
+        scaling: float,
+        weights: dict,
+        tp_rank: int = 0,
+        tp_world_size: int = 1
+    ) -> bool:
+        """Write A and B weights to buffer at given location.
+
+        Args:
+            loc: Buffer location index
+            rank: LoRA rank
+            scaling: Scaling factor
+            weights: Dict with "A" and "B" keys
+            tp_rank: Tensor parallel rank
+            tp_world_size: Tensor parallel world size
+        """
+        a_weight = weights.get("A")
+        b_weight = weights.get("B")
+
+        if a_weight is not None:
+            # A weight matrix: [rank, hidden]
+            # Case 1: Perfect match (TP=1 or pre-sharded weights)
+            if self.a_buffer.shape[-1] == a_weight.shape[-1]:
+                self.a_buffer[loc, :rank] = a_weight.to(self.a_buffer.dtype)
+            # Case 2: TP sharding needed - validate math is consistent
+            elif (self.a_buffer.shape[-1] < a_weight.shape[-1] and
+                  a_weight.shape[-1] == self.a_buffer.shape[-1] * tp_world_size):
+                split_size = self.a_buffer.shape[-1]
+                start_idx = tp_rank * split_size
+                end_idx = (tp_rank + 1) * split_size
+                # Validate range
+                if end_idx <= a_weight.shape[-1]:
+                    a_weight_sharded = a_weight[:, start_idx:end_idx]
+                    self.a_buffer[loc, :rank] = a_weight_sharded.to(self.a_buffer.dtype)
+                else:
+                    logger.error(f"TP slicing out of bounds! rank={tp_rank}, size={split_size}, w_shape={a_weight.shape}")
+                    return False
+            # Case 3: Invalid mismatch
+            else:
+                logger.error(
+                    f"Shape Mismatch Error: Buffer {self.a_buffer.shape[-1]} vs Weight {a_weight.shape[-1]}. "
+                    f"TP_Size={tp_world_size}. This is not a valid TP split."
+                )
+                return False
+
+        if b_weight is not None:
+            # B weight matrix: [rank, hidden]
+            # Case 1: Perfect match (TP=1 or pre-sharded weights)
+            if self.b_buffer.shape[-1] == b_weight.shape[-1]:
+                self.b_buffer[loc, :rank] = b_weight.to(self.b_buffer.dtype)
+            # Case 2: TP sharding needed - validate math is consistent
+            elif (self.b_buffer.shape[-1] < b_weight.shape[-1] and
+                  b_weight.shape[-1] == self.b_buffer.shape[-1] * tp_world_size):
+                split_size = self.b_buffer.shape[-1]
+                start_idx = tp_rank * split_size
+                end_idx = (tp_rank + 1) * split_size
+                # Validate range
+                if end_idx <= b_weight.shape[-1]:
+                    b_weight_sharded = b_weight[:, start_idx:end_idx]
+                    self.b_buffer[loc, :rank] = b_weight_sharded.to(self.b_buffer.dtype)
+                else:
+                    logger.error(f"TP slicing out of bounds! rank={tp_rank}, size={split_size}, w_shape={b_weight.shape}")
+                    return False
+            # Case 3: Invalid mismatch
+            else:
+                logger.error(
+                    f"Shape Mismatch Error: Buffer {self.b_buffer.shape[-1]} vs Weight {b_weight.shape[-1]}. "
+                    f"TP_Size={tp_world_size}. This is not a valid TP split."
+                )
+                return False
+
+        return True
+
     def load_adapter(
         self,
         adapter_idx: int,
         rank: int,
         scaling: float,
-        layer_weights: Dict[int, torch.Tensor],
+        layer_weights: Dict,
         tp_rank: int = 0,
         tp_world_size: int = 1
     ) -> bool:
         """
         Load adapter weights for all layers.
 
+        Supports two structures:
+        - Flat (Attention): {layer_id: {"A": tensor, "B": tensor}}
+        - MoE Nested: {layer_id: {expert_id: {"A": tensor, "B": tensor}}}
+
         Args:
             adapter_idx: Index of this adapter in the global pool
             rank: LoRA rank
             scaling: Scaling factor
-            layer_weights: Dict mapping layer_id -> {proj_A, proj_B} for this module type
+            layer_weights: Dict mapping layer_id -> weights
             tp_rank: Tensor parallel rank for sharded weight loading
             tp_world_size: Tensor parallel world size for sharded weight loading
         """
@@ -190,8 +274,17 @@ class LoRAModulePool:
 
         loc_start = self._compute_location()
 
-        # Count how many valid layers this adapter has (for slot calculation)
-        # A layer is valid if 0 <= buffer_layer_id < num_layers
+        # Detect structure: MoE nested or flat
+        # Check first layer's first value to determine structure
+        first_layer_id = next(iter(layer_weights.keys())) if layer_weights else None
+        if first_layer_id is None:
+            return False
+
+        first_layer_content = layer_weights[first_layer_id]
+        first_val = next(iter(first_layer_content.values())) if first_layer_content else None
+        is_moe_structure = isinstance(first_val, dict) and "A" in first_val
+
+        # Count valid layers for metadata
         valid_layers = 0
         for layer_id in layer_weights.keys():
             if layer_id >= 10000:
@@ -201,12 +294,11 @@ class LoRAModulePool:
             if 0 <= buffer_layer_id < self.num_layers:
                 valid_layers += 1
 
-        # If no valid layers, skip loading
         if valid_layers == 0:
             logger.warning(f"[LoRA] No valid layers for adapter in pool (num_layers={self.num_layers})")
             return False
 
-        # Extend metadata - a_len stores number of slots (layers) this adapter occupies
+        # Extend metadata - a_len stores number of slots (layers * experts) this adapter occupies
         self.a_start = torch.cat([
             self.a_start,
             torch.tensor([loc_start], dtype=torch.long, device=self.a_start.device)
@@ -220,81 +312,48 @@ class LoRAModulePool:
             torch.tensor([scaling], dtype=self.a_scaling.dtype, device=self.a_scaling.device)
         ])
 
-        # Store weights for each layer
-        for layer_id, weights in layer_weights.items():
-            if weights is None or not weights:
-                continue
+        try:
+            if is_moe_structure:
+                # MoE nested structure: {layer_id: {expert_id: {"A": ..., "B": ...}}}
+                for layer_id, expert_weights in layer_weights.items():
+                    if expert_weights is None or not expert_weights:
+                        continue
 
-            # Convert layer_id to buffer index
-            # Vision layers use offset 10000, LLM layers don't
-            if layer_id >= 10000:
-                buffer_layer_id = layer_id - 10000
+                    # Convert layer_id to buffer base index
+                    if layer_id >= 10000:
+                        buffer_layer_id = layer_id - 10000
+                    else:
+                        buffer_layer_id = layer_id
+
+                    if buffer_layer_id < 0 or buffer_layer_id >= self.num_layers:
+                        continue
+
+                    # Process each expert
+                    for expert_id, weights in expert_weights.items():
+                        # Calculate flattened index: layer * num_experts + expert
+                        loc = loc_start + buffer_layer_id * self.num_experts + expert_id
+                        self._write_weights(loc, rank, scaling, weights, tp_rank, tp_world_size)
             else:
-                buffer_layer_id = layer_id
+                # Flat structure: {layer_id: {"A": ..., "B": ...}}
+                for layer_id, weights in layer_weights.items():
+                    if weights is None or not weights:
+                        continue
 
-            # Skip if out of range
-            if buffer_layer_id < 0 or buffer_layer_id >= self.num_layers:
-                continue
+                    # Convert layer_id to buffer index
+                    if layer_id >= 10000:
+                        buffer_layer_id = layer_id - 10000
+                    else:
+                        buffer_layer_id = layer_id
 
-            # weights is a dict with "A" and "B" keys
-            a_weight = weights.get("A")
-            b_weight = weights.get("B")
-            try:
-                if a_weight is not None:
-                    # A weight matrix: [rank, hidden]
-                    # Case 1: Perfect match (TP=1 or pre-sharded weights)
-                    if self.a_buffer.shape[-1] == a_weight.shape[-1]:
-                        self.a_buffer[loc_start + buffer_layer_id, :rank] = a_weight.to(self.a_buffer.dtype)
-                    # Case 2: TP sharding needed - validate math is consistent
-                    elif (self.a_buffer.shape[-1] < a_weight.shape[-1] and
-                          a_weight.shape[-1] == self.a_buffer.shape[-1] * tp_world_size):
-                        split_size = self.a_buffer.shape[-1]
-                        start_idx = tp_rank * split_size
-                        end_idx = (tp_rank + 1) * split_size
-                        # Validate range
-                        if end_idx <= a_weight.shape[-1]:
-                            a_weight_sharded = a_weight[:, start_idx:end_idx]
-                            self.a_buffer[loc_start + buffer_layer_id, :rank] = a_weight_sharded.to(self.a_buffer.dtype)
-                        else:
-                            logger.error(f"TP slicing out of bounds! rank={tp_rank}, size={split_size}, w_shape={a_weight.shape}")
-                            return False
-                    # Case 3: Invalid mismatch
-                    else:
-                        logger.error(
-                            f"Shape Mismatch Error: Buffer {self.a_buffer.shape[-1]} vs Weight {a_weight.shape[-1]}. "
-                            f"TP_Size={tp_world_size}. This is not a valid TP split."
-                        )
-                        return False
-                if b_weight is not None:
-                    # B weight matrix: [rank, hidden]
-                    # Case 1: Perfect match (TP=1 or pre-sharded weights)
-                    if self.b_buffer.shape[-1] == b_weight.shape[-1]:
-                        self.b_buffer[loc_start + buffer_layer_id, :rank] = b_weight.to(self.b_buffer.dtype)
-                    # Case 2: TP sharding needed - validate math is consistent
-                    elif (self.b_buffer.shape[-1] < b_weight.shape[-1] and
-                          b_weight.shape[-1] == self.b_buffer.shape[-1] * tp_world_size):
-                        split_size = self.b_buffer.shape[-1]
-                        start_idx = tp_rank * split_size
-                        end_idx = (tp_rank + 1) * split_size
-                        # Validate range
-                        if end_idx <= b_weight.shape[-1]:
-                            b_weight_sharded = b_weight[:, start_idx:end_idx]
-                            self.b_buffer[loc_start + buffer_layer_id, :rank] = b_weight_sharded.to(self.b_buffer.dtype)
-                        else:
-                            logger.error(f"TP slicing out of bounds! rank={tp_rank}, size={split_size}, w_shape={b_weight.shape}")
-                            return False
-                    # Case 3: Invalid mismatch
-                    else:
-                        logger.error(
-                            f"Shape Mismatch Error: Buffer {self.b_buffer.shape[-1]} vs Weight {b_weight.shape[-1]}. "
-                            f"TP_Size={tp_world_size}. This is not a valid TP split."
-                        )
-                        return False
-            except Exception as e:
-                logger.error(f"Error loading adapter weights for layer {buffer_layer_id}: {e}")
-                logger.error(f"a_buffer shape: {self.a_buffer.shape}; b_buffer shape: {self.b_buffer.shape}")
-                logger.error(f"a_weight shape: {a_weight.shape}; b_weight shape: {b_weight.shape}")
-                return False
+                    if buffer_layer_id < 0 or buffer_layer_id >= self.num_layers:
+                        continue
+
+                    loc = loc_start + buffer_layer_id
+                    self._write_weights(loc, rank, scaling, weights, tp_rank, tp_world_size)
+        except Exception as e:
+            logger.error(f"Error loading adapter weights: {e}")
+            return False
+
         return True
 
     def unload_adapter(self, adapter_idx: int) -> bool:
@@ -371,6 +430,7 @@ class LoRAMemPool:
     moe_intermediate_dim: int = 0  # For MoE models (gate/up/down projection size)
     hidden_size: int = 0
     vocab_size: int = 0
+    num_experts: int = 1  # Number of experts per layer (for MoE models). num_experts=1 for non-MoE.
 
     # TP world info for sharded weight loading
     tp_rank_: int = 0
@@ -397,6 +457,8 @@ class LoRAMemPool:
         vl_depth: int | None = None,
         # MoE config parameter (optional)
         moe_intermediate_dim: int | None = None,
+        # MoE number of experts
+        num_experts: int = 1,
         # TP world size for sharded dimensions
         tp_world_size: int = 1,
     ) -> "LoRAMemPool":
@@ -408,6 +470,8 @@ class LoRAMemPool:
             vl_intermediate_size: Vision MLP intermediate size. If None, uses intermediate_dim.
             vl_out_hidden_size: Vision output hidden size. If None, uses vl_hidden_size.
             vl_depth: Vision model depth for pool layer capacity. If None, uses num_layers.
+            moe_intermediate_dim: MoE intermediate size for gate/up/down projections.
+            num_experts: Number of experts per layer (for MoE models).
             tp_world_size: Tensor parallel world size for sharded dimensions (default: 1).
         """
         # Use vision dimensions if provided, otherwise fall back to text model dimensions
@@ -488,16 +552,25 @@ class LoRAMemPool:
             # O Pool: Row Parallel -> Input is SPLIT (Correct in your code)
             # a_hidden_dim must be 2048 (which is 4096 // 2)
             attn_o_pool = LoRAModulePool.create(
-                pool_size, max_rank, 
+                pool_size, max_rank,
                 attn_internal_dim // tp_world_size,  # <--- DIVIDE BY TP
-                attn_in_hidden, 
+                attn_in_hidden,
                 dtype, device, num_layers=num_layers
             ),
 
             # MoE MLP pools - Gate/Up expand, Down shrinks
-            moe_gate_pool=LoRAModulePool.create(pool_size, max_rank, hidden_size, mlp_inter, dtype, device, num_layers=num_layers),
-            moe_up_pool=LoRAModulePool.create(pool_size, max_rank, hidden_size, mlp_inter, dtype, device, num_layers=num_layers),
-            moe_down_pool=LoRAModulePool.create(pool_size, max_rank, mlp_inter, hidden_size, dtype, device, num_layers=num_layers),
+            moe_gate_pool=LoRAModulePool.create(
+                pool_size, max_rank, hidden_size, mlp_inter,
+                dtype, device, num_layers=num_layers, num_experts=num_experts
+            ),
+            moe_up_pool=LoRAModulePool.create(
+                pool_size, max_rank, hidden_size, mlp_inter,
+                dtype, device, num_layers=num_layers, num_experts=num_experts
+            ),
+            moe_down_pool=LoRAModulePool.create(
+                pool_size, max_rank, mlp_inter, hidden_size,
+                dtype, device, num_layers=num_layers, num_experts=num_experts
+            ),
             
             # LM Head pool
             lm_head_pool=LoRAModulePool.create(pool_size, max_rank, hidden_size, vocab_size, dtype, device, num_layers=1),
@@ -514,6 +587,7 @@ class LoRAMemPool:
             hidden_size=hidden_size,
             moe_intermediate_dim=moe_intermediate_dim,
             vocab_size=vocab_size,
+            num_experts=num_experts,
             tp_world_size_=tp_world_size
         )
         return pool
@@ -843,6 +917,7 @@ def create_lora_mem_pool(
     vl_depth: int | None = None,
     # MoE config parameter (optional)
     moe_intermediate_dim: int | None = None,
+    num_experts: int = 1,
     # TP world size for sharded dimensions
     tp_world_size: int = 1,
 ) -> LoRAMemPool:
@@ -855,6 +930,7 @@ def create_lora_mem_pool(
         vl_out_hidden_size: Vision output hidden size. If None, uses vl_hidden_size.
         vl_depth: Vision model depth for pool layer capacity. If None, uses num_layers.
         moe_intermediate_dim: MoE intermediate size. If None, uses intermediate_dim.
+        num_experts: Number of experts per layer (for MoE models).
         tp_world_size: Tensor parallel world size for sharded dimensions (default: 1).
     """
     return LoRAMemPool.create(
@@ -874,5 +950,6 @@ def create_lora_mem_pool(
         vl_out_hidden_size=vl_out_hidden_size,
         vl_depth=vl_depth,
         moe_intermediate_dim=moe_intermediate_dim,
+        num_experts=num_experts,
         tp_world_size=tp_world_size,
     )

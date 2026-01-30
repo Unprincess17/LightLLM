@@ -100,6 +100,9 @@ class FusedMoeWeightTP(BaseWeight):
         self.w1 = [None, None]  # weight, weight_scale
         self.w2 = [None, None]  # weight, weight_scale
         self.lock = threading.Lock()
+        # Flag to keep expert weight lists for per-expert LoRA baseline
+        # Set to True by default to enable per-expert LoRA functionality
+        self.keep_expert_lists_ = True
 
     def experts(self, input_tensor, router_logits, top_k, renormalize, use_grouped_topk, topk_group, num_expert_group):
         from lightllm.common.fused_moe.topk_select import select_experts
@@ -158,6 +161,8 @@ class FusedMoeWeightTP(BaseWeight):
         return
 
     def _fuse(self):
+        """Fuse individual expert weights into fused tensors.
+        """
         if self.quantized_weight:
             self._fuse_weight_scale()
         with self.lock:
@@ -191,9 +196,12 @@ class FusedMoeWeightTP(BaseWeight):
                 else:
                     self.w1[0] = self._cuda(w1)
                     self.w2[0] = self._cuda(w2)
-                delattr(self, "w2_list")
-                delattr(self, "experts_up_projs")
-                delattr(self, "experts_gate_projs")
+
+                # Only delete expert lists if not keeping them for per-expert LoRA
+                if not self.keep_expert_lists_:
+                    delattr(self, "w2_list")
+                    delattr(self, "experts_up_projs")
+                    delattr(self, "experts_gate_projs")
 
     def _fuse_weight_scale(self):
         with self.lock:

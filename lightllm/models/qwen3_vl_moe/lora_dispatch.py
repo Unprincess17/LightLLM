@@ -282,14 +282,29 @@ class Qwen3VLMoELoRADispatcher:
         self,
         input_tensor: torch.Tensor,
         layer_id: int,
-        req_bins: Optional[torch.Tensor] = None
+        req_bins: Optional[torch.Tensor] = None,
+        expert_id: Optional[int] = None
     ) -> torch.Tensor:
-        """Apply gate_proj LoRA to batch with different adapters."""
+        """Apply gate_proj LoRA to batch with different adapters.
+
+        Args:
+            input_tensor: Input tensor [batch, hidden]
+            layer_id: Layer index
+            req_bins: Request to adapter mapping
+            expert_id: For MoE, the expert index to apply LoRA for.
+                       If None, uses base layer_id (for weight loading).
+        """
         if self.lora_mem_pool is None or self.lora_mem_pool.moe_gate_pool is None:
             return torch.zeros_like(input_tensor)
 
         pool = self.lora_mem_pool.moe_gate_pool
         bins = req_bins if req_bins is not None else self.req_bins
+
+        # [MODIFIED] Calculate buffer index with expert dimension
+        if expert_id is not None:
+            buffer_layer_id = layer_id * pool.num_experts + expert_id
+        else:
+            buffer_layer_id = layer_id
 
         if BGMV_AVAILABLE:
             output = torch.zeros_like(input_tensor)
@@ -302,7 +317,7 @@ class Qwen3VLMoELoRADispatcher:
                 pool.a_len,
                 pool.a_scaling,
                 bins,
-                layer_id=layer_id
+                layer_id=buffer_layer_id
             )
             return output
         else:
@@ -312,14 +327,29 @@ class Qwen3VLMoELoRADispatcher:
         self,
         input_tensor: torch.Tensor,
         layer_id: int,
-        req_bins: Optional[torch.Tensor] = None
+        req_bins: Optional[torch.Tensor] = None,
+        expert_id: Optional[int] = None
     ) -> torch.Tensor:
-        """Apply up_proj LoRA to batch with different adapters."""
+        """Apply up_proj LoRA to batch with different adapters.
+
+        Args:
+            input_tensor: Input tensor [batch, hidden]
+            layer_id: Layer index
+            req_bins: Request to adapter mapping
+            expert_id: For MoE, the expert index to apply LoRA for.
+                       If None, uses base layer_id (for weight loading).
+        """
         if self.lora_mem_pool is None or self.lora_mem_pool.moe_up_pool is None:
             return torch.zeros_like(input_tensor)
 
         pool = self.lora_mem_pool.moe_up_pool
         bins = req_bins if req_bins is not None else self.req_bins
+
+        # [MODIFIED] Calculate buffer index with expert dimension
+        if expert_id is not None:
+            buffer_layer_id = layer_id * pool.num_experts + expert_id
+        else:
+            buffer_layer_id = layer_id
 
         if BGMV_AVAILABLE:
             output = torch.zeros_like(input_tensor)
@@ -332,7 +362,7 @@ class Qwen3VLMoELoRADispatcher:
                 pool.a_len,
                 pool.a_scaling,
                 bins,
-                layer_id=layer_id
+                layer_id=buffer_layer_id
             )
             return output
         else:
@@ -342,14 +372,29 @@ class Qwen3VLMoELoRADispatcher:
         self,
         input_tensor: torch.Tensor,
         layer_id: int,
-        req_bins: Optional[torch.Tensor] = None
+        req_bins: Optional[torch.Tensor] = None,
+        expert_id: Optional[int] = None
     ) -> torch.Tensor:
-        """Apply down_proj LoRA. Input: Intermediate, Output: Hidden."""
+        """Apply down_proj LoRA. Input: Intermediate, Output: Hidden.
+
+        Args:
+            input_tensor: Input tensor [batch, hidden]
+            layer_id: Layer index
+            req_bins: Request to adapter mapping
+            expert_id: For MoE, the expert index to apply LoRA for.
+                       If None, uses base layer_id (for weight loading).
+        """
         if self.lora_mem_pool is None or self.lora_mem_pool.moe_down_pool is None:
             return torch.zeros_like(input_tensor)
 
         pool = self.lora_mem_pool.moe_down_pool
         bins = req_bins if req_bins is not None else self.req_bins
+
+        # [MODIFIED] Calculate buffer index with expert dimension
+        if expert_id is not None:
+            buffer_layer_id = layer_id * pool.num_experts + expert_id
+        else:
+            buffer_layer_id = layer_id
 
         output = self._get_output_buffer(input_tensor, pool)
 
@@ -360,7 +405,7 @@ class Qwen3VLMoELoRADispatcher:
                 pool.a_start, pool.a_len, pool.a_scaling, bins,
                 a_hidden_dim=input_tensor.shape[1],
                 b_hidden_dim=output.shape[1],
-                layer_id=layer_id
+                layer_id=buffer_layer_id
             )
             return output
         else:
