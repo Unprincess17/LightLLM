@@ -6,13 +6,18 @@
 #   ./start_server.sh [OPTIONS]
 #
 # Options:
-#   --model_dir PATH      Base model directory (required)
-#   --lora_dir PATH       LoRA adapter directory (optional)
-#   --port PORT           Server port (default: 8080)
-#   --tp TP               Tensor parallel degree (default: 1)
-#   --host HOST           Server host (default: 127.0.0.1)
-#   --enable_multimodal   Enable multimodal support
-#   --help                Show this help message
+#   --model_dir PATH       Base model directory (required)
+#   --lora_dir PATH        LoRA adapter directory (optional)
+#   --port PORT            Server port (default: 8080)
+#   --tp TP                Tensor parallel degree (default: 1)
+#   --host HOST            Server host (default: 127.0.0.1)
+#   --enable_multimodal    Enable multimodal support
+#   --lora_max_size SIZE   Max LoRA size (default: 1024)
+#   --compute_on_cpu       Run compute on CPU
+#   --max_req_total_len    Max request total length
+#   --mem_fraction         Memory fraction (default: 0.6)
+#   --batch_max_tokens     Batch max tokens (default: 4096)
+#   --help                 Show this help message
 #
 # Examples:
 #   # Start server with base model only
@@ -37,6 +42,14 @@ HOST="0.0.0.0"
 ENABLE_MULTIMODAL=true
 LORA_MAX_SIZE=1024
 COMPUTE_ON_CPU=true
+MAX_REQ_TOTAL_LEN=8192
+MEM_FRACTION=0.6
+BATCH_MAX_TOKENS=4096
+
+# Environment variables
+LOADWORKER=8
+LIGHTLLM_LOGGING="DEBUG"
+MOE_MODE="TP"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -122,7 +135,12 @@ CMD="python -m lightllm.server.api_server \
     --model_dir $MODEL_DIR \
     --host $HOST \
     --port $PORT \
-    --tp $TP"
+    --tp $TP \
+    --batch_max_tokens $BATCH_MAX_TOKENS \
+    --max_req_total_len $MAX_REQ_TOTAL_LEN \
+    --trust_remote_code \
+    --mem_fraction $MEM_FRACTION \
+    --disable_cudagraph"
 
 if [[ -n "$LORA_DIR" ]]; then
     CMD="$CMD --lora_dir $LORA_DIR --lora_max_size $LORA_MAX_SIZE"
@@ -136,12 +154,19 @@ if [[ "$COMPUTE_ON_CPU" == "true" ]]; then
     CMD="$CMD --compute_on_cpu"
 fi
 
-# Add common optimizations and disable cudagraph (requires cupy)
-CMD="$CMD --mem_fraction 0.7 --batch_max_tokens 4096 --disable_cudagraph"
+# Export environment variables
+export LOADWORKER=$LOADWORKER
+export LIGHTLLM_LOGGING=$LIGHTLLM_LOGGING
+export MOE_MODE=$MOE_MODE
 
 echo ""
 echo "Starting server..."
 echo "Command: $CMD"
+echo ""
+echo "Environment:"
+echo "  LOADWORKER=$LOADWORKER"
+echo "  LIGHTLLM_LOGGING=$LIGHTLLM_LOGGING"
+echo "  MOE_MODE=$MOE_MODE"
 echo ""
 
 # Execute

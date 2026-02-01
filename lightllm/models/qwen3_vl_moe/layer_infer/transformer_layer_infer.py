@@ -64,7 +64,7 @@ class Qwen3VLMOETransformerLayerInfer(Qwen3MOETransformerLayerInfer):
             assert self.req_bins_ is not None, "req_bins_ must be set for batched mode"
 
             batch_size = input.shape[0]
-            logger.debug(f"[LoRA Infer] Layer {self.layer_num_}: apply_qkv_lora batch={batch_size}")
+            logger.info(f"[LoRA Infer] Layer {self.layer_num_}: apply_qkv_lora batch={batch_size}")
 
             lora_results = self.lora_dispatcher_.get_attn_qkv_lora(
                 input, self.layer_num_, self.req_bins_

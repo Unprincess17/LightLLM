@@ -76,6 +76,10 @@ class LoRAModulePool:
     - Each adapter needs num_layers slots (one per layer the adapter applies to)
     - Each slot stores [rank, hidden_dim] weights
     - a_len stores the number of slots (layers) the adapter occupies
+
+    EP (Expert Parallel) Support:
+    - In EP mode, each rank only owns a subset of experts
+    - global_to_local_map: Maps global expert ID -> local slot index (-1 if not owned)
     """
     # Shape: [pool_size, max_rank, a_hidden_dim] for A
     key_buffer: torch.Tensor  # LoRA A weights
@@ -92,6 +96,10 @@ class LoRAModulePool:
     pool_size: int
     num_layers: int = 1  # Number of layers this pool handles (for slot calculation)
     num_experts: int = 1  # Number of experts per layer (for MoE models)
+
+    # EP-specific: Global expert ID -> local slot index mapping
+    # -1 means this rank doesn't own that expert
+    global_to_local_map: list = field(default_factory=list)
 
     @property
     def a_buffer(self) -> torch.Tensor:
@@ -161,6 +169,84 @@ class LoRAModulePool:
         used_slots = self.a_len.sum().item() if len(self.a_len) > 0 else 0
         slots_needed = self.num_layers * self.num_experts  # Each adapter needs num_layers * num_experts slots
         return (used_slots + slots_needed) <= self.pool_size
+
+    def init_ep_mapping(
+        self,
+        total_experts: int,
+        ep_rank: int = 0,
+        ep_world_size: int = 1,
+        local_expert_ids: list | None = None
+    ):
+        """Initialize global-to-local expert ID mapping for EP mode.
+
+        In EP mode, each rank only owns a subset of experts.
+        Standard LoRA checkpoints contain ALL experts, so we need to:
+        1. Map global expert IDs to local slot indices
+        2. Mark non-owned experts with -1
+
+        Args:
+            total_experts: Total number of experts in the model
+            ep_rank: Current EP rank
+            ep_world_size: Total EP world size
+            local_expert_ids: Optional list of global expert IDs owned by this rank.
+                             If None, computed as: ep_rank * (total_experts // ep_world_size) to (ep_rank+1) * ...
+        """
+        if ep_world_size == 1:
+            # TP-only mode: all ranks own all experts
+            self.global_to_local_map = list(range(total_experts))
+            return
+
+        if local_expert_ids is not None:
+            # Explicit list provided
+            self.global_to_local_map = [-1] * total_experts
+            for local_idx, global_id in enumerate(local_expert_ids):
+                if 0 <= global_id < total_experts:
+                    self.global_to_local_map[global_id] = local_idx
+        else:
+            # Compute from EP rank
+            experts_per_rank = total_experts // ep_world_size
+            start_expert = ep_rank * experts_per_rank
+            end_expert = start_expert + experts_per_rank
+
+            self.global_to_local_map = [-1] * total_experts
+            for i, global_id in enumerate(range(start_expert, end_expert)):
+                self.global_to_local_map[global_id] = i
+
+        logger.debug(
+            f"[LoRA Pool] EP mapping initialized: rank={ep_rank}, world_size={ep_world_size}, "
+            f"total_experts={total_experts}, local_experts={len([x for x in self.global_to_local_map if x >= 0])}"
+        )
+
+    def is_expert_local(self, global_expert_id: int) -> bool:
+        """Check if a global expert ID is owned by this rank.
+
+        Args:
+            global_expert_id: Global expert ID
+
+        Returns:
+            True if this rank owns the expert, False otherwise
+        """
+        if not self.global_to_local_map:
+            # No EP mapping, assume all experts are local
+            return True
+        if global_expert_id < 0 or global_expert_id >= len(self.global_to_local_map):
+            return False
+        return self.global_to_local_map[global_expert_id] >= 0
+
+    def global_to_local(self, global_expert_id: int) -> int:
+        """Convert global expert ID to local slot index.
+
+        Args:
+            global_expert_id: Global expert ID
+
+        Returns:
+            Local slot index, or -1 if not owned by this rank
+        """
+        if not self.global_to_local_map:
+            return global_expert_id
+        if global_expert_id < 0 or global_expert_id >= len(self.global_to_local_map):
+            return -1
+        return self.global_to_local_map[global_expert_id]
 
     def _compute_location(self) -> int:
         """Compute next available slot location."""
@@ -252,7 +338,10 @@ class LoRAModulePool:
         scaling: float,
         layer_weights: Dict,
         tp_rank: int = 0,
-        tp_world_size: int = 1
+        tp_world_size: int = 1,
+        ep_rank: int = 0,
+        ep_world_size: int = 1,
+        total_experts: int = 1
     ) -> bool:
         """
         Load adapter weights for all layers.
@@ -261,6 +350,10 @@ class LoRAModulePool:
         - Flat (Attention): {layer_id: {"A": tensor, "B": tensor}}
         - MoE Nested: {layer_id: {expert_id: {"A": tensor, "B": tensor}}}
 
+        In EP mode, uses Filter & Map logic:
+        - Filter: Skip weights for experts not owned by this rank
+        - Map: Global expert ID -> Local slot index
+
         Args:
             adapter_idx: Index of this adapter in the global pool
             rank: LoRA rank
@@ -268,6 +361,9 @@ class LoRAModulePool:
             layer_weights: Dict mapping layer_id -> weights
             tp_rank: Tensor parallel rank for sharded weight loading
             tp_world_size: Tensor parallel world size for sharded weight loading
+            ep_rank: Expert parallel rank for EP mode
+            ep_world_size: Expert parallel world size for EP mode
+            total_experts: Total number of experts in the model (for EP mapping)
         """
         if not self.can_fit(rank):
             return False
@@ -315,6 +411,10 @@ class LoRAModulePool:
         try:
             if is_moe_structure:
                 # MoE nested structure: {layer_id: {expert_id: {"A": ..., "B": ...}}}
+                # Initialize EP mapping if not already done and EP is enabled
+                if ep_world_size > 1 and not self.global_to_local_map:
+                    self.init_ep_mapping(total_experts, ep_rank, ep_world_size)
+
                 for layer_id, expert_weights in layer_weights.items():
                     if expert_weights is None or not expert_weights:
                         continue
@@ -330,8 +430,17 @@ class LoRAModulePool:
 
                     # Process each expert
                     for expert_id, weights in expert_weights.items():
-                        # Calculate flattened index: layer * num_experts + expert
-                        loc = loc_start + buffer_layer_id * self.num_experts + expert_id
+                        # EP mode: Filter non-local experts
+                        if ep_world_size > 1:
+                            local_expert_id = self.global_to_local(expert_id)
+                            if local_expert_id < 0:
+                                # This rank doesn't own the expert, skip
+                                continue
+                        else:
+                            local_expert_id = expert_id
+
+                        # Calculate flattened index: layer * num_experts + local_expert_id
+                        loc = loc_start + buffer_layer_id * self.num_experts + local_expert_id
                         self._write_weights(loc, rank, scaling, weights, tp_rank, tp_world_size)
             else:
                 # Flat structure: {layer_id: {"A": ..., "B": ...}}
@@ -436,6 +545,11 @@ class LoRAMemPool:
     tp_rank_: int = 0
     tp_world_size_: int = 1
 
+    # EP world info for expert sharding (MoE models)
+    ep_rank_: int = 0
+    ep_world_size_: int = 1
+    local_expert_ids_: list = field(default_factory=list)  # List of global expert IDs owned by this rank
+
     @classmethod
     def create(
         cls,
@@ -461,6 +575,8 @@ class LoRAMemPool:
         num_experts: int = 1,
         # TP world size for sharded dimensions
         tp_world_size: int = 1,
+        # EP world size for expert sharding
+        ep_world_size: int = 1,
     ) -> "LoRAMemPool":
         """Create a complete LoRA memory pool.
 
@@ -559,16 +675,18 @@ class LoRAMemPool:
             ),
 
             # MoE MLP pools - Gate/Up expand, Down shrinks
+            # For TP mode: intermediate dimension is split across TP ranks
+            # For EP mode: each rank only has subset of experts
             moe_gate_pool=LoRAModulePool.create(
-                pool_size, max_rank, hidden_size, mlp_inter,
+                pool_size, max_rank, hidden_size, mlp_inter // tp_world_size,
                 dtype, device, num_layers=num_layers, num_experts=num_experts
             ),
             moe_up_pool=LoRAModulePool.create(
-                pool_size, max_rank, hidden_size, mlp_inter,
+                pool_size, max_rank, hidden_size, mlp_inter // tp_world_size,
                 dtype, device, num_layers=num_layers, num_experts=num_experts
             ),
             moe_down_pool=LoRAModulePool.create(
-                pool_size, max_rank, mlp_inter, hidden_size,
+                pool_size, max_rank, mlp_inter // tp_world_size, hidden_size,
                 dtype, device, num_layers=num_layers, num_experts=num_experts
             ),
             
@@ -588,7 +706,8 @@ class LoRAMemPool:
             moe_intermediate_dim=moe_intermediate_dim,
             vocab_size=vocab_size,
             num_experts=num_experts,
-            tp_world_size_=tp_world_size
+            tp_world_size_=tp_world_size,
+            ep_world_size_=ep_world_size
         )
         return pool
 
@@ -611,6 +730,48 @@ class LoRAMemPool:
             LoRATargetType.LM_HEAD: self.lm_head_pool,
         }
         return pool_map.get(target_type)
+
+    def init_ep_mapping(
+        self,
+        ep_rank: int = 0,
+        ep_world_size: int = 1,
+        local_expert_ids: list | None = None
+    ):
+        """Initialize global-to-local expert ID mapping for all MoE pools.
+
+        In EP mode, each rank only owns a subset of experts.
+        This must be called before loading adapters in EP mode.
+
+        Args:
+            ep_rank: Current EP rank
+            ep_world_size: Total EP world size
+            local_expert_ids: Optional list of global expert IDs owned by this rank.
+        """
+        if ep_world_size <= 1:
+            # No EP, all ranks own all experts
+            self.ep_rank_ = 0
+            self.ep_world_size_ = 1
+            return
+
+        self.ep_rank_ = ep_rank
+        self.ep_world_size_ = ep_world_size
+
+        # Initialize mapping for MoE pools
+        moe_pools = ['moe_gate_pool', 'moe_up_pool', 'moe_down_pool']
+        for pool_attr in moe_pools:
+            pool = getattr(self, pool_attr)
+            if pool is not None:
+                pool.init_ep_mapping(
+                    total_experts=self.num_experts,
+                    ep_rank=ep_rank,
+                    ep_world_size=ep_world_size,
+                    local_expert_ids=local_expert_ids
+                )
+
+        logger.info(
+            f"[LoRA Pool] EP mapping initialized: ep_rank={ep_rank}, ep_world_size={ep_world_size}, "
+            f"num_experts={self.num_experts}"
+        )
 
     def load_adapter(
         self,
@@ -680,7 +841,10 @@ class LoRAMemPool:
                     scaling=scaling,
                     layer_weights=weights_by_layer,
                     tp_rank=self.tp_rank_,
-                    tp_world_size=self.tp_world_size_
+                    tp_world_size=self.tp_world_size_,
+                    ep_rank=self.ep_rank_,
+                    ep_world_size=self.ep_world_size_,
+                    total_experts=self.num_experts
                 )
                 logger.debug(f"[LoRA]   Loaded {target_type} with {len(weights_by_layer)} layers")
 
@@ -920,6 +1084,8 @@ def create_lora_mem_pool(
     num_experts: int = 1,
     # TP world size for sharded dimensions
     tp_world_size: int = 1,
+    # EP world size for expert sharding
+    ep_world_size: int = 1,
 ) -> LoRAMemPool:
     """Create a complete LoRA memory pool.
 
@@ -932,6 +1098,7 @@ def create_lora_mem_pool(
         moe_intermediate_dim: MoE intermediate size. If None, uses intermediate_dim.
         num_experts: Number of experts per layer (for MoE models).
         tp_world_size: Tensor parallel world size for sharded dimensions (default: 1).
+        ep_world_size: Expert parallel world size for expert sharding (default: 1).
     """
     return LoRAMemPool.create(
         num_layers=num_layers,
@@ -952,4 +1119,5 @@ def create_lora_mem_pool(
         moe_intermediate_dim=moe_intermediate_dim,
         num_experts=num_experts,
         tp_world_size=tp_world_size,
+        ep_world_size=ep_world_size,
     )

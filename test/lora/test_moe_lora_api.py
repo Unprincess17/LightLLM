@@ -32,7 +32,7 @@ def parse_args():
     parser.add_argument("--url", type=str, default=DEFAULT_URL, help="API server URL")
     parser.add_argument("--model", type=str, default=DEFAULT_MODEL, help="Model name")
     parser.add_argument("--prompt", type=str, default="Describe the image", help="Input prompt")
-    parser.add_argument("--max_tokens", type=int, default=50, help="Max tokens to generate")
+    parser.add_argument("--max_tokens", type=int, default=2, help="Max tokens to generate")
     parser.add_argument("--adapter_id", type=str, default="lora_dummy", help="Adapter ID for LoRA switching")
     parser.add_argument("--mode", type=str, default="detached", choices=["merged", "detached"], help="LoRA mode")
     parser.add_argument("--num_requests", type=int, default=1, help="Number of requests to send")

@@ -1,4 +1,5 @@
 import os
+import logging
 import torch
 import torch.functional as F
 import torch.distributed as dist
@@ -79,6 +80,38 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
 
     def clear_lora_dispatcher(self):
         """Clear the LoRA dispatcher."""
+        self.lora_dispatcher_ = None
+        self.use_detached_lora_ = False
+
+    def _get_local_expert_info(self, layer_weight):
+        """Get information about local experts for EP mode.
+
+        Returns:
+            is_ep: Whether EP mode is enabled
+            local_expert_ids: List of global expert IDs owned by this rank (empty if TP mode)
+            local_to_global: Dict mapping local expert ID -> global expert ID
+            global_to_local: Dict mapping global expert ID -> local expert ID (-1 if not local)
+        """
+        moe_mode = os.environ.get("MOE_MODE", "TP")
+        if moe_mode != "EP":
+            return False, [], {}, {}
+
+        experts = layer_weight.experts
+        ep_world_size = get_global_world_size()
+        ep_rank = getattr(experts, 'global_rank_', 0)
+
+        n_routed_experts = experts.n_routed_experts
+        ep_n_routed_experts = n_routed_experts // ep_world_size
+
+        # Compute global expert IDs owned by this rank
+        start_expert = ep_rank * ep_n_routed_experts
+        local_expert_ids = list(range(start_expert, start_expert + ep_n_routed_experts))
+
+        # Build mapping dicts
+        local_to_global = {i: g for i, g in enumerate(local_expert_ids)}
+        global_to_local = {g: i for i, g in enumerate(local_expert_ids)}
+
+        return True, local_expert_ids, local_to_global, global_to_local
         self.lora_dispatcher_ = None
         self.use_detached_lora_ = False
 
@@ -218,10 +251,29 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
         final_output = torch.zeros_like(hidden_states)
         total_experts = experts.n_routed_experts
 
+        # EP mode: get local expert info
+        is_ep, local_expert_ids, local_to_global, global_to_local = self._get_local_expert_info(layer_weight)
+
         # 4. Expert Loop
-        for expert_idx in range(total_experts):
-            # 4.1 Filter tokens
-            mask = topk_ids == expert_idx
+        # In TP mode: iterate over all experts
+        # In EP mode: iterate only over local experts
+        expert_iter_range = local_expert_ids if is_ep else range(total_experts)
+
+        # Log token distribution per expert before entering the loop
+        if logger.isEnabledFor(logging.DEBUG):
+            token_counts = {}
+            for global_eid in (local_to_global.values() if is_ep else range(total_experts)):
+                count = int((topk_ids == global_eid).sum())
+                if count > 0:
+                    token_counts[global_eid] = count
+            logger.debug(f"[MoE] Layer {self.layer_num_}: {num_tokens} tokens -> {token_counts}")
+
+        for local_expert_idx in expert_iter_range:
+            # Get global expert ID (used for filtering tokens)
+            global_expert_id = local_to_global.get(local_expert_idx, local_expert_idx) if is_ep else local_expert_idx
+
+            # 4.1 Filter tokens assigned to this expert
+            mask = topk_ids == global_expert_id
             batch_indices, k_indices = torch.where(mask)
 
             if batch_indices.shape[0] == 0:
@@ -231,11 +283,11 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
             expert_input = hidden_states[batch_indices]
             expert_req_bins = self.req_bins_[batch_indices]
 
-            # 4.3 Get Weights
+            # 4.3 Get Weights (use local index for experts list)
             # TODO(FIX): offload here
-            w1 = experts.experts_gate_projs[expert_idx].cuda()
-            w3 = experts.experts_up_projs[expert_idx].cuda()
-            w2 = experts.w2_list[expert_idx].cuda()
+            w1 = experts.experts_gate_projs[local_expert_idx].cuda()
+            w3 = experts.experts_up_projs[local_expert_idx].cuda()
+            w2 = experts.w2_list[local_expert_idx].cuda()
 
             # 4.4 Compute Base
             # input: [N, hidden], w.T: [hidden, inter] -> output: [N, inter]
@@ -243,12 +295,12 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
             up_out = torch.mm(expert_input, w3.T)
 
             # 4.5 Apply Per-Expert LoRA (Gate/Up)
-            # 关键：传入 expert_id
+            # Use LOCAL expert index for LoRA buffer (as buffer only stores local experts)
             gate_lora = self.lora_dispatcher_.batch_apply_gate_lora(
-                expert_input, layer_weight.layer_num_, expert_req_bins, expert_id=expert_idx
+                expert_input, layer_weight.layer_num_, expert_req_bins, expert_id=local_expert_idx
             )
             up_lora = self.lora_dispatcher_.batch_apply_up_lora(
-                expert_input, layer_weight.layer_num_, expert_req_bins, expert_id=expert_idx
+                expert_input, layer_weight.layer_num_, expert_req_bins, expert_id=local_expert_idx
             )
 
             gate_out += gate_lora
@@ -261,15 +313,16 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
             down_out = torch.mm(current_hidden, w2.T)
 
             # 4.8 Apply Per-Expert LoRA (Down)
+            # Use LOCAL expert index for LoRA buffer
             down_lora = self.lora_dispatcher_.batch_apply_down_lora(
-                current_hidden, layer_weight.layer_num_, expert_req_bins, expert_id=expert_idx
+                current_hidden, layer_weight.layer_num_, expert_req_bins, expert_id=local_expert_idx
             )
             down_out += down_lora
 
             # 4.9 Weighted Aggregation (Corrected)
             # routing_weights: [num_selected, 1]
             routing_weights = topk_weights[batch_indices, k_indices].view(-1, 1)
-            weighted_output = down_out * routing_weights
+            weighted_output = (down_out * routing_weights).to(hidden_states.dtype)
 
             # 使用 index_add_ 在 final_output 上原地累加
             final_output.index_add_(0, batch_indices, weighted_output)

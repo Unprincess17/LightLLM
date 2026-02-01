@@ -190,7 +190,8 @@ class Qwen3VLMoELoRADispatcher:
             )
             return output
         else:
-            return self._naive_batch_lora(input_tensor, layer_id, pool, bins)
+            effective_bins = bins if bins is not None else self.req_bins
+            return self._naive_batch_lora(input_tensor, layer_id, pool, effective_bins)
 
     def batch_apply_k_lora(
         self,
@@ -218,7 +219,8 @@ class Qwen3VLMoELoRADispatcher:
             )
             return output
         else:
-            return self._naive_batch_lora(input_tensor, layer_id, pool, bins)
+            effective_bins = bins if bins is not None else self.req_bins
+            return self._naive_batch_lora(input_tensor, layer_id, pool, effective_bins)
 
     def batch_apply_v_lora(
         self,
@@ -246,7 +248,8 @@ class Qwen3VLMoELoRADispatcher:
             )
             return output
         else:
-            return self._naive_batch_lora(input_tensor, layer_id, pool, bins)
+            effective_bins = bins if bins is not None else self.req_bins
+            return self._naive_batch_lora(input_tensor, layer_id, pool, effective_bins)
 
     def batch_apply_o_lora(
         self,
@@ -276,7 +279,8 @@ class Qwen3VLMoELoRADispatcher:
             )
             return output
         else:
-            return self._naive_batch_lora(input_tensor, layer_id, pool, bins)
+            effective_bins = bins if bins is not None else self.req_bins
+            return self._naive_batch_lora(input_tensor, layer_id, pool, effective_bins)
 
     def batch_apply_gate_lora(
         self,
@@ -291,7 +295,8 @@ class Qwen3VLMoELoRADispatcher:
             input_tensor: Input tensor [batch, hidden]
             layer_id: Layer index
             req_bins: Request to adapter mapping
-            expert_id: For MoE, the expert index to apply LoRA for.
+            expert_id: For MoE, the LOCAL expert index to apply LoRA for.
+                       In EP mode, this is the local index (0 to num_local_experts-1).
                        If None, uses base layer_id (for weight loading).
         """
         if self.lora_mem_pool is None or self.lora_mem_pool.moe_gate_pool is None:
@@ -300,14 +305,16 @@ class Qwen3VLMoELoRADispatcher:
         pool = self.lora_mem_pool.moe_gate_pool
         bins = req_bins if req_bins is not None else self.req_bins
 
-        # [MODIFIED] Calculate buffer index with expert dimension
+        # Calculate buffer index with expert dimension
+        # expert_id is now always LOCAL (after translation in transformer_layer_infer.py)
         if expert_id is not None:
+            # Use pool's actual num_experts which matches local expert count
             buffer_layer_id = layer_id * pool.num_experts + expert_id
         else:
             buffer_layer_id = layer_id
 
         if BGMV_AVAILABLE:
-            output = torch.zeros_like(input_tensor)
+            output = self._get_output_buffer(input_tensor, pool)
             batch_lora_get_mlp(
                 output,
                 input_tensor,
@@ -317,11 +324,15 @@ class Qwen3VLMoELoRADispatcher:
                 pool.a_len,
                 pool.a_scaling,
                 bins,
+                a_hidden_dim=input_tensor.shape[1],
+                b_hidden_dim=output.shape[1],
                 layer_id=buffer_layer_id
             )
             return output
         else:
-            return self._naive_batch_lora(input_tensor, layer_id, pool, bins)
+            # bins should never be None here, but safeguard
+            effective_bins = bins if bins is not None else self.req_bins
+            return self._naive_batch_lora(input_tensor, buffer_layer_id, pool, effective_bins)
 
     def batch_apply_up_lora(
         self,
@@ -352,7 +363,7 @@ class Qwen3VLMoELoRADispatcher:
             buffer_layer_id = layer_id
 
         if BGMV_AVAILABLE:
-            output = torch.zeros_like(input_tensor)
+            output = self._get_output_buffer(input_tensor, pool)
             batch_lora_get_mlp(
                 output,
                 input_tensor,
@@ -362,11 +373,14 @@ class Qwen3VLMoELoRADispatcher:
                 pool.a_len,
                 pool.a_scaling,
                 bins,
+                a_hidden_dim=input_tensor.shape[1],
+                b_hidden_dim=output.shape[1],
                 layer_id=buffer_layer_id
             )
             return output
         else:
-            return self._naive_batch_lora(input_tensor, layer_id, pool, bins)
+            effective_bins = bins if bins is not None else self.req_bins
+            return self._naive_batch_lora(input_tensor, buffer_layer_id, pool, effective_bins)
 
     def batch_apply_down_lora(
         self,
@@ -409,7 +423,8 @@ class Qwen3VLMoELoRADispatcher:
             )
             return output
         else:
-            return self._naive_batch_lora(input_tensor, layer_id, pool, bins)
+            effective_bins = bins if bins is not None else self.req_bins
+            return self._naive_batch_lora(input_tensor, buffer_layer_id, pool, effective_bins)
 
     def batch_apply_vl_lora(
         self,
@@ -450,7 +465,8 @@ class Qwen3VLMoELoRADispatcher:
             )
             return output
         else:
-            return self._naive_batch_lora(input_tensor, layer_id, pool, bins)
+            effective_bins = bins if bins is not None else self.req_bins
+            return self._naive_batch_lora(input_tensor, layer_id, pool, effective_bins)
 
     # =====================================================================
     # Fallback Naive Implementation (when BGMV kernel unavailable)
@@ -461,13 +477,25 @@ class Qwen3VLMoELoRADispatcher:
         input_tensor: torch.Tensor,
         layer_id: int,
         pool,
-        req_bins: torch.Tensor
+        req_bins: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Naive per-request LoRA computation (fallback when BGMV unavailable).
 
+        Args:
+            input_tensor: Input tensor [batch, hidden]
+            layer_id: Layer index
+            pool: Module pool
+            req_bins: Request to adapter mapping (optional, uses self.req_bins if None)
+
         This is slower but correctness-preserving.
         """
+        # Ensure req_bins is available
+        if req_bins is None:
+            req_bins = self.req_bins
+        if req_bins is None:
+            return torch.zeros_like(input_tensor)
+
         batch_size = input_tensor.shape[0]
         hidden_dim = input_tensor.shape[1]
         output = torch.zeros(batch_size, hidden_dim, dtype=input_tensor.dtype, device=input_tensor.device)
