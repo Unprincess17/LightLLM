@@ -125,12 +125,22 @@ def make_argument_parser() -> argparse.ArgumentParser:
         help="LoRA alpha scaling factor (default: 16.0).",
     )
     parser.add_argument(
-        "--compute_on_cpu",
+        "--compute_device",
+        type=str,
+        default="",
+        help="""Configure LoRA storage and compute locations for each component.
+        Format: 'vl_storage:{gpu|cpu},vl_compute:{gpu|cpu|off},attn_storage:{gpu|cpu},attn_compute:{gpu|cpu|off},moe_storage:{gpu|cpu},moe_compute:{gpu|cpu|off}'
+        Examples:
+          'vl_storage:cpu,vl_compute:gpu,attn_storage:gpu,attn_compute:gpu,moe_storage:cpu,moe_compute:cpu'
+          'vl:off,attn:gpu,moe:cpu' (sets both storage and compute for each)
+        Default: '' (all components use GPU storage and compute)""",
+    )
+    parser.add_argument(
+        "--force_slow_lora_path",
         action="store_true",
-        help="""Compute LoRA on CPU instead of GPU.
-        When enabled, LoRA weights stay on CPU and computation happens on CPU.
-        This reduces GPU memory usage at the cost of performance.
-        Useful for running with limited GPU memory or large LoRA ranks.""",
+        help="""Force use of slow path for LoRA (per-expert computation).
+        This enables per-expert LoRA but significantly reduces throughput.
+        Used for baseline performance testing.""",
     )
 
     parser.add_argument(

@@ -13,7 +13,12 @@
 #   --host HOST            Server host (default: 127.0.0.1)
 #   --enable_multimodal    Enable multimodal support
 #   --lora_max_size SIZE   Max LoRA size (default: 1024)
-#   --compute_on_cpu       Run compute on CPU
+#   --compute_device STR   Configure LoRA storage and compute locations
+#                          Format: 'vl_storage:{gpu|cpu},vl_compute:{gpu|cpu|off},attn_storage:{gpu|cpu},attn_compute:{gpu|cpu|off},moe_storage:{gpu|cpu},moe_compute:{gpu|cpu|off}'
+#                          Short format 'moe:cpu' sets both storage and compute
+#                          Example: 'moe:cpu' - MoE on CPU (both storage and compute)
+#                          Example: 'vl_storage:cpu,vl_compute:gpu' - VL weights on CPU, compute on GPU
+#   --force_slow_lora_path Force slow path for LoRA (per-expert baseline)
 #   --max_req_total_len    Max request total length
 #   --mem_fraction         Memory fraction (default: 0.6)
 #   --batch_max_tokens     Batch max tokens (default: 4096)
@@ -28,6 +33,9 @@
 #
 #   # Start server with multiple LoRA adapters
 #   ./start_server.sh --model_dir /path/to/qwen3-vl-2b --lora_dir /path/to/lora1 --port 8080
+#
+#   # Run MoE LoRA on CPU only
+#   ./start_server.sh --model_dir /path/to/qwen3-vl-2b --compute_device "moe:cpu"
 # =============================================================================
 
 set -e
@@ -41,7 +49,20 @@ TP=2
 HOST="0.0.0.0"
 ENABLE_MULTIMODAL=true
 LORA_MAX_SIZE=1024
-COMPUTE_ON_CPU=true
+
+### Baseline 1: Store on CPU, Compute on GPU ###
+# COMPUTE_DEVICE="vl_storage:cpu,vl_compute:gpu,attn_storage:cpu,attn_compute:gpu,moe_storage:cpu,moe_compute:gpu"
+
+### Baseline 2: Store on CPU, Compute on CPU ###
+# COMPUTE_DEVICE="vl_storage:cpu,vl_compute:gpu,attn_storage:cpu,attn_compute:cpu,moe_storage:cpu,moe_compute:cpu"
+
+### Baseline 3: Store on GPU, compute on GPU ###
+COMPUTE_DEVICE="vl_storage:cpu,vl_compute:gpu,attn_storage:cpu,attn_compute:cpu,moe_storage:cpu,moe_compute:cpu"
+
+### Proposed: Store on CPU, compute Attn on CPU, MoE on GPU ###
+# COMPUTE_DEVICE="vl_storage:cpu,vl_compute:gpu,attn_storage:cpu,attn_compute:cpu,moe_storage:cpu,moe_compute:cpu"
+
+FORCE_SLOW_LORA_PATH=true
 MAX_REQ_TOTAL_LEN=8192
 MEM_FRACTION=0.6
 BATCH_MAX_TOKENS=4096
@@ -82,8 +103,12 @@ while [[ $# -gt 0 ]]; do
             LORA_MAX_SIZE="$2"
             shift 2
             ;;
-        --compute_on_cpu)
-            COMPUTE_ON_CPU=true
+        --compute_device)
+            COMPUTE_DEVICE="$2"
+            shift 2
+            ;;
+        --force_slow_lora_path)
+            FORCE_SLOW_LORA_PATH=true
             shift
             ;;
         --help|-h)
@@ -150,8 +175,12 @@ if [[ "$ENABLE_MULTIMODAL" == "true" ]]; then
     CMD="$CMD --enable_multimodal"
 fi
 
-if [[ "$COMPUTE_ON_CPU" == "true" ]]; then
-    CMD="$CMD --compute_on_cpu"
+if [[ -n "$COMPUTE_DEVICE" ]]; then
+    CMD="$CMD --compute_device $COMPUTE_DEVICE"
+fi
+
+if [[ "$FORCE_SLOW_LORA_PATH" == "true" ]]; then
+    CMD="$CMD --force_slow_lora_path"
 fi
 
 # Export environment variables

@@ -11,6 +11,8 @@ Each injection point can be enabled independently for flexible LoRA composition.
 import torch
 from typing import Dict, Optional, Any
 
+from lightllm.server.core.objs.lora_compute_config import LoRAComputeConfig
+
 
 class Qwen3MOELoRADispatcher:
     """Dispatcher for applying LoRA to Qwen3-MOE layers.
@@ -34,13 +36,13 @@ class Qwen3MOELoRADispatcher:
         lora_rank: int = 64,
         lora_alpha: float = 1.0,
         lora_dropout: float = 0.0,
-        compute_on_cpu: bool = False
+        lora_compute_config: Optional[LoRAComputeConfig] = None
     ):
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha
         self.lora_dropout = lora_dropout
         self.scaling = lora_alpha / lora_rank if lora_rank > 0 else 1.0
-        self.compute_on_cpu = compute_on_cpu  # NEW: CPU offload flag
+        self.lora_compute_config = lora_compute_config or LoRAComputeConfig()
 
         # Active adapter (loaded for current batch)
         self.active_adapter: Optional[Dict[int, Dict[str, torch.Tensor]]] = None
@@ -205,8 +207,8 @@ class Qwen3MOELoRADispatcher:
         if gate_A is None or gate_B is None:
             return torch.zeros(hidden_states.size(0), 1, device=hidden_states.device, dtype=hidden_states.dtype)
 
-        # Compute LoRA on GPU or CPU based on flag
-        if self.compute_on_cpu:
+        # Compute LoRA on GPU or CPU based on config
+        if self.lora_compute_config.moe_compute == "cpu":
             return self._compute_lora_on_cpu(hidden_states, gate_A, gate_B, self.scaling)
         else:
             return hidden_states @ gate_A @ gate_B.t() * self.scaling
@@ -243,10 +245,11 @@ class Qwen3MOELoRADispatcher:
         if w1_A is None or w1_B is None:
             return torch.zeros_like(intermediate_states)
 
-        # Compute LoRA: intermediate @ A @ B.T * scaling
-        # Result shape: [token * topk, inter_size] @ [inter_size, rank] @ [rank, inter_size]
-        #             = [token * topk, inter_size]
-        return intermediate_states @ w1_A @ w1_B.t() * self.scaling
+        # Compute LoRA on GPU or CPU based on config
+        if self.lora_compute_config.moe_compute == "cpu":
+            return self._compute_lora_on_cpu(intermediate_states, w1_A, w1_B, self.scaling)
+        else:
+            return intermediate_states @ w1_A @ w1_B.t() * self.scaling
 
     def apply_w2_lora(
         self,
@@ -280,8 +283,8 @@ class Qwen3MOELoRADispatcher:
         if w2_A is None or w2_B is None:
             return torch.zeros_like(output_states)
 
-        # Compute LoRA on GPU or CPU based on flag
-        if self.compute_on_cpu:
+        # Compute LoRA on GPU or CPU based on config
+        if self.lora_compute_config.moe_compute == "cpu":
             return self._compute_lora_on_cpu(output_states, w2_A, w2_B, self.scaling)
         else:
             return output_states @ w2_A @ w2_B.t() * self.scaling
@@ -291,7 +294,7 @@ def create_moe_lora_dispatcher(
     lora_rank: int = 64,
     lora_alpha: float = 1.0,
     lora_dropout: float = 0.0,
-    compute_on_cpu: bool = False
+    lora_compute_config: Optional[LoRAComputeConfig] = None
 ) -> Qwen3MOELoRADispatcher:
     """Factory function to create a MoE LoRA dispatcher.
 
@@ -299,7 +302,7 @@ def create_moe_lora_dispatcher(
         lora_rank: LoRA rank for all MoE injection points
         lora_alpha: LoRA alpha scaling factor
         lora_dropout: LoRA dropout rate
-        compute_on_cpu: If True, compute LoRA on CPU (reduces GPU memory bandwidth)
+        lora_compute_config: Configuration for compute location per component
 
     Returns:
         Qwen3MOELoRADispatcher instance
@@ -308,11 +311,12 @@ def create_moe_lora_dispatcher(
         # GPU computation (default)
         dispatcher = create_moe_lora_dispatcher(lora_rank=64, lora_alpha=1.0)
 
-        # CPU offload (weights stay on CPU, computation on CPU)
+        # CPU offload for MoE (weights stay on CPU, computation on CPU)
+        config = LoRAComputeConfig(moe="cpu")
         dispatcher = create_moe_lora_dispatcher(
             lora_rank=64,
             lora_alpha=1.0,
-            compute_on_cpu=True
+            lora_compute_config=config
         )
     """
-    return Qwen3MOELoRADispatcher(lora_rank, lora_alpha, lora_dropout, compute_on_cpu)
+    return Qwen3MOELoRADispatcher(lora_rank, lora_alpha, lora_dropout, lora_compute_config)

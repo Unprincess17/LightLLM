@@ -20,6 +20,8 @@ import os
 import logging
 from typing import Dict, Optional, Any, List
 
+from lightllm.server.core.objs.lora_compute_config import LoRAComputeConfig
+
 # Configure logging using global env var
 _LOG_LEVEL = os.environ.get("LIGHTLLM_LOGGING", "INFO").upper()
 _LOG_LEVEL = getattr(logging, _LOG_LEVEL, logging.INFO)
@@ -77,10 +79,10 @@ class Qwen3VLMoELoRADispatcher:
         vl_fc2_rank: int = 0,
         # Common settings
         lora_alpha: float = 1.0,
-        compute_on_cpu: bool = False,
+        lora_compute_config: Optional[LoRAComputeConfig] = None,
     ):
         self.num_layers = num_layers
-        self.compute_on_cpu = compute_on_cpu
+        self.lora_compute_config = lora_compute_config or LoRAComputeConfig()
         self.lora_alpha = lora_alpha
 
         # Attention ranks
@@ -112,6 +114,11 @@ class Qwen3VLMoELoRADispatcher:
         self.lora_mem_pool = None
         self.req_bins = None
         self.use_batched_mode = False
+
+        # CPU Storage + GPU Compute scratchpad buffers (compact, per-batch)
+        self.gpu_scratchpad_a = None
+        self.gpu_scratchpad_b = None
+        self.transfer_stream = None
 
         # Check if any LoRA is enabled
         self.has_any_lora = any([
@@ -156,12 +163,99 @@ class Qwen3VLMoELoRADispatcher:
 
     def _get_output_buffer(self, input_tensor, pool):
         """Helper to create output buffer with correct dimension (Crucial for GQA/MLP)"""
+        # Use actual buffer dimension to ensure correct shape for copy operations
         return torch.zeros(
             input_tensor.shape[0],
-            pool.b_hidden_dim,
+            pool.value_buffer.shape[2],  # Use actual B buffer dimension
             dtype=input_tensor.dtype,
             device=input_tensor.device
         )
+
+    def _should_use_cpu_compute(self, component: str) -> bool:
+        """Check if a component should use CPU computation."""
+        if self.lora_compute_config is None:
+            return False
+        return self.lora_compute_config.should_compute_on_cpu(component)
+
+    def _should_use_cpu_storage(self, component: str) -> bool:
+        """Check if component uses CPU storage (requires transfer to GPU for compute)."""
+        if self.lora_compute_config is None:
+            return False
+        return self.lora_compute_config.get_storage_device(component) == "cpu"
+
+    def _ensure_compact_scratchpad(self, pool, device, active_count: int):
+        """
+        Allocate scratchpad for ONLY active adapters (compact, not full pool).
+        Avoids OOM with thousands of adapters.
+
+        NOTE: Always reallocate when pool dimensions change (e.g., switching from Q to K pool).
+        """
+        max_rank = pool.max_rank
+        a_hidden = pool.key_buffer.shape[2]
+        b_hidden = pool.value_buffer.shape[2]
+
+        # Check if we need to resize or if dimensions changed
+        needs_resize = False
+        current_a_hidden = self.gpu_scratchpad_a.shape[2] if self.gpu_scratchpad_a is not None else 0
+        current_b_hidden = self.gpu_scratchpad_b.shape[2] if self.gpu_scratchpad_b is not None else 0
+
+        if self.gpu_scratchpad_a is None or self.gpu_scratchpad_a.shape[0] < active_count:
+            needs_resize = True
+        elif current_a_hidden != a_hidden or current_b_hidden != b_hidden:
+            # Pool dimensions changed (e.g., Q pool -> K pool), need to reallocate
+            needs_resize = True
+
+        if needs_resize:
+            logger.debug(f"[LoRA Scratchpad] Reallocating: pool type={type(pool).__name__}, a_hidden={a_hidden}, b_hidden={b_hidden}, active_count={active_count}")
+            logger.debug(f"[LoRA Scratchpad] pool.key_buffer.shape={pool.key_buffer.shape}, pool.value_buffer.shape={pool.value_buffer.shape}")
+            # Allocate for active count only
+            self.gpu_scratchpad_a = torch.empty(
+                (active_count, max_rank, a_hidden),
+                dtype=pool.key_buffer.dtype, device=device
+            )
+            self.gpu_scratchpad_b = torch.empty(
+                (active_count, max_rank, b_hidden),
+                dtype=pool.value_buffer.dtype, device=device
+            )
+            logger.debug(f"[LoRA Scratchpad] gpu_scratchpad_a.shape={self.gpu_scratchpad_a.shape}, gpu_scratchpad_b.shape={self.gpu_scratchpad_b.shape}")
+            # Create dedicated stream for async transfers
+            if device.type == "cuda" and self.transfer_stream is None:
+                self.transfer_stream = torch.cuda.Stream(priority=0)
+
+    def _transfer_compact_to_gpu(self, pool, layer_id: int, global_adapter_ids: torch.Tensor,
+                                  a_dest: torch.Tensor, b_dest: torch.Tensor):
+        """
+        Transfer ONLY active adapters from CPU pool to compact GPU scratchpad.
+        Maps: Global[5, 999] → Local[0, 1]
+        """
+        # Get CPU slot indices for each active adapter (indices must be on same device as indexed tensor)
+        cpu_slots = pool.a_start[global_adapter_ids.cpu()] + layer_id  # [active_count]
+
+        logger.debug(f"[LoRA Transfer] pool={type(pool).__name__}, layer_id={layer_id}, active_count={len(global_adapter_ids)}")
+        logger.debug(f"[LoRA Transfer] a_dest[0].shape={a_dest[0].shape if len(a_dest) > 0 else 'empty'}, b_dest[0].shape={b_dest[0].shape if len(b_dest) > 0 else 'empty'}")
+        logger.debug(f"[LoRA Transfer] pool.key_buffer.shape={pool.key_buffer.shape}, pool.value_buffer.shape={pool.value_buffer.shape}")
+
+        # Async transfer using dedicated stream
+        if self.transfer_stream is not None:
+            with torch.cuda.stream(self.transfer_stream):
+                for i in range(len(global_adapter_ids)):
+                    adapter_id = global_adapter_ids[i].item()
+                    if adapter_id < 0:
+                        continue
+                    slot = cpu_slots[i].item()
+                    logger.debug(f"[LoRA Transfer] i={i}, slot={slot}, key_buffer[{slot}].shape={pool.key_buffer[slot].shape}, value_buffer[{slot}].shape={pool.value_buffer[slot].shape}")
+                    a_dest[i].copy_(pool.key_buffer[slot], non_blocking=True)
+                    b_dest[i].copy_(pool.value_buffer[slot], non_blocking=True)
+            self.transfer_stream.synchronize()  # Sync for baseline correctness
+        else:
+            # Sync fallback (no CUDA stream available)
+            for i in range(len(global_adapter_ids)):
+                adapter_id = global_adapter_ids[i].item()
+                if adapter_id < 0:
+                    continue
+                slot = cpu_slots[i].item()
+                a_dest[i].copy_(pool.key_buffer[slot])
+                b_dest[i].copy_(pool.value_buffer[slot])
 
     def batch_apply_q_lora(
         self,
@@ -175,23 +269,63 @@ class Qwen3VLMoELoRADispatcher:
 
         pool = self.lora_mem_pool.attn_q_pool
         bins = req_bins if req_bins is not None else self.req_bins
+        if bins is None:
+            return torch.zeros_like(input_tensor)
+
+        # Use CPU compute if configured
+        if self._should_use_cpu_compute("attn"):
+            return self._naive_batch_lora(input_tensor, layer_id, pool, bins)
 
         if BGMV_AVAILABLE:
             output = self._get_output_buffer(input_tensor, pool)
-            batch_lora_get_qkv(
-                output, input_tensor,
-                pool.key_buffer,
-                pool.value_buffer,
-                pool.a_start,
-                pool.a_len,
-                pool.a_scaling,
-                bins,
-                layer_id=layer_id
-            )
+
+            # Compact dispatcher: CPU storage + GPU compute
+            if self._should_use_cpu_storage("attn"):
+                # 1. Identify ONLY the adapters needed for this batch
+                unique_adapters, inverse_indices = torch.unique(bins, return_inverse=True)
+                active_count = unique_adapters.size(0)
+
+                # 2. Allocate SMALL scratchpad (only for active adapters)
+                self._ensure_compact_scratchpad(pool, input_tensor.device, active_count)
+
+                # 3. Transfer ONLY active adapters to packed scratchpad
+                assert self.gpu_scratchpad_a is not None and self.gpu_scratchpad_b is not None
+                self._transfer_compact_to_gpu(
+                    pool, layer_id, unique_adapters,
+                    self.gpu_scratchpad_a, self.gpu_scratchpad_b
+                )
+
+                # 4. Create TEMPORARY compact metadata for kernel
+                temp_a_start = torch.arange(active_count, device=input_tensor.device, dtype=torch.int32)
+                temp_a_len = torch.ones(active_count, device=input_tensor.device, dtype=torch.int32)
+                temp_scaling = pool.a_scaling[unique_adapters.long().cpu()].to(input_tensor.device).to(input_tensor.device)
+
+                # 5. Launch kernel with REMAPPED indices
+                assert self.gpu_scratchpad_a is not None and self.gpu_scratchpad_b is not None
+                batch_lora_get_qkv(
+                    output, input_tensor,
+                    self.gpu_scratchpad_a, self.gpu_scratchpad_b,
+                    temp_a_start, temp_a_len, temp_scaling,
+                    inverse_indices,
+                    a_hidden_dim=input_tensor.shape[1],
+                    b_hidden_dim=output.shape[1],
+                    layer_id=0
+                )
+            else:
+                # Standard GPU path
+                batch_lora_get_qkv(
+                    output, input_tensor,
+                    pool.key_buffer,
+                    pool.value_buffer,
+                    pool.a_start,
+                    pool.a_len,
+                    pool.a_scaling,
+                    bins,
+                    layer_id=layer_id
+                )
             return output
         else:
-            effective_bins = bins if bins is not None else self.req_bins
-            return self._naive_batch_lora(input_tensor, layer_id, pool, effective_bins)
+            return self._naive_batch_lora(input_tensor, layer_id, pool, bins)
 
     def batch_apply_k_lora(
         self,
@@ -204,23 +338,52 @@ class Qwen3VLMoELoRADispatcher:
             return torch.zeros(input_tensor.shape[0], 0, device=input_tensor.device)
 
         pool = self.lora_mem_pool.attn_k_pool
+        logger.debug(f"[LoRA K] pool={type(pool).__name__}, key_buffer.shape={pool.key_buffer.shape}, value_buffer.shape={pool.value_buffer.shape}")
         bins = req_bins if req_bins is not None else self.req_bins
+        if bins is None:
+            return torch.zeros(input_tensor.shape[0], pool.value_buffer.shape[2], dtype=input_tensor.dtype, device=input_tensor.device)
 
         output = self._get_output_buffer(input_tensor, pool)
 
+        # Use CPU compute if configured
+        if self._should_use_cpu_compute("attn"):
+            return self._naive_batch_lora(input_tensor, layer_id, pool, bins)
+
         if BGMV_AVAILABLE:
-            batch_lora_get_qkv(
-                output, input_tensor,
-                pool.key_buffer, pool.value_buffer,
-                pool.a_start, pool.a_len, pool.a_scaling, bins,
-                a_hidden_dim=input_tensor.shape[1],
-                b_hidden_dim=output.shape[1],
-                layer_id=layer_id
-            )
+            # Compact dispatcher: CPU storage + GPU compute
+            if self._should_use_cpu_storage("attn"):
+                unique_adapters, inverse_indices = torch.unique(bins, return_inverse=True)
+                active_count = unique_adapters.size(0)
+                self._ensure_compact_scratchpad(pool, input_tensor.device, active_count)
+                assert self.gpu_scratchpad_a is not None and self.gpu_scratchpad_b is not None
+                self._transfer_compact_to_gpu(
+                    pool, layer_id, unique_adapters,
+                    self.gpu_scratchpad_a, self.gpu_scratchpad_b
+                )
+                temp_a_start = torch.arange(active_count, device=input_tensor.device, dtype=torch.int32)
+                temp_a_len = torch.ones(active_count, device=input_tensor.device, dtype=torch.int32)
+                temp_scaling = pool.a_scaling[unique_adapters.long().cpu()].to(input_tensor.device)
+                batch_lora_get_qkv(
+                    output, input_tensor,
+                    self.gpu_scratchpad_a, self.gpu_scratchpad_b,
+                    temp_a_start, temp_a_len, temp_scaling,
+                    inverse_indices,
+                    a_hidden_dim=input_tensor.shape[1],
+                    b_hidden_dim=output.shape[1],
+                    layer_id=0
+                )
+            else:
+                batch_lora_get_qkv(
+                    output, input_tensor,
+                    pool.key_buffer, pool.value_buffer,
+                    pool.a_start, pool.a_len, pool.a_scaling, bins,
+                    a_hidden_dim=input_tensor.shape[1],
+                    b_hidden_dim=output.shape[1],
+                    layer_id=layer_id
+                )
             return output
         else:
-            effective_bins = bins if bins is not None else self.req_bins
-            return self._naive_batch_lora(input_tensor, layer_id, pool, effective_bins)
+            return self._naive_batch_lora(input_tensor, layer_id, pool, bins)
 
     def batch_apply_v_lora(
         self,
@@ -234,22 +397,50 @@ class Qwen3VLMoELoRADispatcher:
 
         pool = self.lora_mem_pool.attn_v_pool
         bins = req_bins if req_bins is not None else self.req_bins
+        if bins is None:
+            return torch.zeros_like(input_tensor)
 
         output = self._get_output_buffer(input_tensor, pool)
 
+        # Use CPU compute if configured
+        if self._should_use_cpu_compute("attn"):
+            return self._naive_batch_lora(input_tensor, layer_id, pool, bins)
+
         if BGMV_AVAILABLE:
-            batch_lora_get_qkv(
-                output, input_tensor,
-                pool.key_buffer, pool.value_buffer,
-                pool.a_start, pool.a_len, pool.a_scaling, bins,
-                a_hidden_dim=input_tensor.shape[1],
-                b_hidden_dim=output.shape[1],
-                layer_id=layer_id
-            )
+            # Compact dispatcher: CPU storage + GPU compute
+            if self._should_use_cpu_storage("attn"):
+                unique_adapters, inverse_indices = torch.unique(bins, return_inverse=True)
+                active_count = unique_adapters.size(0)
+                self._ensure_compact_scratchpad(pool, input_tensor.device, active_count)
+                assert self.gpu_scratchpad_a is not None and self.gpu_scratchpad_b is not None
+                self._transfer_compact_to_gpu(
+                    pool, layer_id, unique_adapters,
+                    self.gpu_scratchpad_a, self.gpu_scratchpad_b
+                )
+                temp_a_start = torch.arange(active_count, device=input_tensor.device, dtype=torch.int32)
+                temp_a_len = torch.ones(active_count, device=input_tensor.device, dtype=torch.int32)
+                temp_scaling = pool.a_scaling[unique_adapters.long().cpu()].to(input_tensor.device)
+                batch_lora_get_qkv(
+                    output, input_tensor,
+                    self.gpu_scratchpad_a, self.gpu_scratchpad_b,
+                    temp_a_start, temp_a_len, temp_scaling,
+                    inverse_indices,
+                    a_hidden_dim=input_tensor.shape[1],
+                    b_hidden_dim=output.shape[1],
+                    layer_id=0
+                )
+            else:
+                batch_lora_get_qkv(
+                    output, input_tensor,
+                    pool.key_buffer, pool.value_buffer,
+                    pool.a_start, pool.a_len, pool.a_scaling, bins,
+                    a_hidden_dim=input_tensor.shape[1],
+                    b_hidden_dim=output.shape[1],
+                    layer_id=layer_id
+                )
             return output
         else:
-            effective_bins = bins if bins is not None else self.req_bins
-            return self._naive_batch_lora(input_tensor, layer_id, pool, effective_bins)
+            return self._naive_batch_lora(input_tensor, layer_id, pool, bins)
 
     def batch_apply_o_lora(
         self,
@@ -263,24 +454,51 @@ class Qwen3VLMoELoRADispatcher:
 
         pool = self.lora_mem_pool.attn_o_pool
         bins = req_bins if req_bins is not None else self.req_bins
+        if bins is None:
+            return torch.zeros_like(input_tensor)
+
+        # Use CPU compute if configured
+        if self._should_use_cpu_compute("attn"):
+            return self._naive_batch_lora(input_tensor, layer_id, pool, bins)
 
         if BGMV_AVAILABLE:
             output = torch.zeros_like(input_tensor)
-            batch_lora_get_o(
-                output,
-                input_tensor,
-                pool.key_buffer,  # A matrices
-                pool.value_buffer,  # B matrices
-                pool.a_start,
-                pool.a_len,
-                pool.a_scaling,
-                bins,
-                layer_id=layer_id
-            )
+            # Compact dispatcher: CPU storage + GPU compute
+            if self._should_use_cpu_storage("attn"):
+                unique_adapters, inverse_indices = torch.unique(bins, return_inverse=True)
+                active_count = unique_adapters.size(0)
+                self._ensure_compact_scratchpad(pool, input_tensor.device, active_count)
+                assert self.gpu_scratchpad_a is not None and self.gpu_scratchpad_b is not None
+                self._transfer_compact_to_gpu(
+                    pool, layer_id, unique_adapters,
+                    self.gpu_scratchpad_a, self.gpu_scratchpad_b
+                )
+                temp_a_start = torch.arange(active_count, device=input_tensor.device, dtype=torch.int32)
+                temp_a_len = torch.ones(active_count, device=input_tensor.device, dtype=torch.int32)
+                temp_scaling = pool.a_scaling[unique_adapters.long().cpu()].to(input_tensor.device)
+                batch_lora_get_o(
+                    output,
+                    input_tensor,
+                    self.gpu_scratchpad_a, self.gpu_scratchpad_b,
+                    temp_a_start, temp_a_len, temp_scaling,
+                    inverse_indices,
+                    layer_id=0
+                )
+            else:
+                batch_lora_get_o(
+                    output,
+                    input_tensor,
+                    pool.key_buffer,
+                    pool.value_buffer,
+                    pool.a_start,
+                    pool.a_len,
+                    pool.a_scaling,
+                    bins,
+                    layer_id=layer_id
+                )
             return output
         else:
-            effective_bins = bins if bins is not None else self.req_bins
-            return self._naive_batch_lora(input_tensor, layer_id, pool, effective_bins)
+            return self._naive_batch_lora(input_tensor, layer_id, pool, bins)
 
     def batch_apply_gate_lora(
         self,
@@ -304,6 +522,8 @@ class Qwen3VLMoELoRADispatcher:
 
         pool = self.lora_mem_pool.moe_gate_pool
         bins = req_bins if req_bins is not None else self.req_bins
+        if bins is None:
+            return torch.zeros_like(input_tensor)
 
         # Calculate buffer index with expert dimension
         # expert_id is now always LOCAL (after translation in transformer_layer_infer.py)
@@ -313,26 +533,52 @@ class Qwen3VLMoELoRADispatcher:
         else:
             buffer_layer_id = layer_id
 
+        # Use CPU compute if configured
+        if self._should_use_cpu_compute("moe"):
+            return self._naive_batch_lora(input_tensor, buffer_layer_id, pool, bins)
+
         if BGMV_AVAILABLE:
             output = self._get_output_buffer(input_tensor, pool)
-            batch_lora_get_mlp(
-                output,
-                input_tensor,
-                pool.key_buffer,  # A matrices
-                pool.value_buffer,  # B matrices
-                pool.a_start,
-                pool.a_len,
-                pool.a_scaling,
-                bins,
-                a_hidden_dim=input_tensor.shape[1],
-                b_hidden_dim=output.shape[1],
-                layer_id=buffer_layer_id
-            )
+            # Compact dispatcher: CPU storage + GPU compute
+            if self._should_use_cpu_storage("moe"):
+                unique_adapters, inverse_indices = torch.unique(bins, return_inverse=True)
+                active_count = unique_adapters.size(0)
+                self._ensure_compact_scratchpad(pool, input_tensor.device, active_count)
+                assert self.gpu_scratchpad_a is not None and self.gpu_scratchpad_b is not None
+                self._transfer_compact_to_gpu(
+                    pool, buffer_layer_id, unique_adapters,
+                    self.gpu_scratchpad_a, self.gpu_scratchpad_b
+                )
+                temp_a_start = torch.arange(active_count, device=input_tensor.device, dtype=torch.int32)
+                temp_a_len = torch.ones(active_count, device=input_tensor.device, dtype=torch.int32)
+                temp_scaling = pool.a_scaling[unique_adapters.long().cpu()].to(input_tensor.device)
+                batch_lora_get_mlp(
+                    output,
+                    input_tensor,
+                    self.gpu_scratchpad_a, self.gpu_scratchpad_b,
+                    temp_a_start, temp_a_len, temp_scaling,
+                    inverse_indices,
+                    a_hidden_dim=input_tensor.shape[1],
+                    b_hidden_dim=output.shape[1],
+                    layer_id=0
+                )
+            else:
+                batch_lora_get_mlp(
+                    output,
+                    input_tensor,
+                    pool.key_buffer,
+                    pool.value_buffer,
+                    pool.a_start,
+                    pool.a_len,
+                    pool.a_scaling,
+                    bins,
+                    a_hidden_dim=input_tensor.shape[1],
+                    b_hidden_dim=output.shape[1],
+                    layer_id=buffer_layer_id
+                )
             return output
         else:
-            # bins should never be None here, but safeguard
-            effective_bins = bins if bins is not None else self.req_bins
-            return self._naive_batch_lora(input_tensor, buffer_layer_id, pool, effective_bins)
+            return self._naive_batch_lora(input_tensor, buffer_layer_id, pool, bins)
 
     def batch_apply_up_lora(
         self,
@@ -355,6 +601,8 @@ class Qwen3VLMoELoRADispatcher:
 
         pool = self.lora_mem_pool.moe_up_pool
         bins = req_bins if req_bins is not None else self.req_bins
+        if bins is None:
+            return torch.zeros_like(input_tensor)
 
         # [MODIFIED] Calculate buffer index with expert dimension
         if expert_id is not None:
@@ -362,25 +610,52 @@ class Qwen3VLMoELoRADispatcher:
         else:
             buffer_layer_id = layer_id
 
+        # Use CPU compute if configured
+        if self._should_use_cpu_compute("moe"):
+            return self._naive_batch_lora(input_tensor, buffer_layer_id, pool, bins)
+
         if BGMV_AVAILABLE:
             output = self._get_output_buffer(input_tensor, pool)
-            batch_lora_get_mlp(
-                output,
-                input_tensor,
-                pool.key_buffer,  # A matrices
-                pool.value_buffer,  # B matrices
-                pool.a_start,
-                pool.a_len,
-                pool.a_scaling,
-                bins,
-                a_hidden_dim=input_tensor.shape[1],
-                b_hidden_dim=output.shape[1],
-                layer_id=buffer_layer_id
-            )
+            # Compact dispatcher: CPU storage + GPU compute
+            if self._should_use_cpu_storage("moe"):
+                unique_adapters, inverse_indices = torch.unique(bins, return_inverse=True)
+                active_count = unique_adapters.size(0)
+                self._ensure_compact_scratchpad(pool, input_tensor.device, active_count)
+                assert self.gpu_scratchpad_a is not None and self.gpu_scratchpad_b is not None
+                self._transfer_compact_to_gpu(
+                    pool, buffer_layer_id, unique_adapters,
+                    self.gpu_scratchpad_a, self.gpu_scratchpad_b
+                )
+                temp_a_start = torch.arange(active_count, device=input_tensor.device, dtype=torch.int32)
+                temp_a_len = torch.ones(active_count, device=input_tensor.device, dtype=torch.int32)
+                temp_scaling = pool.a_scaling[unique_adapters.long().cpu()].to(input_tensor.device)
+                batch_lora_get_mlp(
+                    output,
+                    input_tensor,
+                    self.gpu_scratchpad_a, self.gpu_scratchpad_b,
+                    temp_a_start, temp_a_len, temp_scaling,
+                    inverse_indices,
+                    a_hidden_dim=input_tensor.shape[1],
+                    b_hidden_dim=output.shape[1],
+                    layer_id=0
+                )
+            else:
+                batch_lora_get_mlp(
+                    output,
+                    input_tensor,
+                    pool.key_buffer,
+                    pool.value_buffer,
+                    pool.a_start,
+                    pool.a_len,
+                    pool.a_scaling,
+                    bins,
+                    a_hidden_dim=input_tensor.shape[1],
+                    b_hidden_dim=output.shape[1],
+                    layer_id=buffer_layer_id
+                )
             return output
         else:
-            effective_bins = bins if bins is not None else self.req_bins
-            return self._naive_batch_lora(input_tensor, buffer_layer_id, pool, effective_bins)
+            return self._naive_batch_lora(input_tensor, buffer_layer_id, pool, bins)
 
     def batch_apply_down_lora(
         self,
@@ -403,6 +678,8 @@ class Qwen3VLMoELoRADispatcher:
 
         pool = self.lora_mem_pool.moe_down_pool
         bins = req_bins if req_bins is not None else self.req_bins
+        if bins is None:
+            return torch.zeros_like(input_tensor)
 
         # [MODIFIED] Calculate buffer index with expert dimension
         if expert_id is not None:
@@ -412,19 +689,45 @@ class Qwen3VLMoELoRADispatcher:
 
         output = self._get_output_buffer(input_tensor, pool)
 
+        # Use CPU compute if configured
+        if self._should_use_cpu_compute("moe"):
+            return self._naive_batch_lora(input_tensor, buffer_layer_id, pool, bins)
+
         if BGMV_AVAILABLE:
-            batch_lora_get_mlp(
-                output, input_tensor,
-                pool.key_buffer, pool.value_buffer,
-                pool.a_start, pool.a_len, pool.a_scaling, bins,
-                a_hidden_dim=input_tensor.shape[1],
-                b_hidden_dim=output.shape[1],
-                layer_id=buffer_layer_id
-            )
+            # Compact dispatcher: CPU storage + GPU compute
+            if self._should_use_cpu_storage("moe"):
+                unique_adapters, inverse_indices = torch.unique(bins, return_inverse=True)
+                active_count = unique_adapters.size(0)
+                self._ensure_compact_scratchpad(pool, input_tensor.device, active_count)
+                assert self.gpu_scratchpad_a is not None and self.gpu_scratchpad_b is not None
+                self._transfer_compact_to_gpu(
+                    pool, buffer_layer_id, unique_adapters,
+                    self.gpu_scratchpad_a, self.gpu_scratchpad_b
+                )
+                temp_a_start = torch.arange(active_count, device=input_tensor.device, dtype=torch.int32)
+                temp_a_len = torch.ones(active_count, device=input_tensor.device, dtype=torch.int32)
+                temp_scaling = pool.a_scaling[unique_adapters.long().cpu()].to(input_tensor.device)
+                batch_lora_get_mlp(
+                    output, input_tensor,
+                    self.gpu_scratchpad_a, self.gpu_scratchpad_b,
+                    temp_a_start, temp_a_len, temp_scaling,
+                    inverse_indices,
+                    a_hidden_dim=input_tensor.shape[1],
+                    b_hidden_dim=output.shape[1],
+                    layer_id=0
+                )
+            else:
+                batch_lora_get_mlp(
+                    output, input_tensor,
+                    pool.key_buffer, pool.value_buffer,
+                    pool.a_start, pool.a_len, pool.a_scaling, bins,
+                    a_hidden_dim=input_tensor.shape[1],
+                    b_hidden_dim=output.shape[1],
+                    layer_id=buffer_layer_id
+                )
             return output
         else:
-            effective_bins = bins if bins is not None else self.req_bins
-            return self._naive_batch_lora(input_tensor, buffer_layer_id, pool, effective_bins)
+            return self._naive_batch_lora(input_tensor, buffer_layer_id, pool, bins)
 
     def batch_apply_vl_lora(
         self,
@@ -451,22 +754,50 @@ class Qwen3VLMoELoRADispatcher:
             return torch.zeros_like(input_tensor)
 
         bins = req_bins if req_bins is not None else self.req_bins
+        if bins is None:
+            return torch.zeros_like(input_tensor)
 
         output = self._get_output_buffer(input_tensor, pool)
 
+        # Use CPU compute if configured
+        if self._should_use_cpu_compute("vl"):
+            return self._naive_batch_lora(input_tensor, layer_id, pool, bins)
+
         if BGMV_AVAILABLE:
-            batch_lora_get_vl(
-                output, input_tensor,
-                pool.key_buffer, pool.value_buffer,
-                pool.a_start, pool.a_len, pool.a_scaling, bins,
-                a_hidden_dim=input_tensor.shape[1],
-                b_hidden_dim=output.shape[1],
-                layer_id=layer_id
-            )
+            # Compact dispatcher: CPU storage + GPU compute
+            if self._should_use_cpu_storage("vl"):
+                unique_adapters, inverse_indices = torch.unique(bins, return_inverse=True)
+                active_count = unique_adapters.size(0)
+                self._ensure_compact_scratchpad(pool, input_tensor.device, active_count)
+                assert self.gpu_scratchpad_a is not None and self.gpu_scratchpad_b is not None
+                self._transfer_compact_to_gpu(
+                    pool, layer_id, unique_adapters,
+                    self.gpu_scratchpad_a, self.gpu_scratchpad_b
+                )
+                temp_a_start = torch.arange(active_count, device=input_tensor.device, dtype=torch.int32)
+                temp_a_len = torch.ones(active_count, device=input_tensor.device, dtype=torch.int32)
+                temp_scaling = pool.a_scaling[unique_adapters.long().cpu()].to(input_tensor.device)
+                batch_lora_get_vl(
+                    output, input_tensor,
+                    self.gpu_scratchpad_a, self.gpu_scratchpad_b,
+                    temp_a_start, temp_a_len, temp_scaling,
+                    inverse_indices,
+                    a_hidden_dim=input_tensor.shape[1],
+                    b_hidden_dim=output.shape[1],
+                    layer_id=0
+                )
+            else:
+                batch_lora_get_vl(
+                    output, input_tensor,
+                    pool.key_buffer, pool.value_buffer,
+                    pool.a_start, pool.a_len, pool.a_scaling, bins,
+                    a_hidden_dim=input_tensor.shape[1],
+                    b_hidden_dim=output.shape[1],
+                    layer_id=layer_id
+                )
             return output
         else:
-            effective_bins = bins if bins is not None else self.req_bins
-            return self._naive_batch_lora(input_tensor, layer_id, pool, effective_bins)
+            return self._naive_batch_lora(input_tensor, layer_id, pool, bins)
 
     # =====================================================================
     # Fallback Naive Implementation (when BGMV kernel unavailable)
@@ -581,7 +912,7 @@ def create_vl_moe_lora_dispatcher(
     num_layers: int,
     lora_rank: int = 64,
     lora_alpha: float = 1.0,
-    compute_on_cpu: bool = False,
+    lora_compute_config: Optional[LoRAComputeConfig] = None,
 ) -> Qwen3VLMoELoRADispatcher:
     """
     Factory function to create a VL-MoE LoRA dispatcher with S-LoRA batched mode.
@@ -592,7 +923,7 @@ def create_vl_moe_lora_dispatcher(
         num_layers: Number of transformer layers
         lora_rank: Global LoRA rank for all modules (q, k, v, o, gate, up, down, vl_*)
         lora_alpha: LoRA alpha scaling factor
-        compute_on_cpu: If True, compute LoRA on CPU
+        lora_compute_config: Configuration for compute location per component
 
     Returns:
         Qwen3VLMoELoRADispatcher instance configured for batched inference
@@ -613,7 +944,7 @@ def create_vl_moe_lora_dispatcher(
         vl_fc1_rank=lora_rank,
         vl_fc2_rank=lora_rank,
         lora_alpha=lora_alpha,
-        compute_on_cpu=compute_on_cpu,
+        lora_compute_config=lora_compute_config,
     )
 
 

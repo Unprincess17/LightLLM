@@ -132,8 +132,11 @@ class StartArgs:
     multi_level_kv_cache_port: int = field(default=None)
     # LoRA serving port
     lora_port: int = field(default=None)
-    # LoRA compute on CPU (weights stay on CPU, computation on CPU)
-    compute_on_cpu: bool = field(default=False)
+    # LoRA compute device for components
+    # Format: 'vl:{gpu|cpu|off},attn:{gpu|cpu|off},moe:{gpu|cpu|off}'
+    compute_device: str = field(default="")
+    # Force slow path for LoRA (per-expert baseline)
+    force_slow_lora_path: bool = field(default=False)
     # multi_modal
     enable_multimodal: bool = field(default=False)
     enable_multimodal_audio: bool = field(default=False)

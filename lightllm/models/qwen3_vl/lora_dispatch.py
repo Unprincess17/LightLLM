@@ -15,6 +15,8 @@ The dispatch approach:
 import torch
 from typing import Dict, Optional, Any
 
+from lightllm.server.core.objs.lora_compute_config import LoRAComputeConfig
+
 
 class LoRADispatcher:
     """Dispatcher for applying LoRA to MLP layers.
@@ -33,13 +35,13 @@ class LoRADispatcher:
         lora_rank: int = 0,
         lora_alpha: float = 1.0,
         lora_dropout: float = 0.0,
-        compute_on_cpu: bool = False
+        lora_compute_config: Optional[LoRAComputeConfig] = None
     ):
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha
         self.lora_dropout = lora_dropout
         self.lora_scaling = lora_alpha / lora_rank if lora_rank > 0 else 1.0
-        self.compute_on_cpu = compute_on_cpu  # CPU offload flag
+        self.lora_compute_config = lora_compute_config or LoRAComputeConfig()
 
         # Active adapter (loaded for current batch)
         self.active_adapter: Optional[Dict[int, Dict[str, torch.Tensor]]] = None
@@ -220,13 +222,13 @@ class LoRADispatcher:
         # input: [batch, hidden], A: [hidden, rank], B: [output_dim, rank]
         # input @ A: [batch, rank]
         # (input @ A) @ B.t(): [batch, rank] @ [rank, output_dim] = [batch, output_dim]
-        if self.compute_on_cpu:
+        if self.lora_compute_config.moe == "cpu":
             gate_lora = self._compute_lora_on_cpu(input_embeds, gate_A, gate_B, scaling)
         else:
             gate_lora = input_embeds @ gate_A @ gate_B.t() * scaling
 
         # Compute LoRA contribution for up_proj (on GPU or CPU)
-        if self.compute_on_cpu:
+        if self.lora_compute_config.moe == "cpu":
             up_lora = self._compute_lora_on_cpu(input_embeds, up_A, up_B, scaling)
         else:
             up_lora = input_embeds @ up_A @ up_B.t() * scaling
@@ -241,7 +243,7 @@ class LoRADispatcher:
 
         # Compute LoRA contribution for down_proj (on GPU or CPU)
         # ffn1_lora: [batch, intermediate*2], A: [intermediate, rank], B: [hidden, rank]
-        if self.compute_on_cpu:
+        if self.lora_compute_config.moe == "cpu":
             down_lora = self._compute_lora_on_cpu(ffn1_lora, down_A, down_B, scaling)
         else:
             down_lora = ffn1_lora @ down_A @ down_B.t() * scaling
@@ -345,7 +347,7 @@ class LoRADispatcher:
         # Compute LoRA for q_proj (on GPU or CPU)
         q_lora = torch.zeros_like(input_embeds)
         if q_A is not None and q_B is not None:
-            if self.compute_on_cpu:
+            if self.lora_compute_config.attn == "cpu":
                 q_lora = self._compute_lora_on_cpu(input_embeds, q_A, q_B, scaling)
             else:
                 q_lora = input_embeds @ q_A @ q_B.t() * scaling
@@ -353,7 +355,7 @@ class LoRADispatcher:
         # Compute LoRA for k_proj (on GPU or CPU)
         k_lora = torch.zeros_like(input_embeds)
         if k_A is not None and k_B is not None:
-            if self.compute_on_cpu:
+            if self.lora_compute_config.attn == "cpu":
                 k_lora = self._compute_lora_on_cpu(input_embeds, k_A, k_B, scaling)
             else:
                 k_lora = input_embeds @ k_A @ k_B.t() * scaling
@@ -361,7 +363,7 @@ class LoRADispatcher:
         # Compute LoRA for v_proj (on GPU or CPU)
         v_lora = torch.zeros_like(input_embeds)
         if v_A is not None and v_B is not None:
-            if self.compute_on_cpu:
+            if self.lora_compute_config.attn == "cpu":
                 v_lora = self._compute_lora_on_cpu(input_embeds, v_A, v_B, scaling)
             else:
                 v_lora = input_embeds @ v_A @ v_B.t() * scaling
@@ -369,7 +371,7 @@ class LoRADispatcher:
         # Compute LoRA for o_proj (on GPU or CPU, takes attention output as input)
         o_lora = torch.zeros_like(input_embeds)
         if o_A is not None and o_B is not None:
-            if self.compute_on_cpu:
+            if self.lora_compute_config.attn == "cpu":
                 o_lora = self._compute_lora_on_cpu(input_embeds, o_A, o_B, scaling)
             else:
                 o_lora = input_embeds @ o_A @ o_B.t() * scaling
@@ -509,7 +511,7 @@ def create_lora_dispatcher(
     lora_rank: int = 0,
     lora_alpha: float = 1.0,
     lora_dropout: float = 0.0,
-    compute_on_cpu: bool = False
+    lora_compute_config: Optional[LoRAComputeConfig] = None
 ) -> LoRADispatcher:
     """Factory function to create a LoRA dispatcher.
 
@@ -517,9 +519,9 @@ def create_lora_dispatcher(
         lora_rank: LoRA rank (0 means disabled)
         lora_alpha: LoRA alpha scaling factor
         lora_dropout: LoRA dropout rate
-        compute_on_cpu: If True, compute LoRA on CPU (reduces GPU memory bandwidth)
+        lora_compute_config: Configuration for compute location per component
 
     Returns:
         LoRADispatcher instance
     """
-    return LoRADispatcher(lora_rank, lora_alpha, lora_dropout, compute_on_cpu)
+    return LoRADispatcher(lora_rank, lora_alpha, lora_dropout, lora_compute_config)

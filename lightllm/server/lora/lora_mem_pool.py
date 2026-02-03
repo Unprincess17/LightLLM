@@ -29,6 +29,8 @@ from dataclasses import dataclass, field
 from safetensors import safe_open
 import glob
 
+from lightllm.server.core.objs.lora_compute_config import LoRAComputeConfig
+
 # Configure logging using global env var
 _LOG_LEVEL = os.environ.get("LIGHTLLM_LOGGING", "INFO").upper()
 _LOG_LEVEL = getattr(logging, _LOG_LEVEL, logging.INFO)
@@ -146,9 +148,13 @@ class LoRAModulePool:
         """
         if output_dim is None:
             output_dim = input_dim
+
+        # Use pinned memory for CPU buffers to enable async transfers
+        use_pinned = (device == "cpu")
+
         return cls(
-            key_buffer=torch.empty((pool_size, max_rank, input_dim), dtype=dtype, device=device),
-            value_buffer=torch.empty((pool_size, max_rank, output_dim), dtype=dtype, device=device),
+            key_buffer=torch.empty((pool_size, max_rank, input_dim), dtype=dtype, device=device, pin_memory=use_pinned),
+            value_buffer=torch.empty((pool_size, max_rank, output_dim), dtype=dtype, device=device, pin_memory=use_pinned),
             a_start=torch.zeros(0, dtype=torch.long, device=device),
             a_len=torch.zeros(0, dtype=torch.long, device=device),
             a_scaling=torch.zeros(0, dtype=dtype, device=device),
@@ -563,7 +569,8 @@ class LoRAMemPool:
         vocab_size: int,
         num_kv_heads: int | None = None,
         dtype: torch.dtype = torch.float16,
-        device: str = "cuda",
+        # LoRA compute config for storage settings
+        lora_compute_config: LoRAComputeConfig | None = None,
         # Vision config parameters (optional)
         vl_hidden_size: int | None = None,
         vl_intermediate_size: int | None = None,
@@ -589,7 +596,25 @@ class LoRAMemPool:
             moe_intermediate_dim: MoE intermediate size for gate/up/down projections.
             num_experts: Number of experts per layer (for MoE models).
             tp_world_size: Tensor parallel world size for sharded dimensions (default: 1).
+            lora_compute_config: LoRAComputeConfig for storage locations.
+                               If None, defaults to GPU storage for all components.
         """
+        # Extract storage devices from config and convert to PyTorch device strings
+        # "gpu" -> "cuda", "cpu" -> "cpu"
+        def to_device_string(loc: str) -> str:
+            if loc == "gpu":
+                return "cuda"
+            return loc  # "cpu" or other
+
+        if lora_compute_config is not None:
+            vl_storage_device = to_device_string(lora_compute_config.vl_storage)
+            attn_storage_device = to_device_string(lora_compute_config.attn_storage)
+            moe_storage_device = to_device_string(lora_compute_config.moe_storage)
+        else:
+            vl_storage_device = "cuda"
+            attn_storage_device = "cuda"
+            moe_storage_device = "cuda"
+
         # Use vision dimensions if provided, otherwise fall back to text model dimensions
         if vl_hidden_size is None:
             vl_hidden_size = hidden_size
@@ -606,12 +631,12 @@ class LoRAMemPool:
         mlp_inter = moe_intermediate_dim  # Use MoE intermediate size for MoE pools
 
         # Attention dimensions
-        
+
         # 1. Input Dimension (From Residual Stream)
         attn_in_hidden = hidden_size
-        
+
         # 2. Internal Attention Dimension (Q output / O input)
-        attn_internal_dim = num_heads * head_dim 
+        attn_internal_dim = num_heads * head_dim
 
         if num_kv_heads is None:
             num_kv_heads = num_heads
@@ -625,44 +650,44 @@ class LoRAMemPool:
         vl_mlp_hidden = vl_intermediate_size
         vl_out_hidden = vl_out_hidden_size
 
-        logger.info(f"[LoRA Pool] Creating pool: attn_in={attn_in_hidden}, attn_internal={attn_internal_dim}, kv_internal={kv_internal_dim}, mlp_hidden={mlp_inter}, vl_hidden={vl_hidden}, vl_mlp_hidden={vl_mlp_hidden}, vl_out_hidden={vl_out_hidden}, vl_depth={vl_depth}, tp_world_size={tp_world_size}")
+        logger.info(f"[LoRA Pool] Creating pool: attn_in={attn_in_hidden}, attn_internal={attn_internal_dim}, kv_internal={kv_internal_dim}, mlp_hidden={mlp_inter}, vl_hidden={vl_hidden}, vl_mlp_hidden={vl_mlp_hidden}, vl_out_hidden={vl_out_hidden}, vl_depth={vl_depth}, tp_world_size={tp_world_size}, vl_storage={vl_storage_device}, attn_storage={attn_storage_device}, moe_storage={moe_storage_device}")
 
         pool = cls(
             # Vision-Language pools (Q/K/V/O use vl_hidden, FC1/FC2 use vl_hidden/vl_mlp_hidden)
             # Vision pools use vl_depth for num_layers
-            vl_q_pool=LoRAModulePool.create(pool_size, max_rank, vl_hidden, vl_hidden, dtype, device, num_layers=vl_depth),
-            vl_k_pool=LoRAModulePool.create(pool_size, max_rank, vl_hidden, vl_hidden, dtype, device, num_layers=vl_depth),
-            vl_v_pool=LoRAModulePool.create(pool_size, max_rank, vl_hidden, vl_hidden, dtype, device, num_layers=vl_depth),
-            vl_o_pool=LoRAModulePool.create(pool_size, max_rank, vl_hidden, vl_hidden, dtype, device, num_layers=vl_depth),
+            vl_q_pool=LoRAModulePool.create(pool_size, max_rank, vl_hidden, vl_hidden, dtype, vl_storage_device, num_layers=vl_depth),
+            vl_k_pool=LoRAModulePool.create(pool_size, max_rank, vl_hidden, vl_hidden, dtype, vl_storage_device, num_layers=vl_depth),
+            vl_v_pool=LoRAModulePool.create(pool_size, max_rank, vl_hidden, vl_hidden, dtype, vl_storage_device, num_layers=vl_depth),
+            vl_o_pool=LoRAModulePool.create(pool_size, max_rank, vl_hidden, vl_hidden, dtype, vl_storage_device, num_layers=vl_depth),
             # Vision MLP: FC1 expands from vl_hidden to vl_mlp_hidden, FC2 shrinks from vl_mlp_hidden to vl_out_hidden
-            vl_fc1_pool=LoRAModulePool.create(pool_size, max_rank, vl_hidden, vl_mlp_hidden, dtype, device, num_layers=vl_depth),
-            vl_fc2_pool=LoRAModulePool.create(pool_size, max_rank, vl_mlp_hidden, vl_hidden, dtype, device, num_layers=vl_depth),
+            vl_fc1_pool=LoRAModulePool.create(pool_size, max_rank, vl_hidden, vl_mlp_hidden, dtype, vl_storage_device, num_layers=vl_depth),
+            vl_fc2_pool=LoRAModulePool.create(pool_size, max_rank, vl_mlp_hidden, vl_hidden, dtype, vl_storage_device, num_layers=vl_depth),
 
             # Q Pool: Column Parallel -> Output is SPLIT
             # b_hidden_dim must be 4096 // 2 = 2048
             attn_q_pool = LoRAModulePool.create(
-                pool_size, max_rank, 
-                attn_in_hidden, 
+                pool_size, max_rank,
+                attn_in_hidden,
                 attn_internal_dim // tp_world_size,  # <--- DIVIDE BY TP
-                dtype, device, num_layers=num_layers
+                dtype, attn_storage_device, num_layers=num_layers
             ),
 
             # K Pool: Column Parallel -> Output is SPLIT
             # b_hidden_dim must be 512 // 2 = 256
             attn_k_pool = LoRAModulePool.create(
-                pool_size, max_rank, 
-                attn_in_hidden, 
+                pool_size, max_rank,
+                attn_in_hidden,
                 kv_internal_dim // tp_world_size,    # <--- DIVIDE BY TP
-                dtype, device, num_layers=num_layers
+                dtype, attn_storage_device, num_layers=num_layers
             ),
 
             # V Pool: Column Parallel -> Output is SPLIT
             # b_hidden_dim must be 512 // 2 = 256
             attn_v_pool = LoRAModulePool.create(
-                pool_size, max_rank, 
-                attn_in_hidden, 
+                pool_size, max_rank,
+                attn_in_hidden,
                 kv_internal_dim // tp_world_size,    # <--- DIVIDE BY TP
-                dtype, device, num_layers=num_layers
+                dtype, attn_storage_device, num_layers=num_layers
             ),
 
             # O Pool: Row Parallel -> Input is SPLIT (Correct in your code)
@@ -671,7 +696,7 @@ class LoRAMemPool:
                 pool_size, max_rank,
                 attn_internal_dim // tp_world_size,  # <--- DIVIDE BY TP
                 attn_in_hidden,
-                dtype, device, num_layers=num_layers
+                dtype, attn_storage_device, num_layers=num_layers
             ),
 
             # MoE MLP pools - Gate/Up expand, Down shrinks
@@ -679,19 +704,19 @@ class LoRAMemPool:
             # For EP mode: each rank only has subset of experts
             moe_gate_pool=LoRAModulePool.create(
                 pool_size, max_rank, hidden_size, mlp_inter // tp_world_size,
-                dtype, device, num_layers=num_layers, num_experts=num_experts
+                dtype, moe_storage_device, num_layers=num_layers, num_experts=num_experts
             ),
             moe_up_pool=LoRAModulePool.create(
                 pool_size, max_rank, hidden_size, mlp_inter // tp_world_size,
-                dtype, device, num_layers=num_layers, num_experts=num_experts
+                dtype, moe_storage_device, num_layers=num_layers, num_experts=num_experts
             ),
             moe_down_pool=LoRAModulePool.create(
                 pool_size, max_rank, mlp_inter // tp_world_size, hidden_size,
-                dtype, device, num_layers=num_layers, num_experts=num_experts
+                dtype, moe_storage_device, num_layers=num_layers, num_experts=num_experts
             ),
-            
-            # LM Head pool
-            lm_head_pool=LoRAModulePool.create(pool_size, max_rank, hidden_size, vocab_size, dtype, device, num_layers=1),
+
+            # LM Head pool - use moe_storage_device for lm_head
+            lm_head_pool=LoRAModulePool.create(pool_size, max_rank, hidden_size, vocab_size, dtype, moe_storage_device, num_layers=1),
 
             adapter_dirs=[],
             idx_map={},
@@ -1073,7 +1098,8 @@ def create_lora_mem_pool(
     vocab_size: int = 151936,
     num_kv_heads: int | None = None,
     dtype: torch.dtype = torch.float16,
-    device: str = "cuda",
+    # LoRA compute config for storage/compute settings
+    lora_compute_config = None,
     # Vision config parameters (optional)
     vl_hidden_size: int | None = None,
     vl_intermediate_size: int | None = None,
@@ -1099,6 +1125,8 @@ def create_lora_mem_pool(
         num_experts: Number of experts per layer (for MoE models).
         tp_world_size: Tensor parallel world size for sharded dimensions (default: 1).
         ep_world_size: Expert parallel world size for expert sharding (default: 1).
+        lora_compute_config: LoRAComputeConfig for storage and compute locations.
+                           If None, defaults to GPU storage and compute.
     """
     return LoRAMemPool.create(
         num_layers=num_layers,
@@ -1111,7 +1139,7 @@ def create_lora_mem_pool(
         vocab_size=vocab_size,
         num_kv_heads=num_kv_heads,
         dtype=dtype,
-        device=device,
+        lora_compute_config=lora_compute_config,
         vl_hidden_size=vl_hidden_size,
         vl_intermediate_size=vl_intermediate_size,
         vl_out_hidden_size=vl_out_hidden_size,

@@ -198,7 +198,8 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
 
         # Check if we need per-expert LoRA
         # 确保 dispatcher 存在且开启了 detached lora 模式
-        use_per_expert_lora = self.use_detached_lora_ and self.lora_dispatcher_ is not None
+        force_slow = getattr(self, 'force_slow_lora_path', False)
+        use_per_expert_lora = (self.use_detached_lora_ and self.lora_dispatcher_ is not None) or force_slow
 
         # ----------------------------------------------------------------
         # Fast Path: 使用 Fused Kernel (无 LoRA)

@@ -19,6 +19,7 @@ from lightllm.common.basemodel.triton_kernel.mtp_utils import mtp_verify
 from lightllm.utils.dist_utils import init_distributed_env
 from lightllm.utils.envs_utils import get_unique_server_name
 from lightllm.server.core.objs import ShmReqManager, StartArgs
+from lightllm.server.core.objs.lora_compute_config import LoRAComputeConfig
 from lightllm.server.core.objs.io_objs import AbortedReqCmd, StopStrMatchedReqCmd
 from lightllm.server.router.model_infer.infer_batch import g_infer_context
 from lightllm.server.router.model_infer.pin_mem_manager import g_pin_mem_manager
@@ -180,7 +181,8 @@ class ModeBackend:
             # Use batched mode for S-LoRA
             self.use_batched_lora_mode = True
             lora_adapter_dirs = {1: lora_dir}  # adapter_id -> directory mapping
-            self._import_lora_modules(compute_on_cpu=False)
+            lora_compute_config = LoRAComputeConfig.from_string(self.args.compute_device)
+            self._import_lora_modules(lora_compute_config=lora_compute_config)
             self.init_batched_lora_adapters(lora_adapter_dirs)
 
         self.radix_cache = (
@@ -885,10 +887,10 @@ class ModeBackend:
     # _import_lora_modules is called from init_model() to set up LoRA functions
     # for S-LoRA batched mode
 
-    def _import_lora_modules(self, compute_on_cpu: bool):
+    def _import_lora_modules(self, lora_compute_config: LoRAComputeConfig):
         """Import LoRA modules based on model type."""
         self.lora_support = False
-        self._compute_on_cpu = compute_on_cpu
+        self._lora_compute_config = lora_compute_config
 
         model_module = getattr(self.model, '__module__', '')
 
@@ -996,7 +998,7 @@ class ModeBackend:
                 vocab_size=vocab_size,
                 num_kv_heads=num_kv_heads,
                 dtype=torch.float16,
-                device="cuda",
+                lora_compute_config=self._lora_compute_config,
                 vl_hidden_size=vl_hidden_size,
                 vl_intermediate_size=vl_intermediate_size,
                 vl_out_hidden_size=vl_out_hidden_size,
@@ -1072,7 +1074,7 @@ class ModeBackend:
                 num_layers=1,  # Single layer dispatcher
                 lora_rank=max_rank,
                 lora_alpha=1.0,  # scaling handled separately via a_scaling in pool
-                compute_on_cpu=getattr(self, '_compute_on_cpu', False)
+                lora_compute_config=self._lora_compute_config
             )
             self.lora_dispatchers.append(dispatcher)
 
@@ -1179,6 +1181,7 @@ class ModeBackend:
         # Set LoRA enabled on all layers
         for layer_infer in self.model.layers_infer:
             layer_infer.use_detached_lora_ = True
+            layer_infer.force_slow_lora_path = getattr(self, 'force_slow_lora_path', False)
 
         # Run the actual inference
         # The actual inference logic is in the subclass implementations

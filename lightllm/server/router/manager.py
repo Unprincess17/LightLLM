@@ -198,7 +198,7 @@ class RouterManager:
             "lora_max_size": self.args.lora_max_size,
             "lora_adapter_id": self.args.lora_adapter_id,
             "lora_port": self.args.lora_port,
-            "compute_on_cpu": self.args.compute_on_cpu,
+            "compute_device": self.args.compute_device,
         }
 
         await self.model_rpc_client.init_model(kvargs=kvargs)
