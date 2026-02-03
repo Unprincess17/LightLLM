@@ -29,6 +29,12 @@ from .control_state import ControlState
 logger = init_logger(__name__)
 
 
+def _use_mock_prefill() -> bool:
+    """Check if mock prefill mode is enabled via environment variable."""
+    import os
+    return os.environ.get("MOCK_PREFILL_LOGITS", "").lower() == "true"
+
+
 class ChunkedPrefillBackend(ModeBackend):
     def __init__(self) -> None:
         super().__init__()
@@ -36,7 +42,12 @@ class ChunkedPrefillBackend(ModeBackend):
         # 用于控制每一步是执行prefill 和 decode 还是跳过
         self.control_state_machine = ControlState()
 
+        # Mock prefill buffer for performance testing (avoids torch.randn overhead)
+        self._mock_logit_buffer = None
+        self._mock_kv_buffer = None
+
         # 在 mtp 模式下切换绑定的prefill 和 decode 函数
+        logger.debug(f"MTP mode: {get_env_start_args().mtp_mode}")
         if get_env_start_args().mtp_mode:
             self.prefill = self.prefill_mtp
             self.decode = self.decode_mtp
@@ -127,17 +138,59 @@ class ChunkedPrefillBackend(ModeBackend):
         model_input, run_reqs = prepare_prefill_inputs(
             prefill_reqs, is_chuncked_mode=not self.disable_chunked_prefill, is_multimodal=self.is_multimodal
         )
+
+        # Mock prefill mode for performance testing (PD disaggregation)
+        use_mock = _use_mock_prefill()
+        if use_mock:
+            logger.debug(f"MOCK MODE ACTIVE: skipping model.forward for {len(prefill_reqs)} requests")
+            # Force greedy sampling to avoid _top_p_top_k issues in chunked prefill
+            for req in run_reqs:
+                req.sampling_param.shm_param.top_k = 1
+            mock_logits = self._get_mock_logits(model_input.total_token_num)
+            # In chunked prefill mode, logits has shape [total_tokens, vocab_size]
+            # where total_tokens is the sum of all sequence lengths.
+            # The sample function processes each token's logits individually.
+            # We slice to get exactly the needed shape.
+            mock_logits = mock_logits[:model_input.total_token_num]
+        else:
+            mock_logits = None
+            logger.debug(f"Don't use mock prefill logits.")
+
         with torch.cuda.stream(g_infer_context.get_overlap_stream()):
-            model_output = self.model.forward(model_input)
-            _, next_token_ids_cpu, next_token_logprobs_cpu = self._sample_and_scatter_token(
-                logits=model_output.logits,
-                b_req_idx=model_input.b_req_idx,
-                b_mtp_index=model_input.b_mtp_index,
-                run_reqs=run_reqs,
-                is_prefill=True,
-                b_prefill_has_output_cpu=model_input.b_prefill_has_output_cpu,
-                mask_func=self.prefill_mask_func,
-            )
+            if use_mock:
+                # Minimal mock: compute greedy samples and copy to CPU
+                model_output = None
+                # Greedy sampling: argmax over vocabulary
+                next_token_ids = torch.argmax(mock_logits, dim=-1)  # [total_tokens]
+                next_token_probs = torch.softmax(mock_logits, dim=-1)
+                next_token_probs = torch.gather(next_token_probs, dim=-1, index=next_token_ids.unsqueeze(-1)).squeeze(-1)
+                next_token_logprobs = torch.log(next_token_probs)
+
+                # Move to CPU for downstream code
+                next_token_ids_cpu = next_token_ids.cpu()
+                next_token_logprobs_cpu = next_token_logprobs.cpu()
+
+                # Move b_req_idx for downstream updates
+                b_req_idx = model_input.b_req_idx.cuda()
+                b_mtp_index = model_input.b_mtp_index.cuda()
+
+                # Manually update req_to_next_token_ids (only for last token of each request in prefill)
+                req_to_next = self.model.req_manager.req_sampling_params_manager.req_to_next_token_ids
+                for i, req in enumerate(run_reqs):
+                    req_to_next[req.req_idx, 0] = next_token_ids_cpu[-1]  # Last token
+            else:
+                model_output = self.model.forward(model_input)
+                b_req_idx = model_input.b_req_idx
+                b_mtp_index = model_input.b_mtp_index
+                _, next_token_ids_cpu, next_token_logprobs_cpu = self._sample_and_scatter_token(
+                    logits=model_output.logits,
+                    b_req_idx=b_req_idx,
+                    b_mtp_index=b_mtp_index,
+                    run_reqs=run_reqs,
+                    is_prefill=True,
+                    b_prefill_has_output_cpu=model_input.b_prefill_has_output_cpu,
+                    mask_func=self.prefill_mask_func,
+                )
             sync_event = torch.cuda.Event()
             sync_event.record()
 
@@ -439,3 +492,48 @@ class ChunkedPrefillBackend(ModeBackend):
             mtp_accept_len=mtp_accept_len,
         )
         return eagle_mem_indexes_cpu
+
+    def _get_mock_logits(self, total_tokens: int) -> torch.Tensor:
+        """
+        Get a mock logits tensor for prefill performance testing.
+
+        Uses a pre-allocated buffer to avoid torch.randn overhead.
+        The buffer is reused across calls to minimize memory allocation.
+
+        Note: This skips actual model forward, so KV cache will be uninitialized.
+        For PD mode testing, this is acceptable if you're only testing:
+        - Control plane logic
+        - Scheduling decisions
+        - Network transfer (KV will be garbage but transfer speed is measured)
+
+        For accurate decode performance testing, ensure requests are properly
+        initialized with valid KV cache before entering decode stage.
+
+        Returns:
+            torch.Tensor: Logits tensor of shape [total_tokens, vocab_size]
+        """
+        vocab_size = getattr(self.model, "vocab_size", 32000)
+
+        # Initialize attribute if it doesn't exist (safety check)
+        if not hasattr(self, "_mock_logit_buffer"):
+            self._mock_logit_buffer = None
+
+        # Check if resize is needed
+        if self._mock_logit_buffer is None or self._mock_logit_buffer.shape[0] < total_tokens:
+            # SAFETY: Lower default to ~2GB (32k tokens) to prevent OOM
+            # If total_tokens is huge, allocate exactly what's needed + 10% padding
+            safe_default = 32768
+            alloc_size = max(total_tokens + 1024, safe_default)
+
+            self._mock_logit_buffer = torch.zeros(
+                (alloc_size, vocab_size),
+                dtype=torch.float16,
+                device="cuda"
+            )
+            # Deterministic hot-spots to stabilize greedy/top-k sampling
+            # Token 100 will be the dominant token (exp(5) >> exp(0))
+            self._mock_logit_buffer[:, 100] = 5.0
+            self._mock_logit_buffer[:, 1000] = 3.0
+
+        # Return a zero-copy view slice
+        return self._mock_logit_buffer[:total_tokens]
