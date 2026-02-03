@@ -50,17 +50,17 @@ HOST="0.0.0.0"
 ENABLE_MULTIMODAL=true
 LORA_MAX_SIZE=1024
 
-### Baseline 1: Store on CPU, Compute on GPU ###
+# ## Baseline 1: Store on CPU, Compute on GPU ###
 # COMPUTE_DEVICE="vl_storage:cpu,vl_compute:gpu,attn_storage:cpu,attn_compute:gpu,moe_storage:cpu,moe_compute:gpu"
 
-### Baseline 2: Store on CPU, Compute on CPU ###
-# COMPUTE_DEVICE="vl_storage:cpu,vl_compute:gpu,attn_storage:cpu,attn_compute:cpu,moe_storage:cpu,moe_compute:cpu"
-
-### Baseline 3: Store on GPU, compute on GPU ###
+## Baseline 2: Store on CPU, Compute on CPU ###
 COMPUTE_DEVICE="vl_storage:cpu,vl_compute:gpu,attn_storage:cpu,attn_compute:cpu,moe_storage:cpu,moe_compute:cpu"
 
-### Proposed: Store on CPU, compute Attn on CPU, MoE on GPU ###
-# COMPUTE_DEVICE="vl_storage:cpu,vl_compute:gpu,attn_storage:cpu,attn_compute:cpu,moe_storage:cpu,moe_compute:cpu"
+# ### Baseline 3: Store on GPU, compute on GPU ###
+# COMPUTE_DEVICE="vl_storage:cpu,vl_compute:gpu,attn_storage:gpu,attn_compute:gpu,moe_storage:gpu,moe_compute:gpu"
+
+### Proposed: Store on CPU, compute Attn on GPU, MoE on CPU ###
+# COMPUTE_DEVICE="vl_storage:cpu,vl_compute:gpu,attn_storage:cpu,attn_compute:gpu,moe_storage:cpu,moe_compute:cpu"
 
 FORCE_SLOW_LORA_PATH=true
 MAX_REQ_TOTAL_LEN=8192
@@ -71,6 +71,7 @@ BATCH_MAX_TOKENS=4096
 LOADWORKER=8
 LIGHTLLM_LOGGING="DEBUG"
 MOE_MODE="TP"
+MOCK_PREFILL_LOGITS=FALSE
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -187,6 +188,7 @@ fi
 export LOADWORKER=$LOADWORKER
 export LIGHTLLM_LOGGING=$LIGHTLLM_LOGGING
 export MOE_MODE=$MOE_MODE
+export MOCK_PREFILL_LOGITS=$MOCK_PREFILL_LOGITS
 
 echo ""
 echo "Starting server..."
@@ -196,6 +198,7 @@ echo "Environment:"
 echo "  LOADWORKER=$LOADWORKER"
 echo "  LIGHTLLM_LOGGING=$LIGHTLLM_LOGGING"
 echo "  MOE_MODE=$MOE_MODE"
+echo "  MOCK_PREFILL_LOGITS=$MOCK_PREFILL_LOGITS"
 echo ""
 
 # Execute

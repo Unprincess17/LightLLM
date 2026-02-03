@@ -69,10 +69,10 @@ class Qwen3VLMOETransformerLayerInfer(Qwen3MOETransformerLayerInfer):
             lora_results = self.lora_dispatcher_.get_attn_qkv_lora(
                 input, self.layer_num_, self.req_bins_
             )
-            logger.debug(f"[LoRA Infer] Layer {self.layer_num_}: q_shape={q.shape}, cache_kv_shape={cache_kv.shape}")
-            logger.debug(f"[LoRA Infer]   q_lora_shape={lora_results['q_lora'].shape}")
-            logger.debug(f"[LoRA Infer]   k_lora_shape={lora_results['k_lora'].shape}")
-            logger.debug(f"[LoRA Infer]   v_lora_shape={lora_results['v_lora'].shape}")
+            # logger.debug(f"[LoRA Infer] Layer {self.layer_num_}: q_shape={q.shape}, cache_kv_shape={cache_kv.shape}")
+            # logger.debug(f"[LoRA Infer]   q_lora_shape={lora_results['q_lora'].shape}")
+            # logger.debug(f"[LoRA Infer]   k_lora_shape={lora_results['k_lora'].shape}")
+            # logger.debug(f"[LoRA Infer]   v_lora_shape={lora_results['v_lora'].shape}")
             q = q + lora_results["q_lora"]
             # cache_kv is [batch, (tp_k + tp_v) * head_dim] with K and V concatenated
             # View to [batch, num_heads, head_dim] to add LoRA to correct heads
@@ -87,9 +87,9 @@ class Qwen3VLMOETransformerLayerInfer(Qwen3MOETransformerLayerInfer):
             # View back to 2D for downstream processing
             cache_kv = cache_kv.view(-1, (self.tp_k_head_num_ + self.tp_v_head_num_) * self.head_dim_)
 
-            logger.debug(f"[LoRA Infer]   q_lora norm={lora_results['q_lora'].norm().item():.4f}")
-            logger.debug(f"[LoRA Infer]   k_lora norm={lora_results['k_lora'].norm().item():.4f}")
-            logger.debug(f"[LoRA Infer]   v_lora norm={lora_results['v_lora'].norm().item():.4f}")
+            # logger.debug(f"[LoRA Infer]   q_lora norm={lora_results['q_lora'].norm().item():.4f}")
+            # logger.debug(f"[LoRA Infer]   k_lora norm={lora_results['k_lora'].norm().item():.4f}")
+            # logger.debug(f"[LoRA Infer]   v_lora norm={lora_results['v_lora'].norm().item():.4f}")
 
         qk_rmsnorm_forward(
             q,
@@ -137,7 +137,7 @@ class Qwen3VLMOETransformerLayerInfer(Qwen3MOETransformerLayerInfer):
             o_lora = self.lora_dispatcher_.batch_apply_o_lora(input, self.layer_num_, self.req_bins_)
             o_tensor = o_tensor + o_lora
 
-            logger.debug(f"[LoRA Infer]   o_lora norm={o_lora.norm().item():.4f}")
+            # logger.debug(f"[LoRA Infer]   o_lora norm={o_lora.norm().item():.4f}")
 
         return o_tensor
 

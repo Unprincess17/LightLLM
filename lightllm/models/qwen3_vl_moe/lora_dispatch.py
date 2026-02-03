@@ -42,6 +42,19 @@ except ImportError:
     BGMV_AVAILABLE = False
     # Fallback: naive per-request computation
 
+# Try to import AVX-512 CPU kernel for CPU offload mode
+try:
+    from lightllm._kernels.lora.lora_cpu_kernel import (
+        batch_lora_avx,
+        lora_down_avx,
+        lora_up_avx,
+        is_available as AVX_AVAILABLE,
+    )
+    if AVX_AVAILABLE:
+        logger.info("AVX-512 BF16 CPU kernel available")
+except ImportError:
+    AVX_AVAILABLE = False
+
 
 class Qwen3VLMoELoRADispatcher:
     """
@@ -338,7 +351,7 @@ class Qwen3VLMoELoRADispatcher:
             return torch.zeros(input_tensor.shape[0], 0, device=input_tensor.device)
 
         pool = self.lora_mem_pool.attn_k_pool
-        logger.debug(f"[LoRA K] pool={type(pool).__name__}, key_buffer.shape={pool.key_buffer.shape}, value_buffer.shape={pool.value_buffer.shape}")
+        
         bins = req_bins if req_bins is not None else self.req_bins
         if bins is None:
             return torch.zeros(input_tensor.shape[0], pool.value_buffer.shape[2], dtype=input_tensor.dtype, device=input_tensor.device)
@@ -820,16 +833,22 @@ class Qwen3VLMoELoRADispatcher:
             req_bins: Request to adapter mapping (optional, uses self.req_bins if None)
 
         This is slower but correctness-preserving.
+        Uses AVX-512 BF16 kernel when available on CPU.
         """
         # Ensure req_bins is available
         if req_bins is None:
             req_bins = self.req_bins
         if req_bins is None:
-            return torch.zeros_like(input_tensor)
+            return torch.zeros(input_tensor.shape[0], pool.value_buffer.shape[2], dtype=input_tensor.dtype, device=input_tensor.device)
 
         batch_size = input_tensor.shape[0]
-        hidden_dim = input_tensor.shape[1]
-        output = torch.zeros(batch_size, hidden_dim, dtype=input_tensor.dtype, device=input_tensor.device)
+        # Use pool's B dimension (handles GQA where K/V output != input)
+        output_dim = pool.value_buffer.shape[2]
+        output = torch.zeros(batch_size, output_dim, dtype=input_tensor.dtype, device=input_tensor.device)
+
+        # Truncate req_bins to match batch_size (handles decode phase with fewer requests)
+        if len(req_bins) > batch_size:
+            req_bins = req_bins[:batch_size]
 
         # Group requests by adapter
         adapter_to_indices = {}
@@ -838,6 +857,11 @@ class Qwen3VLMoELoRADispatcher:
             if bin_idx not in adapter_to_indices:
                 adapter_to_indices[bin_idx] = []
             adapter_to_indices[bin_idx].append(i)
+
+        # Determine if we should use AVX kernel
+        use_avx = (AVX_AVAILABLE and
+                   input_tensor.device.type == 'cpu' and
+                   input_tensor.dtype == torch.bfloat16)
 
         # Process each adapter group
         for adapter_idx, req_indices in adapter_to_indices.items():
@@ -858,14 +882,43 @@ class Qwen3VLMoELoRADispatcher:
             B = pool.value_buffer[loc, :a_len]  # [rank, hidden]
 
             # Compute LoRA for each request in this group
-            for req_idx in req_indices:
-                x = input_tensor[req_idx]  # [hidden]
-                # LoRA: x @ A @ B.T * scaling
-                # x @ A: [hidden] @ [rank, hidden].T = [rank]
-                intermediate = torch.matmul(x, A)  # [rank]
-                # intermediate @ B: [rank] @ [hidden, rank].T = [hidden]
-                lora_out = torch.matmul(intermediate, B.T) * a_scaling
-                output[req_idx] = lora_out
+            if use_avx:
+                # Use AVX-512 BF16 kernel for batched computation
+                batch_input = input_tensor[req_indices]  # [n, hidden]
+
+                # Convert to bfloat16 if needed
+                if A.dtype != torch.bfloat16:
+                    A = A.to(dtype=torch.bfloat16)
+                    B = B.to(dtype=torch.bfloat16)
+
+                # Ensure contiguous layout
+                if not batch_input.is_contiguous():
+                    batch_input = batch_input.contiguous()
+                if not A.is_contiguous():
+                    A = A.contiguous()
+                if not B.is_contiguous():
+                    B = B.contiguous()
+
+                # Call AVX kernel for batched LoRA
+                batch_output = batch_lora_avx(batch_input, A, B, a_scaling)  # [n, hidden]
+                output[req_indices] = batch_output
+            else:
+                # Fallback: PyTorch matmul per request
+                # Move to input device and dtype if pool is on different device
+                if A.device != input_tensor.device or A.dtype != input_tensor.dtype:
+                    A = A.to(dtype=input_tensor.dtype, device=input_tensor.device)
+                    B = B.to(dtype=input_tensor.dtype, device=input_tensor.device)
+
+                for req_idx in req_indices:
+                    x = input_tensor[req_idx]  # [hidden]
+                    # LoRA: x @ A @ B * scaling
+                    # A stored as [rank, hidden], need A.T for [hidden, rank]
+                    # B stored as [rank, hidden], need B for [hidden, rank]
+                    # x @ A.T: [hidden] @ [hidden, rank] = [rank]
+                    intermediate = torch.matmul(x, A.T)  # [rank]
+                    # intermediate @ B: [rank] @ [hidden, rank] = [hidden]
+                    lora_out = torch.matmul(intermediate, B) * a_scaling
+                    output[req_idx] = lora_out
 
         return output
 

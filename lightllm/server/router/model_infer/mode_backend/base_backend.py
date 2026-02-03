@@ -1146,7 +1146,7 @@ class ModeBackend:
             if hasattr(layer_infer, 'set_req_bins'):
                 layer_infer.set_req_bins(req_bins)
 
-        self.logger.debug(f"[LoRA Backend]   Batched mode enabled for {len(self.lora_dispatchers)} dispatchers")
+        # self.logger.debug(f"[LoRA Backend]   Batched mode enabled for {len(self.lora_dispatchers)} dispatchers")
         return req_bins
 
     def _get_batch_adapter_status(self, reqs: list) -> Tuple[bool, bool]:
