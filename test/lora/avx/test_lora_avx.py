@@ -176,7 +176,13 @@ def run_correctness_tests(verbose=False):
 
 
 def run_performance_benchmark(verbose=False):
-    """Run performance benchmarks comparing AVX vs PyTorch."""
+    """Run performance benchmarks comparing AVX vs PyTorch.
+
+    For fair comparison, we compare against:
+    1. Single-threaded PyTorch (same resource usage)
+    2. Multi-threaded PyTorch (absolute throughput)
+    3. PCIe transfer time (Shadow Pipelining budget)
+    """
     print("\n" + "=" * 60)
     print("Performance Benchmark")
     print("=" * 60)
@@ -185,8 +191,9 @@ def run_performance_benchmark(verbose=False):
         print("SKIP: AVX kernel not available")
         return
 
-    print("\nNote: PyTorch uses multi-threaded MKL.")
-    print("For Shadow Pipelining, single-threaded AVX has minimal interference.\n")
+    # Store original thread count
+    import torch
+    original_threads = torch.get_num_threads()
 
     # Configuration
     configs = [
@@ -202,7 +209,62 @@ def run_performance_benchmark(verbose=False):
         (4, 8192, 16, "B=4, H=8192, R=16"),
     ]
 
-    print(f"{'Config':<25} {'AVX (ms)':<12} {'PyTorch (ms)':<14} {'Ratio':<10}")
+    print(f"Original PyTorch threads: {original_threads}")
+    print("\n" + "=" * 60)
+    print("Comparison 1: Single-threaded PyTorch (Fair Comparison)")
+    print("=" * 60)
+
+    # Set PyTorch to single-threaded for fair comparison
+    torch.set_num_threads(1)
+
+    print(f"{'Config':<25} {'AVX (ms)':<12} {'PyTorch-1T (ms)':<18} {'Ratio':<10} {'Status':<15}")
+    print("-" * 80)
+
+    single_thread_results = []
+
+    for batch, hidden, rank, desc in configs:
+        # Create tensors
+        x = torch.randn(batch, hidden, dtype=torch.bfloat16)
+        A = torch.randn(rank, hidden, dtype=torch.bfloat16)
+        B = torch.randn(rank, hidden, dtype=torch.bfloat16)
+
+        # Warm up AVX
+        for _ in range(10):
+            _ = batch_lora_avx(x, A, B, 0.1)
+
+        # Benchmark AVX
+        iterations = 100
+        start = time.perf_counter()
+        for _ in range(iterations):
+            out_avx = batch_lora_avx(x, A, B, 0.1)
+        avx_time = (time.perf_counter() - start) / iterations * 1000
+
+        # Benchmark PyTorch (single-threaded)
+        x_f32 = x.float()
+        A_f32 = A.float()
+        B_f32 = B.float()
+
+        start = time.perf_counter()
+        for _ in range(iterations):
+            intermediate = torch.matmul(x_f32, A_f32.T)
+            out_pt = torch.matmul(intermediate, B_f32) * 0.1
+        pytorch_time = (time.perf_counter() - start) / iterations * 1000
+
+        ratio = avx_time / pytorch_time if pytorch_time > 0 else float('inf')
+        status = "FASTER" if ratio < 1.0 else "SLOWER"
+
+        print(f"{desc:<25} {avx_time:<12.3f} {pytorch_time:<18.3f} {ratio:<10.2f}x {status:<15}")
+
+        single_thread_results.append((desc, avx_time, pytorch_time))
+
+    # Restore original threads for multi-threaded comparison
+    torch.set_num_threads(original_threads)
+
+    print("\n" + "=" * 60)
+    print("Comparison 2: Multi-threaded PyTorch (Absolute Throughput)")
+    print("=" * 60)
+
+    print(f"{'Config':<25} {'AVX (ms)':<12} {'PyTorch-MT (ms)':<18} {'Ratio':<10}")
     print("-" * 65)
 
     for batch, hidden, rank, desc in configs:
@@ -222,7 +284,7 @@ def run_performance_benchmark(verbose=False):
             out_avx = batch_lora_avx(x, A, B, 0.1)
         avx_time = (time.perf_counter() - start) / iterations * 1000
 
-        # Benchmark PyTorch
+        # Benchmark PyTorch (multi-threaded)
         x_f32 = x.float()
         A_f32 = A.float()
         B_f32 = B.float()
@@ -235,11 +297,39 @@ def run_performance_benchmark(verbose=False):
 
         ratio = avx_time / pytorch_time if pytorch_time > 0 else float('inf')
 
-        print(f"{desc:<25} {avx_time:<12.3f} {pytorch_time:<14.3f} {ratio:<10.2f}x")
+        print(f"{desc:<25} {avx_time:<12.3f} {pytorch_time:<18.3f} {ratio:<10.2f}x")
+
+    print("\n" + "=" * 60)
+    print("Shadow Pipelining Analysis")
+    print("=" * 60)
+
+    # PCIe Gen4 x16 bandwidth: ~16 GB/s theoretical, ~12-14 GB/s practical
+    # BF16 = 2 bytes per element
+    pcie_bandwidth_gbs = 14.0  # GB/s (practical)
+
+    print(f"PCIe Gen4 x16 Bandwidth: ~{pcie_bandwidth_gbs} GB/s")
+    print(f"{'Config':<25} {'Data Size':<12} {'PCIe Time':<15} {'AVX Time':<12} {'Status':<15}")
+    print("-" * 80)
+
+    for batch, hidden, rank, desc in configs:
+        # Data size: input + output BF16 tensors
+        data_bytes = (batch * hidden * 2) * 2  # input + output, 2 bytes each
+        pcie_time_us = (data_bytes / (pcie_bandwidth_gbs * 1e9)) * 1e6
+
+        # Find AVX time from results
+        avx_time = next((r[1] for r in single_thread_results if r[0] == desc), 0)
+        avx_time_us = avx_time * 1000
+
+        # Check if AVX can hide behind PCIe
+        status = "CAN HIDE" if avx_time_us < pcie_time_us else "TOO SLOW"
+
+        print(f"{desc:<25} {data_bytes/1024:<10.1f} KB {pcie_time_us:<15.1f} us {avx_time_us:<12.1f} us {status:<15}")
 
     print("\n" + "-" * 65)
-    print("Note: Lower ratio = AVX is slower than PyTorch MKL")
-    print("For Shadow Pipelining, single-threaded AVX minimizes interference.")
+    print("Interpretation:")
+    print("  - 'CAN HIDE': AVX time < PCIe transfer time (good for Shadow Pipelining)")
+    print("  - 'TOO SLOW': AVX time > PCIe transfer time (needs optimization)")
+    print("  - Single-threaded comparison shows true AVX efficiency")
 
 
 def run_individual_kernel_tests(verbose=False):

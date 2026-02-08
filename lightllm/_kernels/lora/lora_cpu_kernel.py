@@ -90,6 +90,7 @@ def batch_lora_avx(
 ) -> torch.Tensor:
     """
     Batch LoRA computation using AVX-512 BF16 kernel.
+    Native BF16 computation with _mm512_dpbf16_ps instruction.
 
     Args:
         input_tensor: Input tensor [batch, hidden] (bfloat16, CPU)
@@ -111,7 +112,10 @@ def batch_lora_avx(
     assert A.dtype == torch.bfloat16, "A must be bfloat16"
     assert B.dtype == torch.bfloat16, "B must be bfloat16"
 
-    # Ensure contiguous memory layout
+    batch, hidden = input_tensor.shape
+    rank = A.shape[0]
+
+    # Ensure contiguous layout for cache efficiency
     if not input_tensor.is_contiguous():
         input_tensor = input_tensor.contiguous()
     if not A.is_contiguous():
@@ -119,13 +123,10 @@ def batch_lora_avx(
     if not B.is_contiguous():
         B = B.contiguous()
 
-    batch, hidden = input_tensor.shape
-    rank = A.shape[0]
-
-    # Allocate output tensor
+    # Allocate output (BF16)
     output = torch.empty(batch, hidden, dtype=torch.bfloat16, device='cpu')
 
-    # Call C++ kernel
+    # Call C++ kernel with native BF16
     _lora_cpu_kernel.batch_lora_bindings(
         input_tensor,
         A,

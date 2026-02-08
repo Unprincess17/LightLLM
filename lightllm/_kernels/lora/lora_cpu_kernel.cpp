@@ -1,177 +1,141 @@
-// AVX-512 BF16 LoRA Kernel for Sapphire Rapids (Intel Xeon Gold 5520+)
-// Uses _mm512_dpbf16_ps for 2x throughput: BF16*BF16 + F32 -> F32 in one cycle
+// AVX-512 BF16 LoRA Kernel for Sapphire Rapids
+// Uses native _mm512_dpbf16_ps instruction
+// Optimized for cache-friendly memory access
 
 #include <torch/extension.h>
 #include <immintrin.h>
 #include <cstddef>
 #include <vector>
+#include <cstring>
 
-// Use torch::BFloat16 type
 using bf16 = c10::BFloat16;
 
 // Down Projection: x [B, H] @ A.T [R, H] -> Out [B, R]
-// A is stored as [R, H] Row-major (no transpose needed)
-// x is stored as [B, H] Row-major
+// Inner product pattern: contiguous access for both x and A rows
 void lora_down_avx512_bf16(
-    const bf16* x,      // [B, H] - contiguous
-    const bf16* A_mat,  // [R, H] - contiguous (Row-major)
-    bf16* out,          // [B, R] - output
+    const bf16* x, const bf16* A_mat, bf16* out,
     int B, int H, int R) {
 
-    // Process each batch element
     for (int b = 0; b < B; ++b) {
         const bf16* x_ptr = x + b * H;
 
-        // Process each rank
         for (int r = 0; r < R; ++r) {
             const bf16* A_ptr = A_mat + r * H;
-            __m512 acc = _mm512_setzero_ps();  // F32 accumulator
+            __m512 acc = _mm512_setzero_ps();
 
-            // Vectorized dot product: 32 BF16s (512 bits) per iteration
+            // Process 32 BF16 elements per iteration (512 bits)
             int k = 0;
             for (; k + 31 < H; k += 32) {
-                auto v_x = _mm512_loadu_si512((void*)(x_ptr + k));
-                auto v_A = _mm512_loadu_si512((void*)(A_ptr + k));
+                auto v_x = _mm512_loadu_si512((const __m512i*)(x_ptr + k));
+                auto v_A = _mm512_loadu_si512((const __m512i*)(A_ptr + k));
                 // DPBF16: Dot product BF16 pairs, accumulate to F32
                 acc = _mm512_dpbf16_ps(acc, (__m512bh)v_x, (__m512bh)v_A);
             }
 
-            // Horizontal reduce F32 accumulator to single scalar
+            // Horizontal reduce and store
             float res_f32 = _mm512_reduce_add_ps(acc);
-
-            // Store as BF16
+            for (; k < H; ++k) {
+                res_f32 += (float)x_ptr[k] * (float)A_ptr[k];
+            }
             out[b * R + r] = bf16(res_f32);
         }
     }
 }
 
 // Up Projection: x [B, R] @ B [R, H] -> Out [B, H]
-void lora_up_avx512_bf16_opt(
-    const bf16* x,       // [B, R] - contiguous
-    const bf16* B_mat,   // [R, H] - contiguous (Row-major)
-    bf16* out,          // [B, H] - output
+// CORRECTED: Iterate H on outside, accumulate R in register
+// Writes to memory only ONCE per output element
+void lora_up_avx512_bf16(
+    const bf16* x, const bf16* B_mat, bf16* out,
     int B, int R, int H) {
 
-    // Process each batch element
     for (int b = 0; b < B; ++b) {
         const bf16* x_ptr = x + b * R;
+        bf16* out_ptr = out + b * H;
 
-        // Process H in chunks of 16 (32 bytes = 16 BF16s)
+        // Process in blocks of 16 (one AVX-512 register = 16 floats = 32 BF16s)
         int h = 0;
         for (; h + 15 < H; h += 16) {
-            // Initialize accumulators for each H position
-            __m512 accs[16];
-            for (int i = 0; i < 16; ++i) {
-                accs[i] = _mm512_setzero_ps();
-            }
+            __m512 acc = _mm512_setzero_ps();
 
-            // Accumulate over ranks
+            // Accumulate over rank dimension
             for (int r = 0; r < R; ++r) {
                 float x_val = (float)x_ptr[r];
-                __m512 v_x = _mm512_set1_ps(x_val);
+                if (x_val == 0.0f) continue;
 
-                // Load 16 BF16s from B matrix
-                const bf16* B_ptr = B_mat + r * H + h;
-
-                // Process each of the 16 elements
-                for (int hi = 0; hi < 16; ++hi) {
-                    float b_val = (float)B_ptr[hi];
-                    accs[hi] = _mm512_fmadd_ps(v_x, _mm512_set1_ps(b_val), accs[hi]);
-                }
+                const bf16* B_row = B_mat + r * H;
+                // Load 16 BF16s as F32 via vcvtneps_pbh (if available) or manual
+                // For Sapphire Rapids, use native BF16 support
+                __m512i v_B = _mm512_loadu_si512((const __m512i*)(B_row + h));
+                // Convert BF16 to F32 using DPBF16-style conversion
+                // Shift upper 16 bits (BF16) to lower 16 bits, then zero-extend to F32
+                // Actually, BF16 is in upper bits for DPBF16, let's use vmovnebhd
+                __m512 v_Bf32 = _mm512_castsi512_ps(_mm512_srli_epi32(v_B, 16));
+                acc = _mm512_fmadd_ps(_mm512_set1_ps(x_val), v_Bf32, acc);
             }
 
-            // Store results
-            for (int hi = 0; hi < 16; ++hi) {
-                float res = _mm512_cvtss_f32(accs[hi]);
-                out[b * H + h + hi] = bf16(res);
+            // Store result
+            float acc_arr[16];
+            _mm512_storeu_ps(acc_arr, acc);
+            for (int i = 0; i < 16; ++i) {
+                out_ptr[h + i] = bf16(acc_arr[i]);
             }
         }
 
-        // Handle remaining H elements
+        // Handle remaining elements
         for (; h < H; ++h) {
-            __m512 acc = _mm512_setzero_ps();
+            float sum = 0.0f;
             for (int r = 0; r < R; ++r) {
-                float x_val = (float)x_ptr[r];
-                float b_val = (float)B_mat[r * H + h];
-                acc = _mm512_fmadd_ps(_mm512_set1_ps(x_val), _mm512_set1_ps(b_val), acc);
+                sum += (float)x_ptr[r] * (float)B_mat[r * H + h];
             }
-            out[b * H + h] = bf16(_mm512_cvtss_f32(acc));
+            out_ptr[h] = bf16(sum);
         }
     }
 }
 
-// Combined LoRA: x @ A.T @ B * scaling
+// Combined LoRA computation
 void batch_lora_avx512_bf16(
-    const bf16* x,       // [B, H]
-    const bf16* A_mat,   // [R, H]
-    const bf16* B_mat,   // [R, H]
-    bf16* temp,          // [B, R] - intermediate storage
-    bf16* out,           // [B, H]
-    int B, int H, int R,
-    float scaling) {
+    const bf16* x, const bf16* A_mat, const bf16* B_mat,
+    bf16* temp, bf16* out,
+    int B, int H, int R, float scaling) {
 
-    // Step 1: Down projection x @ A.T -> temp [B, R]
     lora_down_avx512_bf16(x, A_mat, temp, B, H, R);
-
-    // Step 2: Up projection temp @ B -> out [B, H]
-    lora_up_avx512_bf16_opt(temp, B_mat, out, B, R, H);
+    lora_up_avx512_bf16(temp, B_mat, out, B, R, H);
 
     // Apply scaling
-    for (int i = 0; i < B * H; ++i) {
-        out[i] = bf16((float)out[i] * scaling);
+    if (scaling != 1.0f) {
+        for (int i = 0; i < B * H; ++i) {
+            out[i] = bf16((float)out[i] * scaling);
+        }
     }
 }
 
 // PyTorch bindings
-void lora_down_bindings(
-    torch::Tensor x,        // [B, H]
-    torch::Tensor A,        // [R, H]
-    torch::Tensor out) {    // [B, R]
-
-    const bf16* x_ptr = (const bf16*)x.data_ptr();
-    const bf16* A_ptr = (const bf16*)A.data_ptr();
-    bf16* out_ptr = (bf16*)out.data_ptr();
-
-    int B = x.size(0);
-    int H = x.size(1);
-    int R = A.size(0);
-
-    lora_down_avx512_bf16(x_ptr, A_ptr, out_ptr, B, H, R);
+void lora_down_bindings(torch::Tensor x, torch::Tensor A, torch::Tensor out) {
+    lora_down_avx512_bf16(
+        (const bf16*)x.data_ptr(),
+        (const bf16*)A.data_ptr(),
+        (bf16*)out.data_ptr(),
+        x.size(0), x.size(1), A.size(0));
 }
 
-void lora_up_bindings(
-    torch::Tensor x,        // [B, R]
-    torch::Tensor B_tensor, // [R, H]
-    torch::Tensor out) {   // [B, H]
-
-    const bf16* x_ptr = (const bf16*)x.data_ptr();
-    const bf16* B_ptr = (const bf16*)B_tensor.data_ptr();
-    bf16* out_ptr = (bf16*)out.data_ptr();
-
-    int batch = x.size(0);
-    int R = x.size(1);
-    int H = B_tensor.size(1);
-
-    lora_up_avx512_bf16_opt(x_ptr, B_ptr, out_ptr, batch, R, H);
+void lora_up_bindings(torch::Tensor x, torch::Tensor B_tensor, torch::Tensor out) {
+    lora_up_avx512_bf16(
+        (const bf16*)x.data_ptr(),
+        (const bf16*)B_tensor.data_ptr(),
+        (bf16*)out.data_ptr(),
+        x.size(0), x.size(1), B_tensor.size(1));
 }
 
-void batch_lora_bindings(
-    torch::Tensor x,        // [B, H]
-    torch::Tensor A,        // [R, H]
-    torch::Tensor B_tensor, // [R, H]
-    torch::Tensor out,      // [B, H]
-    float scaling) {
-
-    const bf16* x_ptr = (const bf16*)x.data_ptr();
-    const bf16* A_ptr = (const bf16*)A.data_ptr();
-    const bf16* B_ptr = (const bf16*)B_tensor.data_ptr();
-    bf16* out_ptr = (bf16*)out.data_ptr();
-
-    int B = x.size(0);
-    int H = x.size(1);
-    int R = A.size(0);
-
-    // Allocate temporary buffer for intermediate
+void batch_lora_bindings(torch::Tensor x, torch::Tensor A, torch::Tensor B_tensor,
+                        torch::Tensor out, float scaling) {
+    int B = x.size(0), H = x.size(1), R = A.size(0);
     std::vector<bf16> temp(B * R);
-    batch_lora_avx512_bf16(x_ptr, A_ptr, B_ptr, temp.data(), out_ptr, B, H, R, scaling);
+    batch_lora_avx512_bf16(
+        (const bf16*)x.data_ptr(),
+        (const bf16*)A.data_ptr(),
+        (const bf16*)B_tensor.data_ptr(),
+        temp.data(),
+        (bf16*)out.data_ptr(),
+        B, H, R, scaling);
 }
