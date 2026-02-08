@@ -219,8 +219,6 @@ class Qwen3VLMoELoRADispatcher:
             needs_resize = True
 
         if needs_resize:
-            logger.debug(f"[LoRA Scratchpad] Reallocating: pool type={type(pool).__name__}, a_hidden={a_hidden}, b_hidden={b_hidden}, active_count={active_count}")
-            logger.debug(f"[LoRA Scratchpad] pool.key_buffer.shape={pool.key_buffer.shape}, pool.value_buffer.shape={pool.value_buffer.shape}")
             # Allocate for active count only
             self.gpu_scratchpad_a = torch.empty(
                 (active_count, max_rank, a_hidden),
@@ -230,7 +228,6 @@ class Qwen3VLMoELoRADispatcher:
                 (active_count, max_rank, b_hidden),
                 dtype=pool.value_buffer.dtype, device=device
             )
-            logger.debug(f"[LoRA Scratchpad] gpu_scratchpad_a.shape={self.gpu_scratchpad_a.shape}, gpu_scratchpad_b.shape={self.gpu_scratchpad_b.shape}")
             # Create dedicated stream for async transfers
             if device.type == "cuda" and self.transfer_stream is None:
                 self.transfer_stream = torch.cuda.Stream(priority=0)

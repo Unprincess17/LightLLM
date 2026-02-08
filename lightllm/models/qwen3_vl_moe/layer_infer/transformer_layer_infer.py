@@ -17,6 +17,7 @@ from lightllm.models.qwen3.triton_kernel.qk_norm import qk_rmsnorm_forward
 from lightllm.distributed import all_reduce
 from lightllm.utils.dist_utils import get_global_world_size
 from lightllm.models.qwen3_vl.triton_kernel.deepstack_multimodal_emb import apply_deepstack_features
+from lightllm.utils.nvtx_utils import NvtxAnnotate
 
 # Configure logging using global env var
 _LOG_LEVEL = os.environ.get("LIGHTLLM_LOGGING", "INFO").upper()
@@ -46,6 +47,7 @@ class Qwen3VLMOETransformerLayerInfer(Qwen3MOETransformerLayerInfer):
         """
         self.req_bins_ = req_bins
 
+    @NvtxAnnotate("Qwen3VL_QKV")
     def _get_qkv(
         self,
         input: torch.Tensor,
@@ -112,6 +114,7 @@ class Qwen3VLMOETransformerLayerInfer(Qwen3MOETransformerLayerInfer):
         )
         return q, cache_kv
 
+    @NvtxAnnotate("Qwen3VL_O_Proj")
     def _get_o(
         self, input, infer_state: Qwen3VLInferStateInfo, layer_weight: Qwen3MOETransformerLayerWeight
     ) -> torch.Tensor:
@@ -141,6 +144,7 @@ class Qwen3VLMOETransformerLayerInfer(Qwen3MOETransformerLayerInfer):
 
         return o_tensor
 
+    @NvtxAnnotate("Qwen3VLMOE_ContextForward")
     def context_forward(self, input_embdings, infer_state: Qwen3VLInferStateInfo, layer_weight):
         input1 = self._att_norm(input_embdings, infer_state, layer_weight)
         q, cache_kv = self._get_qkv(input1, infer_state, layer_weight)

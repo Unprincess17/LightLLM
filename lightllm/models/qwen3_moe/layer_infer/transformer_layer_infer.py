@@ -16,6 +16,7 @@ from functools import partial
 from lightllm.utils.log_utils import init_logger
 from lightllm.utils.dist_utils import get_global_world_size
 from lightllm.distributed.communication_op import all_gather_into_tensor, reduce_scatter_tensor
+from lightllm.utils.nvtx_utils import NvtxAnnotate
 
 logger = init_logger(__name__)
 
@@ -189,6 +190,7 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
 
         return q, cache_kv
 
+    @NvtxAnnotate("MoE_FFN")
     def _moe_ffn(
         self, input, infer_state: LlamaInferStateInfo, layer_weight: Qwen3MOETransformerLayerWeight
     ) -> torch.Tensor:

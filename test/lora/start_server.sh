@@ -50,14 +50,17 @@ HOST="0.0.0.0"
 ENABLE_MULTIMODAL=true
 LORA_MAX_SIZE=1024
 
-# ## Baseline 1: Store on CPU, Compute on GPU ###
+### Baseline 1: Store on CPU, Compute on GPU ###
 # COMPUTE_DEVICE="vl_storage:cpu,vl_compute:gpu,attn_storage:cpu,attn_compute:gpu,moe_storage:cpu,moe_compute:gpu"
 
-## Baseline 2: Store on CPU, Compute on CPU ###
-COMPUTE_DEVICE="vl_storage:cpu,vl_compute:gpu,attn_storage:cpu,attn_compute:cpu,moe_storage:cpu,moe_compute:cpu"
+### Baseline 2: Store on CPU, Compute on CPU ###
+# COMPUTE_DEVICE="vl_storage:cpu,vl_compute:cpu,attn_storage:cpu,attn_compute:cpu,moe_storage:cpu,moe_compute:cpu"
 
-# ### Baseline 3: Store on GPU, compute on GPU ###
-# COMPUTE_DEVICE="vl_storage:cpu,vl_compute:gpu,attn_storage:gpu,attn_compute:gpu,moe_storage:gpu,moe_compute:gpu"
+### Baseline 3: Store on GPU, compute on GPU ###
+ COMPUTE_DEVICE="vl_storage:gpu,vl_compute:gpu,attn_storage:gpu,attn_compute:gpu,moe_storage:gpu,moe_compute:gpu"
+
+### Baseline 4: Store on CPU, compute Attn on CPU, MoE off ### TODO: it's fails.
+# COMPUTE_DEVICE="vl_storage:cpu,vl_compute:gpu,attn_storage:cpu,attn_compute:cpu,moe_storage:off,moe_compute:off"
 
 ### Proposed: Store on CPU, compute Attn on GPU, MoE on CPU ###
 # COMPUTE_DEVICE="vl_storage:cpu,vl_compute:gpu,attn_storage:cpu,attn_compute:gpu,moe_storage:cpu,moe_compute:cpu"
@@ -68,7 +71,7 @@ MEM_FRACTION=0.6
 BATCH_MAX_TOKENS=4096
 
 # Environment variables
-LOADWORKER=8
+LOADWORKER=13
 LIGHTLLM_LOGGING="DEBUG"
 MOE_MODE="TP"
 MOCK_PREFILL_LOGITS="TRUE"
