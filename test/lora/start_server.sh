@@ -71,7 +71,7 @@ MEM_FRACTION=0.6
 BATCH_MAX_TOKENS=4096
 
 # Environment variables
-LOADWORKER=13
+LOADWORKER=8
 LIGHTLLM_LOGGING="DEBUG"
 MOE_MODE="TP"
 MOCK_PREFILL_LOGITS="TRUE"
@@ -159,6 +159,9 @@ echo "Host: $HOST"
 echo "Port: $PORT"
 echo "TP: $TP"
 echo "=============================================="
+
+echo "Cache model in memory (vmtouch)"
+find -L "$MODEL_DIR" -type f \( -name "*.safetensors" -o -name "*.bin" \) -print0 | xargs -0 vmtouch -vt
 
 # Build command
 CMD="python -m lightllm.server.api_server \

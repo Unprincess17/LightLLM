@@ -16,7 +16,7 @@ from functools import partial
 from lightllm.utils.log_utils import init_logger
 from lightllm.utils.dist_utils import get_global_world_size
 from lightllm.distributed.communication_op import all_gather_into_tensor, reduce_scatter_tensor
-from lightllm.utils.nvtx_utils import NvtxAnnotate
+from lightllm.utils.nvtx_utils import NvtxAnnotate, NvtxScope
 
 logger = init_logger(__name__)
 
@@ -272,63 +272,64 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
             logger.debug(f"[MoE] Layer {self.layer_num_}: {num_tokens} tokens -> {token_counts}")
 
         for local_expert_idx in expert_iter_range:
-            # Get global expert ID (used for filtering tokens)
-            global_expert_id = local_to_global.get(local_expert_idx, local_expert_idx) if is_ep else local_expert_idx
+            with NvtxScope(f"Expert_{local_expert_idx}"):
+                # Get global expert ID (used for filtering tokens)
+                global_expert_id = local_to_global.get(local_expert_idx, local_expert_idx) if is_ep else local_expert_idx
 
-            # 4.1 Filter tokens assigned to this expert
-            mask = topk_ids == global_expert_id
-            batch_indices, k_indices = torch.where(mask)
+                # 4.1 Filter tokens assigned to this expert
+                mask = topk_ids == global_expert_id
+                batch_indices, k_indices = torch.where(mask)
 
-            if batch_indices.shape[0] == 0:
-                continue
+                if batch_indices.shape[0] == 0:
+                    continue
 
-            # 4.2 Slice Input
-            expert_input = hidden_states[batch_indices]
-            expert_req_bins = self.req_bins_[batch_indices]
+                # 4.2 Slice Input
+                expert_input = hidden_states[batch_indices]
+                expert_req_bins = self.req_bins_[batch_indices]
 
-            # 4.3 Get Weights (use local index for experts list)
-            # TODO(FIX): offload here
-            w1 = experts.experts_gate_projs[local_expert_idx].cuda()
-            w3 = experts.experts_up_projs[local_expert_idx].cuda()
-            w2 = experts.w2_list[local_expert_idx].cuda()
+                # 4.3 Get Weights (use local index for experts list)
+                # TODO(FIX): offload here
+                w1 = experts.experts_gate_projs[local_expert_idx].cuda()
+                w3 = experts.experts_up_projs[local_expert_idx].cuda()
+                w2 = experts.w2_list[local_expert_idx].cuda()
 
-            # 4.4 Compute Base
-            # input: [N, hidden], w.T: [hidden, inter] -> output: [N, inter]
-            gate_out = torch.mm(expert_input, w1.T)
-            up_out = torch.mm(expert_input, w3.T)
+                # 4.4 Compute Base
+                # input: [N, hidden], w.T: [hidden, inter] -> output: [N, inter]
+                gate_out = torch.mm(expert_input, w1.T)
+                up_out = torch.mm(expert_input, w3.T)
 
-            # 4.5 Apply Per-Expert LoRA (Gate/Up)
-            # Use LOCAL expert index for LoRA buffer (as buffer only stores local experts)
-            gate_lora = self.lora_dispatcher_.batch_apply_gate_lora(
-                expert_input, layer_weight.layer_num_, expert_req_bins, expert_id=local_expert_idx
-            )
-            up_lora = self.lora_dispatcher_.batch_apply_up_lora(
-                expert_input, layer_weight.layer_num_, expert_req_bins, expert_id=local_expert_idx
-            )
+                # 4.5 Apply Per-Expert LoRA (Gate/Up)
+                # Use LOCAL expert index for LoRA buffer (as buffer only stores local experts)
+                gate_lora = self.lora_dispatcher_.batch_apply_gate_lora(
+                    expert_input, layer_weight.layer_num_, expert_req_bins, expert_id=local_expert_idx
+                )
+                up_lora = self.lora_dispatcher_.batch_apply_up_lora(
+                    expert_input, layer_weight.layer_num_, expert_req_bins, expert_id=local_expert_idx
+                )
 
-            gate_out += gate_lora
-            up_out += up_lora
+                gate_out += gate_lora
+                up_out += up_lora
 
-            # 4.6 Activation
-            current_hidden = torch.nn.functional.silu(gate_out) * up_out
+                # 4.6 Activation
+                current_hidden = torch.nn.functional.silu(gate_out) * up_out
 
-            # 4.7 Down Projection Base
-            down_out = torch.mm(current_hidden, w2.T)
+                # 4.7 Down Projection Base
+                down_out = torch.mm(current_hidden, w2.T)
 
-            # 4.8 Apply Per-Expert LoRA (Down)
-            # Use LOCAL expert index for LoRA buffer
-            down_lora = self.lora_dispatcher_.batch_apply_down_lora(
-                current_hidden, layer_weight.layer_num_, expert_req_bins, expert_id=local_expert_idx
-            )
-            down_out += down_lora
+                # 4.8 Apply Per-Expert LoRA (Down)
+                # Use LOCAL expert index for LoRA buffer
+                down_lora = self.lora_dispatcher_.batch_apply_down_lora(
+                    current_hidden, layer_weight.layer_num_, expert_req_bins, expert_id=local_expert_idx
+                )
+                down_out += down_lora
 
-            # 4.9 Weighted Aggregation (Corrected)
-            # routing_weights: [num_selected, 1]
-            routing_weights = topk_weights[batch_indices, k_indices].view(-1, 1)
-            weighted_output = (down_out * routing_weights).to(hidden_states.dtype)
+                # 4.9 Weighted Aggregation (Corrected)
+                # routing_weights: [num_selected, 1]
+                routing_weights = topk_weights[batch_indices, k_indices].view(-1, 1)
+                weighted_output = (down_out * routing_weights).to(hidden_states.dtype)
 
-            # 使用 index_add_ 在 final_output 上原地累加
-            final_output.index_add_(0, batch_indices, weighted_output)
+                # 使用 index_add_ 在 final_output 上原地累加
+                final_output.index_add_(0, batch_indices, weighted_output)
 
         return final_output.view(num_tokens, hidden_dim)
 
