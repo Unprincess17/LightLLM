@@ -50,17 +50,22 @@ HOST="0.0.0.0"
 ENABLE_MULTIMODAL=true
 LORA_MAX_SIZE=1024
 
-### Baseline 1: Store on CPU, Compute on GPU ###
-# COMPUTE_DEVICE="vl_storage:cpu,vl_compute:gpu,attn_storage:cpu,attn_compute:gpu,moe_storage:cpu,moe_compute:gpu"
+<<EOF
+# This two baselines are not implemented yet.
+### TODO: it's fails.
+### Baseline 1: Store on CPU, compute Attn on CPU, MoE off 
+# COMPUTE_DEVICE="vl_storage:cpu,vl_compute:gpu,attn_storage:cpu,attn_compute:cpu,moe_storage:off,moe_compute:off"
 
+### TODO: This is a little faulty. To fast, and contains CUDA kernel.
 ### Baseline 2: Store on CPU, Compute on CPU ###
 # COMPUTE_DEVICE="vl_storage:cpu,vl_compute:cpu,attn_storage:cpu,attn_compute:cpu,moe_storage:cpu,moe_compute:cpu"
+EOF
 
-### Baseline 3: Store on GPU, compute on GPU ###
- COMPUTE_DEVICE="vl_storage:gpu,vl_compute:gpu,attn_storage:gpu,attn_compute:gpu,moe_storage:gpu,moe_compute:gpu"
+### Baseline 3: Store on CPU, Compute on GPU ###
+ COMPUTE_DEVICE="vl_storage:cpu,vl_compute:gpu,attn_storage:cpu,attn_compute:gpu,moe_storage:cpu,moe_compute:gpu"
 
-### Baseline 4: Store on CPU, compute Attn on CPU, MoE off ### TODO: it's fails.
-# COMPUTE_DEVICE="vl_storage:cpu,vl_compute:gpu,attn_storage:cpu,attn_compute:cpu,moe_storage:off,moe_compute:off"
+### Baseline 4: Store on GPU, compute on GPU ###
+# COMPUTE_DEVICE="vl_storage:gpu,vl_compute:gpu,attn_storage:gpu,attn_compute:gpu,moe_storage:gpu,moe_compute:gpu"
 
 ### Proposed: Store on CPU, compute Attn on GPU, MoE on CPU ###
 # COMPUTE_DEVICE="vl_storage:cpu,vl_compute:gpu,attn_storage:cpu,attn_compute:gpu,moe_storage:cpu,moe_compute:cpu"
@@ -161,7 +166,8 @@ echo "TP: $TP"
 echo "=============================================="
 
 echo "Cache model in memory (vmtouch)"
-find -L "$MODEL_DIR" -type f \( -name "*.safetensors" -o -name "*.bin" \) -print0 | xargs -0 vmtouch -vt
+find  "$MODEL_DIR" -name "*safetensors" | xargs -n 1 realpath | xargs vmtouch -vt
+
 
 # Build command
 CMD="python -m lightllm.server.api_server \
@@ -208,5 +214,5 @@ echo "  MOE_MODE=$MOE_MODE"
 echo "  MOCK_PREFILL_LOGITS=$MOCK_PREFILL_LOGITS"
 echo ""
 
-# Execute
-eval "$CMD"
+
+eval "exec $CMD"

@@ -21,6 +21,7 @@ import logging
 from typing import Dict, Optional, Any, List
 
 from lightllm.server.core.objs.lora_compute_config import LoRAComputeConfig
+from lightllm.utils.nvtx_utils import NvtxAnnotate
 
 # Configure logging using global env var
 _LOG_LEVEL = os.environ.get("LIGHTLLM_LOGGING", "INFO").upper()
@@ -510,6 +511,7 @@ class Qwen3VLMoELoRADispatcher:
         else:
             return self._naive_batch_lora(input_tensor, layer_id, pool, bins)
 
+    @NvtxAnnotate("batch_apply_gate_lora")
     def batch_apply_gate_lora(
         self,
         input_tensor: torch.Tensor,
@@ -545,51 +547,59 @@ class Qwen3VLMoELoRADispatcher:
 
         # Use CPU compute if configured
         if self._should_use_cpu_compute("moe"):
-            return self._naive_batch_lora(input_tensor, buffer_layer_id, pool, bins)
+            with NvtxAnnotate("batch_apply_gate_lora_cpu"):
+                return self._naive_batch_lora(input_tensor, buffer_layer_id, pool, bins)
 
         if BGMV_AVAILABLE:
             output = self._get_output_buffer(input_tensor, pool)
             # Compact dispatcher: CPU storage + GPU compute
             if self._should_use_cpu_storage("moe"):
-                unique_adapters, inverse_indices = torch.unique(bins, return_inverse=True)
-                active_count = unique_adapters.size(0)
-                self._ensure_compact_scratchpad(pool, input_tensor.device, active_count)
-                assert self.gpu_scratchpad_a is not None and self.gpu_scratchpad_b is not None
-                self._transfer_compact_to_gpu(
-                    pool, buffer_layer_id, unique_adapters,
-                    self.gpu_scratchpad_a, self.gpu_scratchpad_b
-                )
-                temp_a_start = torch.arange(active_count, device=input_tensor.device, dtype=torch.int32)
-                temp_a_len = torch.ones(active_count, device=input_tensor.device, dtype=torch.int32)
-                temp_scaling = pool.a_scaling[unique_adapters.long().cpu()].to(input_tensor.device)
-                batch_lora_get_mlp(
-                    output,
-                    input_tensor,
-                    self.gpu_scratchpad_a, self.gpu_scratchpad_b,
-                    temp_a_start, temp_a_len, temp_scaling,
-                    inverse_indices,
-                    a_hidden_dim=input_tensor.shape[1],
-                    b_hidden_dim=output.shape[1],
-                    layer_id=0
-                )
+                with NvtxAnnotate("batch_apply_gate_lora_gpu_compact"):
+                    unique_adapters, inverse_indices = torch.unique(bins, return_inverse=True)
+                    active_count = unique_adapters.size(0)
+                    self._ensure_compact_scratchpad(pool, input_tensor.device, active_count)
+                    assert self.gpu_scratchpad_a is not None and self.gpu_scratchpad_b is not None
+                    
+                    with NvtxAnnotate("batch_apply_gate_lora_data_movement"):
+                        self._transfer_compact_to_gpu(
+                            pool, buffer_layer_id, unique_adapters,
+                            self.gpu_scratchpad_a, self.gpu_scratchpad_b
+                        )
+                        temp_a_start = torch.arange(active_count, device=input_tensor.device, dtype=torch.int32)
+                        temp_a_len = torch.ones(active_count, device=input_tensor.device, dtype=torch.int32)
+                        temp_scaling = pool.a_scaling[unique_adapters.long().cpu()].to(input_tensor.device)
+                        
+                    batch_lora_get_mlp(
+                        output,
+                        input_tensor,
+                        self.gpu_scratchpad_a, self.gpu_scratchpad_b,
+                        temp_a_start, temp_a_len, temp_scaling,
+                        inverse_indices,
+                        a_hidden_dim=input_tensor.shape[1],
+                        b_hidden_dim=output.shape[1],
+                        layer_id=0
+                    )
             else:
-                batch_lora_get_mlp(
-                    output,
-                    input_tensor,
-                    pool.key_buffer,
-                    pool.value_buffer,
-                    pool.a_start,
-                    pool.a_len,
-                    pool.a_scaling,
-                    bins,
-                    a_hidden_dim=input_tensor.shape[1],
-                    b_hidden_dim=output.shape[1],
-                    layer_id=buffer_layer_id
-                )
+                with NvtxAnnotate("batch_apply_gate_lora_gpu"):
+                    batch_lora_get_mlp(
+                        output,
+                        input_tensor,
+                        pool.key_buffer,
+                        pool.value_buffer,
+                        pool.a_start,
+                        pool.a_len,
+                        pool.a_scaling,
+                        bins,
+                        a_hidden_dim=input_tensor.shape[1],
+                        b_hidden_dim=output.shape[1],
+                        layer_id=buffer_layer_id
+                    )
             return output
         else:
-            return self._naive_batch_lora(input_tensor, buffer_layer_id, pool, bins)
+            with NvtxAnnotate("batch_apply_gate_lora_cpu"):
+                return self._naive_batch_lora(input_tensor, buffer_layer_id, pool, bins)
 
+    @NvtxAnnotate("batch_apply_up_lora")
     def batch_apply_up_lora(
         self,
         input_tensor: torch.Tensor,
@@ -667,6 +677,7 @@ class Qwen3VLMoELoRADispatcher:
         else:
             return self._naive_batch_lora(input_tensor, buffer_layer_id, pool, bins)
 
+    @NvtxAnnotate("batch_apply_down_lora")
     def batch_apply_down_lora(
         self,
         input_tensor: torch.Tensor,
@@ -813,6 +824,7 @@ class Qwen3VLMoELoRADispatcher:
     # Fallback Naive Implementation (when BGMV kernel unavailable)
     # =====================================================================
 
+    @NvtxAnnotate
     def _naive_batch_lora(
         self,
         input_tensor: torch.Tensor,

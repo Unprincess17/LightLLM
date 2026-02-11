@@ -15,6 +15,7 @@ import torch
 import triton
 import triton.language as tl
 from lightllm.utils.log_utils import init_logger
+from lightllm.utils.nvtx_utils import NvtxAnnotate
 
 logger = init_logger(__name__)
 
@@ -138,6 +139,7 @@ def bgmv_kernel(
         tl.store(y_ptrs, acc_block, mask=y_mask)
 
 
+@NvtxAnnotate
 def dispatch_bgmv(
     y: torch.Tensor,
     x: torch.Tensor,
@@ -206,6 +208,7 @@ def dispatch_bgmv(
     )
     return
 
+@NvtxAnnotate
 def batch_lora_get_qkv(
     y: torch.Tensor,
     x: torch.Tensor,
@@ -226,7 +229,8 @@ def batch_lora_get_qkv(
         a_hidden_dim=a_hidden_dim, b_hidden_dim=b_hidden_dim,
         layer_id=layer_id
     )
-
+    
+@NvtxAnnotate
 def batch_lora_get_o(
     y: torch.Tensor, x: torch.Tensor, a_buffer: torch.Tensor, b_buffer: torch.Tensor,
     a_start: torch.Tensor, a_len: torch.Tensor,
@@ -239,6 +243,7 @@ def batch_lora_get_o(
                   a_hidden_dim=a_hidden_dim, b_hidden_dim=b_hidden_dim,
                   layer_id=layer_id)
 
+@NvtxAnnotate
 def batch_lora_get_mlp(
     y: torch.Tensor, x: torch.Tensor, a_buffer: torch.Tensor, b_buffer: torch.Tensor,
     a_start: torch.Tensor, a_len: torch.Tensor,

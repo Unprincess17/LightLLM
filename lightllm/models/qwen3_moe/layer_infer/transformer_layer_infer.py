@@ -16,7 +16,7 @@ from functools import partial
 from lightllm.utils.log_utils import init_logger
 from lightllm.utils.dist_utils import get_global_world_size
 from lightllm.distributed.communication_op import all_gather_into_tensor, reduce_scatter_tensor
-from lightllm.utils.nvtx_utils import NvtxAnnotate, NvtxScope
+from lightllm.utils.nvtx_utils import NvtxAnnotate
 
 logger = init_logger(__name__)
 
@@ -272,7 +272,7 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
             logger.debug(f"[MoE] Layer {self.layer_num_}: {num_tokens} tokens -> {token_counts}")
 
         for local_expert_idx in expert_iter_range:
-            with NvtxScope(f"Expert_{local_expert_idx}"):
+            with NvtxAnnotate(f"Expert_{local_expert_idx}"):
                 # Get global expert ID (used for filtering tokens)
                 global_expert_id = local_to_global.get(local_expert_idx, local_expert_idx) if is_ep else local_expert_idx
 

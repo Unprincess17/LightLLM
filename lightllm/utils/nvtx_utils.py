@@ -1,71 +1,121 @@
 """
 NVTX Annotation Utility for Hybrid CPU-GPU Pipeline Profiling.
 
-Provides a wrapper around torch.cuda.nvtx.range_push/range_pop
-for use with NVIDIA Nsight Systems (nsys).
+Uses the nvtx Python package for NVIDIA Nsight Systems (nsys).
 
-Colors are automatically assigned using hash(name) % 7 for consistent
-coloring across different range names.
+Usage:
+    @NvtxAnnotate("name")
+    def func(...):
+
+    with NvtxAnnotate("name"):
+        ...
 """
 
-from functools import wraps
-from contextlib import ContextDecorator
-from typing import Optional
+import hashlib
+from collections.abc import Callable
 
-import torch
-
-# NVTX reserved color IDs: 0=red, 1=orange, 2=yellow, 3=green, 4=blue, 5=purple, 6=white
-_NUM_COLORS = 7
+import functools
 
 
-class NvtxAnnotate(ContextDecorator):
+# from nvtx import annotate  # type: ignore
+from torch.cuda import nvtx as torch_nvtx  # type: ignore
+
+
+# NVTX colors for consistent visual distinction in Nsight Systems traces
+_NVTX_COLORS = [
+    "green",
+    "blue",
+    "purple",
+    "rapids",
+    "orange",
+    "yellow",
+    "red",
+]
+_NUM_COLORS = len(_NVTX_COLORS)
+
+
+def _get_color(name: str) -> str:
+    """Get a consistent color from a range name using hash.
+
+    Uses SHA256 for cross-run consistent hashing.
     """
-    NVTX range annotation utility supporting both context manager and decorator usage.
+    m = hashlib.sha256()
+    m.update(name.encode())
+    hash_value = int(m.hexdigest(), 16)
+    return _NVTX_COLORS[hash_value % _NUM_COLORS]
 
-    Colors are automatically assigned using hash(name) % 7 for consistent
-    visual distinction in Nsight Systems traces.
-
-    Args:
-        name: Range name. If None, uses function's __name__ (decorator mode).
+class NvtxAnnotate:
     """
+    Hybrid NVTX utility that works as both a decorator and a context manager.
+    
+    Usage 1: Context Manager
+        with NvtxAnnotate("My Scope"):
+            ...
+            
+    Usage 2: Decorator (auto-naming)
+        @NvtxAnnotate
+        def my_func(): ...
+        
+    Usage 3: Decorator (custom name)
+        @NvtxAnnotate("My Label")
+        def my_func(): ...
+    """
+    def __init__(self, msg_or_func=None):
+        self.msg = None
+        self.func = None
+        self._is_wrapping_func = False
 
-    def __init__(self, name: Optional[str] = None):
-        self.name = name
-
-    @staticmethod
-    def get_color_id(name: str) -> int:
-        """Get a consistent color ID from a range name using hash."""
-        return hash(name) % _NUM_COLORS
+        if callable(msg_or_func):
+            # Case: @NvtxAnnotate (no parentheses)
+            # Used as: @NvtxAnnotate
+            #          def func(): ...
+            self.func = msg_or_func
+            self.msg = msg_or_func.__qualname__
+            self._is_wrapping_func = True
+            functools.update_wrapper(self, msg_or_func)
+        else:
+            # Case: @NvtxAnnotate("msg") or with NvtxAnnotate("msg")
+            self.msg = msg_or_func
+            self.func = None
+            self._is_wrapping_func = False
 
     def __enter__(self):
-        """Enter context manager: push NVTX range."""
-        name = self.name
-        if name is None:
-            raise ValueError(
-                "NvtxAnnotate requires a name when used as a context manager. "
-                "Use: NvtxAnnotate('YourName') or @NvtxAnnotate('YourName')"
-            )
-        torch.cuda.nvtx.range_push(name)
+        # Support for 'with' statement
+        if self.msg is None:
+            self.msg = "NVTX Range"
+        torch_nvtx.range_push(self.msg)
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        """Exit context manager: pop NVTX range (always called, even on exception)."""
-        torch.cuda.nvtx.range_pop()
-        return False  # Don't suppress exceptions
+        # Support for 'with' statement
+        torch_nvtx.range_pop()
 
-    def __call__(self, func):
-        """Decorator mode: wrap function with NVTX ranges."""
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            # Use function name if no explicit name provided
-            range_name = self.name if self.name else func.__name__
-            torch.cuda.nvtx.range_push(range_name)
+    def __call__(self, *args, **kwargs):
+        if self._is_wrapping_func:
+            # Case 1: Act as the wrapper (executing the decorated function)
+            torch_nvtx.range_push(self.msg)
             try:
-                return func(*args, **kwargs)
+                return self.func(*args, **kwargs)
             finally:
-                torch.cuda.nvtx.range_pop()
-        return wrapper
+                torch_nvtx.range_pop()
+        else:
+            # Case 2: Act as the decorator factory (receiving the function to decorate)
+            # This happens when using @NvtxAnnotate("msg")
+            func = args[0]
+            name = self.msg if self.msg else func.__qualname__
+            
+            @functools.wraps(func)
+            def wrapper(*a, **kw):
+                torch_nvtx.range_push(name)
+                try:
+                    return func(*a, **kw)
+                finally:
+                    torch_nvtx.range_pop()
+            return wrapper
 
-
-# Backwards compatibility alias
-NvtxScope = NvtxAnnotate
+    def __get__(self, instance, owner):
+        # Essential for supporting class methods when using @NvtxAnnotate (no parens)
+        # It ensures 'self' is passed correctly to the method.
+        if instance is None:
+            return self
+        return functools.partial(self.__call__, instance)
