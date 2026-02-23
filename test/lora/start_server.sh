@@ -165,9 +165,9 @@ echo "Port: $PORT"
 echo "TP: $TP"
 echo "=============================================="
 
+# cache
 echo "Cache model in memory (vmtouch)"
 find  "$MODEL_DIR" -name "*safetensors" | xargs -n 1 realpath | xargs vmtouch -vt
-
 
 # Build command
 CMD="python -m lightllm.server.api_server \

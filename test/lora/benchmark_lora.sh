@@ -50,6 +50,14 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Step 0: clean up old processes if any
+echo "cleanup processes"
+pgrep -f "lightllm.server|lightllm::|gunicorn|multiprocessing.resource_tracker|multiprocessing.spawn" && echo "Killing old processes..." && \
+pkill -9 -f "lightllm.server|lightllm::|gunicorn" && \
+pkill -9 -f "multiprocessing.resource_tracker|multiprocessing.spawn"
+
+sleep 5
+
 echo "=============================================="
 echo "Starting MoE Profiling"
 echo "=============================================="
