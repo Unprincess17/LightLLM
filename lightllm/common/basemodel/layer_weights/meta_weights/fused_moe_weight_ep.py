@@ -479,11 +479,11 @@ class FusedMoeWeightEP(BaseWeight):
             w2_weight = f"{self.weight_prefix}.{i_experts}.{self.w2_weight_name}.weight"
             w3_weight = f"{self.weight_prefix}.{i_experts}.{self.w3_weight_name}.weight"
             if w1_weight in weights:
-                self.experts_gate_projs[i_experts_ep] = weights[w1_weight]
+                self.experts_gate_projs[i_experts_ep] = weights[w1_weight].pin_memory()
             if w3_weight in weights:
-                self.experts_up_projs[i_experts_ep] = weights[w3_weight]
+                self.experts_up_projs[i_experts_ep] = weights[w3_weight].pin_memory()
             if w2_weight in weights:
-                self.w2_list[i_experts_ep] = weights[w2_weight]
+                self.w2_list[i_experts_ep] = weights[w2_weight].pin_memory()
 
         # Load weight parameters for redundant experts
         for i, redundant_expert_id in enumerate(self.redundancy_expert_ids):
@@ -492,11 +492,11 @@ class FusedMoeWeightEP(BaseWeight):
             w2_weight = f"{self.weight_prefix}.{i_experts}.{self.w2_weight_name}.weight"
             w3_weight = f"{self.weight_prefix}.{i_experts}.{self.w3_weight_name}.weight"
             if w1_weight in weights:
-                self.experts_gate_projs[n_expert_ep + i] = weights[w1_weight]
+                self.experts_gate_projs[n_expert_ep + i] = weights[w1_weight].pin_memory()
             if w3_weight in weights:
-                self.experts_up_projs[n_expert_ep + i] = weights[w3_weight]
+                self.experts_up_projs[n_expert_ep + i] = weights[w3_weight].pin_memory()
             if w2_weight in weights:
-                self.w2_list[n_expert_ep + i] = weights[w2_weight]
+                self.w2_list[n_expert_ep + i] = weights[w2_weight].pin_memory()
 
         if self.quantized_weight:
             self._load_weight_scale(weights)

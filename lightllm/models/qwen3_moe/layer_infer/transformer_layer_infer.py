@@ -257,7 +257,7 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
         # EP mode: get local expert info
         is_ep, local_expert_ids, local_to_global, global_to_local = self._get_local_expert_info(layer_weight)
 
-        # 4. Expert Loop
+        # 4. Expert Loop with Compute-Transfer Pipelining
         # In TP mode: iterate over all experts
         # In EP mode: iterate only over local experts
         expert_iter_range = local_expert_ids if is_ep else range(total_experts)
@@ -271,34 +271,60 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
                     token_counts[global_eid] = count
             logger.debug(f"[MoE] Layer {self.layer_num_}: {num_tokens} tokens -> {token_counts}")
 
+        # 4.1 Active Expert Extraction - collect only experts with assigned tokens
+        active_experts_data = []
         for local_expert_idx in expert_iter_range:
-            with NvtxAnnotate(f"Expert_{local_expert_idx}"):
-                # Get global expert ID (used for filtering tokens)
-                global_expert_id = local_to_global.get(local_expert_idx, local_expert_idx) if is_ep else local_expert_idx
+            global_expert_id = local_to_global.get(local_expert_idx, local_expert_idx) if is_ep else local_expert_idx
+            mask = topk_ids == global_expert_id
+            batch_indices, k_indices = torch.where(mask)
 
-                # 4.1 Filter tokens assigned to this expert
-                mask = topk_ids == global_expert_id
-                batch_indices, k_indices = torch.where(mask)
+            if batch_indices.shape[0] > 0:
+                active_experts_data.append((local_expert_idx, batch_indices, k_indices))
 
-                if batch_indices.shape[0] == 0:
-                    continue
+        # Early exit if no active experts
+        if not active_experts_data:
+            return final_output.view(num_tokens, hidden_dim)
 
-                # 4.2 Slice Input
+        # 4.2 Stream Setup for pipelining
+        transfer_stream = torch.cuda.Stream()
+        compute_stream = torch.cuda.current_stream()
+
+        def prefetch_weights(local_idx):
+            """Prefetch weights for a specific expert using non-blocking transfer."""
+            w1 = experts.experts_gate_projs[local_idx].cuda(non_blocking=True)
+            w3 = experts.experts_up_projs[local_idx].cuda(non_blocking=True)
+            w2 = experts.w2_list[local_idx].cuda(non_blocking=True)
+            return w1, w3, w2
+
+        # 4.3 Prime the Pipeline - prefetch first expert's weights
+        first_expert_idx, _, _ = active_experts_data[0]
+        with torch.cuda.stream(transfer_stream):
+            next_weights = prefetch_weights(first_expert_idx)
+
+        # 4.4 Pipelined Expert Loop
+        for i, (local_expert_idx, batch_indices, k_indices) in enumerate(active_experts_data):
+            with NvtxAnnotate(f"Expert_{local_expert_idx}_{layer_weight.layer_num_}"):
                 expert_input = hidden_states[batch_indices]
                 expert_req_bins = self.req_bins_[batch_indices]
 
-                # 4.3 Get Weights (use local index for experts list)
-                # TODO(FIX): offload here
-                w1 = experts.experts_gate_projs[local_expert_idx].cuda()
-                w3 = experts.experts_up_projs[local_expert_idx].cuda()
-                w2 = experts.w2_list[local_expert_idx].cuda()
+                # 4.4.1 Synchronize: ensure current expert's weights have arrived
+                compute_stream.wait_stream(transfer_stream)
+                current_weights = next_weights
 
-                # 4.4 Compute Base
+                # 4.4.2 Prefetch next expert's weights concurrently
+                if i + 1 < len(active_experts_data):
+                    next_expert_idx, _, _ = active_experts_data[i + 1]
+                    with torch.cuda.stream(transfer_stream):
+                        next_weights = prefetch_weights(next_expert_idx)
+
+                w1, w3, w2 = current_weights
+
+                # 4.4.3 Compute Base
                 # input: [N, hidden], w.T: [hidden, inter] -> output: [N, inter]
                 gate_out = torch.mm(expert_input, w1.T)
                 up_out = torch.mm(expert_input, w3.T)
 
-                # 4.5 Apply Per-Expert LoRA (Gate/Up)
+                # 4.4.4 Apply Per-Expert LoRA (Gate/Up)
                 # Use LOCAL expert index for LoRA buffer (as buffer only stores local experts)
                 gate_lora = self.lora_dispatcher_.batch_apply_gate_lora(
                     expert_input, layer_weight.layer_num_, expert_req_bins, expert_id=local_expert_idx
@@ -310,26 +336,29 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
                 gate_out += gate_lora
                 up_out += up_lora
 
-                # 4.6 Activation
+                # 4.4.5 Activation
                 current_hidden = torch.nn.functional.silu(gate_out) * up_out
 
-                # 4.7 Down Projection Base
+                # 4.4.6 Down Projection Base
                 down_out = torch.mm(current_hidden, w2.T)
 
-                # 4.8 Apply Per-Expert LoRA (Down)
+                # 4.4.7 Apply Per-Expert LoRA (Down)
                 # Use LOCAL expert index for LoRA buffer
                 down_lora = self.lora_dispatcher_.batch_apply_down_lora(
                     current_hidden, layer_weight.layer_num_, expert_req_bins, expert_id=local_expert_idx
                 )
                 down_out += down_lora
 
-                # 4.9 Weighted Aggregation (Corrected)
+                # 4.4.8 Weighted Aggregation (Corrected)
                 # routing_weights: [num_selected, 1]
                 routing_weights = topk_weights[batch_indices, k_indices].view(-1, 1)
                 weighted_output = (down_out * routing_weights).to(hidden_states.dtype)
 
                 # 使用 index_add_ 在 final_output 上原地累加
                 final_output.index_add_(0, batch_indices, weighted_output)
+
+                # 4.4.9 Cleanup - eagerly free GPU tensor references
+                del current_weights, w1, w3, w2
 
         return final_output.view(num_tokens, hidden_dim)
 

@@ -245,16 +245,16 @@ class FusedMoeWeightTP(BaseWeight):
             if w1_weight in weights:
                 self.experts_gate_projs[i_experts] = weights[w1_weight][
                     self.split_inter_size * self.tp_rank_ : self.split_inter_size * (self.tp_rank_ + 1), :
-                ]
+                ].pin_memory()
             if w3_weight in weights:
                 self.experts_up_projs[i_experts] = weights[w3_weight][
                     self.split_inter_size * self.tp_rank_ : self.split_inter_size * (self.tp_rank_ + 1), :
-                ]
+                ].pin_memory()
 
             if w2_weight in weights:
                 self.w2_list[i_experts] = weights[w2_weight][
                     :, self.split_inter_size * self.tp_rank_ : self.split_inter_size * (self.tp_rank_ + 1)
-                ]
+                ].pin_memory()
         if self.quant_method is not None:
             self._load_weight_scale(weights)
         self._fuse()
