@@ -32,6 +32,7 @@ from lightllm.utils.custom_kernel_utis import pad2dim_tensor_to_new_batch
 from lightllm.utils.envs_utils import set_model_init_status, enable_diverse_mode_gqa_decode_fast_kernel
 from lightllm.common.triton_utils.autotuner import Autotuner
 from lightllm.utils.infer_utils import post_empty_cache
+from lightllm.utils.nvtx_utils import NvtxAnnotate
 
 logger = init_logger(__name__)
 
@@ -264,9 +265,11 @@ class TpPartBaseModel:
         assert model_input.mem_indexes.is_cuda
 
         if model_input.is_prefill:
-            return self._prefill(model_input)
+            with NvtxAnnotate("prefill"):
+                return self._prefill(model_input)
         else:
-            return self._decode(model_input)
+            with NvtxAnnotate("decode"):
+                return self._decode(model_input)
 
     def _create_inferstate(self, model_input: ModelInput, microbatch_index: int = 0):
         infer_state = self.infer_state_class()
