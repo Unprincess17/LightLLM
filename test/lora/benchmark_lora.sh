@@ -7,7 +7,7 @@ set -e
 
 # Default values
 SETUP_DELAY=10
-MAX_WAIT=180
+MAX_WAIT=600
 OUTPUT_PREFIX="moe_offload_profile"
 TEST_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEST_SCRIPT="$TEST_SCRIPT_DIR/test_moe_lora_api.py"
@@ -63,7 +63,7 @@ echo "Starting MoE Profiling"
 echo "=============================================="
 
 # Step 1: Start nsys profiling with server
-echo "[1/4] Launching server"
+echo "[1/5] Launching server"
 bash "$SERVER_SCRIPT" --host "$SERVER_HOST" --port "$SERVER_PORT" &
 SERVER_PID=$!
 echo "Server PID: $SERVER_PID"
@@ -72,7 +72,7 @@ echo "Server PID: $SERVER_PID"
 start_time=$SECONDS
 
 # Step 2: Wait for server to be healthy
-echo "[2/4] Waiting for server to be healthy..."
+echo "[2/5] Waiting for server to be healthy..."
 
 while (( SECONDS - start_time < MAX_WAIT )); do
     if nc -vz "$SERVER_HOST" "$SERVER_PORT" 2>/dev/null; then
@@ -95,7 +95,7 @@ echo "Waiting additional ${SETUP_DELAY}s before sending test request..."
 sleep "$SETUP_DELAY"
 
 # Step 4: Send test request (nsys is now capturing)
-echo "[3/4] Sending test request..."
+echo "[3/5] Sending test request..."
 python "$TEST_SCRIPT" --max_tokens "$MAX_TOKENS"
 
 
@@ -103,6 +103,14 @@ sleep 5
 echo "send second request\n\n"
 
 # Step 5: Send test request (nsys is now capturing)
-echo "[4/4] Sending second test request..."
+echo "[4/5] Sending second test request..."
+python "$TEST_SCRIPT" --max_tokens "$MAX_TOKENS"
+
+
+sleep 5
+echo "send third request\n\n"
+
+# Step 6: Send test request (nsys is now capturing)
+echo "[5/5] Sending third test request..."
 python "$TEST_SCRIPT" --max_tokens "$MAX_TOKENS"
 

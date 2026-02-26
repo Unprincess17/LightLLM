@@ -1,6 +1,8 @@
 import os
 import torch
 import torch.distributed as dist
+
+from lightllm.utils.nvtx_utils import NvtxAnnotate
 from ..transformer_layer_infer import TransformerLayerInfer
 from ...infer_struct import InferStateInfo
 from lightllm.utils.infer_utils import mark_cost_time
@@ -90,25 +92,26 @@ class TransformerLayerInferTpl(TransformerLayerInfer):
         return input_embdings
 
     def token_forward(self, input_embdings, infer_state: InferStateInfo, layer_weight):
-        input1 = self._att_norm(input_embdings, infer_state, layer_weight)
-        q, cache_kv = self._get_qkv(input1, infer_state, layer_weight)
-        input1 = None
-        self._post_cache_kv(cache_kv, infer_state, layer_weight)
-        o = self._token_attention_kernel(q, infer_state, layer_weight)
-        q = None
-        o = self._get_o(o, infer_state, layer_weight)
-        if self.tp_world_size_ > 1:
-            all_reduce(o, op=dist.ReduceOp.SUM, group=infer_state.dist_group, async_op=False)
-        input_embdings.add_(o.view(-1, self.embed_dim_))
-        o = None
+        with NvtxAnnotate(f"Layer {self.layer_num_}"):
+            input1 = self._att_norm(input_embdings, infer_state, layer_weight)
+            q, cache_kv = self._get_qkv(input1, infer_state, layer_weight)
+            input1 = None
+            self._post_cache_kv(cache_kv, infer_state, layer_weight)
+            o = self._token_attention_kernel(q, infer_state, layer_weight)
+            q = None
+            o = self._get_o(o, infer_state, layer_weight)
+            if self.tp_world_size_ > 1:
+                all_reduce(o, op=dist.ReduceOp.SUM, group=infer_state.dist_group, async_op=False)
+            input_embdings.add_(o.view(-1, self.embed_dim_))
+            o = None
 
-        input1 = self._ffn_norm(input_embdings, infer_state, layer_weight)
-        ffn_out = self._ffn(input1, infer_state, layer_weight)
-        input1 = None
-        if self.tp_world_size_ > 1:
-            all_reduce(ffn_out, op=dist.ReduceOp.SUM, group=infer_state.dist_group, async_op=False)
-        input_embdings.add_(ffn_out.view(-1, self.embed_dim_))
-        return input_embdings
+            input1 = self._ffn_norm(input_embdings, infer_state, layer_weight)
+            ffn_out = self._ffn(input1, infer_state, layer_weight)
+            input1 = None
+            if self.tp_world_size_ > 1:
+                all_reduce(ffn_out, op=dist.ReduceOp.SUM, group=infer_state.dist_group, async_op=False)
+            input_embdings.add_(ffn_out.view(-1, self.embed_dim_))
+            return input_embdings
 
     def tpsp_context_forward(self, input_embdings: torch.Tensor, infer_state: InferStateInfo, layer_weight):
         input1 = self._att_norm(input_embdings, infer_state, layer_weight)

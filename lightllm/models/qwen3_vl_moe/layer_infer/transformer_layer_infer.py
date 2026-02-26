@@ -136,9 +136,7 @@ class Qwen3VLMOETransformerLayerInfer(Qwen3MOETransformerLayerInfer):
 
         return o_tensor
 
-    @NvtxAnnotate("Qwen3VLMOE")
     def context_forward(self, input_embdings, infer_state: Qwen3VLInferStateInfo, layer_weight):
-        with NvtxAnnotate(f"Layer {self.layer_num_}"):
             input1 = self._att_norm(input_embdings, infer_state, layer_weight)
             q, cache_kv = self._get_qkv(input1, infer_state, layer_weight)
             input1 = None

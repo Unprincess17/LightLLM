@@ -18,6 +18,8 @@ from lightllm.utils.dist_utils import get_global_world_size
 from lightllm.distributed.communication_op import all_gather_into_tensor, reduce_scatter_tensor
 from lightllm.utils.nvtx_utils import NvtxAnnotate
 
+from lightllm.common.fused_moe.topk_select import select_experts
+
 logger = init_logger(__name__)
 
 
@@ -222,7 +224,6 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
         # ----------------------------------------------------------------
         # Slow Path: Per-Expert LoRA Baseline (Explicit Loop, Research purpose)
         # ----------------------------------------------------------------
-        from lightllm.common.fused_moe.topk_select import select_experts
 
         # 1. Router computation
         router_logits = layer_weight.moe_gate.mm(hidden_states)
@@ -241,15 +242,14 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
         )
 
         if hasattr(layer_weight.experts, "routed_scaling_factor"):
-            topk_weights = topk_weights * layer_weight.experts.routed_scaling_factor
+            # topk_weights = topk_weights * layer_weight.experts.routed_scaling_factor
+            topk_weights.mul_(layer_weight.experts.routed_scaling_factor)
 
         # 3. Check weights availability
         experts = layer_weight.experts
         # 必须确保使用了 keep_expert_lists=True
-        if not hasattr(experts, "experts_gate_projs") or experts.experts_gate_projs[0] is None:
-            raise RuntimeError(
-                "Per-Expert Baseline requires 'keep_expert_lists=True' in FusedMoeWeightTP."
-            )
+        assert hasattr(experts, "experts_gate_projs") and experts.experts_gate_projs[0] is not None, \
+            "Per-Expert Baseline requires 'keep_expert_lists=True' in FusedMoeWeightTP."
 
         final_output = torch.zeros_like(hidden_states)
         total_experts = experts.n_routed_experts
@@ -272,93 +272,137 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
             logger.debug(f"[MoE] Layer {self.layer_num_}: {num_tokens} tokens -> {token_counts}")
 
         # 4.1 Active Expert Extraction - collect only experts with assigned tokens
-        active_experts_data = []
-        for local_expert_idx in expert_iter_range:
-            global_expert_id = local_to_global.get(local_expert_idx, local_expert_idx) if is_ep else local_expert_idx
-            mask = topk_ids == global_expert_id
-            batch_indices, k_indices = torch.where(mask)
+        
+        # with NvtxAnnotate("MoE_ActiveExpertExtraction"):
+        #     active_experts_data = []
+        #     for local_expert_idx in expert_iter_range:
+        #         global_expert_id = local_to_global.get(local_expert_idx, local_expert_idx) if is_ep else local_expert_idx
+        #         mask = topk_ids == global_expert_id
+        #         batch_indices, k_indices = torch.where(mask)
 
-            if batch_indices.shape[0] > 0:
-                active_experts_data.append((local_expert_idx, batch_indices, k_indices))
+        #         if batch_indices.shape[0] > 0:
+        #             active_experts_data.append((local_expert_idx, batch_indices, k_indices))
+
+        with NvtxAnnotate("MoE_ActiveExpertExtraction_Optimized"):
+            # 1. 扁平化 topk_ids [num_tokens * top_k]
+            flat_topk_ids = topk_ids.flatten()
+            
+            # 2. 关键：全局仅触发 1 次 D2H 同步，获取所有专家的 token 分布
+            # 这只占用不到 0.1ms 的时间
+            expert_counts = torch.bincount(flat_topk_ids, minlength=total_experts).cpu().tolist()
+            
+            # 3. 纯 GPU 排序，瞬间将 Token 按 Expert 聚类
+            sorted_token_indices = torch.argsort(flat_topk_ids)
+            
+            # 4. 在 CPU 端瞬间计算出全局内存块的偏移量
+            global_offsets = [0] * (total_experts + 1)
+            for i in range(total_experts):
+                global_offsets[i+1] = global_offsets[i] + expert_counts[i]
+            
+            active_experts_data = []
+            for local_expert_idx in expert_iter_range:
+                global_expert_id = local_to_global.get(local_expert_idx, local_expert_idx) if is_ep else local_expert_idx
+                count = expert_counts[global_expert_id]
+                
+                if count > 0:
+                    start_idx = global_offsets[global_expert_id]
+                    end_idx = start_idx + count
+                    
+                    # 5. 纯 GPU View 截取，零同步！
+                    token_idx = sorted_token_indices[start_idx:end_idx]
+                    batch_indices = token_idx // self.num_experts_per_tok
+                    k_indices = token_idx % self.num_experts_per_tok
+                    
+                    active_experts_data.append((local_expert_idx, batch_indices, k_indices))
 
         # Early exit if no active experts
         if not active_experts_data:
             return final_output.view(num_tokens, hidden_dim)
 
         # 4.2 Stream Setup for pipelining
-        transfer_stream = torch.cuda.Stream()
-        compute_stream = torch.cuda.current_stream()
+        with NvtxAnnotate("MoE_StreamSetup"):
+            transfer_stream = torch.cuda.Stream()
+            compute_stream = torch.cuda.current_stream()
 
-        def prefetch_weights(local_idx):
-            """Prefetch weights for a specific expert using non-blocking transfer."""
-            w1 = experts.experts_gate_projs[local_idx].cuda(non_blocking=True)
-            w3 = experts.experts_up_projs[local_idx].cuda(non_blocking=True)
-            w2 = experts.w2_list[local_idx].cuda(non_blocking=True)
-            return w1, w3, w2
+            def prefetch_weights(local_idx):
+                """Prefetch weights for a specific expert using non-blocking transfer."""
+                w1 = experts.experts_gate_projs[local_idx].cuda(non_blocking=True)
+                w3 = experts.experts_up_projs[local_idx].cuda(non_blocking=True)
+                w2 = experts.w2_list[local_idx].cuda(non_blocking=True)
+                return w1, w3, w2
 
         # 4.3 Prime the Pipeline - prefetch first expert's weights
-        first_expert_idx, _, _ = active_experts_data[0]
-        with torch.cuda.stream(transfer_stream):
-            next_weights = prefetch_weights(first_expert_idx)
+        with NvtxAnnotate("MoE_PipelinePrime"):
+            first_expert_idx, _, _ = active_experts_data[0]
+            with torch.cuda.stream(transfer_stream):
+                next_weights = prefetch_weights(first_expert_idx)
 
         # 4.4 Pipelined Expert Loop
         for i, (local_expert_idx, batch_indices, k_indices) in enumerate(active_experts_data):
-            with NvtxAnnotate(f"Expert_{local_expert_idx}_{layer_weight.layer_num_}"):
+            with NvtxAnnotate(f"MoE_Expert_{local_expert_idx}"):
                 expert_input = hidden_states[batch_indices]
                 expert_req_bins = self.req_bins_[batch_indices]
 
                 # 4.4.1 Synchronize: ensure current expert's weights have arrived
-                compute_stream.wait_stream(transfer_stream)
+                with NvtxAnnotate("MoE_WaitTransfer"):
+                    compute_stream.wait_stream(transfer_stream)
                 current_weights = next_weights
 
                 # 4.4.2 Prefetch next expert's weights concurrently
                 if i + 1 < len(active_experts_data):
-                    next_expert_idx, _, _ = active_experts_data[i + 1]
-                    with torch.cuda.stream(transfer_stream):
-                        next_weights = prefetch_weights(next_expert_idx)
+                    with NvtxAnnotate("MoE_PrefetchNext"):
+                        next_expert_idx, _, _ = active_experts_data[i + 1]
+                        with torch.cuda.stream(transfer_stream):
+                            next_weights = prefetch_weights(next_expert_idx)
 
                 w1, w3, w2 = current_weights
 
-                # 4.4.3 Compute Base
-                # input: [N, hidden], w.T: [hidden, inter] -> output: [N, inter]
-                gate_out = torch.mm(expert_input, w1.T)
-                up_out = torch.mm(expert_input, w3.T)
+                # 4.4.3 Compute Base GEMM
+                with NvtxAnnotate("MoE_GateGEMM"):
+                    gate_out = torch.mm(expert_input, w1.T)
+                with NvtxAnnotate("MoE_UpGEMM"):
+                    up_out = torch.mm(expert_input, w3.T)
 
                 # 4.4.4 Apply Per-Expert LoRA (Gate/Up)
-                # Use LOCAL expert index for LoRA buffer (as buffer only stores local experts)
-                gate_lora = self.lora_dispatcher_.batch_apply_gate_lora(
-                    expert_input, layer_weight.layer_num_, expert_req_bins, expert_id=local_expert_idx
-                )
-                up_lora = self.lora_dispatcher_.batch_apply_up_lora(
-                    expert_input, layer_weight.layer_num_, expert_req_bins, expert_id=local_expert_idx
-                )
+                with NvtxAnnotate("MoE_GateLoRA"):
+                    gate_lora = self.lora_dispatcher_.batch_apply_gate_lora(
+                        expert_input, layer_weight.layer_num_, expert_req_bins, expert_id=local_expert_idx
+                    )
+                with NvtxAnnotate("MoE_UpLoRA"):
+                    up_lora = self.lora_dispatcher_.batch_apply_up_lora(
+                        expert_input, layer_weight.layer_num_, expert_req_bins, expert_id=local_expert_idx
+                    )
 
                 gate_out += gate_lora
                 up_out += up_lora
 
                 # 4.4.5 Activation
-                current_hidden = torch.nn.functional.silu(gate_out) * up_out
+                with NvtxAnnotate("MoE_Activation"):
+                    current_hidden = torch.nn.functional.silu(gate_out) * up_out
 
                 # 4.4.6 Down Projection Base
-                down_out = torch.mm(current_hidden, w2.T)
+                with NvtxAnnotate("MoE_DownGEMM"):
+                    down_out = torch.mm(current_hidden, w2.T)
 
                 # 4.4.7 Apply Per-Expert LoRA (Down)
-                # Use LOCAL expert index for LoRA buffer
-                down_lora = self.lora_dispatcher_.batch_apply_down_lora(
-                    current_hidden, layer_weight.layer_num_, expert_req_bins, expert_id=local_expert_idx
-                )
+                with NvtxAnnotate("MoE_DownLoRA"):
+                    down_lora = self.lora_dispatcher_.batch_apply_down_lora(
+                        current_hidden, layer_weight.layer_num_, expert_req_bins, expert_id=local_expert_idx
+                    )
                 down_out += down_lora
 
                 # 4.4.8 Weighted Aggregation (Corrected)
-                # routing_weights: [num_selected, 1]
-                routing_weights = topk_weights[batch_indices, k_indices].view(-1, 1)
-                weighted_output = (down_out * routing_weights).to(hidden_states.dtype)
+                with NvtxAnnotate("MoE_Aggregation"):
+                    # routing_weights: [num_selected, 1]
+                    routing_weights = topk_weights[batch_indices, k_indices].view(-1, 1)
+                    weighted_output = (down_out * routing_weights).to(hidden_states.dtype)
 
-                # 使用 index_add_ 在 final_output 上原地累加
-                final_output.index_add_(0, batch_indices, weighted_output)
+                    # 使用 index_add_ 在 final_output 上原地累加
+                    final_output.index_add_(0, batch_indices, weighted_output)
 
                 # 4.4.9 Cleanup - eagerly free GPU tensor references
-                del current_weights, w1, w3, w2
+                with NvtxAnnotate("MoE_Cleanup"):
+                    del current_weights, w1, w3, w2
 
         return final_output.view(num_tokens, hidden_dim)
 
