@@ -19,3 +19,4 @@ test/lora/avx/pcie_bench
 test/lora/avx/pcie_benchmark.cu
 test/lora/avx/results.csv
 test/lora/*.nsys-rep
+test/lora/*.sqlite

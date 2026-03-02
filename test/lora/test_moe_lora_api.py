@@ -22,6 +22,9 @@ from typing import Optional, Dict, List
 import os
 import base64
 import mimetypes
+import concurrent.futures
+
+
 
 DEFAULT_URL = "http://localhost:8040"
 DEFAULT_MODEL = "Qwen3-VL-30B-A3B-Instruct"
@@ -41,14 +44,24 @@ def parse_args():
     return parser.parse_args()
 
 
-class MoELoRAPIClient:
-    """Client for testing MoE LoRA API."""
+from requests.adapters import HTTPAdapter
 
-    def __init__(self, url: str, model: str):
+class MoELoRAPIClient:
+    """Client for testing MoE LoRA API with high concurrency support."""
+
+    def __init__(self, url: str, model: str, max_concurrent_requests: int = 100):
         self.url = url.rstrip("/")
         self.model = model
         self.session = requests.Session()
-
+        
+        # Configure the connection pool to handle large concurrent batches
+        adapter = HTTPAdapter(
+            pool_connections=max_concurrent_requests, 
+            pool_maxsize=max_concurrent_requests
+        )
+        self.session.mount('http://', adapter)
+        self.session.mount('https://', adapter)
+        
     def generate(
         self,
         prompt: str,
@@ -260,6 +273,7 @@ def test_streaming(
     return {"token_count": token_count, "elapsed": elapsed}
 
 
+
 def test_batch_generation(
     client: MoELoRAPIClient,
     prompts: List[str],
@@ -267,17 +281,32 @@ def test_batch_generation(
     adapter_id: Optional[str],
     verbose: bool,
 ):
-    """Test batch generation with multiple prompts."""
-    print(f"\n=== Batch Generation ({len(prompts)} prompts) ===")
+    """Test batch generation with multiple concurrent prompts."""
+    print(f"\n=== Concurrent Batch Generation ({len(prompts)} requests) ===")
 
     start_time = time.time()
     results = []
 
-    for i, prompt in enumerate(prompts):
-        result = client.generate(prompt, max_tokens=max_tokens, adapter_id=adapter_id)
-        results.append(result)
+    # Wrapper function for the executor
+    def fetch(prompt_text):
+        return client.generate(prompt_text, max_tokens=max_tokens, adapter_id=adapter_id)
+
+    # Dispatch all requests concurrently
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(prompts)) as executor:
+        # Submit tasks and store future-to-prompt mapping
+        future_to_req = {executor.submit(fetch, p): p for p in prompts}
+        
+        # As each request completes, collect the results
+        for future in concurrent.futures.as_completed(future_to_req):
+            try:
+                result = future.result()
+                results.append(result)
+            except Exception as exc:
+                results.append({"error": str(exc)})
 
     elapsed = time.time() - start_time
+    
+    # Calculate performance metrics
     total_tokens = sum(
         r.get("usage", {}).get("completion_tokens", 0) if "error" not in r else 0
         for r in results
@@ -287,7 +316,15 @@ def test_batch_generation(
     print(f"Successful requests: {success_count}/{len(prompts)}")
     print(f"Total tokens: {total_tokens}")
     print(f"Time: {elapsed:.2f}s")
-    print(f"Speed: {total_tokens / elapsed:.2f} tokens/s")
+    print(f"Overall System Throughput: {total_tokens / elapsed:.2f} tokens/s")
+
+    if verbose:
+        for i, res in enumerate(results):
+            if "error" in res:
+                print(f"Request {i} failed: {res['error']}")
+            else:
+                out = res["choices"][0]["message"]["content"]
+                print(f"Request {i} output: {out[:50]}...")
 
     return results
 
@@ -296,71 +333,52 @@ def main():
     args = parse_args()
 
     print("=" * 60)
-    print("MoE LoRA API Test Script")
+    print("MoE LoRA API Test Script (Concurrent Batching)")
     print("=" * 60)
     print(f"URL: {args.url}")
     print(f"Model: {args.model}")
     print(f"Mode: {args.mode}")
     print(f"Adapter ID: {args.adapter_id}")
-    print(f"Num requests: {args.num_requests}")
+    print(f"Num requests (Target Batch Size): {args.num_requests}")
     print("=" * 60)
 
     client = MoELoRAPIClient(args.url, args.model)
 
-    # # Health check
-    # if not test_health_check(client):
-    #     print("\nServer is not healthy. Please start the server first.")
-    #     print("See: bash test/lora/start_server.sh")
-    #     return 1
-
-    # # Get model config
-    # test_model_config(client)
-
-    # Test prompts
-    test_prompts = [
-        "Hello, I am a language model. My name is",
-        "The capital of France is",
-        "Explain quantum computing in simple terms:",
-    ]
-
-    # Basic generation (no LoRA)
-    # test_basic_generation(client, args.prompt, args.max_tokens, args.verbose)
-
-    # Basic image generation
+    # Basic image generation logic remains unchanged
     if args.vision:
         print("\n=== Basic Image Generation ===")
-        image_path = "/home/shufan/LightLLM/test/lora/test.png"  # Replace with your test image path
+        image_path = "/home/shufan/LightLLM/test/lora/test.png"  
         result = client.generate(
             args.prompt,
             max_tokens=args.max_tokens,
             adapter_id=args.adapter_id if args.adapter_id != "default" else None,
             temperature=0.7,
-            image_path= image_path,
+            image_path=image_path,
         )
         print(f"Image generation result: {result}")
 
-    # Test with LoRA (if adapter_id provided)
-    if args.adapter_id:
-        test_lora_generation(
-            client,
-            args.prompt,
-            args.max_tokens,
-            args.adapter_id,
-            args.verbose,
-        )
+    # Single LoRA generation test
+    # if args.adapter_id and args.num_requests == 1:
+    #     test_lora_generation(
+    #         client,
+    #         args.prompt,
+    #         args.max_tokens,
+    #         args.adapter_id,
+    #         args.verbose,
+    #     )
 
-
-    # Batch generation
-    if args.num_requests > 1:
-        prompts = [args.prompt] * args.num_requests
-        test_batch_generation(
-            client,
-            prompts,
-            args.max_tokens,
-            args.adapter_id if args.adapter_id != "default" else None,
-            args.verbose,
-        )
-
+    # Concurrent Batch generation with Cache Evasion
+    # if args.num_requests > 1:
+    # Prepend a unique ID to each prompt to bypass the RadixAttention prefix cache
+    prompts = [f"[Req-{i}] {args.prompt}" for i in range(args.num_requests)]
+    
+    test_batch_generation(
+        client,
+        prompts,
+        args.max_tokens,
+        args.adapter_id if args.adapter_id != "default" else None,
+        args.verbose,
+    )
 
     return 0
 

@@ -24,21 +24,12 @@
 #   --batch_max_tokens     Batch max tokens (default: 4096)
 #   --help                 Show this help message
 #
-# Examples:
-#   # Start server with base model only
-#   ./start_server.sh --model_dir /path/to/qwen3-vl-2b --port 8080
-#
-#   # Start server with LoRA adapter
-#   ./start_server.sh --model_dir /path/to/qwen3-vl-2b --lora_dir /path/to/lora_adapter --port 8080
-#
-#   # Start server with multiple LoRA adapters
-#   ./start_server.sh --model_dir /path/to/qwen3-vl-2b --lora_dir /path/to/lora1 --port 8080
-#
-#   # Run MoE LoRA on CPU only
-#   ./start_server.sh --model_dir /path/to/qwen3-vl-2b --compute_device "moe:cpu"
 # =============================================================================
 
 set -e
+
+# Env
+export MOE_PROFILING=1
 
 # Default values
 MODEL_DIR="/home/shufan/.cache/huggingface/hub/models--Qwen--Qwen3-VL-30B-A3B-Instruct/snapshots/9c4b90e1e4ba969fd3b5378b57d966d725f1b86c"
@@ -62,13 +53,13 @@ LORA_MAX_SIZE=1024
 EOF
 
 ### Baseline 3: Store on CPU, Compute on GPU ###
-#  COMPUTE_DEVICE="vl_storage:cpu,vl_compute:gpu,attn_storage:cpu,attn_compute:gpu,moe_storage:cpu,moe_compute:gpu"
+COMPUTE_DEVICE="vl_storage:cpu,vl_compute:gpu,attn_storage:cpu,attn_compute:gpu,moe_storage:cpu,moe_compute:gpu"
 
 ### Baseline 4: Store on GPU, compute on GPU ###
 # COMPUTE_DEVICE="vl_storage:gpu,vl_compute:gpu,attn_storage:gpu,attn_compute:gpu,moe_storage:gpu,moe_compute:gpu"
 
 ### Proposed: Store on CPU, compute Attn on GPU, MoE on CPU ###
-COMPUTE_DEVICE="vl_storage:cpu,vl_compute:gpu,attn_storage:cpu,attn_compute:gpu,moe_storage:cpu,moe_compute:cpu"
+# COMPUTE_DEVICE="vl_storage:cpu,vl_compute:gpu,attn_storage:cpu,attn_compute:gpu,moe_storage:cpu,moe_compute:cpu"
 
 FORCE_SLOW_LORA_PATH=true
 MAX_REQ_TOTAL_LEN=8192

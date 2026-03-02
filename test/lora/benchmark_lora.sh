@@ -5,9 +5,10 @@ set -e
 # Automated MoE LoRA Profiling Script
 # =============================================================================
 
+
 # Default values
 SETUP_DELAY=10
-MAX_WAIT=600
+MAX_WAIT=1200
 OUTPUT_PREFIX="moe_offload_profile"
 TEST_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEST_SCRIPT="$TEST_SCRIPT_DIR/test_moe_lora_api.py"
@@ -36,6 +37,9 @@ cleanup() {
     # 1. Send SIGINT to the group. 
     # This tells nsys to "stop and save" and the server to "gracefully exit."
     kill -INT -$$ 2>/dev/null
+
+    pkill -9 -f "lightllm.server|lightllm::|gunicorn" && \
+    pkill -9 -f "multiprocessing.resource_tracker|multiprocessing.spawn"
     
     echo "[Cleanup] Waiting for nsys to finalize report (max 15s)..."
     # Wait for the specific nsys process to finish
@@ -96,21 +100,44 @@ sleep "$SETUP_DELAY"
 
 # Step 4: Send test request (nsys is now capturing)
 echo "[3/5] Sending test request..."
-python "$TEST_SCRIPT" --max_tokens "$MAX_TOKENS"
+echo > benchmark_lora.log
+# python "$TEST_SCRIPT" --max_tokens "$MAX_TOKENS" 2>&1 | tee -a benchmark_lora.log
 
+# sleep 5
+# python "$TEST_SCRIPT" --max_tokens "$MAX_TOKENS" 2>&1 | tee -a benchmark_lora.log
+
+# sleep 5
+# python "$TEST_SCRIPT" --max_tokens "$MAX_TOKENS" --num_requests 1 2>&1 | tee -a benchmark_lora.log
+
+# sleep 5
+# python "$TEST_SCRIPT" --max_tokens "$MAX_TOKENS" --num_requests 2 2>&1 | tee -a benchmark_lora.log
+
+# sleep 5
+# python "$TEST_SCRIPT" --max_tokens "$MAX_TOKENS" --num_requests 4 2>&1 | tee -a benchmark_lora.log
+
+# sleep 5
+# python "$TEST_SCRIPT" --max_tokens "$MAX_TOKENS" --num_requests 8 2>&1 | tee -a benchmark_lora.log
+
+# sleep 5
+# python "$TEST_SCRIPT" --max_tokens "$MAX_TOKENS" --num_requests 16 2>&1 | tee -a benchmark_lora.log
+
+# sleep 5
+# python "$TEST_SCRIPT" --max_tokens "$MAX_TOKENS" --num_requests 32 2>&1 | tee -a benchmark_lora.log
+
+# sleep 5
+# python "$TEST_SCRIPT" --max_tokens "$MAX_TOKENS" --num_requests 64 2>&1 | tee -a benchmark_lora.log
 
 sleep 5
-echo "send second request\n\n"
+python "$TEST_SCRIPT" --max_tokens "$MAX_TOKENS" --num_requests 128 2>&1 | tee -a benchmark_lora.log
 
-# Step 5: Send test request (nsys is now capturing)
-echo "[4/5] Sending second test request..."
-python "$TEST_SCRIPT" --max_tokens "$MAX_TOKENS"
+# sleep 5
+# python "$TEST_SCRIPT" --max_tokens "$MAX_TOKENS" --num_requests 256 2>&1 | tee -a benchmark_lora.log
 
+# sleep 5
+# python "$TEST_SCRIPT" --max_tokens "$MAX_TOKENS" --num_requests 512 2>&1 | tee -a benchmark_lora.log
 
-sleep 5
-echo "send third request\n\n"
+# sleep 5
+# python "$TEST_SCRIPT" --max_tokens "$MAX_TOKENS" --num_requests 1024 2>&1 | tee -a benchmark_lora.log
 
-# Step 6: Send test request (nsys is now capturing)
-echo "[5/5] Sending third test request..."
-python "$TEST_SCRIPT" --max_tokens "$MAX_TOKENS"
-
+# sleep 5
+# python "$TEST_SCRIPT" --max_tokens "$MAX_TOKENS" --num_requests 2048 2>&1 | tee -a benchmark_lora.log
