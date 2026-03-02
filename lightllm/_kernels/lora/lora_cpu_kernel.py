@@ -5,6 +5,8 @@ import torch
 import os
 from torch.utils.cpp_extension import load_inline
 
+from lightllm.utils.nvtx_utils import NvtxAnnotate
+
 # Get the directory where this file is located
 _KERNEL_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -81,7 +83,7 @@ except Exception as e:
     _lora_cpu_kernel = None
     _KERNEL_LOADED = False
 
-
+@NvtxAnnotate("batch_lora_avx")
 def batch_lora_avx(
     input_tensor: torch.Tensor,
     A: torch.Tensor,
@@ -127,13 +129,14 @@ def batch_lora_avx(
     output = torch.empty(batch, hidden, dtype=torch.bfloat16, device='cpu')
 
     # Call C++ kernel with native BF16
-    _lora_cpu_kernel.batch_lora_bindings(
-        input_tensor,
-        A,
-        B,
-        output,
-        scaling
-    )
+    with NvtxAnnotate("LoRA_CPU_GEMM_Batch"):
+        _lora_cpu_kernel.batch_lora_bindings(
+            input_tensor,
+            A,
+            B,
+            output,
+            scaling
+        )
 
     return output
 

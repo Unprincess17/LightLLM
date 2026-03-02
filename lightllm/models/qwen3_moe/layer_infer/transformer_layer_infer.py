@@ -272,7 +272,7 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
             logger.debug(f"[MoE] Layer {self.layer_num_}: {num_tokens} tokens -> {token_counts}")
 
         # 4.1 Active Expert Extraction - collect only experts with assigned tokens
-        
+
         # with NvtxAnnotate("MoE_ActiveExpertExtraction"):
         #     active_experts_data = []
         #     for local_expert_idx in expert_iter_range:
@@ -286,28 +286,36 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
         with NvtxAnnotate("MoE_ActiveExpertExtraction_Optimized"):
             # 1. 扁平化 topk_ids [num_tokens * top_k]
             flat_topk_ids = topk_ids.flatten()
-            
+
             # 2. 关键：全局仅触发 1 次 D2H 同步，获取所有专家的 token 分布
             # 这只占用不到 0.1ms 的时间
             expert_counts = torch.bincount(flat_topk_ids, minlength=total_experts).cpu().tolist()
-            
+
+            # Profile: 记录每层激活的experts (使用环境变量 MOE_PROFILING=1 开启)
+            if os.environ.get("MOE_PROFILING", "0") == "1":
+                layer_id = layer_weight.layer_num_
+                active_experts = [i for i, count in enumerate(expert_counts) if count > 0]
+                with open("/tmp/moe_profiling.log", "a") as f:
+                    f.write(f"Layer {layer_id}: activated_experts={active_experts}, "
+                            f"expert_counts={expert_counts}, total_tokens={sum(expert_counts)}\n")
+
             # 3. 纯 GPU 排序，瞬间将 Token 按 Expert 聚类
             sorted_token_indices = torch.argsort(flat_topk_ids)
-            
+
             # 4. 在 CPU 端瞬间计算出全局内存块的偏移量
             global_offsets = [0] * (total_experts + 1)
             for i in range(total_experts):
                 global_offsets[i+1] = global_offsets[i] + expert_counts[i]
-            
+
             active_experts_data = []
             for local_expert_idx in expert_iter_range:
                 global_expert_id = local_to_global.get(local_expert_idx, local_expert_idx) if is_ep else local_expert_idx
                 count = expert_counts[global_expert_id]
-                
+
                 if count > 0:
                     start_idx = global_offsets[global_expert_id]
                     end_idx = start_idx + count
-                    
+
                     # 5. 纯 GPU View 截取，零同步！
                     token_idx = sorted_token_indices[start_idx:end_idx]
                     batch_indices = token_idx // self.num_experts_per_tok
@@ -326,9 +334,10 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
 
             def prefetch_weights(local_idx):
                 """Prefetch weights for a specific expert using non-blocking transfer."""
-                w1 = experts.experts_gate_projs[local_idx].cuda(non_blocking=True)
-                w3 = experts.experts_up_projs[local_idx].cuda(non_blocking=True)
-                w2 = experts.w2_list[local_idx].cuda(non_blocking=True)
+                with NvtxAnnotate("LoRA_PCIe_HtoD_Weight"):
+                    w1 = experts.experts_gate_projs[local_idx].cuda(non_blocking=True)
+                    w3 = experts.experts_up_projs[local_idx].cuda(non_blocking=True)
+                    w2 = experts.w2_list[local_idx].cuda(non_blocking=True)
                 return w1, w3, w2
 
         # 4.3 Prime the Pipeline - prefetch first expert's weights

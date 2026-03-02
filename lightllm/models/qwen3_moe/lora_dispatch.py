@@ -12,6 +12,7 @@ import torch
 from typing import Dict, Optional, Any
 
 from lightllm.server.core.objs.lora_compute_config import LoRAComputeConfig
+from lightllm.utils.nvtx_utils import NvtxAnnotate
 
 
 class Qwen3MOELoRADispatcher:
@@ -123,7 +124,8 @@ class Qwen3MOELoRADispatcher:
         output_dim = lora_B.shape[1] if lora_B.dim() == 2 else lora_B.shape[0]
 
         # Transfer input to CPU (non-blocking for overlap)
-        input_cpu = input_tensor.to("cpu", non_blocking=True)
+        with NvtxAnnotate("LoRA_PCIe_DtoH"):
+            input_cpu = input_tensor.to("cpu", non_blocking=True)
 
         # Ensure weights are on CPU
         if lora_A.device.type != "cpu":
@@ -134,11 +136,14 @@ class Qwen3MOELoRADispatcher:
         # Compute LoRA on CPU: input @ A @ B.T * scaling
         # Use torch.matmul for efficiency
         with torch.no_grad():
-            intermediate = torch.matmul(input_cpu, lora_A)  # [*, rank]
-            output_cpu = torch.matmul(intermediate, lora_B.t()) * scaling  # [*, output_dim]
+            with NvtxAnnotate("LoRA_CPU_GEMM_Down"):
+                intermediate = torch.matmul(input_cpu, lora_A)  # [*, rank]
+            with NvtxAnnotate("LoRA_CPU_GEMM_Up"):
+                output_cpu = torch.matmul(intermediate, lora_B.t()) * scaling  # [*, output_dim]
 
         # Transfer result back to GPU
-        output_gpu = output_cpu.to(input_tensor.device, non_blocking=True)
+        with NvtxAnnotate("LoRA_PCIe_HtoD"):
+            output_gpu = output_cpu.to(input_tensor.device, non_blocking=True)
 
         return output_gpu
 
