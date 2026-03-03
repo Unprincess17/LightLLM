@@ -18,7 +18,7 @@ import argparse
 import json
 import time
 import requests
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Union
 import os
 import base64
 import mimetypes
@@ -278,31 +278,60 @@ def test_batch_generation(
     client: MoELoRAPIClient,
     prompts: List[str],
     max_tokens: int,
-    adapter_id: Optional[str],
+    adapter_ids: Optional[Union[str, List[Optional[str]]]],
     verbose: bool,
 ):
-    """Test batch generation with multiple concurrent prompts."""
+    """Test batch generation with multiple concurrent prompts.
+
+    ``adapter_ids`` can be:
+    - ``None``: no adapter for all requests.
+    - ``str``: same adapter for all requests.
+    - ``List[Optional[str]]``: per-request adapter IDs (must match ``prompts`` length).
+    """
     print(f"\n=== Concurrent Batch Generation ({len(prompts)} requests) ===")
 
+    if not prompts:
+        print("No prompts provided. Skipping batch generation.")
+        return []
+
+    if adapter_ids is None:
+        request_adapter_ids = [None] * len(prompts)
+    elif isinstance(adapter_ids, str):
+        request_adapter_ids = [adapter_ids] * len(prompts)
+    elif isinstance(adapter_ids, list):
+        if len(adapter_ids) != len(prompts):
+            raise ValueError(
+                f"adapter_ids length ({len(adapter_ids)}) must equal prompts length ({len(prompts)})."
+            )
+        request_adapter_ids = adapter_ids
+    else:
+        raise TypeError(
+            "adapter_ids must be None, a string adapter ID, or a list of optional adapter IDs."
+        )
+
     start_time = time.time()
-    results = []
+    results: List[Dict] = [{} for _ in prompts]
 
     # Wrapper function for the executor
-    def fetch(prompt_text):
-        return client.generate(prompt_text, max_tokens=max_tokens, adapter_id=adapter_id)
+    def fetch(prompt_text: str, req_adapter_id: Optional[str]) -> Dict:
+        return client.generate(prompt_text, max_tokens=max_tokens, adapter_id=req_adapter_id)
 
     # Dispatch all requests concurrently
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(prompts)) as executor:
         # Submit tasks and store future-to-prompt mapping
-        future_to_req = {executor.submit(fetch, p): p for p in prompts}
+        future_to_req = {
+            executor.submit(fetch, prompt_text, req_adapter_id): idx
+            for idx, (prompt_text, req_adapter_id) in enumerate(zip(prompts, request_adapter_ids))
+        }
         
         # As each request completes, collect the results
         for future in concurrent.futures.as_completed(future_to_req):
+            idx = future_to_req[future]
             try:
                 result = future.result()
-                results.append(result)
+                results[idx] = result
             except Exception as exc:
-                results.append({"error": str(exc)})
+                results[idx] = {"error": str(exc)}
 
     elapsed = time.time() - start_time
     
@@ -357,16 +386,6 @@ def main():
         )
         print(f"Image generation result: {result}")
 
-    # Single LoRA generation test
-    # if args.adapter_id and args.num_requests == 1:
-    #     test_lora_generation(
-    #         client,
-    #         args.prompt,
-    #         args.max_tokens,
-    #         args.adapter_id,
-    #         args.verbose,
-    #     )
-
     # Concurrent Batch generation with Cache Evasion
     # if args.num_requests > 1:
     # Prepend a unique ID to each prompt to bypass the RadixAttention prefix cache
@@ -375,9 +394,9 @@ def main():
     test_batch_generation(
         client,
         prompts,
-        args.max_tokens,
-        args.adapter_id if args.adapter_id != "default" else None,
-        args.verbose,
+        max_tokens=args.max_tokens,
+        adapter_ids=args.adapter_id if args.adapter_id != "default" else None,
+        verbose=args.verbose,
     )
 
     return 0
