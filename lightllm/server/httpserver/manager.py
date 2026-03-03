@@ -617,24 +617,24 @@ class HttpServerManager:
                             (out_token_counter - metadata["mtp_accepted_token_num"]), 1
                         )
                         format_start_time = datetime.datetime.fromtimestamp(start_time).strftime("%Y-%m-%d %H:%M:%S")
-                        logger.info(
-                            f"X-Request-Id:{x_request_id} "
-                            f"X-Session-Id:{x_session_id} start_time:{format_start_time} "
-                            f"lightllm_req_id:{group_request_id} first_token_cost:{first_token_cost_ms}ms "
-                            f"total_cost_time:{total_cost_time_ms}ms,out_token_counter:{out_token_counter} "
-                            f"mean_per_token_cost_time: {mean_per_token_cost_time_ms}ms "
-                            f"prompt_token_num:{prompt_tokens} "
-                            f"gpu cache hit: {prompt_cache_len > 0} "
-                            f"gpu_prompt_cache_len:{prompt_cache_len} "
-                            f"gpu_prompt_cache_ratio:{prompt_cache_ratio} "
-                            f"cpu cache hit: {cpu_prompt_cache_len > 0} "
-                            f"cpu_prompt_cache_len:{cpu_prompt_cache_len} "
-                            f"cpu_prompt_cache_ratio:{cpu_prompt_cache_ratio} "
-                            f"disk cache hit: {disk_prompt_cache_len > 0} "
-                            f"disk_prompt_cache_len:{disk_prompt_cache_len} "
-                            f"disk_prompt_cache_ratio:{disk_prompt_cache_ratio} "
-                            f"mtp_avg_token_per_step:{mtp_avg_token_per_step} "
-                        )
+                        # logger.info(
+                        #     f"X-Request-Id:{x_request_id} "
+                        #     f"X-Session-Id:{x_session_id} start_time:{format_start_time} "
+                        #     f"lightllm_req_id:{group_request_id} first_token_cost:{first_token_cost_ms}ms "
+                        #     f"total_cost_time:{total_cost_time_ms}ms,out_token_counter:{out_token_counter} "
+                        #     f"mean_per_token_cost_time: {mean_per_token_cost_time_ms}ms "
+                        #     f"prompt_token_num:{prompt_tokens} "
+                        #     f"gpu cache hit: {prompt_cache_len > 0} "
+                        #     f"gpu_prompt_cache_len:{prompt_cache_len} "
+                        #     f"gpu_prompt_cache_ratio:{prompt_cache_ratio} "
+                        #     f"cpu cache hit: {cpu_prompt_cache_len > 0} "
+                        #     f"cpu_prompt_cache_len:{cpu_prompt_cache_len} "
+                        #     f"cpu_prompt_cache_ratio:{cpu_prompt_cache_ratio} "
+                        #     f"disk cache hit: {disk_prompt_cache_len > 0} "
+                        #     f"disk_prompt_cache_len:{disk_prompt_cache_len} "
+                        #     f"disk_prompt_cache_ratio:{disk_prompt_cache_ratio} "
+                        #     f"mtp_avg_token_per_step:{mtp_avg_token_per_step} "
+                        # )
                         if group_request_id < 0:
                             # health 探测请求，不记录日志和监控
                             return
