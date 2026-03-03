@@ -53,7 +53,8 @@ void lora_up_avx512_bf16(
         const bf16* x_ptr = x + b * R;
         bf16* out_ptr = out + b * H;
 
-        // Process in blocks of 16 (one AVX-512 register = 16 floats = 32 BF16s)
+        // Process 16 outputs per block.
+        // Each block needs 16 BF16 values (32 bytes) from B_mat.
         int h = 0;
         for (; h + 15 < H; h += 16) {
             __m512 acc = _mm512_setzero_ps();
@@ -64,13 +65,11 @@ void lora_up_avx512_bf16(
                 if (x_val == 0.0f) continue;
 
                 const bf16* B_row = B_mat + r * H;
-                // Load 16 BF16s as F32 via vcvtneps_pbh (if available) or manual
-                // For Sapphire Rapids, use native BF16 support
-                __m512i v_B = _mm512_loadu_si512((const __m512i*)(B_row + h));
-                // Convert BF16 to F32 using DPBF16-style conversion
-                // Shift upper 16 bits (BF16) to lower 16 bits, then zero-extend to F32
-                // Actually, BF16 is in upper bits for DPBF16, let's use vmovnebhd
-                __m512 v_Bf32 = _mm512_castsi512_ps(_mm512_srli_epi32(v_B, 16));
+                // Load 16 BF16 (256 bits), widen to 32-bit ints, then place BF16 bits
+                // in the upper 16 bits of FP32 lanes.
+                __m256i v_B_u16 = _mm256_loadu_si256((const __m256i*)(B_row + h));
+                __m512i v_B_u32 = _mm512_cvtepu16_epi32(v_B_u16);
+                __m512 v_Bf32 = _mm512_castsi512_ps(_mm512_slli_epi32(v_B_u32, 16));
                 acc = _mm512_fmadd_ps(_mm512_set1_ps(x_val), v_Bf32, acc);
             }
 
@@ -130,12 +129,17 @@ void lora_up_bindings(torch::Tensor x, torch::Tensor B_tensor, torch::Tensor out
 void batch_lora_bindings(torch::Tensor x, torch::Tensor A, torch::Tensor B_tensor,
                         torch::Tensor out, float scaling) {
     int B = x.size(0), H = x.size(1), R = A.size(0);
-    std::vector<bf16> temp(B * R);
+    // Reuse temporary buffer per-thread to avoid repeated heap allocations.
+    thread_local std::vector<bf16> temp_buffer;
+    size_t temp_size = static_cast<size_t>(B) * static_cast<size_t>(R);
+    if (temp_buffer.size() < temp_size) {
+        temp_buffer.resize(temp_size);
+    }
     batch_lora_avx512_bf16(
         (const bf16*)x.data_ptr(),
         (const bf16*)A.data_ptr(),
         (const bf16*)B_tensor.data_ptr(),
-        temp.data(),
+        temp_buffer.data(),
         (bf16*)out.data_ptr(),
         B, H, R, scaling);
 }

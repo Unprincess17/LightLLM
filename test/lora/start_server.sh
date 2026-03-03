@@ -156,6 +156,9 @@ echo "Port: $PORT"
 echo "TP: $TP"
 echo "=============================================="
 
+# Clean up shared memory segments
+ipcs -m | awk -v user="$USER" '$3 == user && $6 == "0" && $2 ~ /^[0-9]+$/ {print $2}' | xargs -r -n 1 ipcrm -m
+
 # cache
 echo "Cache model in memory (vmtouch)"
 find  "$MODEL_DIR" -name "*safetensors" | xargs -n 1 realpath | xargs vmtouch -vt

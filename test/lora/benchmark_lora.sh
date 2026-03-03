@@ -40,7 +40,8 @@ cleanup() {
 
     pkill -9 -f "lightllm.server|lightllm::|gunicorn" && \
     pkill -9 -f "multiprocessing.resource_tracker|multiprocessing.spawn"
-    
+    ipcs -m | awk -v user="$USER" '$3 == user && $6 == "0" && $2 ~ /^[0-9]+$/ {print $2}' | xargs -r -n 1 ipcrm -m
+
     echo "[Cleanup] Waiting for nsys to finalize report (max 15s)..."
     # Wait for the specific nsys process to finish
     # nsys post-processing can take a while for large MoE models
@@ -128,10 +129,10 @@ echo > benchmark_lora.log
 # python "$TEST_SCRIPT" --max_tokens "$MAX_TOKENS" --num_requests 64 2>&1 | tee -a benchmark_lora.log
 
 sleep 5
-python "$TEST_SCRIPT" --max_tokens "$MAX_TOKENS" --num_requests 128 2>&1 | tee -a benchmark_lora.log
+# python "$TEST_SCRIPT" --max_tokens "$MAX_TOKENS" --num_requests 128 2>&1 | tee -a benchmark_lora.log
 
-# sleep 5
-# python "$TEST_SCRIPT" --max_tokens "$MAX_TOKENS" --num_requests 256 2>&1 | tee -a benchmark_lora.log
+sleep 5
+python "$TEST_SCRIPT" --max_tokens "$MAX_TOKENS" --num_requests 256 2>&1 | tee -a benchmark_lora.log
 
 # sleep 5
 # python "$TEST_SCRIPT" --max_tokens "$MAX_TOKENS" --num_requests 512 2>&1 | tee -a benchmark_lora.log

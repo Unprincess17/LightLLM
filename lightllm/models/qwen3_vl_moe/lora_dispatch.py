@@ -49,8 +49,9 @@ try:
         batch_lora_avx,
         lora_down_avx,
         lora_up_avx,
-        is_available as AVX_AVAILABLE,
+        is_available as _avx_is_available,
     )
+    AVX_AVAILABLE = _avx_is_available()
     if AVX_AVAILABLE:
         logger.info("AVX-512 BF16 CPU kernel available")
 except ImportError:
