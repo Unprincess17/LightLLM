@@ -1,11 +1,13 @@
 import os
+import json
 import logging
 import torch
 import torch.functional as F
 import torch.distributed as dist
 import numpy as np
 import triton
-from typing import Tuple, Optional, Any
+from typing import Tuple, Optional, Any, Dict, Callable
+from contextlib import nullcontext
 from lightllm.models.qwen3_moe.layer_weights.transformer_layer_weight import Qwen3MOETransformerLayerWeight
 from lightllm.models.llama.layer_infer.transformer_layer_infer import LlamaTransformerLayerInfer
 from lightllm.models.llama.infer_struct import LlamaInferStateInfo
@@ -53,6 +55,262 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
         """
         self.req_bins_ = req_bins
 
+    def _coalesce_lora_activations(
+        self,
+        activations: torch.Tensor,
+        req_bins: Optional[torch.Tensor],
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        """Pack expert activations into adapter-sorted contiguous blocks on GPU.
+
+        The output metadata follows CSR-like semantics:
+        - adapter_ids: sorted unique adapter IDs
+        - adapter_offsets: prefix-sum offsets into packed activations
+        - token_positions: positions in original activations for each packed row
+        """
+        if req_bins is None or activations.numel() == 0:
+            return None
+
+        bins = req_bins.to(device=activations.device, dtype=torch.long)
+        valid_mask = bins >= 0
+        if not torch.any(valid_mask):
+            return None
+
+        token_positions = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1)
+        valid_bins = bins.index_select(0, token_positions)
+
+        # Group rows by adapter to maximize contiguous D2H/H2D transfer efficiency.
+        if valid_bins.numel() > 1:
+            sorted_bins, sort_idx = torch.sort(valid_bins)
+            token_positions = token_positions.index_select(0, sort_idx)
+        else:
+            sorted_bins = valid_bins
+
+        packed_activations = activations.index_select(0, token_positions).contiguous()
+
+        adapter_ids, adapter_counts = torch.unique_consecutive(sorted_bins, return_counts=True)
+        adapter_offsets = torch.empty(adapter_counts.numel() + 1, dtype=torch.int32, device=activations.device)
+        adapter_offsets[0] = 0
+        adapter_offsets[1:] = torch.cumsum(adapter_counts.to(torch.int32), dim=0)
+
+        return {
+            "packed_activations": packed_activations,
+            "packed_bins": sorted_bins.contiguous(),
+            "token_positions": token_positions,
+            "adapter_ids": adapter_ids,
+            "adapter_offsets": adapter_offsets,
+        }
+
+    def _scatter_lora_from_packed(
+        self,
+        packed_output: torch.Tensor,
+        token_positions: torch.Tensor,
+        total_tokens: int,
+    ) -> torch.Tensor:
+        """Scatter packed LoRA output back to the original expert token order."""
+        full_output = torch.zeros(
+            (total_tokens, packed_output.shape[1]),
+            dtype=packed_output.dtype,
+            device=packed_output.device,
+        )
+        if packed_output.numel() > 0:
+            full_output.index_copy_(0, token_positions, packed_output)
+        return full_output
+
+    def _dispatch_lora_with_optional_coalescing(
+        self,
+        dispatch_fn: Callable[..., torch.Tensor],
+        input_tensor: torch.Tensor,
+        layer_id: int,
+        req_bins: Optional[torch.Tensor],
+        expert_id: int,
+        pack_meta: Optional[Dict[str, torch.Tensor]],
+        reuse_packed_input: bool = False,
+        phase_name: str = "",
+        study2_prefix: Optional[str] = None,
+    ) -> torch.Tensor:
+        """Run LoRA with packed activations when metadata is available."""
+        if pack_meta is None:
+            return dispatch_fn(input_tensor, layer_id, req_bins, expert_id=expert_id)
+
+        use_cpu_compute = self._should_use_moe_cpu_compute()
+        if use_cpu_compute:
+            return self._dispatch_lora_with_coalesced_cpu_roundtrip(
+                dispatch_fn=dispatch_fn,
+                input_tensor=input_tensor,
+                layer_id=layer_id,
+                expert_id=expert_id,
+                pack_meta=pack_meta,
+                reuse_packed_input=reuse_packed_input,
+                phase_name=phase_name,
+                study2_prefix=study2_prefix,
+            )
+
+        if reuse_packed_input:
+            packed_input = pack_meta["packed_activations"]
+        else:
+            packed_input = input_tensor.index_select(0, pack_meta["token_positions"]).contiguous()
+        packed_out = dispatch_fn(
+            packed_input,
+            layer_id,
+            pack_meta["packed_bins"],
+            expert_id=expert_id,
+        )
+        return self._scatter_lora_from_packed(
+            packed_output=packed_out,
+            token_positions=pack_meta["token_positions"],
+            total_tokens=input_tensor.shape[0],
+        )
+
+    def _should_use_moe_cpu_compute(self) -> bool:
+        """Best-effort detection for MoE CPU-compute mode across dispatcher variants."""
+        dispatcher = self.lora_dispatcher_
+        if dispatcher is None:
+            return False
+
+        should_cpu_fn = getattr(dispatcher, "_should_use_cpu_compute", None)
+        if callable(should_cpu_fn):
+            try:
+                return bool(should_cpu_fn("moe"))
+            except Exception:
+                pass
+
+        cfg = getattr(dispatcher, "lora_compute_config", None)
+        if cfg is None:
+            return False
+
+        cfg_should_cpu = getattr(cfg, "should_compute_on_cpu", None)
+        if callable(cfg_should_cpu):
+            try:
+                return bool(cfg_should_cpu("moe"))
+            except Exception:
+                pass
+
+        moe_compute = getattr(cfg, "moe_compute", None)
+        if isinstance(moe_compute, str):
+            return moe_compute.lower() == "cpu"
+        return False
+
+    def _get_study2_profile_prefix(self, expert_id: int, step_idx: int, token_count: int) -> Optional[str]:
+        """Build Study2 NVTX prefix for real-model profiling when enabled via env."""
+        if os.environ.get("MOE_STUDY2_PROFILE", "0") != "1":
+            return None
+
+        layer_filter = os.environ.get("MOE_STUDY2_LAYER", "").strip()
+        if layer_filter:
+            try:
+                if int(layer_filter) != int(self.layer_num_):
+                    return None
+            except ValueError:
+                logger.warning(f"[Study2] Invalid MOE_STUDY2_LAYER={layer_filter}, ignoring filter.")
+
+        return (
+            f"Study2/Layer={int(self.layer_num_)}"
+            f"/Expert={int(expert_id)}"
+            f"/Step={int(step_idx)}"
+            f"/N={int(token_count)}"
+        )
+
+    def _dispatch_lora_with_coalesced_cpu_roundtrip(
+        self,
+        dispatch_fn: Callable[..., torch.Tensor],
+        input_tensor: torch.Tensor,
+        layer_id: int,
+        expert_id: int,
+        pack_meta: Dict[str, torch.Tensor],
+        reuse_packed_input: bool,
+        phase_name: str,
+        study2_prefix: Optional[str],
+    ) -> torch.Tensor:
+        """Coalesced D2H->CPU compute->H2D path using packed activation order."""
+        if reuse_packed_input:
+            packed_input_gpu = pack_meta["packed_activations"]
+        else:
+            packed_input_gpu = input_tensor.index_select(0, pack_meta["token_positions"]).contiguous()
+
+        if "packed_bins_cpu" not in pack_meta:
+            pack_meta["packed_bins_cpu"] = pack_meta["packed_bins"].to(device="cpu", non_blocking=False)
+        packed_bins_cpu = pack_meta["packed_bins_cpu"]
+
+        if packed_input_gpu.device.type != "cuda":
+            packed_out = dispatch_fn(
+                packed_input_gpu,
+                layer_id,
+                packed_bins_cpu.to(device=packed_input_gpu.device),
+                expert_id=expert_id,
+            )
+            return self._scatter_lora_from_packed(
+                packed_output=packed_out,
+                token_positions=pack_meta["token_positions"],
+                total_tokens=input_tensor.shape[0],
+            )
+
+        phase_suffix = phase_name if phase_name else "LoRA"
+        to_cpu_label = (
+            f"{study2_prefix}/Transfer_ToCPU/{phase_suffix}"
+            if study2_prefix is not None
+            else "MoE_COLoRA_D2H_Activation"
+        )
+        cpu_compute_label = (
+            f"{study2_prefix}/CPU_AVX_Compute/{phase_suffix}"
+            if study2_prefix is not None
+            else "MoE_COLoRA_CPU_AVX_Compute"
+        )
+        to_gpu_label = (
+            f"{study2_prefix}/Transfer_ToGPU/{phase_suffix}"
+            if study2_prefix is not None
+            else "MoE_COLoRA_H2D_Activation"
+        )
+
+        with NvtxAnnotate(to_cpu_label):
+            packed_input_cpu = torch.empty(
+                packed_input_gpu.shape,
+                dtype=packed_input_gpu.dtype,
+                device="cpu",
+                pin_memory=True,
+            )
+            packed_input_cpu.copy_(packed_input_gpu, non_blocking=True)
+            # CPU kernel consumes host data directly; ensure D2H completion first.
+            torch.cuda.current_stream().synchronize()
+
+        with NvtxAnnotate(cpu_compute_label):
+            packed_out_cpu = dispatch_fn(
+                packed_input_cpu,
+                layer_id,
+                packed_bins_cpu,
+                expert_id=expert_id,
+            )
+
+        if packed_out_cpu.device.type != "cpu":
+            return self._scatter_lora_from_packed(
+                packed_output=packed_out_cpu,
+                token_positions=pack_meta["token_positions"],
+                total_tokens=input_tensor.shape[0],
+            )
+
+        with NvtxAnnotate(to_gpu_label):
+            # Keep H2D contiguous and pinned to maximize PCIe bandwidth.
+            packed_out_cpu = packed_out_cpu.contiguous()
+            packed_out_cpu_pinned = torch.empty(
+                packed_out_cpu.shape,
+                dtype=packed_out_cpu.dtype,
+                device="cpu",
+                pin_memory=True,
+            )
+            packed_out_cpu_pinned.copy_(packed_out_cpu, non_blocking=False)
+
+            packed_out_gpu = torch.empty(
+                packed_out_cpu_pinned.shape,
+                dtype=packed_out_cpu_pinned.dtype,
+                device=input_tensor.device,
+            )
+            packed_out_gpu.copy_(packed_out_cpu_pinned, non_blocking=True)
+
+        return self._scatter_lora_from_packed(
+            packed_output=packed_out_gpu,
+            token_positions=pack_meta["token_positions"],
+            total_tokens=input_tensor.shape[0],
+        )
+
     def _bind_func(self):
         super()._bind_func()
         self._bind_ffn()
@@ -85,6 +343,96 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
         """Clear the LoRA dispatcher."""
         self.lora_dispatcher_ = None
         self.use_detached_lora_ = False
+
+    def _log_adapter_expert_distribution(
+        self,
+        topk_ids: torch.Tensor,
+        req_bins: Optional[torch.Tensor],
+        num_experts: int,
+        num_tokens: int,
+        infer_state: LlamaInferStateInfo,
+    ) -> None:
+        """
+        Log adapter x expert routing counts for one MoE layer call.
+
+        Output format: one JSON object per line for easy downstream parsing.
+        """
+        if os.environ.get("MOE_ADAPTER_EXPERT_PROFILING", "0") != "1":
+            return
+        if req_bins is None or topk_ids is None:
+            return
+
+        if req_bins.numel() < num_tokens:
+            logger.warning(
+                f"[MoE Adapter Profile] Layer {self.layer_num_}: req_bins shorter than tokens "
+                f"({req_bins.numel()} < {num_tokens}), skip profiling."
+            )
+            return
+
+        token_bins = req_bins[:num_tokens].to(topk_ids.device)
+        valid_token_mask = token_bins >= 0
+        if not torch.any(valid_token_mask):
+            return
+
+        token_bins = token_bins[valid_token_mask].long()
+        token_topk_ids = topk_ids[valid_token_mask].long()
+        top_k = token_topk_ids.shape[1]
+
+        adapter_ids = token_bins.unsqueeze(1).expand(-1, top_k).reshape(-1)
+        expert_ids = token_topk_ids.reshape(-1)
+
+        valid_pair_mask = (expert_ids >= 0) & (expert_ids < num_experts)
+        if not torch.any(valid_pair_mask):
+            return
+
+        adapter_ids = adapter_ids[valid_pair_mask]
+        expert_ids = expert_ids[valid_pair_mask]
+
+        max_adapter = int(token_bins.max().item())
+
+        def _matrix_to_dict(matrix: torch.Tensor) -> dict:
+            result = {}
+            non_zero = torch.nonzero(matrix, as_tuple=False)
+            for pair in non_zero.tolist():
+                adapter_idx, expert_idx = int(pair[0]), int(pair[1])
+                count = int(matrix[adapter_idx, expert_idx].item())
+                if count <= 0:
+                    continue
+                adapter_key = str(adapter_idx)
+                if adapter_key not in result:
+                    result[adapter_key] = {}
+                result[adapter_key][str(expert_idx)] = count
+            return result
+
+        flat_ids = adapter_ids * num_experts + expert_ids
+        pair_counts = torch.bincount(flat_ids, minlength=(max_adapter + 1) * num_experts)
+        pair_counts = pair_counts.view(max_adapter + 1, num_experts).cpu()
+        counts_dict = _matrix_to_dict(pair_counts)
+
+        top1_expert_ids = token_topk_ids[:, 0]
+        valid_top1_mask = (top1_expert_ids >= 0) & (top1_expert_ids < num_experts)
+        top1_adapter_ids = token_bins[valid_top1_mask]
+        top1_expert_ids = top1_expert_ids[valid_top1_mask]
+        top1_flat_ids = top1_adapter_ids * num_experts + top1_expert_ids
+        top1_pair_counts = torch.bincount(top1_flat_ids, minlength=(max_adapter + 1) * num_experts)
+        top1_pair_counts = top1_pair_counts.view(max_adapter + 1, num_experts).cpu()
+        top1_counts_dict = _matrix_to_dict(top1_pair_counts)
+
+
+        record = {
+            "event": "adapter_expert_routing",
+            "layer": int(self.layer_num_),
+            "mode": "prefill" if getattr(infer_state, "is_prefill", False) else "decode",
+            "num_tokens": int(num_tokens),
+            "top_k": int(top_k),
+            "num_experts": int(num_experts),
+            "counts_topk": counts_dict,
+            "counts_top1": top1_counts_dict,
+        }
+
+        log_path = os.environ.get("MOE_ADAPTER_EXPERT_LOG_PATH", "/tmp/moe_adapter_expert_profile.log")
+        with open(log_path, "a") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     def _get_local_expert_info(self, layer_weight):
         """Get information about local experts for EP mode.
@@ -210,6 +558,30 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
         # ----------------------------------------------------------------
         if not use_per_expert_lora:
             router_logits = layer_weight.moe_gate.mm(hidden_states)
+            # Profiling-only: explicitly compute top-k assignments to build
+            # adapter x expert routing counts in fast path.
+            if (
+                os.environ.get("MOE_ADAPTER_EXPERT_PROFILING", "0") == "1"
+                and self.req_bins_ is not None
+            ):
+                _, fast_topk_ids = select_experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    correction_bias=getattr(layer_weight.experts, "e_score_correction_bias", None),
+                    top_k=self.num_experts_per_tok,
+                    renormalize=self.norm_topk_prob,
+                    use_grouped_topk=False,
+                    topk_group=None,
+                    num_expert_group=None,
+                    scoring_func=getattr(layer_weight.experts, "scoring_func", "softmax"),
+                )
+                self._log_adapter_expert_distribution(
+                    topk_ids=fast_topk_ids,
+                    req_bins=self.req_bins_,
+                    num_experts=layer_weight.experts.n_routed_experts,
+                    num_tokens=num_tokens,
+                    infer_state=infer_state,
+                )
             layer_weight.experts.experts(
                 hidden_states,
                 router_logits=router_logits,
@@ -244,6 +616,14 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
         if hasattr(layer_weight.experts, "routed_scaling_factor"):
             # topk_weights = topk_weights * layer_weight.experts.routed_scaling_factor
             topk_weights.mul_(layer_weight.experts.routed_scaling_factor)
+
+        self._log_adapter_expert_distribution(
+            topk_ids=topk_ids,
+            req_bins=self.req_bins_,
+            num_experts=layer_weight.experts.n_routed_experts,
+            num_tokens=num_tokens,
+            infer_state=infer_state,
+        )
 
         # 3. Check weights availability
         experts = layer_weight.experts
@@ -350,7 +730,24 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
         for i, (local_expert_idx, batch_indices, k_indices) in enumerate(active_experts_data):
             with NvtxAnnotate(f"MoE_Expert_{local_expert_idx}"):
                 expert_input = hidden_states[batch_indices]
-                expert_req_bins = self.req_bins_[batch_indices]
+                expert_req_bins = self.req_bins_[batch_indices] if self.req_bins_ is not None else None
+
+                study2_prefix = self._get_study2_profile_prefix(
+                    expert_id=local_expert_idx,
+                    step_idx=i,
+                    token_count=int(expert_input.shape[0]),
+                )
+                gpu_stream_label = f"{study2_prefix}/GPU_Stream" if study2_prefix is not None else None
+
+                enable_coalescing = os.environ.get("MOE_COALESCING_PACKER", "1") == "1"
+                pack_meta = None
+                if enable_coalescing:
+                    pack_label = f"{study2_prefix}/Gather" if study2_prefix is not None else "MoE_COLoRA_CoalescePack"
+                    with NvtxAnnotate(pack_label):
+                        pack_meta = self._coalesce_lora_activations(
+                            activations=expert_input,
+                            req_bins=expert_req_bins,
+                        )
 
                 # 4.4.1 Synchronize: ensure current expert's weights have arrived
                 with NvtxAnnotate("MoE_WaitTransfer"):
@@ -367,36 +764,61 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
                 w1, w3, w2 = current_weights
 
                 # 4.4.3 Compute Base GEMM
-                with NvtxAnnotate("MoE_GateGEMM"):
-                    gate_out = torch.mm(expert_input, w1.T)
-                with NvtxAnnotate("MoE_UpGEMM"):
-                    up_out = torch.mm(expert_input, w3.T)
+                with (NvtxAnnotate(gpu_stream_label) if gpu_stream_label is not None else nullcontext()):
+                    with NvtxAnnotate("MoE_GateGEMM"):
+                        gate_out = torch.mm(expert_input, w1.T)
+                    with NvtxAnnotate("MoE_UpGEMM"):
+                        up_out = torch.mm(expert_input, w3.T)
 
                 # 4.4.4 Apply Per-Expert LoRA (Gate/Up)
                 with NvtxAnnotate("MoE_GateLoRA"):
-                    gate_lora = self.lora_dispatcher_.batch_apply_gate_lora(
-                        expert_input, layer_weight.layer_num_, expert_req_bins, expert_id=local_expert_idx
+                    gate_lora = self._dispatch_lora_with_optional_coalescing(
+                        dispatch_fn=self.lora_dispatcher_.batch_apply_gate_lora,
+                        input_tensor=expert_input,
+                        layer_id=layer_weight.layer_num_,
+                        req_bins=expert_req_bins,
+                        expert_id=local_expert_idx,
+                        pack_meta=pack_meta,
+                        reuse_packed_input=True,
+                        phase_name="Gate",
+                        study2_prefix=study2_prefix,
                     )
                 with NvtxAnnotate("MoE_UpLoRA"):
-                    up_lora = self.lora_dispatcher_.batch_apply_up_lora(
-                        expert_input, layer_weight.layer_num_, expert_req_bins, expert_id=local_expert_idx
+                    up_lora = self._dispatch_lora_with_optional_coalescing(
+                        dispatch_fn=self.lora_dispatcher_.batch_apply_up_lora,
+                        input_tensor=expert_input,
+                        layer_id=layer_weight.layer_num_,
+                        req_bins=expert_req_bins,
+                        expert_id=local_expert_idx,
+                        pack_meta=pack_meta,
+                        reuse_packed_input=True,
+                        phase_name="Up",
+                        study2_prefix=study2_prefix,
                     )
 
                 gate_out += gate_lora
                 up_out += up_lora
 
                 # 4.4.5 Activation
-                with NvtxAnnotate("MoE_Activation"):
-                    current_hidden = torch.nn.functional.silu(gate_out) * up_out
+                with (NvtxAnnotate(gpu_stream_label) if gpu_stream_label is not None else nullcontext()):
+                    with NvtxAnnotate("MoE_Activation"):
+                        current_hidden = torch.nn.functional.silu(gate_out) * up_out
 
-                # 4.4.6 Down Projection Base
-                with NvtxAnnotate("MoE_DownGEMM"):
-                    down_out = torch.mm(current_hidden, w2.T)
+                    # 4.4.6 Down Projection Base
+                    with NvtxAnnotate("MoE_DownGEMM"):
+                        down_out = torch.mm(current_hidden, w2.T)
 
                 # 4.4.7 Apply Per-Expert LoRA (Down)
                 with NvtxAnnotate("MoE_DownLoRA"):
-                    down_lora = self.lora_dispatcher_.batch_apply_down_lora(
-                        current_hidden, layer_weight.layer_num_, expert_req_bins, expert_id=local_expert_idx
+                    down_lora = self._dispatch_lora_with_optional_coalescing(
+                        dispatch_fn=self.lora_dispatcher_.batch_apply_down_lora,
+                        input_tensor=current_hidden,
+                        layer_id=layer_weight.layer_num_,
+                        req_bins=expert_req_bins,
+                        expert_id=local_expert_idx,
+                        pack_meta=pack_meta,
+                        phase_name="Down",
+                        study2_prefix=study2_prefix,
                     )
                 down_out += down_lora
 
@@ -430,6 +852,29 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
                 hidden_states, layer_weight.layer_num_, self.req_bins_
             )
             router_logits = router_logits + gate_lora
+
+        if (
+            os.environ.get("MOE_ADAPTER_EXPERT_PROFILING", "0") == "1"
+            and self.req_bins_ is not None
+        ):
+            _, edp_topk_ids = select_experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                correction_bias=getattr(layer_weight.experts, "e_score_correction_bias", None),
+                top_k=self.num_experts_per_tok,
+                renormalize=self.norm_topk_prob,
+                use_grouped_topk=False,
+                topk_group=None,
+                num_expert_group=None,
+                scoring_func=getattr(layer_weight.experts, "scoring_func", "softmax"),
+            )
+            self._log_adapter_expert_distribution(
+                topk_ids=edp_topk_ids,
+                req_bins=self.req_bins_,
+                num_experts=layer_weight.experts.n_routed_experts,
+                num_tokens=token_num,
+                infer_state=infer_state,
+            )
 
         ep_output = layer_weight.experts.experts(
             hidden_states,
