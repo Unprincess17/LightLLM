@@ -75,6 +75,22 @@ class ModeBackend:
         self._radix_tree_merge_update_delta: int = get_radix_tree_merge_update_delta()
         pass
 
+    @staticmethod
+    def _split_lora_dirs(lora_dir_arg: Optional[str]) -> List[str]:
+        if not lora_dir_arg:
+            return []
+        return [item.strip() for item in lora_dir_arg.split(",") if item.strip()]
+
+    def _build_lora_adapter_dirs(self, lora_dir_arg: Optional[str]) -> Dict[int, str]:
+        lora_dirs = self._split_lora_dirs(lora_dir_arg)
+        adapter_dirs: Dict[int, str] = {}
+        for adapter_id, adapter_dir in enumerate(lora_dirs, start=1):
+            abs_dir = os.path.abspath(adapter_dir)
+            if not os.path.isdir(abs_dir):
+                raise FileNotFoundError(f"LoRA directory not found: {abs_dir}")
+            adapter_dirs[adapter_id] = abs_dir
+        return adapter_dirs
+
     def init_model(self, kvargs):
         self.args: StartArgs = kvargs.get("args", None)
         assert self.args is not None
@@ -180,9 +196,13 @@ class ModeBackend:
         if lora_dir:
             # Use batched mode for S-LoRA
             self.use_batched_lora_mode = True
-            lora_adapter_dirs = {1: lora_dir}  # adapter_id -> directory mapping
+            lora_adapter_dirs = self._build_lora_adapter_dirs(lora_dir)
             lora_compute_config = LoRAComputeConfig.from_string(self.args.compute_device)
             self._import_lora_modules(lora_compute_config=lora_compute_config)
+            self.logger.info(
+                "[LoRA Backend] Startup adapter map: "
+                + ", ".join(f"{adapter_id}:{adapter_dir}" for adapter_id, adapter_dir in lora_adapter_dirs.items())
+            )
             self.init_batched_lora_adapters(lora_adapter_dirs)
 
         self.radix_cache = (
@@ -1104,21 +1124,28 @@ class ModeBackend:
         if not self.use_batched_lora_mode:
             return None
 
-        # Get adapter IDs for all requests
-        adapter_ids = [req.adapter_id for req in batch.reqs]
+        # Adapter IDs are 1-based in requests (0 means no adapter).
+        # LoRA memory pool uses 0-based adapter indices.
+        req_bins_list: List[int] = []
+        active_adapter_ids = set()
+        for req in batch.reqs:
+            raw_adapter_id = getattr(req, "adapter_id", 0)
+            try:
+                adapter_id = int(raw_adapter_id)
+            except (TypeError, ValueError):
+                adapter_id = 0
 
-        # Build adapter order (unique adapter IDs in order of appearance)
-        seen = set()
-        adapter_order = []
-        for aid in adapter_ids:
-            if aid not in seen:
-                seen.add(aid)
-                adapter_order.append(aid)
+            if adapter_id > 0:
+                req_bins_list.append(adapter_id - 1)
+                active_adapter_ids.add(adapter_id)
+            else:
+                req_bins_list.append(-1)
 
-        self.logger.info(f"[LoRA Backend] Preparing batch: batch_size={len(batch.reqs)}, adapters={adapter_order}")
+        self.logger.info(
+            f"[LoRA Backend] Preparing batch: batch_size={len(batch.reqs)}, active_adapters={sorted(active_adapter_ids)}"
+        )
 
-        # Create req_bins tensor mapping request index -> adapter index
-        req_bins = batch.get_req_bins(adapter_order)
+        req_bins = torch.tensor(req_bins_list, dtype=torch.long, device="cuda")
 
         self.logger.debug(f"[LoRA Backend]   req_bins (per request)={req_bins.tolist()}")
 
@@ -1163,9 +1190,15 @@ class ModeBackend:
         has_adapter = False
 
         for req in reqs:
-            if hasattr(req, 'adapter_id') and req.adapter_id is not None:
+            if not hasattr(req, "adapter_id"):
+                continue
+            try:
+                adapter_id = int(req.adapter_id)
+            except (TypeError, ValueError):
+                adapter_id = 0
+            if adapter_id > 0:
                 has_adapter = True
-                adapter_ids.add(req.adapter_id)
+                adapter_ids.add(adapter_id)
 
         return has_adapter, len(adapter_ids) > 1
 
@@ -1198,4 +1231,3 @@ class ModeBackend:
 
         self.lora_mem_pool = None
         self.lora_dispatchers = []
-

@@ -23,6 +23,9 @@ import os
 import base64
 import mimetypes
 import concurrent.futures
+import math
+import random
+from collections import Counter
 
 
 
@@ -35,13 +38,153 @@ def parse_args():
     parser.add_argument("--url", type=str, default=DEFAULT_URL, help="API server URL")
     parser.add_argument("--model", type=str, default=DEFAULT_MODEL, help="Model name")
     parser.add_argument("--prompt", type=str, default="Describe the image", help="Input prompt")
-    parser.add_argument("--max_tokens", type=int, default=1, help="Max tokens to generate")
+    parser.add_argument(
+        "--max_tokens",
+        type=int,
+        default=1,
+        help="Max completion tokens to generate",
+    )
+    parser.add_argument(
+        "--decode_target_tokens",
+        type=int,
+        default=None,
+        help=(
+            "Target decode-phase tokens per request. If set, this overrides --max_tokens "
+            "using max_tokens = decode_target_tokens + 1."
+        ),
+    )
+    parser.add_argument(
+        "--ignore_eos",
+        dest="ignore_eos",
+        action="store_true",
+        help="Ignore EOS so generation continues until max_tokens",
+    )
+    parser.add_argument(
+        "--no_ignore_eos",
+        dest="ignore_eos",
+        action="store_false",
+        help="Stop when EOS is generated",
+    )
+    parser.set_defaults(ignore_eos=True)
     parser.add_argument("--adapter_id", type=str, default="lora_dummy", help="Adapter ID for LoRA switching")
+    parser.add_argument(
+        "--adapter_ids",
+        type=str,
+        nargs="+",
+        default=None,
+        help=(
+            "Multiple adapter IDs (space/comma separated), "
+            "e.g. --adapter_ids lora_dummy_0 lora_dummy_1 or "
+            "--adapter_ids lora_dummy_0,lora_dummy_1"
+        ),
+    )
+    parser.add_argument(
+        "--poisson_lambda",
+        type=float,
+        default=3.0,
+        help="Lambda used to sample adapter IDs from Poisson distribution in batched requests",
+    )
+    parser.add_argument(
+        "--poisson_seed",
+        type=int,
+        default=42,
+        help="Random seed for Poisson adapter sampling",
+    )
     parser.add_argument("--mode", type=str, default="detached", choices=["merged", "detached"], help="LoRA mode")
     parser.add_argument("--num_requests", type=int, default=1, help="Number of requests to send")
     parser.add_argument("--vision", action="store_true", help="Use image input")
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
     return parser.parse_args()
+
+
+def _is_base_model_token(token: str) -> bool:
+    return token.lower() in {"default", "none", "null", "base"}
+
+
+def parse_adapter_pool(single_adapter_id: str, adapter_ids: Optional[List[str]]) -> List[Optional[str]]:
+    """Parse adapter IDs from CLI into a deduplicated adapter pool."""
+    raw_tokens: List[str] = adapter_ids if adapter_ids else [single_adapter_id]
+    parsed: List[Optional[str]] = []
+
+    for raw in raw_tokens:
+        for token in raw.split(","):
+            normalized = token.strip()
+            if not normalized:
+                continue
+            if _is_base_model_token(normalized):
+                parsed.append(None)
+            else:
+                parsed.append(normalized)
+
+    if not parsed:
+        return [None]
+
+    deduped: List[Optional[str]] = []
+    seen = set()
+    for adapter_id in parsed:
+        if adapter_id in seen:
+            continue
+        seen.add(adapter_id)
+        deduped.append(adapter_id)
+    return deduped
+
+
+def _sample_poisson_value(poisson_lambda: float, rng: random.Random) -> int:
+    """Sample one Poisson random value using Knuth's algorithm."""
+    if poisson_lambda <= 0:
+        return 0
+
+    threshold = math.exp(-poisson_lambda)
+    product = 1.0
+    count = 0
+    while product > threshold:
+        count += 1
+        product *= rng.random()
+    return count - 1
+
+
+def build_poisson_adapter_ids(
+    num_requests: int,
+    adapter_pool: List[Optional[str]],
+    poisson_lambda: float,
+    poisson_seed: int,
+) -> List[Optional[str]]:
+    """
+    Build per-request adapter IDs by sampling adapter indices from a Poisson distribution.
+
+    Sampled index k is clipped into [0, len(adapter_pool)-1].
+    """
+    if num_requests <= 0:
+        return []
+    if poisson_lambda < 0:
+        raise ValueError(f"poisson_lambda must be >= 0, got {poisson_lambda}")
+    if not adapter_pool:
+        return [None] * num_requests
+    if len(adapter_pool) == 1:
+        return [adapter_pool[0]] * num_requests
+
+    max_idx = len(adapter_pool) - 1
+    rng = random.Random(poisson_seed)
+    sampled_ids: List[Optional[str]] = []
+    for _ in range(num_requests):
+        sampled_idx = _sample_poisson_value(poisson_lambda, rng)
+        sampled_ids.append(adapter_pool[min(sampled_idx, max_idx)])
+    return sampled_ids
+
+
+def _format_adapter_id(adapter_id: Optional[str]) -> str:
+    return adapter_id if adapter_id is not None else "base_model"
+
+
+def resolve_effective_max_tokens(max_tokens: int, decode_target_tokens: Optional[int]) -> int:
+    """Resolve runtime max_tokens, optionally targeting decode-phase token count."""
+    if decode_target_tokens is not None:
+        if decode_target_tokens < 1:
+            raise ValueError(f"decode_target_tokens must be >= 1, got {decode_target_tokens}")
+        return decode_target_tokens + 1
+    if max_tokens < 1:
+        raise ValueError(f"max_tokens must be >= 1, got {max_tokens}")
+    return max_tokens
 
 
 from requests.adapters import HTTPAdapter
@@ -70,6 +213,7 @@ class MoELoRAPIClient:
         temperature: float = 0.7,
         top_p: float = 0.9,
         image_path: Optional[str] = None,
+        ignore_eos: bool = True,
     ) -> Dict:
         """Send a generation request with optional image support."""
         
@@ -107,6 +251,7 @@ class MoELoRAPIClient:
             "max_tokens": max_tokens,
             "temperature": temperature,
             "top_p": top_p,
+            "ignore_eos": ignore_eos,
         }
 
         # Add LoRA adapter ID if provided
@@ -138,6 +283,7 @@ class MoELoRAPIClient:
         prompt: str,
         max_tokens: int = 50,
         adapter_id: Optional[str] = None,
+        ignore_eos: bool = True,
     ):
         """Stream generation request."""
         body = {
@@ -145,6 +291,7 @@ class MoELoRAPIClient:
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_tokens,
             "stream": True,
+            "ignore_eos": ignore_eos,
         }
 
         if adapter_id:
@@ -173,13 +320,15 @@ class MoELoRAPIClient:
             yield {"error": str(e)}
 
 
-def test_basic_generation(client: MoELoRAPIClient, prompt: str, max_tokens: int, verbose: bool):
+def test_basic_generation(
+    client: MoELoRAPIClient, prompt: str, max_tokens: int, verbose: bool, ignore_eos: bool
+):
     """Test basic generation without LoRA."""
     print(f"\n=== Basic Generation (no LoRA) ===")
     print(f"Prompt: {prompt[:50]}...")
 
     start_time = time.time()
-    result = client.generate(prompt, max_tokens=max_tokens)
+    result = client.generate(prompt, max_tokens=max_tokens, ignore_eos=ignore_eos)
     elapsed = time.time() - start_time
 
     if "error" in result:
@@ -205,6 +354,7 @@ def test_lora_generation(
     max_tokens: int,
     adapter_id: str,
     verbose: bool,
+    ignore_eos: bool,
 ):
     """Test generation with LoRA.
     """
@@ -217,6 +367,7 @@ def test_lora_generation(
         max_tokens=max_tokens,
         adapter_id=adapter_id,
         temperature=0.7,
+        ignore_eos=ignore_eos,
     )
     elapsed = time.time() - start_time
 
@@ -243,6 +394,7 @@ def test_streaming(
     max_tokens: int,
     adapter_id: Optional[str],
     verbose: bool,
+    ignore_eos: bool,
 ):
     """Test streaming generation."""
     print(f"\n=== Streaming Generation ===")
@@ -251,7 +403,12 @@ def test_streaming(
     start_time = time.time()
     token_count = 0
 
-    for chunk in client.stream_generate(prompt, max_tokens=max_tokens, adapter_id=adapter_id):
+    for chunk in client.stream_generate(
+        prompt,
+        max_tokens=max_tokens,
+        adapter_id=adapter_id,
+        ignore_eos=ignore_eos,
+    ):
         if "error" in chunk:
             print(f"Error: {chunk['error']}")
             return None
@@ -280,6 +437,7 @@ def test_batch_generation(
     max_tokens: int,
     adapter_ids: Optional[Union[str, List[Optional[str]]]],
     verbose: bool,
+    ignore_eos: bool,
 ):
     """Test batch generation with multiple concurrent prompts.
 
@@ -314,7 +472,12 @@ def test_batch_generation(
 
     # Wrapper function for the executor
     def fetch(prompt_text: str, req_adapter_id: Optional[str]) -> Dict:
-        return client.generate(prompt_text, max_tokens=max_tokens, adapter_id=req_adapter_id)
+        return client.generate(
+            prompt_text,
+            max_tokens=max_tokens,
+            adapter_id=req_adapter_id,
+            ignore_eos=ignore_eos,
+        )
 
     # Dispatch all requests concurrently
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(prompts)) as executor:
@@ -360,6 +523,15 @@ def test_batch_generation(
 
 def main():
     args = parse_args()
+    effective_max_tokens = resolve_effective_max_tokens(args.max_tokens, args.decode_target_tokens)
+    adapter_pool = parse_adapter_pool(args.adapter_id, args.adapter_ids)
+    batch_adapter_ids = build_poisson_adapter_ids(
+        num_requests=args.num_requests,
+        adapter_pool=adapter_pool,
+        poisson_lambda=args.poisson_lambda,
+        poisson_seed=args.poisson_seed,
+    )
+    vision_adapter_id = batch_adapter_ids[0] if batch_adapter_ids else None
 
     print("=" * 60)
     print("MoE LoRA API Test Script (Concurrent Batching)")
@@ -367,7 +539,21 @@ def main():
     print(f"URL: {args.url}")
     print(f"Model: {args.model}")
     print(f"Mode: {args.mode}")
-    print(f"Adapter ID: {args.adapter_id}")
+    print(f"Max tokens (effective): {effective_max_tokens}")
+    if args.decode_target_tokens is not None:
+        print(f"Decode target tokens: {args.decode_target_tokens}")
+    print(f"Ignore EOS: {args.ignore_eos}")
+    print(
+        "Adapter Pool: "
+        + ", ".join(_format_adapter_id(adapter_id) for adapter_id in adapter_pool)
+    )
+    print(f"Poisson lambda: {args.poisson_lambda}")
+    print(f"Poisson seed: {args.poisson_seed}")
+    adapter_counts = Counter(_format_adapter_id(adapter_id) for adapter_id in batch_adapter_ids)
+    print(
+        "Batch adapter distribution: "
+        + ", ".join(f"{adapter}:{count}" for adapter, count in adapter_counts.items())
+    )
     print(f"Num requests (Target Batch Size): {args.num_requests}")
     print("=" * 60)
 
@@ -379,10 +565,11 @@ def main():
         image_path = "/home/shufan/LightLLM/test/lora/test.png"  
         result = client.generate(
             args.prompt,
-            max_tokens=args.max_tokens,
-            adapter_id=args.adapter_id if args.adapter_id != "default" else None,
+            max_tokens=effective_max_tokens,
+            adapter_id=vision_adapter_id,
             temperature=0.7,
             image_path=image_path,
+            ignore_eos=args.ignore_eos,
         )
         print(f"Image generation result: {result}")
 
@@ -394,9 +581,10 @@ def main():
     test_batch_generation(
         client,
         prompts,
-        max_tokens=args.max_tokens,
-        adapter_ids=args.adapter_id if args.adapter_id != "default" else None,
+        max_tokens=effective_max_tokens,
+        adapter_ids=batch_adapter_ids,
         verbose=args.verbose,
+        ignore_eos=args.ignore_eos,
     )
 
     return 0

@@ -1,4 +1,5 @@
 import time
+import os
 import uvloop
 import asyncio
 import torch
@@ -118,9 +119,19 @@ class RouterManager:
 
         # Initialize LoRA manager in router process (for handling API requests)
         if args.lora_dir is not None:
-            from lightllm.server.lora.manager import init_lora_manager
+            from lightllm.server.lora.manager import init_lora_manager, get_lora_manager
             init_lora_manager(max_adapters=args.lora_max_size if hasattr(args, 'lora_max_size') else 1024)
             logger.info("Initialized LoRA manager in router process")
+            lora_manager = get_lora_manager()
+            lora_dirs = [item.strip() for item in args.lora_dir.split(",") if item.strip()]
+            for adapter_dir in lora_dirs:
+                abs_dir = os.path.abspath(adapter_dir)
+                if not os.path.isdir(abs_dir):
+                    logger.warning(f"[LoRA] Startup adapter dir does not exist: {abs_dir}")
+                    continue
+                adapter_name = os.path.basename(os.path.normpath(abs_dir))
+                lora_manager.register_lora_dir(abs_dir, adapter_name)
+                logger.info(f"[LoRA] Startup registered adapter: {adapter_name} -> {abs_dir}")
         return
 
     async def wait_to_model_ready(self):

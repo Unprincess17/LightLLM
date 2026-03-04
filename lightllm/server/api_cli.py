@@ -97,6 +97,7 @@ def make_argument_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="""Path to LoRA adapter directory for detached LoRA serving.
+        You can also pass multiple adapter directories separated by commas.
         When specified, LoRA weights are loaded separately from base model weights
         and can be dynamically switched per request.""",
     )

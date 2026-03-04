@@ -7,7 +7,8 @@
 #
 # Options:
 #   --model_dir PATH       Base model directory (required)
-#   --lora_dir PATH        LoRA adapter directory (optional)
+#   --lora_dir PATH        Single LoRA adapter directory (optional)
+#   --lora_dirs PATHS      Comma-separated LoRA adapter directories (optional)
 #   --port PORT            Server port (default: 8080)
 #   --tp TP                Tensor parallel degree (default: 1)
 #   --host HOST            Server host (default: 127.0.0.1)
@@ -22,6 +23,8 @@
 #   --max_req_total_len    Max request total length
 #   --mem_fraction         Memory fraction (default: 0.6)
 #   --batch_max_tokens     Batch max tokens (default: 4096)
+#   --adapter_expert_profile Enable adapter x expert routing profiling log
+#   --adapter_expert_log_path PATH Log path for adapter x expert routing profiling
 #   --help                 Show this help message
 #
 # =============================================================================
@@ -34,7 +37,11 @@ export MOE_PROFILING=1
 # Default values
 MODEL_DIR="/home/shufan/.cache/huggingface/hub/models--Qwen--Qwen3-VL-30B-A3B-Instruct/snapshots/9c4b90e1e4ba969fd3b5378b57d966d725f1b86c"
 MODEL_NAME="Qwen3-VL-30B-A3B-Instruct"
-LORA_DIR="/home/shufan/Qwen-VL-FT/work/lora_dummy"
+DEFAULT_LORA_DIRS=()
+for i in {0..9}; do
+    DEFAULT_LORA_DIRS+=("/home/shufan/Qwen-VL-FT/work/lora_dummy_${i}")
+done
+LORA_DIR=$(IFS=,; echo "${DEFAULT_LORA_DIRS[*]}")
 PORT=8040
 TP=2
 HOST="0.0.0.0"
@@ -53,13 +60,13 @@ LORA_MAX_SIZE=1024
 EOF
 
 ### Baseline 3: Store on CPU, Compute on GPU ###
-COMPUTE_DEVICE="vl_storage:cpu,vl_compute:gpu,attn_storage:cpu,attn_compute:gpu,moe_storage:cpu,moe_compute:gpu"
+# COMPUTE_DEVICE="vl_storage:cpu,vl_compute:gpu,attn_storage:cpu,attn_compute:gpu,moe_storage:cpu,moe_compute:gpu"
 
 ### Baseline 4: Store on GPU, compute on GPU ###
 # COMPUTE_DEVICE="vl_storage:gpu,vl_compute:gpu,attn_storage:gpu,attn_compute:gpu,moe_storage:gpu,moe_compute:gpu"
 
 ### Proposed: Store on CPU, compute Attn on GPU, MoE on CPU ###
-# COMPUTE_DEVICE="vl_storage:cpu,vl_compute:gpu,attn_storage:cpu,attn_compute:gpu,moe_storage:cpu,moe_compute:cpu"
+COMPUTE_DEVICE="vl_storage:cpu,vl_compute:gpu,attn_storage:cpu,attn_compute:gpu,moe_storage:cpu,moe_compute:cpu"
 
 FORCE_SLOW_LORA_PATH=true
 MAX_REQ_TOTAL_LEN=8192
@@ -72,6 +79,8 @@ LIGHTLLM_LOGGING="DEBUG"
 MOE_MODE="TP"
 MOCK_PREFILL_LOGITS="TRUE"
 #MOCK_PREFILL_LOGITS="FALSE"
+MOE_ADAPTER_EXPERT_PROFILING=0
+MOE_ADAPTER_EXPERT_LOG_PATH="/tmp/moe_adapter_expert_profile.log"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -81,6 +90,10 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --lora_dir)
+            LORA_DIR="$2"
+            shift 2
+            ;;
+        --lora_dirs)
             LORA_DIR="$2"
             shift 2
             ;;
@@ -112,6 +125,14 @@ while [[ $# -gt 0 ]]; do
             FORCE_SLOW_LORA_PATH=true
             shift
             ;;
+        --adapter_expert_profile)
+            MOE_ADAPTER_EXPERT_PROFILING=1
+            shift
+            ;;
+        --adapter_expert_log_path)
+            MOE_ADAPTER_EXPERT_LOG_PATH="$2"
+            shift 2
+            ;;
         --help|-h)
             cat "$0" | grep -E '^[A-Z#]|^[a-zA-Z_]+:'
             exit 0
@@ -137,20 +158,30 @@ if [[ ! -d "$MODEL_DIR" ]]; then
 fi
 
 # Check LoRA directory exists if specified
-if [[ -n "$LORA_DIR" && ! -d "$LORA_DIR" ]]; then
-    echo "ERROR: LoRA directory not found: $LORA_DIR"
-    exit 1
+if [[ -n "$LORA_DIR" ]]; then
+    IFS=',' read -r -a LORA_DIR_ARRAY <<< "$LORA_DIR"
+    ABS_LORA_DIRS=()
+    for ADAPTER_DIR in "${LORA_DIR_ARRAY[@]}"; do
+        ADAPTER_DIR="${ADAPTER_DIR#"${ADAPTER_DIR%%[![:space:]]*}"}"
+        ADAPTER_DIR="${ADAPTER_DIR%"${ADAPTER_DIR##*[![:space:]]}"}"
+        [[ -z "$ADAPTER_DIR" ]] && continue
+        if [[ ! -d "$ADAPTER_DIR" ]]; then
+            echo "ERROR: LoRA directory not found: $ADAPTER_DIR"
+            exit 1
+        fi
+        ABS_LORA_DIRS+=("$(cd "$ADAPTER_DIR" && pwd)")
+    done
+    LORA_DIR=$(IFS=,; echo "${ABS_LORA_DIRS[*]}")
 fi
 
 # Get absolute paths
 MODEL_DIR=$(cd "$MODEL_DIR" && pwd)
-[[ -n "$LORA_DIR" ]] && LORA_DIR=$(cd "$LORA_DIR" && pwd)
 
 echo "=============================================="
 echo "LightLLM LoRA Server"
 echo "=============================================="
 echo "Base Model: $MODEL_DIR"
-[[ -n "$LORA_DIR" ]] && echo "LoRA Adapter: $LORA_DIR"
+[[ -n "$LORA_DIR" ]] && echo "LoRA Adapter(s): $LORA_DIR"
 echo "Host: $HOST"
 echo "Port: $PORT"
 echo "TP: $TP"
@@ -196,6 +227,8 @@ export LOADWORKER=$LOADWORKER
 export LIGHTLLM_LOGGING=$LIGHTLLM_LOGGING
 export MOE_MODE=$MOE_MODE
 export MOCK_PREFILL_LOGITS=$MOCK_PREFILL_LOGITS
+export MOE_ADAPTER_EXPERT_PROFILING=$MOE_ADAPTER_EXPERT_PROFILING
+export MOE_ADAPTER_EXPERT_LOG_PATH=$MOE_ADAPTER_EXPERT_LOG_PATH
 
 echo ""
 echo "Starting server..."
@@ -206,6 +239,8 @@ echo "  LOADWORKER=$LOADWORKER"
 echo "  LIGHTLLM_LOGGING=$LIGHTLLM_LOGGING"
 echo "  MOE_MODE=$MOE_MODE"
 echo "  MOCK_PREFILL_LOGITS=$MOCK_PREFILL_LOGITS"
+echo "  MOE_ADAPTER_EXPERT_PROFILING=$MOE_ADAPTER_EXPERT_PROFILING"
+echo "  MOE_ADAPTER_EXPERT_LOG_PATH=$MOE_ADAPTER_EXPERT_LOG_PATH"
 echo ""
 
 

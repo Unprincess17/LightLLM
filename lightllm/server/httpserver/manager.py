@@ -1,4 +1,5 @@
 import sys
+import os
 import zmq
 import zmq.asyncio
 import asyncio
@@ -46,6 +47,8 @@ class HttpServerManager:
         args: StartArgs,
     ):
         self.args: StartArgs = args
+        self.lora_name_to_id = self._build_lora_name_to_id_map(args.lora_dir)
+        self._unknown_adapter_warned = set()
         context = zmq.asyncio.Context(2)
         self.send_to_router = context.socket(zmq.PUSH)
         self.send_to_router.connect(f"{args.zmq_mode}127.0.0.1:{args.router_port}")
@@ -119,6 +122,59 @@ class HttpServerManager:
         self.latest_success_infer_time_mark = SharedInt(f"{get_unique_server_name()}_latest_success_infer_time_mark")
         self.latest_success_infer_time_mark.set_value(int(time.time()))
         return
+
+    @staticmethod
+    def _split_lora_dirs(lora_dir_arg: Optional[str]) -> List[str]:
+        if not lora_dir_arg:
+            return []
+        return [item.strip() for item in lora_dir_arg.split(",") if item.strip()]
+
+    def _build_lora_name_to_id_map(self, lora_dir_arg: Optional[str]) -> Dict[str, int]:
+        mapping: Dict[str, int] = {}
+        for adapter_id, adapter_dir in enumerate(self._split_lora_dirs(lora_dir_arg), start=1):
+            abs_dir = os.path.abspath(adapter_dir)
+            base_name = os.path.basename(os.path.normpath(abs_dir))
+            mapping[str(adapter_id)] = adapter_id
+            mapping[abs_dir] = adapter_id
+            if base_name:
+                mapping[base_name] = adapter_id
+        if mapping:
+            logger.info(
+                "[LoRA] Request adapter mapping initialized: "
+                + ", ".join(f"{name}->{aid}" for name, aid in sorted(mapping.items(), key=lambda x: (x[1], x[0])))
+            )
+        return mapping
+
+    def _resolve_request_adapter_id(self, adapters: list, request_index: int) -> int:
+        if not adapters:
+            return 0
+
+        adapter_token = adapters[request_index] if request_index < len(adapters) else adapters[0]
+        if adapter_token is None:
+            return 0
+
+        adapter_name = str(adapter_token).strip()
+        if adapter_name.lower() in {"", "default", "none", "null", "base", "base_model"}:
+            return 0
+
+        if adapter_name.isdigit():
+            return max(int(adapter_name), 0)
+
+        if adapter_name in self.lora_name_to_id:
+            return self.lora_name_to_id[adapter_name]
+
+        abs_name = os.path.abspath(adapter_name)
+        if abs_name in self.lora_name_to_id:
+            return self.lora_name_to_id[abs_name]
+
+        base_name = os.path.basename(os.path.normpath(adapter_name))
+        if base_name in self.lora_name_to_id:
+            return self.lora_name_to_id[base_name]
+
+        if adapter_name not in self._unknown_adapter_warned:
+            logger.warning(f"[LoRA] Unknown adapter name '{adapter_name}', falling back to base model.")
+            self._unknown_adapter_warned.add(adapter_name)
+        return 0
 
     async def _alloc_resource(self, items, md5sums, token_nums, datas):
 
@@ -345,8 +401,8 @@ class HttpServerManager:
             req_objs = []
             for i, req_index in enumerate(alloced_req_indexes):
                 req_obj = await self.shm_req_manager.async_get_req_obj_by_index(req_index)
-                # Get adapter_id: use 1 for first adapter, 0 for no adapter
-                adapter_id = 1 if adapters and len(adapters) > i else 0
+                # Resolve request adapter name/id into internal integer adapter_id.
+                adapter_id = self._resolve_request_adapter_id(adapters, i)
                 req_obj.init(
                     group_request_id + i,
                     prompt_ids,

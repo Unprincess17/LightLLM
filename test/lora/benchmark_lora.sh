@@ -13,10 +13,17 @@ OUTPUT_PREFIX="moe_offload_profile"
 TEST_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEST_SCRIPT="$TEST_SCRIPT_DIR/test_moe_lora_api.py"
 MAX_TOKENS=1
+DECODE_TARGET_TOKENS=8
+IGNORE_EOS=1
 SERVER_SCRIPT="$TEST_SCRIPT_DIR/start_server.sh"
 SERVER_HOST="localhost"
 SERVER_PORT=8040
 SERVER_URL="http://$SERVER_HOST:$SERVER_PORT"
+ADAPTER_IDS="lora_dummy_0,lora_dummy_1,lora_dummy_2,lora_dummy_3,lora_dummy_4,lora_dummy_5,lora_dummy_6,lora_dummy_7,lora_dummy_8,lora_dummy_9"
+POISSON_LAMBDA=3.0
+POISSON_SEED=42
+ADAPTER_EXPERT_PROFILE=1
+ADAPTER_EXPERT_LOG_PATH="/tmp/moe_adapter_expert_profile.log"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -25,6 +32,14 @@ while [[ $# -gt 0 ]]; do
         --output) OUTPUT_PREFIX="$2"; shift 2 ;;
         --test_script) TEST_SCRIPT="$2"; shift 2 ;;
         --max_tokens) MAX_TOKENS="$2"; shift 2 ;;
+        --decode_target_tokens) DECODE_TARGET_TOKENS="$2"; shift 2 ;;
+        --ignore_eos) IGNORE_EOS=1; shift ;;
+        --no_ignore_eos) IGNORE_EOS=0; shift ;;
+        --adapter_ids) ADAPTER_IDS="$2"; shift 2 ;;
+        --poisson_lambda) POISSON_LAMBDA="$2"; shift 2 ;;
+        --poisson_seed) POISSON_SEED="$2"; shift 2 ;;
+        --adapter_expert_profile) ADAPTER_EXPERT_PROFILE="$2"; shift 2 ;;
+        --adapter_expert_log_path) ADAPTER_EXPERT_LOG_PATH="$2"; shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -61,15 +76,44 @@ pgrep -f "lightllm.server|lightllm::|gunicorn|multiprocessing.resource_tracker|m
 pkill -9 -f "lightllm.server|lightllm::|gunicorn" && \
 pkill -9 -f "multiprocessing.resource_tracker|multiprocessing.spawn"
 
+echo > $ADAPTER_EXPERT_LOG_PATH
+
 sleep 5
 
 echo "=============================================="
 echo "Starting MoE Profiling"
 echo "=============================================="
+echo "Adapter IDs: $ADAPTER_IDS"
+echo "Poisson lambda: $POISSON_LAMBDA"
+echo "Poisson seed: $POISSON_SEED"
+echo "Max tokens (fallback): $MAX_TOKENS"
+echo "Decode target tokens: $DECODE_TARGET_TOKENS"
+echo "Ignore EOS: $IGNORE_EOS"
+echo "Adapter expert profile: $ADAPTER_EXPERT_PROFILE"
+echo "Adapter expert profile log: $ADAPTER_EXPERT_LOG_PATH"
+
+COMMON_TEST_ARGS=(
+    --max_tokens "$MAX_TOKENS"
+    --adapter_ids "$ADAPTER_IDS"
+    --poisson_lambda "$POISSON_LAMBDA"
+    --poisson_seed "$POISSON_SEED"
+)
+if [[ -n "$DECODE_TARGET_TOKENS" ]]; then
+    COMMON_TEST_ARGS+=(--decode_target_tokens "$DECODE_TARGET_TOKENS")
+fi
+if [[ "$IGNORE_EOS" == "1" ]]; then
+    COMMON_TEST_ARGS+=(--ignore_eos)
+else
+    COMMON_TEST_ARGS+=(--no_ignore_eos)
+fi
 
 # Step 1: Start nsys profiling with server
 echo "[1/5] Launching server"
-bash "$SERVER_SCRIPT" --host "$SERVER_HOST" --port "$SERVER_PORT" &
+SERVER_ARGS=(--host "$SERVER_HOST" --port "$SERVER_PORT")
+if [[ "$ADAPTER_EXPERT_PROFILE" == "1" ]]; then
+    SERVER_ARGS+=(--adapter_expert_profile --adapter_expert_log_path "$ADAPTER_EXPERT_LOG_PATH")
+fi
+bash "$SERVER_SCRIPT" "${SERVER_ARGS[@]}" &
 SERVER_PID=$!
 echo "Server PID: $SERVER_PID"
 
@@ -102,43 +146,43 @@ sleep "$SETUP_DELAY"
 # Step 4: Send test request (nsys is now capturing)
 echo "[3/5] Sending test request..."
 echo > benchmark_lora.log
-# python "$TEST_SCRIPT" --max_tokens "$MAX_TOKENS" 2>&1 | tee -a benchmark_lora.log
+# python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests 1 2>&1 | tee -a benchmark_lora.log
 
 # sleep 5
-# python "$TEST_SCRIPT" --max_tokens "$MAX_TOKENS" 2>&1 | tee -a benchmark_lora.log
+# python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests 1 2>&1 | tee -a benchmark_lora.log
 
 # sleep 5
-# python "$TEST_SCRIPT" --max_tokens "$MAX_TOKENS" --num_requests 1 2>&1 | tee -a benchmark_lora.log
+# python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests 1 2>&1 | tee -a benchmark_lora.log
 
 # sleep 5
-# python "$TEST_SCRIPT" --max_tokens "$MAX_TOKENS" --num_requests 2 2>&1 | tee -a benchmark_lora.log
+# python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests 2 2>&1 | tee -a benchmark_lora.log
 
 # sleep 5
-# python "$TEST_SCRIPT" --max_tokens "$MAX_TOKENS" --num_requests 4 2>&1 | tee -a benchmark_lora.log
+# python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests 4 2>&1 | tee -a benchmark_lora.log
 
 # sleep 5
-# python "$TEST_SCRIPT" --max_tokens "$MAX_TOKENS" --num_requests 8 2>&1 | tee -a benchmark_lora.log
+# python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests 8 2>&1 | tee -a benchmark_lora.log
 
 # sleep 5
-# python "$TEST_SCRIPT" --max_tokens "$MAX_TOKENS" --num_requests 16 2>&1 | tee -a benchmark_lora.log
+# python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests 16 2>&1 | tee -a benchmark_lora.log
 
 # sleep 5
-# python "$TEST_SCRIPT" --max_tokens "$MAX_TOKENS" --num_requests 32 2>&1 | tee -a benchmark_lora.log
+# python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests 32 2>&1 | tee -a benchmark_lora.log
 
 # sleep 5
-# python "$TEST_SCRIPT" --max_tokens "$MAX_TOKENS" --num_requests 64 2>&1 | tee -a benchmark_lora.log
+# python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests 64 2>&1 | tee -a benchmark_lora.log
+
+# sleep 5
+# python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests 128 2>&1 | tee -a benchmark_lora.log
+
+# sleep 5
+# python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests 256 2>&1 | tee -a benchmark_lora.log
+
+# sleep 5
+# python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests 512 2>&1 | tee -a benchmark_lora.log
 
 sleep 5
-# python "$TEST_SCRIPT" --max_tokens "$MAX_TOKENS" --num_requests 128 2>&1 | tee -a benchmark_lora.log
-
-sleep 5
-python "$TEST_SCRIPT" --max_tokens "$MAX_TOKENS" --num_requests 256 2>&1 | tee -a benchmark_lora.log
+python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests 1024 2>&1 | tee -a benchmark_lora.log
 
 # sleep 5
-# python "$TEST_SCRIPT" --max_tokens "$MAX_TOKENS" --num_requests 512 2>&1 | tee -a benchmark_lora.log
-
-# sleep 5
-# python "$TEST_SCRIPT" --max_tokens "$MAX_TOKENS" --num_requests 1024 2>&1 | tee -a benchmark_lora.log
-
-# sleep 5
-# python "$TEST_SCRIPT" --max_tokens "$MAX_TOKENS" --num_requests 2048 2>&1 | tee -a benchmark_lora.log
+# python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests 2048 2>&1 | tee -a benchmark_lora.log

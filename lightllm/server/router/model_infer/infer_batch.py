@@ -627,8 +627,14 @@ class Batch:
         """
         adapter_ids = set()
         for req in self.reqs:
-            if hasattr(req, 'adapter_id'):
-                adapter_ids.add(req.adapter_id)
+            if not hasattr(req, "adapter_id"):
+                continue
+            try:
+                adapter_id = int(req.adapter_id)
+            except (TypeError, ValueError):
+                adapter_id = 0
+            if adapter_id > 0:
+                adapter_ids.add(adapter_id)
         return adapter_ids
 
     def has_mixed_adapters(self) -> bool:
@@ -648,7 +654,13 @@ class Batch:
             True if at least one request has adapter_id != None
         """
         for req in self.reqs:
-            if hasattr(req, 'adapter_id') and req.adapter_id is not None:
+            if not hasattr(req, "adapter_id"):
+                continue
+            try:
+                adapter_id = int(req.adapter_id)
+            except (TypeError, ValueError):
+                adapter_id = 0
+            if adapter_id > 0:
                 return True
         return False
 
