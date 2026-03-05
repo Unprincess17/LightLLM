@@ -651,18 +651,6 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
                     token_counts[global_eid] = count
             logger.debug(f"[MoE] Layer {self.layer_num_}: {num_tokens} tokens -> {token_counts}")
 
-        # 4.1 Active Expert Extraction - collect only experts with assigned tokens
-
-        # with NvtxAnnotate("MoE_ActiveExpertExtraction"):
-        #     active_experts_data = []
-        #     for local_expert_idx in expert_iter_range:
-        #         global_expert_id = local_to_global.get(local_expert_idx, local_expert_idx) if is_ep else local_expert_idx
-        #         mask = topk_ids == global_expert_id
-        #         batch_indices, k_indices = torch.where(mask)
-
-        #         if batch_indices.shape[0] > 0:
-        #             active_experts_data.append((local_expert_idx, batch_indices, k_indices))
-
         with NvtxAnnotate("MoE_ActiveExpertExtraction_Optimized"):
             # 1. 扁平化 topk_ids [num_tokens * top_k]
             flat_topk_ids = topk_ids.flatten()

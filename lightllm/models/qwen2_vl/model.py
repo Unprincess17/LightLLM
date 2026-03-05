@@ -54,7 +54,7 @@ class QWen2VLTokenizer(BaseMultiModalTokenizer):
 
     def encode(self, prompt, multimodal_params: MultimodalParams = None, **kwargs):
         origin_ids = self.tokenizer.encode(prompt)
-        print("hello I am encoding")
+        # print("hello I am encoding")
         # <img><image_pad></img> -> <img></img>
         origin_ids = [token for token in origin_ids if token != self.image_token_id]
         # <img></img> --> <img>id,id+1...id+num</img>
