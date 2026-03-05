@@ -96,9 +96,31 @@ export MOE_COALESCING_PACKER=1
 bash "\$SERVER_SCRIPT" --host "\$HOST" --port "\$PORT" --compute_device "\$COMPUTE_DEVICE" --force_slow_lora_path &
 SERVER_PID=\$!
 
+terminate_server_tree() {
+    local pid="\$1"
+    if [[ -z "\$pid" ]]; then
+        return 0
+    fi
+
+    # Try graceful stop first.
+    kill -INT "\$pid" 2>/dev/null || true
+    for _ in \$(seq 1 20); do
+        if ! kill -0 "\$pid" 2>/dev/null; then
+            return 0
+        fi
+        sleep 1
+    done
+
+    # Fallback: terminate known descendants and force-kill root pid.
+    pkill -TERM -P "\$pid" 2>/dev/null || true
+    sleep 2
+    pkill -KILL -P "\$pid" 2>/dev/null || true
+    kill -KILL "\$pid" 2>/dev/null || true
+}
+
 cleanup() {
-    kill -INT "\$SERVER_PID" 2>/dev/null || true
-    wait "\$SERVER_PID" || true
+    terminate_server_tree "\$SERVER_PID"
+    wait "\$SERVER_PID" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -132,8 +154,8 @@ for N in "\${N_ARR[@]}"; do
 done
 
 sleep 2
-kill -INT "\$SERVER_PID" 2>/dev/null || true
-wait "\$SERVER_PID" || true
+terminate_server_tree "\$SERVER_PID"
+wait "\$SERVER_PID" 2>/dev/null || true
 trap - EXIT
 EOF
 

@@ -158,6 +158,13 @@ def run_correctness_tests(verbose=False):
     B = torch.randn(8, 2048, dtype=torch.bfloat16)
     results.append(test_correctness(x, A, B, 1.0, "zero_input"))
 
+    # Test 11: Rectangular output projection (H_in != H_out)
+    print("[Test 11] Rectangular output (H_in=2048, H_out=384)")
+    x = torch.randn(4, 2048, dtype=torch.bfloat16)
+    A = torch.randn(8, 2048, dtype=torch.bfloat16)
+    B = torch.randn(8, 384, dtype=torch.bfloat16)
+    results.append(test_correctness(x, A, B, 1.0, "rectangular_output"))
+
     # Print summary
     print("\n" + "=" * 60)
     print("Summary")
