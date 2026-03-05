@@ -92,6 +92,23 @@ def parse_args():
     )
     parser.add_argument("--mode", type=str, default="detached", choices=["merged", "detached"], help="LoRA mode")
     parser.add_argument("--num_requests", type=int, default=1, help="Number of requests to send")
+    parser.add_argument(
+        "--print_per_request",
+        action="store_true",
+        help="Print one performance line for every request in concurrent batch mode",
+    )
+    parser.add_argument(
+        "--top_k_slowest",
+        type=int,
+        default=10,
+        help="Print top-K slowest successful requests (0 to disable)",
+    )
+    parser.add_argument(
+        "--per_request_log_path",
+        type=str,
+        default=None,
+        help="Optional JSONL path for per-request metrics",
+    )
     parser.add_argument("--vision", action="store_true", help="Use image input")
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
     return parser.parse_args()
@@ -174,6 +191,28 @@ def build_poisson_adapter_ids(
 
 def _format_adapter_id(adapter_id: Optional[str]) -> str:
     return adapter_id if adapter_id is not None else "base_model"
+
+
+def _percentile(values: List[float], pct: float) -> float:
+    """Compute percentile with linear interpolation."""
+    if not values:
+        return 0.0
+    if pct <= 0:
+        return min(values)
+    if pct >= 1:
+        return max(values)
+
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * pct
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+
+    lower_value = ordered[lower]
+    upper_value = ordered[upper]
+    weight = position - lower
+    return lower_value + (upper_value - lower_value) * weight
 
 
 def resolve_effective_max_tokens(max_tokens: int, decode_target_tokens: Optional[int]) -> int:
@@ -438,6 +477,9 @@ def test_batch_generation(
     adapter_ids: Optional[Union[str, List[Optional[str]]]],
     verbose: bool,
     ignore_eos: bool,
+    print_per_request: bool,
+    top_k_slowest: int,
+    per_request_log_path: Optional[str],
 ):
     """Test batch generation with multiple concurrent prompts.
 
@@ -467,17 +509,25 @@ def test_batch_generation(
             "adapter_ids must be None, a string adapter ID, or a list of optional adapter IDs."
         )
 
-    start_time = time.time()
+    start_time = time.perf_counter()
     results: List[Dict] = [{} for _ in prompts]
+    request_metrics: List[Optional[Dict]] = [None] * len(prompts)
 
     # Wrapper function for the executor
     def fetch(prompt_text: str, req_adapter_id: Optional[str]) -> Dict:
-        return client.generate(
+        req_start = time.perf_counter()
+        result = client.generate(
             prompt_text,
             max_tokens=max_tokens,
             adapter_id=req_adapter_id,
             ignore_eos=ignore_eos,
         )
+        req_end = time.perf_counter()
+        return {
+            "result": result,
+            "req_start": req_start,
+            "req_end": req_end,
+        }
 
     # Dispatch all requests concurrently
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(prompts)) as executor:
@@ -491,12 +541,44 @@ def test_batch_generation(
         for future in concurrent.futures.as_completed(future_to_req):
             idx = future_to_req[future]
             try:
-                result = future.result()
+                payload = future.result()
+                result = payload["result"]
                 results[idx] = result
+                req_start = payload["req_start"]
+                req_end = payload["req_end"]
+                latency = req_end - req_start
+
+                completion_tokens = 0
+                if "error" not in result:
+                    completion_tokens = result.get("usage", {}).get("completion_tokens", 0)
+
+                request_metrics[idx] = {
+                    "index": idx,
+                    "adapter_id": _format_adapter_id(request_adapter_ids[idx]),
+                    "status": "error" if "error" in result else "ok",
+                    "latency_s": latency,
+                    "start_offset_s": req_start - start_time,
+                    "finish_offset_s": req_end - start_time,
+                    "completion_tokens": completion_tokens,
+                    "token_throughput": (completion_tokens / latency) if latency > 0 else 0.0,
+                    "error": result.get("error") if "error" in result else None,
+                }
             except Exception as exc:
                 results[idx] = {"error": str(exc)}
+                failed_time = time.perf_counter()
+                request_metrics[idx] = {
+                    "index": idx,
+                    "adapter_id": _format_adapter_id(request_adapter_ids[idx]),
+                    "status": "error",
+                    "latency_s": failed_time - start_time,
+                    "start_offset_s": 0.0,
+                    "finish_offset_s": failed_time - start_time,
+                    "completion_tokens": 0,
+                    "token_throughput": 0.0,
+                    "error": str(exc),
+                }
 
-    elapsed = time.time() - start_time
+    elapsed = time.perf_counter() - start_time
     
     # Calculate performance metrics
     total_tokens = sum(
@@ -509,6 +591,69 @@ def test_batch_generation(
     print(f"Total tokens: {total_tokens}")
     print(f"Time: {elapsed:.2f}s")
     print(f"Overall System Throughput: {total_tokens / elapsed:.2f} tokens/s")
+
+    successful_metrics = [
+        m for m in request_metrics
+        if m is not None and m["status"] == "ok"
+    ]
+    if successful_metrics:
+        latencies = [m["latency_s"] for m in successful_metrics]
+        min_latency = min(latencies)
+        max_latency = max(latencies)
+        starvation_ratio = max_latency / min_latency if min_latency > 0 else float("inf")
+        print(
+            "Per-request latency (success): "
+            f"p50={_percentile(latencies, 0.50):.4f}s, "
+            f"p95={_percentile(latencies, 0.95):.4f}s, "
+            f"p99={_percentile(latencies, 0.99):.4f}s, "
+            f"min={min_latency:.4f}s, max={max_latency:.4f}s, "
+            f"max/min={starvation_ratio:.2f}x"
+        )
+
+    if top_k_slowest > 0 and successful_metrics:
+        slowest = sorted(successful_metrics, key=lambda m: m["latency_s"], reverse=True)[:top_k_slowest]
+        print(f"\nTop {len(slowest)} slowest successful requests (starvation candidates):")
+        for rank, metric in enumerate(slowest, start=1):
+            print(
+                f"  #{rank:02d} req={metric['index']} "
+                f"adapter={metric['adapter_id']} "
+                f"latency={metric['latency_s']:.4f}s "
+                f"finish@{metric['finish_offset_s']:.4f}s "
+                f"tokens={metric['completion_tokens']} "
+                f"tok/s={metric['token_throughput']:.2f}"
+            )
+
+    if print_per_request:
+        print("\nPer-request performance:")
+        for metric in request_metrics:
+            if metric is None:
+                continue
+            if metric["status"] == "ok":
+                print(
+                    f"  req={metric['index']} "
+                    f"adapter={metric['adapter_id']} "
+                    f"latency={metric['latency_s']:.4f}s "
+                    f"start@{metric['start_offset_s']:.4f}s "
+                    f"finish@{metric['finish_offset_s']:.4f}s "
+                    f"tokens={metric['completion_tokens']} "
+                    f"tok/s={metric['token_throughput']:.2f}"
+                )
+            else:
+                print(
+                    f"  req={metric['index']} "
+                    f"adapter={metric['adapter_id']} "
+                    f"status=error "
+                    f"latency={metric['latency_s']:.4f}s "
+                    f"error={metric['error']}"
+                )
+
+    if per_request_log_path:
+        with open(per_request_log_path, "w", encoding="utf-8") as log_file:
+            for metric in request_metrics:
+                if metric is None:
+                    continue
+                log_file.write(json.dumps(metric, ensure_ascii=True) + "\n")
+        print(f"Per-request metrics saved to: {per_request_log_path}")
 
     if verbose:
         for i, res in enumerate(results):
@@ -585,6 +730,9 @@ def main():
         adapter_ids=batch_adapter_ids,
         verbose=args.verbose,
         ignore_eos=args.ignore_eos,
+        print_per_request=args.print_per_request,
+        top_k_slowest=args.top_k_slowest,
+        per_request_log_path=args.per_request_log_path,
     )
 
     return 0

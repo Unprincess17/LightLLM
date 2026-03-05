@@ -57,6 +57,10 @@ _extra_cflags = [
     '-O3',
     '-march=sapphirerapids',  # Required for vdpbf16ps instruction
     '-std=c++17',
+    '-fopenmp',  # Enable OpenMP parallelization
+    '-ffast-math',  # Enable fast math optimizations
+    '-ftree-vectorize',  # Enable tree vectorization
+    '-fno-semantic-interposition',  # Optimize for static linking
 ]
 
 # Add ABI flag to match PyTorch's ABI
@@ -95,13 +99,13 @@ def batch_lora_avx(
     Native BF16 computation with _mm512_dpbf16_ps instruction.
 
     Args:
-        input_tensor: Input tensor [batch, hidden] (bfloat16, CPU)
-        A: LoRA A weight [rank, hidden] (bfloat16, CPU)
-        B: LoRA B weight [rank, hidden] (bfloat16, CPU)
+        input_tensor: Input tensor [batch, hidden_in] (bfloat16, CPU)
+        A: LoRA A weight [rank, hidden_in] (bfloat16, CPU)
+        B: LoRA B weight [rank, hidden_out] (bfloat16, CPU)
         scaling: LoRA scaling factor
 
     Returns:
-        Output tensor [batch, hidden] (bfloat16, CPU)
+        Output tensor [batch, hidden_out] (bfloat16, CPU)
     """
     if not _KERNEL_LOADED:
         raise RuntimeError("AVX-512 kernel not loaded")
@@ -113,9 +117,15 @@ def batch_lora_avx(
     assert input_tensor.dtype == torch.bfloat16, "Input must be bfloat16"
     assert A.dtype == torch.bfloat16, "A must be bfloat16"
     assert B.dtype == torch.bfloat16, "B must be bfloat16"
+    assert input_tensor.ndim == 2, "Input must be 2D [batch, hidden_in]"
+    assert A.ndim == 2, "A must be 2D [rank, hidden_in]"
+    assert B.ndim == 2, "B must be 2D [rank, hidden_out]"
 
-    batch, hidden = input_tensor.shape
+    batch, hidden_in = input_tensor.shape
     rank = A.shape[0]
+    hidden_out = B.shape[1]
+    assert A.shape[1] == hidden_in, "A.shape[1] must match input hidden size"
+    assert B.shape[0] == rank, "B.shape[0] must match A rank"
 
     # Ensure contiguous layout for cache efficiency
     if not input_tensor.is_contiguous():
@@ -126,7 +136,7 @@ def batch_lora_avx(
         B = B.contiguous()
 
     # Allocate output (BF16)
-    output = torch.empty(batch, hidden, dtype=torch.bfloat16, device='cpu')
+    output = torch.empty(batch, hidden_out, dtype=torch.bfloat16, device='cpu')
 
     # Call C++ kernel with native BF16
     with NvtxAnnotate("LoRA_CPU_GEMM_Batch"):

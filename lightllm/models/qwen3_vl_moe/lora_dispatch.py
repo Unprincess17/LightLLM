@@ -910,7 +910,7 @@ class Qwen3VLMoELoRADispatcher:
                     B = B.contiguous()
 
                 # Call AVX kernel for batched LoRA
-                batch_output = batch_lora_avx(batch_input, A, B, a_scaling)  # [n, hidden]
+                batch_output = batch_lora_avx(batch_input, A, B, a_scaling)  # [n, output_dim]
                 output[req_indices] = batch_output
             else:
                 # Fallback: PyTorch matmul per request

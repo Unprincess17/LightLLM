@@ -24,6 +24,9 @@ POISSON_LAMBDA=3.0
 POISSON_SEED=42
 ADAPTER_EXPERT_PROFILE=1
 ADAPTER_EXPERT_LOG_PATH="/tmp/moe_adapter_expert_profile.log"
+PRINT_PER_REQUEST=0
+TOP_K_SLOWEST=10
+PER_REQUEST_LOG_PATH="/tmp/moe_per_request_metrics_$(date +%Y%m%d_%H%M%S).jsonl"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -40,6 +43,11 @@ while [[ $# -gt 0 ]]; do
         --poisson_seed) POISSON_SEED="$2"; shift 2 ;;
         --adapter_expert_profile) ADAPTER_EXPERT_PROFILE="$2"; shift 2 ;;
         --adapter_expert_log_path) ADAPTER_EXPERT_LOG_PATH="$2"; shift 2 ;;
+        --print_per_request) PRINT_PER_REQUEST=1; shift ;;
+        --no_print_per_request) PRINT_PER_REQUEST=0; shift ;;
+        --top_k_slowest) TOP_K_SLOWEST="$2"; shift 2 ;;
+        --per_request_log_path) PER_REQUEST_LOG_PATH="$2"; shift 2 ;;
+        --no_per_request_log) PER_REQUEST_LOG_PATH=""; shift ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -91,12 +99,20 @@ echo "Decode target tokens: $DECODE_TARGET_TOKENS"
 echo "Ignore EOS: $IGNORE_EOS"
 echo "Adapter expert profile: $ADAPTER_EXPERT_PROFILE"
 echo "Adapter expert profile log: $ADAPTER_EXPERT_LOG_PATH"
+echo "Top-K slowest requests: $TOP_K_SLOWEST"
+echo "Print per-request lines: $PRINT_PER_REQUEST"
+if [[ -n "$PER_REQUEST_LOG_PATH" ]]; then
+    echo "Per-request metrics log: $PER_REQUEST_LOG_PATH"
+else
+    echo "Per-request metrics log: disabled"
+fi
 
 COMMON_TEST_ARGS=(
     --max_tokens "$MAX_TOKENS"
     --adapter_ids "$ADAPTER_IDS"
     --poisson_lambda "$POISSON_LAMBDA"
     --poisson_seed "$POISSON_SEED"
+    --top_k_slowest "$TOP_K_SLOWEST"
 )
 if [[ -n "$DECODE_TARGET_TOKENS" ]]; then
     COMMON_TEST_ARGS+=(--decode_target_tokens "$DECODE_TARGET_TOKENS")
@@ -105,6 +121,12 @@ if [[ "$IGNORE_EOS" == "1" ]]; then
     COMMON_TEST_ARGS+=(--ignore_eos)
 else
     COMMON_TEST_ARGS+=(--no_ignore_eos)
+fi
+if [[ "$PRINT_PER_REQUEST" == "1" ]]; then
+    COMMON_TEST_ARGS+=(--print_per_request)
+fi
+if [[ -n "$PER_REQUEST_LOG_PATH" ]]; then
+    COMMON_TEST_ARGS+=(--per_request_log_path "$PER_REQUEST_LOG_PATH")
 fi
 
 # Step 1: Start nsys profiling with server
@@ -146,7 +168,7 @@ sleep "$SETUP_DELAY"
 # Step 4: Send test request (nsys is now capturing)
 echo "[3/5] Sending test request..."
 echo > benchmark_lora.log
-# python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests 1 2>&1 | tee -a benchmark_lora.log
+python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests 1 2>&1 | tee -a benchmark_lora.log
 
 # sleep 5
 # python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests 1 2>&1 | tee -a benchmark_lora.log
@@ -181,8 +203,8 @@ echo > benchmark_lora.log
 # sleep 5
 # python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests 512 2>&1 | tee -a benchmark_lora.log
 
-sleep 5
-python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests 1024 2>&1 | tee -a benchmark_lora.log
+# sleep 5
+# python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests 1024 2>&1 | tee -a benchmark_lora.log
 
 # sleep 5
 # python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests 2048 2>&1 | tee -a benchmark_lora.log
