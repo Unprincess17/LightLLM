@@ -3,6 +3,7 @@ import numpy as np
 import torch
 import time
 import threading
+from dataclasses import replace
 import torch.distributed as dist
 from typing import List, Tuple, Callable, Optional, Dict, Set
 from transformers.configuration_utils import PretrainedConfig
@@ -969,12 +970,17 @@ class ModeBackend:
         self.lora_support = True
         self.lora_adapter_dirs = lora_adapter_dirs
         self.use_batched_lora_mode = True
+        self.moe_expert_cache_manager = None
 
         self.logger.info(f"[LoRA Backend] Initializing batched LoRA mode with {len(lora_adapter_dirs)} adapters")
 
         # Create LoRA memory pool
         try:
-            from lightllm.server.lora import create_lora_mem_pool
+            from lightllm.server.lora import (
+                create_lora_mem_pool,
+                MoEExpertCacheConfig,
+                MoEExpertCacheManager,
+            )
 
             config = self.model.config
             num_layers = config["num_hidden_layers"]
@@ -1007,6 +1013,22 @@ class ModeBackend:
             if vl_hidden_size:
                 self.logger.info(f"[LoRA Backend] Vision config: vl_hidden_size={vl_hidden_size}, vl_intermediate_size={vl_intermediate_size}, vl_out_hidden_size={vl_out_hidden_size}, vl_depth={vl_depth}")
 
+            effective_lora_compute_config = self._lora_compute_config
+            use_colora_hybrid = (
+                effective_lora_compute_config is not None
+                and effective_lora_compute_config.should_compute_hybrid("moe")
+            )
+            if (
+                use_colora_hybrid
+                and effective_lora_compute_config is not None
+                and effective_lora_compute_config.moe_storage != "cpu"
+            ):
+                effective_lora_compute_config = replace(effective_lora_compute_config, moe_storage="cpu")
+                self.logger.info(
+                    "[COLoRA] moe_compute=hybrid detected, force moe_storage=cpu "
+                    "for expert-level asymmetric pool."
+                )
+
             self.lora_mem_pool = create_lora_mem_pool(
                 num_layers=num_layers,
                 pool_size=1024,  # Can hold 1024 adapters
@@ -1018,7 +1040,7 @@ class ModeBackend:
                 vocab_size=vocab_size,
                 num_kv_heads=num_kv_heads,
                 dtype=torch.float16,
-                lora_compute_config=self._lora_compute_config,
+                lora_compute_config=effective_lora_compute_config,
                 vl_hidden_size=vl_hidden_size,
                 vl_intermediate_size=vl_intermediate_size,
                 vl_out_hidden_size=vl_out_hidden_size,
@@ -1026,6 +1048,28 @@ class ModeBackend:
                 moe_intermediate_dim=moe_intermediate_dim,
                 tp_world_size=get_global_world_size(),
             )
+
+            if use_colora_hybrid:
+                cache_cfg = MoEExpertCacheConfig(
+                    cache_budget_mb=getattr(self.args, "colora_cache_budget_mb", 2048),
+                    promote_min_hits=getattr(self.args, "colora_promote_min_hits", 2),
+                    promote_window=getattr(self.args, "colora_promote_window", 128),
+                    max_promote_per_step=getattr(self.args, "colora_max_promote_per_step", 8),
+                    decay=getattr(self.args, "colora_decay", 0.9),
+                )
+                self.moe_expert_cache_manager = MoEExpertCacheManager(cache_cfg)
+                self.moe_expert_cache_manager.register_projection_pool("gate", self.lora_mem_pool.moe_gate_pool)
+                self.moe_expert_cache_manager.register_projection_pool("up", self.lora_mem_pool.moe_up_pool)
+                self.moe_expert_cache_manager.register_projection_pool("down", self.lora_mem_pool.moe_down_pool)
+                self.logger.info(
+                    "[COLoRA] Expert cache initialized: budget_mb=%s, promote_min_hits=%s, "
+                    "window=%s, max_promote_per_step=%s, decay=%.4f",
+                    cache_cfg.cache_budget_mb,
+                    cache_cfg.promote_min_hits,
+                    cache_cfg.promote_window,
+                    cache_cfg.max_promote_per_step,
+                    cache_cfg.decay,
+                )
 
             # Set TP rank for sharded weight loading
             self.lora_mem_pool.tp_rank_ = self.rank_in_node
@@ -1159,14 +1203,21 @@ class ModeBackend:
         expanded_bins = torch.tensor(expanded_bins, dtype=torch.long, device="cuda")
 
         self.logger.debug(f"[LoRA Backend]   token_counts={token_counts}, total_tokens={sum(token_counts)}")
-        self.logger.debug(f"[LoRA Backend]   expanded_bins={expanded_bins.tolist()}")
+        # self.logger.debug(f"[LoRA Backend]   expanded_bins={expanded_bins.tolist()}")
 
         # Use expanded_bins for batched mode (per-token adapter indices)
         req_bins = expanded_bins
 
         # Initialize batched mode for all dispatchers
         for dispatcher in self.lora_dispatchers:
-            dispatcher.init_batched_mode(self.lora_mem_pool, req_bins)
+            try:
+                dispatcher.init_batched_mode(
+                    self.lora_mem_pool,
+                    req_bins,
+                    expert_cache_manager=getattr(self, "moe_expert_cache_manager", None),
+                )
+            except TypeError:
+                dispatcher.init_batched_mode(self.lora_mem_pool, req_bins)
 
         # Set req_bins on all layer inference objects
         for layer_infer in self.model.layers_infer:
@@ -1231,3 +1282,4 @@ class ModeBackend:
 
         self.lora_mem_pool = None
         self.lora_dispatchers = []
+        self.moe_expert_cache_manager = None

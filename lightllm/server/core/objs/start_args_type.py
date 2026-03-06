@@ -133,8 +133,14 @@ class StartArgs:
     # LoRA serving port
     lora_port: int = field(default=None)
     # LoRA compute device for components
-    # Format: 'vl:{gpu|cpu|off},attn:{gpu|cpu|off},moe:{gpu|cpu|off}'
+    # Format: 'vl:{gpu|cpu|off},attn:{gpu|cpu|off},moe:{gpu|cpu|hybrid|off}'
     compute_device: str = field(default="")
+    # COLoRA options (decode MoE hybrid mode)
+    colora_cache_budget_mb: int = field(default=2048)
+    colora_promote_min_hits: int = field(default=2)
+    colora_promote_window: int = field(default=128)
+    colora_max_promote_per_step: int = field(default=8)
+    colora_decay: float = field(default=0.9)
     # Force slow path for LoRA (per-expert baseline)
     force_slow_lora_path: bool = field(default=False)
     # multi_modal

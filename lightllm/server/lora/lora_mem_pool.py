@@ -92,6 +92,7 @@ class LoRAModulePool:
     a_start: torch.Tensor  # [num_adapters] - start slot offset per adapter
     a_len: torch.Tensor  # [num_adapters] - number of slots (layers) per adapter
     a_scaling: torch.Tensor  # [num_adapters] - scaling factor per adapter
+    a_rank: torch.Tensor  # [num_adapters] - actual LoRA rank per adapter
     max_rank: int
     a_hidden_dim: int  # Input dimension for A matrix
     b_hidden_dim: int  # Output dimension for B matrix
@@ -149,8 +150,8 @@ class LoRAModulePool:
         if output_dim is None:
             output_dim = input_dim
 
-        # Use pinned memory for CPU buffers to enable async transfers
-        use_pinned = (device == "cpu")
+        # Use pinned memory for CPU buffers only when CUDA runtime is available.
+        use_pinned = (device == "cpu" and torch.cuda.is_available())
 
         return cls(
             key_buffer=torch.empty((pool_size, max_rank, input_dim), dtype=dtype, device=device, pin_memory=use_pinned),
@@ -158,6 +159,7 @@ class LoRAModulePool:
             a_start=torch.zeros(0, dtype=torch.long, device=device),
             a_len=torch.zeros(0, dtype=torch.long, device=device),
             a_scaling=torch.zeros(0, dtype=dtype, device=device),
+            a_rank=torch.zeros(0, dtype=torch.long, device=device),
             max_rank=max_rank,
             a_hidden_dim=input_dim,
             b_hidden_dim=output_dim,
@@ -413,6 +415,10 @@ class LoRAModulePool:
             self.a_scaling,
             torch.tensor([scaling], dtype=self.a_scaling.dtype, device=self.a_scaling.device)
         ])
+        self.a_rank = torch.cat([
+            self.a_rank,
+            torch.tensor([rank], dtype=torch.long, device=self.a_rank.device)
+        ])
 
         try:
             if is_moe_structure:
@@ -488,12 +494,14 @@ class LoRAModulePool:
             self.a_start = torch.zeros(0, dtype=torch.long, device=self.a_start.device)
             self.a_len = torch.zeros(0, dtype=torch.long, device=self.a_len.device)
             self.a_scaling = torch.zeros(0, dtype=self.a_scaling.dtype, device=self.a_scaling.device)
+            self.a_rank = torch.zeros(0, dtype=torch.long, device=self.a_rank.device)
         else:
             mask = torch.ones(len(self.a_start), dtype=torch.bool, device=self.a_start.device)
             mask[adapter_idx] = False
             self.a_start = self.a_start[mask]
             self.a_len = self.a_len[mask]
             self.a_scaling = self.a_scaling[mask]
+            self.a_rank = self.a_rank[mask]
 
         return True
 

@@ -13,6 +13,14 @@ from lightllm._kernels.lora.lora_cpu_kernel import (
     batch_lora_avx,
     is_available as avx_is_available
 )
+from lightllm.server.core.objs.lora_compute_config import LoRAComputeConfig
+from lightllm.server.lora.expert_cache import (
+    ExpertCacheKey,
+    MoEExpertCacheConfig,
+    MoEExpertCacheManager,
+)
+from lightllm.server.lora.lora_mem_pool import LoRAModulePool
+from lightllm.models.qwen3_vl_moe.lora_dispatch import Qwen3VLMoELoRADispatcher, BGMV_AVAILABLE
 
 def torch_reference(x, A, B, scaling=1.0):
     """PyTorch reference implementation for single token"""
@@ -77,6 +85,84 @@ def main():
     pytorch_mt_time = (time.perf_counter() - start) / iterations * 1000
     print(f"PyTorch (MT): {pytorch_mt_time:.3f} ms per iteration")
 
+    # Benchmark COLoRA hybrid miss path (GPU-miss fallback to CPU)
+    print("\nBenchmarking COLoRA hybrid miss path (CPU fallback)...")
+    pool = LoRAModulePool.create(
+        pool_size=8,
+        max_rank=rank,
+        input_dim=hidden,
+        output_dim=hidden,
+        dtype=torch.bfloat16,
+        device="cpu",
+        num_layers=1,
+        num_experts=1,
+    )
+    pool.load_adapter(
+        adapter_idx=0,
+        rank=rank,
+        scaling=scaling,
+        layer_weights={0: {"A": A, "B": B}},
+    )
+
+    cache_mgr = MoEExpertCacheManager(
+        MoEExpertCacheConfig(
+            cache_budget_mb=16,
+            promote_min_hits=1000,  # keep benchmark in miss-only mode
+            promote_window=8,
+            max_promote_per_step=1,
+            decay=0.9,
+        )
+    )
+    cache_mgr.register_projection_pool("gate", pool)
+
+    dispatcher = Qwen3VLMoELoRADispatcher(
+        num_layers=1,
+        gate_lora_rank=rank,
+        lora_compute_config=LoRAComputeConfig(moe_storage="cpu", moe_compute="hybrid"),
+    )
+    dispatcher.expert_cache_manager = cache_mgr
+    bins = torch.tensor([0], dtype=torch.long)
+
+    start = time.perf_counter()
+    for _ in range(iterations):
+        _ = dispatcher._batch_apply_moe_lora_hybrid(
+            input_tensor=x,
+            layer_id=0,
+            buffer_layer_id=0,
+            pool=pool,
+            bins=bins,
+            projection="gate",
+            expert_id=0,
+        )
+    hybrid_miss_time = (time.perf_counter() - start) / iterations * 1000
+    print(f"COLoRA hybrid miss: {hybrid_miss_time:.3f} ms per iteration")
+
+    if torch.cuda.is_available() and BGMV_AVAILABLE:
+        print("\nBenchmarking COLoRA hybrid hit path (GPU cache hit)...")
+        hit_key = ExpertCacheKey(projection="gate", adapter_idx=0, layer_id=0, expert_id=0)
+        cache_mgr.record_access([hit_key])
+        cache_mgr.schedule_promotion([hit_key])
+        cache_mgr.apply_completed_promotions()
+
+        x_cuda = x.to("cuda")
+        bins_cuda = bins.to("cuda")
+        start = time.perf_counter()
+        for _ in range(iterations):
+            _ = dispatcher._batch_apply_moe_lora_hybrid(
+                input_tensor=x_cuda,
+                layer_id=0,
+                buffer_layer_id=0,
+                pool=pool,
+                bins=bins_cuda,
+                projection="gate",
+                expert_id=0,
+            )
+        hybrid_hit_time = (time.perf_counter() - start) / iterations * 1000
+        print(f"COLoRA hybrid hit: {hybrid_hit_time:.3f} ms per iteration")
+    else:
+        hybrid_hit_time = None
+        print("COLoRA hybrid hit path skipped (requires CUDA + BGMV kernel).")
+
     # Calculate ratios
     print()
     print("=" * 60)
@@ -87,6 +173,9 @@ def main():
 
     avx_mt_ratio = avx_time / pytorch_mt_time
     print(f"AVX-512 vs PyTorch (MT): {avx_mt_ratio:.2f}x")
+    print(f"COLoRA hybrid miss vs AVX-512: {(hybrid_miss_time / avx_time):.2f}x")
+    if hybrid_hit_time is not None:
+        print(f"COLoRA hybrid hit vs AVX-512: {(hybrid_hit_time / avx_time):.2f}x")
 
     # Verify correctness
     print()

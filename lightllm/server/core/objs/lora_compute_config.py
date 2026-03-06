@@ -6,6 +6,7 @@ class ComputeLocation:
     """Enum for LoRA compute location."""
     GPU = "gpu"
     CPU = "cpu"
+    HYBRID = "hybrid"
     OFF = "off"
 
     @classmethod
@@ -16,10 +17,12 @@ class ComputeLocation:
             return cls.GPU
         elif value == "cpu":
             return cls.CPU
+        elif value == "hybrid":
+            return cls.HYBRID
         elif value == "off":
             return cls.OFF
         else:
-            raise ValueError(f"Invalid compute location: {value}. Valid: gpu, cpu, off")
+            raise ValueError(f"Invalid compute location: {value}. Valid: gpu, cpu, hybrid, off")
 
 
 @dataclass
@@ -39,6 +42,7 @@ class LoRAComputeConfig:
         - storage=gpu, compute=off: Weights on GPU, LoRA disabled
         - storage=cpu, compute=gpu: Weights on CPU, transfer to GPU for compute
         - storage=cpu, compute=cpu: Weights on CPU, compute on CPU
+        - storage=cpu, compute=hybrid: COLoRA mode, GPU cache hit + CPU miss fallback
         - storage=cpu, compute=off: Weights on CPU, LoRA disabled
 
     Note: GPU storage + CPU compute is NOT supported.
@@ -91,11 +95,10 @@ class LoRAComputeConfig:
             key = key.strip().lower()
             value = value.strip().lower()
 
-            if value not in ("gpu", "cpu", "off"):
-                raise ValueError(f"Invalid value: '{value}'. Valid: gpu, cpu, off")
-
             # Check for _storage or _compute suffix
             if key.endswith("_storage"):
+                if value not in ("gpu", "cpu"):
+                    raise ValueError(f"Invalid storage value: '{value}'. Valid: gpu, cpu")
                 base_key = key[:-len("_storage")]
                 if base_key == "vl":
                     vl_storage = value
@@ -106,6 +109,8 @@ class LoRAComputeConfig:
                 else:
                     raise ValueError(f"Unknown component: '{base_key}'. Valid: vl, attn, moe")
             elif key.endswith("_compute"):
+                if value not in ("gpu", "cpu", "hybrid", "off"):
+                    raise ValueError(f"Invalid compute value: '{value}'. Valid: gpu, cpu, hybrid, off")
                 base_key = key[:-len("_compute")]
                 if base_key == "vl":
                     vl_compute = value
@@ -119,6 +124,11 @@ class LoRAComputeConfig:
                 # Single value format: 'vl:cpu' sets both storage and compute
                 if key not in ("vl", "attn", "moe"):
                     raise ValueError(f"Unknown component: '{key}'. Valid: vl, attn, moe or use vl_storage/vl_compute format")
+                if value not in ("gpu", "cpu", "off"):
+                    raise ValueError(
+                        f"Invalid shorthand value: '{value}'. Valid: gpu, cpu, off "
+                        f"(for hybrid, use explicit *_compute:hybrid)"
+                    )
                 if key == "vl":
                     vl_storage = vl_compute = value
                 elif key == "attn":
@@ -136,6 +146,11 @@ class LoRAComputeConfig:
         """Check if a component should be computed on CPU."""
         attr = f"{component}_compute"
         return getattr(self, attr, ComputeLocation.GPU) == ComputeLocation.CPU
+
+    def should_compute_hybrid(self, component: str) -> bool:
+        """Check if a component should use hybrid compute mode."""
+        attr = f"{component}_compute"
+        return getattr(self, attr, ComputeLocation.GPU) == ComputeLocation.HYBRID
 
     def is_enabled(self, component: str) -> bool:
         """Check if a component's LoRA is enabled (not OFF)."""

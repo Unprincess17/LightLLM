@@ -18,9 +18,11 @@ Debugging:
 import torch
 import os
 import logging
+import time
 from typing import Dict, Optional, Any, List
 
 from lightllm.server.core.objs.lora_compute_config import LoRAComputeConfig
+from lightllm.server.lora.expert_cache import ExpertCacheKey, MoEExpertCacheManager
 from lightllm.utils.nvtx_utils import NvtxAnnotate
 
 # Configure logging using global env var
@@ -129,11 +131,22 @@ class Qwen3VLMoELoRADispatcher:
         self.lora_mem_pool = None
         self.req_bins = None
         self.use_batched_mode = False
+        self.expert_cache_manager: Optional[MoEExpertCacheManager] = None
 
         # CPU Storage + GPU Compute scratchpad buffers (compact, per-batch)
         self.gpu_scratchpad_a = None
         self.gpu_scratchpad_b = None
         self.transfer_stream = None
+
+        # Last-call COLoRA stats for decode observability.
+        self._last_colora_stats = {
+            "colora_hit_tokens": 0,
+            "colora_miss_tokens": 0,
+            "promotion_queue_depth": 0,
+            "cache_hit_rate": 0.0,
+            "cpu_compute_time": 0.0,
+            "gpu_compute_time": 0.0,
+        }
 
         # Check if any LoRA is enabled
         self.has_any_lora = any([
@@ -146,7 +159,8 @@ class Qwen3VLMoELoRADispatcher:
     def init_batched_mode(
         self,
         lora_mem_pool,
-        req_bins: torch.Tensor
+        req_bins: torch.Tensor,
+        expert_cache_manager: Optional[MoEExpertCacheManager] = None,
     ):
         """
         Initialize batched mode with LoRA memory pool and req_bins.
@@ -161,6 +175,8 @@ class Qwen3VLMoELoRADispatcher:
         self.lora_mem_pool = lora_mem_pool
         self.req_bins = req_bins
         self.use_batched_mode = True
+        self.expert_cache_manager = expert_cache_manager
+        self._reset_colora_stats()
 
         # batch_size = req_bins.shape[0] if req_bins is not None else 0
         # unique_adapters = len(torch.unique(req_bins)) if req_bins is not None else 0
@@ -171,6 +187,8 @@ class Qwen3VLMoELoRADispatcher:
         self.use_batched_mode = False
         self.lora_mem_pool = None
         self.req_bins = None
+        self.expert_cache_manager = None
+        self._reset_colora_stats()
 
     # =====================================================================
     # S-LoRA Batched Methods (FIXED)
@@ -197,6 +215,171 @@ class Qwen3VLMoELoRADispatcher:
         if self.lora_compute_config is None:
             return False
         return self.lora_compute_config.get_storage_device(component) == "cpu"
+
+    def _should_use_hybrid_moe_compute(self) -> bool:
+        """Check whether COLoRA hybrid mode is enabled for MoE."""
+        if self.lora_compute_config is None:
+            return False
+        return self.lora_compute_config.should_compute_hybrid("moe")
+
+    def _reset_colora_stats(self) -> None:
+        self._last_colora_stats = {
+            "colora_hit_tokens": 0,
+            "colora_miss_tokens": 0,
+            "promotion_queue_depth": 0,
+            "cache_hit_rate": 0.0,
+            "cpu_compute_time": 0.0,
+            "gpu_compute_time": 0.0,
+        }
+
+    def pop_colora_stats(self) -> Dict[str, float]:
+        stats = dict(self._last_colora_stats)
+        self._reset_colora_stats()
+        return stats
+
+    def _batch_apply_moe_lora_hybrid(
+        self,
+        input_tensor: torch.Tensor,
+        layer_id: int,
+        buffer_layer_id: int,
+        pool,
+        bins: torch.Tensor,
+        projection: str,
+        expert_id: Optional[int],
+    ) -> torch.Tensor:
+        """COLoRA hybrid path: GPU cache hit + CPU miss fallback + async promotion."""
+        output = self._get_output_buffer(input_tensor, pool)
+        self._reset_colora_stats()
+
+        manager = self.expert_cache_manager
+        if manager is None:
+            return self._naive_batch_lora(input_tensor, buffer_layer_id, pool, bins, force_cpu=True)
+
+        manager.apply_completed_promotions()
+
+        batch_size = input_tensor.shape[0]
+        if len(bins) > batch_size:
+            bins = bins[:batch_size]
+        valid_mask = bins >= 0
+        if not torch.any(valid_mask):
+            self._last_colora_stats["promotion_queue_depth"] = manager.get_promotion_queue_depth()
+            self._last_colora_stats["cache_hit_rate"] = manager.get_hit_rate()
+            return output
+
+        valid_pos = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1)
+        valid_bins = bins.index_select(0, valid_pos).long()
+        unique_adapters = torch.unique(valid_bins).cpu().tolist()
+        key_expert = int(expert_id) if expert_id is not None else 0
+        keys = [
+            ExpertCacheKey(
+                projection=projection,
+                adapter_idx=int(adapter_idx),
+                layer_id=int(layer_id),
+                expert_id=key_expert,
+            )
+            for adapter_idx in unique_adapters
+        ]
+
+        manager.record_access(keys)
+        ready_slots = manager.lookup_many(keys)
+        miss_keys = [key for key in keys if key not in ready_slots]
+        manager.schedule_promotion(miss_keys)
+
+        hit_adapters = {key.adapter_idx for key in ready_slots.keys()}
+        hit_mask = torch.zeros_like(valid_bins, dtype=torch.bool)
+        for adapter_idx in hit_adapters:
+            hit_mask |= valid_bins == int(adapter_idx)
+        miss_mask = ~hit_mask
+
+        gpu_compute_time = 0.0
+        cpu_compute_time = 0.0
+
+        if torch.any(hit_mask):
+            hit_pos = valid_pos.index_select(0, torch.nonzero(hit_mask, as_tuple=False).squeeze(-1))
+            hit_bins = valid_bins.index_select(0, torch.nonzero(hit_mask, as_tuple=False).squeeze(-1))
+            hit_unique_adapters, hit_inverse = torch.unique(hit_bins, return_inverse=True)
+
+            slot_ids = []
+            for adapter_idx in hit_unique_adapters.cpu().tolist():
+                key = ExpertCacheKey(
+                    projection=projection,
+                    adapter_idx=int(adapter_idx),
+                    layer_id=int(layer_id),
+                    expert_id=key_expert,
+                )
+                slot_ids.append(int(ready_slots.get(key, -1)))
+
+            cache_a, cache_b = manager.get_projection_buffers(projection)
+            if (
+                BGMV_AVAILABLE
+                and input_tensor.device.type == "cuda"
+                and cache_a is not None
+                and cache_b is not None
+                and all(slot_id >= 0 for slot_id in slot_ids)
+            ):
+                with NvtxAnnotate("COLoRA_GPU_Hit_Path"):
+                    t0 = time.perf_counter()
+                    hit_input = input_tensor.index_select(0, hit_pos).contiguous()
+                    active_count = hit_unique_adapters.size(0)
+                    self._ensure_compact_scratchpad(pool, input_tensor.device, int(active_count))
+
+                    assert self.gpu_scratchpad_a is not None and self.gpu_scratchpad_b is not None
+                    slot_tensor = torch.tensor(slot_ids, dtype=torch.long, device=cache_a.device)
+                    gathered_a = cache_a.index_select(0, slot_tensor)
+                    gathered_b = cache_b.index_select(0, slot_tensor)
+                    self.gpu_scratchpad_a[:active_count].copy_(gathered_a.to(input_tensor.device), non_blocking=True)
+                    self.gpu_scratchpad_b[:active_count].copy_(gathered_b.to(input_tensor.device), non_blocking=True)
+
+                    hit_output = self._get_output_buffer(hit_input, pool)
+                    temp_a_start = torch.arange(active_count, device=input_tensor.device, dtype=torch.int32)
+                    temp_a_len = torch.ones(active_count, device=input_tensor.device, dtype=torch.int32)
+                    temp_scaling = pool.a_scaling[hit_unique_adapters.long().cpu()].to(input_tensor.device)
+
+                    batch_lora_get_mlp(
+                        hit_output,
+                        hit_input,
+                        self.gpu_scratchpad_a,
+                        self.gpu_scratchpad_b,
+                        temp_a_start,
+                        temp_a_len,
+                        temp_scaling,
+                        hit_inverse,
+                        a_hidden_dim=hit_input.shape[1],
+                        b_hidden_dim=hit_output.shape[1],
+                        layer_id=0,
+                    )
+                    output.index_copy_(0, hit_pos, hit_output)
+                    gpu_compute_time += time.perf_counter() - t0
+            else:
+                # Kernel unavailable or GPU cache not ready: degrade to CPU path.
+                hit_mask = torch.zeros_like(valid_bins, dtype=torch.bool)
+                miss_mask = torch.ones_like(valid_bins, dtype=torch.bool)
+
+        if torch.any(miss_mask):
+            miss_pos = valid_pos.index_select(0, torch.nonzero(miss_mask, as_tuple=False).squeeze(-1))
+            miss_bins = valid_bins.index_select(0, torch.nonzero(miss_mask, as_tuple=False).squeeze(-1))
+            with NvtxAnnotate("COLoRA_CPU_Miss_Path"):
+                t0 = time.perf_counter()
+                miss_input = input_tensor.index_select(0, miss_pos).contiguous()
+                miss_output = self._naive_batch_lora(
+                    miss_input,
+                    buffer_layer_id,
+                    pool,
+                    miss_bins,
+                    force_cpu=True,
+                )
+                output.index_copy_(0, miss_pos, miss_output)
+                cpu_compute_time += time.perf_counter() - t0
+
+        self._last_colora_stats = {
+            "colora_hit_tokens": int(hit_mask.sum().item()),
+            "colora_miss_tokens": int(miss_mask.sum().item()),
+            "promotion_queue_depth": manager.get_promotion_queue_depth(),
+            "cache_hit_rate": manager.get_hit_rate(),
+            "cpu_compute_time": cpu_compute_time,
+            "gpu_compute_time": gpu_compute_time,
+        }
+        return output
 
     def _ensure_compact_scratchpad(self, pool, device, active_count: int):
         """
@@ -546,6 +729,17 @@ class Qwen3VLMoELoRADispatcher:
         else:
             buffer_layer_id = layer_id
 
+        if self._should_use_hybrid_moe_compute():
+            return self._batch_apply_moe_lora_hybrid(
+                input_tensor=input_tensor,
+                layer_id=layer_id,
+                buffer_layer_id=buffer_layer_id,
+                pool=pool,
+                bins=bins,
+                projection="gate",
+                expert_id=expert_id,
+            )
+
         # Use CPU compute if configured
         if self._should_use_cpu_compute("moe"):
             with NvtxAnnotate("batch_apply_gate_lora_cpu"):
@@ -631,6 +825,17 @@ class Qwen3VLMoELoRADispatcher:
         else:
             buffer_layer_id = layer_id
 
+        if self._should_use_hybrid_moe_compute():
+            return self._batch_apply_moe_lora_hybrid(
+                input_tensor=input_tensor,
+                layer_id=layer_id,
+                buffer_layer_id=buffer_layer_id,
+                pool=pool,
+                bins=bins,
+                projection="up",
+                expert_id=expert_id,
+            )
+
         # Use CPU compute if configured
         if self._should_use_cpu_compute("moe"):
             return self._naive_batch_lora(input_tensor, buffer_layer_id, pool, bins)
@@ -708,6 +913,17 @@ class Qwen3VLMoELoRADispatcher:
             buffer_layer_id = layer_id * pool.num_experts + expert_id
         else:
             buffer_layer_id = layer_id
+
+        if self._should_use_hybrid_moe_compute():
+            return self._batch_apply_moe_lora_hybrid(
+                input_tensor=input_tensor,
+                layer_id=layer_id,
+                buffer_layer_id=buffer_layer_id,
+                pool=pool,
+                bins=bins,
+                projection="down",
+                expert_id=expert_id,
+            )
 
         output = self._get_output_buffer(input_tensor, pool)
 
@@ -831,7 +1047,8 @@ class Qwen3VLMoELoRADispatcher:
         input_tensor: torch.Tensor,
         layer_id: int,
         pool,
-        req_bins: Optional[torch.Tensor] = None
+        req_bins: Optional[torch.Tensor] = None,
+        force_cpu: bool = False,
     ) -> torch.Tensor:
         """
         Naive per-request LoRA computation (fallback when BGMV unavailable).
@@ -851,10 +1068,19 @@ class Qwen3VLMoELoRADispatcher:
         if req_bins is None:
             return torch.zeros(input_tensor.shape[0], pool.value_buffer.shape[2], dtype=input_tensor.dtype, device=input_tensor.device)
 
-        batch_size = input_tensor.shape[0]
+        original_device = input_tensor.device
+        original_dtype = input_tensor.dtype
+
+        compute_input = input_tensor
+        if force_cpu and compute_input.device.type != "cpu":
+            compute_input = compute_input.to("cpu", non_blocking=True)
+        if force_cpu and AVX_AVAILABLE and compute_input.dtype != torch.bfloat16:
+            compute_input = compute_input.to(dtype=torch.bfloat16)
+
+        batch_size = compute_input.shape[0]
         # Use pool's B dimension (handles GQA where K/V output != input)
         output_dim = pool.value_buffer.shape[2]
-        output = torch.zeros(batch_size, output_dim, dtype=input_tensor.dtype, device=input_tensor.device)
+        output = torch.zeros(batch_size, output_dim, dtype=compute_input.dtype, device=compute_input.device)
 
         # Truncate req_bins to match batch_size (handles decode phase with fewer requests)
         if len(req_bins) > batch_size:
@@ -869,9 +1095,7 @@ class Qwen3VLMoELoRADispatcher:
             adapter_to_indices[bin_idx].append(i)
 
         # Determine if we should use AVX kernel
-        use_avx = (AVX_AVAILABLE and
-                   input_tensor.device.type == 'cpu' and
-                   input_tensor.dtype == torch.bfloat16)
+        use_avx = (AVX_AVAILABLE and compute_input.device.type == 'cpu' and compute_input.dtype == torch.bfloat16)
 
         # Process each adapter group
         for adapter_idx, req_indices in adapter_to_indices.items():
@@ -882,19 +1106,24 @@ class Qwen3VLMoELoRADispatcher:
             a_start = pool.a_start[adapter_idx].item()
             a_len = pool.a_len[adapter_idx].item()
             a_scaling = pool.a_scaling[adapter_idx].item()
+            if hasattr(pool, "a_rank") and len(pool.a_rank) > adapter_idx:
+                a_rank = int(pool.a_rank[adapter_idx].item())
+            else:
+                # Backward compatibility for older pool metadata.
+                a_rank = int(a_len)
 
             # Get A and B matrices for this layer
             loc = a_start + layer_id
             if loc >= a_start + a_len:
                 continue
 
-            A = pool.key_buffer[loc, :a_len]  # [rank, hidden]
-            B = pool.value_buffer[loc, :a_len]  # [rank, hidden]
+            A = pool.key_buffer[loc, :a_rank]  # [rank, hidden]
+            B = pool.value_buffer[loc, :a_rank]  # [rank, hidden]
 
             # Compute LoRA for each request in this group
             if use_avx:
                 # Use AVX-512 BF16 kernel for batched computation
-                batch_input = input_tensor[req_indices]  # [n, hidden]
+                batch_input = compute_input[req_indices]  # [n, hidden]
 
                 # Convert to bfloat16 if needed
                 if A.dtype != torch.bfloat16:
@@ -915,12 +1144,12 @@ class Qwen3VLMoELoRADispatcher:
             else:
                 # Fallback: PyTorch matmul per request
                 # Move to input device and dtype if pool is on different device
-                if A.device != input_tensor.device or A.dtype != input_tensor.dtype:
-                    A = A.to(dtype=input_tensor.dtype, device=input_tensor.device)
-                    B = B.to(dtype=input_tensor.dtype, device=input_tensor.device)
+                if A.device != compute_input.device or A.dtype != compute_input.dtype:
+                    A = A.to(dtype=compute_input.dtype, device=compute_input.device)
+                    B = B.to(dtype=compute_input.dtype, device=compute_input.device)
 
                 for req_idx in req_indices:
-                    x = input_tensor[req_idx]  # [hidden]
+                    x = compute_input[req_idx]  # [hidden]
                     # LoRA: x @ A @ B * scaling
                     # A stored as [rank, hidden], need A.T for [hidden, rank]
                     # B stored as [rank, hidden], need B for [hidden, rank]
@@ -930,6 +1159,8 @@ class Qwen3VLMoELoRADispatcher:
                     lora_out = torch.matmul(intermediate, B) * a_scaling
                     output[req_idx] = lora_out
 
+        if force_cpu and (original_device.type != "cpu" or output.dtype != original_dtype):
+            output = output.to(device=original_device, dtype=original_dtype, non_blocking=True)
         return output
 
     # =====================================================================
@@ -1011,8 +1242,11 @@ def create_vl_moe_lora_dispatcher(
     )
 
 
-# Import for backward compatibility
-from lightllm.models.qwen3_vl_moe.layer_weights.lora_layer_weight import load_moe_lora_adapter as load_lora_adapter
+def load_lora_adapter(*args, **kwargs):
+    """Lazy import wrapper to avoid heavyweight model imports at module import time."""
+    from lightllm.models.qwen3_vl_moe.layer_weights.lora_layer_weight import load_moe_lora_adapter
+
+    return load_moe_lora_adapter(*args, **kwargs)
 
 
 __all__ = [

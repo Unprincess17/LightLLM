@@ -5,6 +5,40 @@ set -e
 # Automated MoE LoRA Profiling Script
 # =============================================================================
 
+usage() {
+    cat <<'USAGE'
+Usage: ./benchmark_lora.sh [OPTIONS]
+
+Core options:
+  --delay SEC
+  --max_tokens N
+  --decode_target_tokens N
+  --ignore_eos | --no_ignore_eos
+  --adapter_ids CSV
+  --poisson_lambda F
+  --poisson_seed N
+  --adapter_expert_profile [0|1] | --no_adapter_expert_profile
+  --top_k_slowest N
+  --print_per_request | --no_print_per_request
+  --per_request_log_path PATH | --no_per_request_log
+
+Server pass-through options:
+  --model_dir PATH
+  --lora_dirs CSV
+  --tp N
+  --compute_device STR
+  --force_slow_lora_path | --no_force_slow_lora_path (default: enabled)
+  --max_req_total_len N
+  --mem_fraction F
+  --batch_max_tokens N
+  --colora_cache_budget_mb MB
+  --colora_promote_min_hits N
+  --colora_promote_window N
+  --colora_max_promote_per_step N
+  --colora_decay F
+USAGE
+}
+
 
 # Default values
 SETUP_DELAY=10
@@ -27,6 +61,19 @@ ADAPTER_EXPERT_LOG_PATH="/tmp/moe_adapter_expert_profile.log"
 PRINT_PER_REQUEST=0
 TOP_K_SLOWEST=10
 PER_REQUEST_LOG_PATH="/tmp/moe_per_request_metrics_$(date +%Y%m%d_%H%M%S).jsonl"
+MODEL_DIR=""
+LORA_DIRS=""
+TP=""
+COMPUTE_DEVICE=""
+FORCE_SLOW_LORA_PATH="1"
+MAX_REQ_TOTAL_LEN=""
+MEM_FRACTION=""
+BATCH_MAX_TOKENS=""
+COLORA_CACHE_BUDGET_MB=""
+COLORA_PROMOTE_MIN_HITS=""
+COLORA_PROMOTE_WINDOW=""
+COLORA_MAX_PROMOTE_PER_STEP=""
+COLORA_DECAY=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -41,13 +88,37 @@ while [[ $# -gt 0 ]]; do
         --adapter_ids) ADAPTER_IDS="$2"; shift 2 ;;
         --poisson_lambda) POISSON_LAMBDA="$2"; shift 2 ;;
         --poisson_seed) POISSON_SEED="$2"; shift 2 ;;
-        --adapter_expert_profile) ADAPTER_EXPERT_PROFILE="$2"; shift 2 ;;
+        --adapter_expert_profile)
+            if [[ -n "${2:-}" && "$2" != --* ]]; then
+                ADAPTER_EXPERT_PROFILE="$2"
+                shift 2
+            else
+                ADAPTER_EXPERT_PROFILE=1
+                shift
+            fi
+            ;;
+        --no_adapter_expert_profile) ADAPTER_EXPERT_PROFILE=0; shift ;;
         --adapter_expert_log_path) ADAPTER_EXPERT_LOG_PATH="$2"; shift 2 ;;
+        --model_dir) MODEL_DIR="$2"; shift 2 ;;
+        --lora_dirs) LORA_DIRS="$2"; shift 2 ;;
+        --tp) TP="$2"; shift 2 ;;
+        --compute_device) COMPUTE_DEVICE="$2"; shift 2 ;;
+        --force_slow_lora_path) FORCE_SLOW_LORA_PATH="1"; shift ;;
+        --no_force_slow_lora_path) FORCE_SLOW_LORA_PATH="0"; shift ;;
+        --max_req_total_len) MAX_REQ_TOTAL_LEN="$2"; shift 2 ;;
+        --mem_fraction) MEM_FRACTION="$2"; shift 2 ;;
+        --batch_max_tokens) BATCH_MAX_TOKENS="$2"; shift 2 ;;
+        --colora_cache_budget_mb) COLORA_CACHE_BUDGET_MB="$2"; shift 2 ;;
+        --colora_promote_min_hits) COLORA_PROMOTE_MIN_HITS="$2"; shift 2 ;;
+        --colora_promote_window) COLORA_PROMOTE_WINDOW="$2"; shift 2 ;;
+        --colora_max_promote_per_step) COLORA_MAX_PROMOTE_PER_STEP="$2"; shift 2 ;;
+        --colora_decay) COLORA_DECAY="$2"; shift 2 ;;
         --print_per_request) PRINT_PER_REQUEST=1; shift ;;
         --no_print_per_request) PRINT_PER_REQUEST=0; shift ;;
         --top_k_slowest) TOP_K_SLOWEST="$2"; shift 2 ;;
         --per_request_log_path) PER_REQUEST_LOG_PATH="$2"; shift 2 ;;
         --no_per_request_log) PER_REQUEST_LOG_PATH=""; shift ;;
+        --help|-h) usage; exit 0 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -101,6 +172,11 @@ echo "Adapter expert profile: $ADAPTER_EXPERT_PROFILE"
 echo "Adapter expert profile log: $ADAPTER_EXPERT_LOG_PATH"
 echo "Top-K slowest requests: $TOP_K_SLOWEST"
 echo "Print per-request lines: $PRINT_PER_REQUEST"
+[[ -n "$MODEL_DIR" ]] && echo "Server model_dir override: $MODEL_DIR"
+[[ -n "$LORA_DIRS" ]] && echo "Server lora_dirs override: $LORA_DIRS"
+[[ -n "$TP" ]] && echo "Server TP override: $TP"
+[[ -n "$COMPUTE_DEVICE" ]] && echo "Server compute_device override: $COMPUTE_DEVICE"
+[[ -n "$FORCE_SLOW_LORA_PATH" ]] && echo "Server force_slow_lora_path override: $FORCE_SLOW_LORA_PATH"
 if [[ -n "$PER_REQUEST_LOG_PATH" ]]; then
     echo "Per-request metrics log: $PER_REQUEST_LOG_PATH"
 else
@@ -135,6 +211,47 @@ SERVER_ARGS=(--host "$SERVER_HOST" --port "$SERVER_PORT")
 if [[ "$ADAPTER_EXPERT_PROFILE" == "1" ]]; then
     SERVER_ARGS+=(--adapter_expert_profile --adapter_expert_log_path "$ADAPTER_EXPERT_LOG_PATH")
 fi
+if [[ -n "$MODEL_DIR" ]]; then
+    SERVER_ARGS+=(--model_dir "$MODEL_DIR")
+fi
+if [[ -n "$LORA_DIRS" ]]; then
+    SERVER_ARGS+=(--lora_dirs "$LORA_DIRS")
+fi
+if [[ -n "$TP" ]]; then
+    SERVER_ARGS+=(--tp "$TP")
+fi
+if [[ -n "$COMPUTE_DEVICE" ]]; then
+    SERVER_ARGS+=(--compute_device "$COMPUTE_DEVICE")
+fi
+if [[ "$FORCE_SLOW_LORA_PATH" == "1" ]]; then
+    SERVER_ARGS+=(--force_slow_lora_path)
+elif [[ "$FORCE_SLOW_LORA_PATH" == "0" ]]; then
+    SERVER_ARGS+=(--no_force_slow_lora_path)
+fi
+if [[ -n "$MAX_REQ_TOTAL_LEN" ]]; then
+    SERVER_ARGS+=(--max_req_total_len "$MAX_REQ_TOTAL_LEN")
+fi
+if [[ -n "$MEM_FRACTION" ]]; then
+    SERVER_ARGS+=(--mem_fraction "$MEM_FRACTION")
+fi
+if [[ -n "$BATCH_MAX_TOKENS" ]]; then
+    SERVER_ARGS+=(--batch_max_tokens "$BATCH_MAX_TOKENS")
+fi
+if [[ -n "$COLORA_CACHE_BUDGET_MB" ]]; then
+    SERVER_ARGS+=(--colora_cache_budget_mb "$COLORA_CACHE_BUDGET_MB")
+fi
+if [[ -n "$COLORA_PROMOTE_MIN_HITS" ]]; then
+    SERVER_ARGS+=(--colora_promote_min_hits "$COLORA_PROMOTE_MIN_HITS")
+fi
+if [[ -n "$COLORA_PROMOTE_WINDOW" ]]; then
+    SERVER_ARGS+=(--colora_promote_window "$COLORA_PROMOTE_WINDOW")
+fi
+if [[ -n "$COLORA_MAX_PROMOTE_PER_STEP" ]]; then
+    SERVER_ARGS+=(--colora_max_promote_per_step "$COLORA_MAX_PROMOTE_PER_STEP")
+fi
+if [[ -n "$COLORA_DECAY" ]]; then
+    SERVER_ARGS+=(--colora_decay "$COLORA_DECAY")
+fi
 bash "$SERVER_SCRIPT" "${SERVER_ARGS[@]}" &
 SERVER_PID=$!
 echo "Server PID: $SERVER_PID"
@@ -168,7 +285,7 @@ sleep "$SETUP_DELAY"
 # Step 4: Send test request (nsys is now capturing)
 echo "[3/5] Sending test request..."
 echo > benchmark_lora.log
-python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests 1 2>&1 | tee -a benchmark_lora.log
+# python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests 1 2>&1 | tee -a benchmark_lora.log
 
 # sleep 5
 # python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests 1 2>&1 | tee -a benchmark_lora.log
@@ -185,8 +302,8 @@ python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests 1 2>&1 | tee -a be
 # sleep 5
 # python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests 8 2>&1 | tee -a benchmark_lora.log
 
-# sleep 5
-# python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests 16 2>&1 | tee -a benchmark_lora.log
+sleep 5
+python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests 16 2>&1 | tee -a benchmark_lora.log
 
 # sleep 5
 # python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests 32 2>&1 | tee -a benchmark_lora.log

@@ -15,14 +15,20 @@
 #   --enable_multimodal    Enable multimodal support
 #   --lora_max_size SIZE   Max LoRA size (default: 1024)
 #   --compute_device STR   Configure LoRA storage and compute locations
-#                          Format: 'vl_storage:{gpu|cpu},vl_compute:{gpu|cpu|off},attn_storage:{gpu|cpu},attn_compute:{gpu|cpu|off},moe_storage:{gpu|cpu},moe_compute:{gpu|cpu|off}'
+#                          Format: 'vl_storage:{gpu|cpu},vl_compute:{gpu|cpu|off},attn_storage:{gpu|cpu},attn_compute:{gpu|cpu|off},moe_storage:{gpu|cpu},moe_compute:{gpu|cpu|hybrid|off}'
 #                          Short format 'moe:cpu' sets both storage and compute
 #                          Example: 'moe:cpu' - MoE on CPU (both storage and compute)
 #                          Example: 'vl_storage:cpu,vl_compute:gpu' - VL weights on CPU, compute on GPU
-#   --force_slow_lora_path Force slow path for LoRA (per-expert baseline)
+#   --force_slow_lora_path Force per-expert LoRA path (needed when fused MoE path cannot inject LoRA)
+#   --no_force_slow_lora_path Disable forced slow path (advanced; only if your model path injects LoRA without it)
 #   --max_req_total_len    Max request total length
 #   --mem_fraction         Memory fraction (default: 0.6)
 #   --batch_max_tokens     Batch max tokens (default: 4096)
+#   --colora_cache_budget_mb MB        COLoRA GPU hot cache budget
+#   --colora_promote_min_hits N        COLoRA min accesses before promotion
+#   --colora_promote_window N          COLoRA utility window
+#   --colora_max_promote_per_step N    COLoRA max promotions per step
+#   --colora_decay F                   COLoRA utility decay
 #   --adapter_expert_profile Enable adapter x expert routing profiling log
 #   --adapter_expert_log_path PATH Log path for adapter x expert routing profiling
 #   --help                 Show this help message
@@ -30,6 +36,36 @@
 # =============================================================================
 
 set -e
+
+usage() {
+    cat <<'USAGE'
+Usage: ./start_server.sh [OPTIONS]
+
+Options:
+  --model_dir PATH
+  --lora_dir PATH
+  --lora_dirs PATHS
+  --port PORT
+  --tp TP
+  --host HOST
+  --enable_multimodal
+  --lora_max_size SIZE
+  --compute_device STR
+  --force_slow_lora_path
+  --no_force_slow_lora_path (default: force_slow enabled)
+  --max_req_total_len N
+  --mem_fraction F
+  --batch_max_tokens N
+  --colora_cache_budget_mb MB
+  --colora_promote_min_hits N
+  --colora_promote_window N
+  --colora_max_promote_per_step N
+  --colora_decay F
+  --adapter_expert_profile
+  --adapter_expert_log_path PATH
+  --help|-h
+USAGE
+}
 
 # Env
 export MOE_PROFILING=1
@@ -65,13 +101,21 @@ EOF
 ### Baseline 4: Store on GPU, compute on GPU ###
 # COMPUTE_DEVICE="vl_storage:gpu,vl_compute:gpu,attn_storage:gpu,attn_compute:gpu,moe_storage:gpu,moe_compute:gpu"
 
-### Proposed: Store on CPU, compute Attn on GPU, MoE on CPU ###
-COMPUTE_DEVICE="vl_storage:cpu,vl_compute:gpu,attn_storage:cpu,attn_compute:gpu,moe_storage:cpu,moe_compute:cpu"
+### Optional baseline (CPU MoE compute):
+# COMPUTE_DEVICE="vl_storage:gpu,vl_compute:gpu,attn_storage:gpu,attn_compute:gpu,moe_storage:cpu,moe_compute:cpu"
+
+### COLoRA default: GPU hit + CPU miss for MoE LoRA ###
+COMPUTE_DEVICE="vl_storage:gpu,vl_compute:gpu,attn_storage:gpu,attn_compute:gpu,moe_storage:cpu,moe_compute:hybrid"
 
 FORCE_SLOW_LORA_PATH=true
 MAX_REQ_TOTAL_LEN=8192
 MEM_FRACTION=0.6
 BATCH_MAX_TOKENS=4096
+COLORA_CACHE_BUDGET_MB=2048
+COLORA_PROMOTE_MIN_HITS=2
+COLORA_PROMOTE_WINDOW=128
+COLORA_MAX_PROMOTE_PER_STEP=8
+COLORA_DECAY=0.9
 
 # Environment variables
 LOADWORKER=8
@@ -125,6 +169,42 @@ while [[ $# -gt 0 ]]; do
             FORCE_SLOW_LORA_PATH=true
             shift
             ;;
+        --no_force_slow_lora_path)
+            FORCE_SLOW_LORA_PATH=false
+            shift
+            ;;
+        --max_req_total_len)
+            MAX_REQ_TOTAL_LEN="$2"
+            shift 2
+            ;;
+        --mem_fraction)
+            MEM_FRACTION="$2"
+            shift 2
+            ;;
+        --batch_max_tokens)
+            BATCH_MAX_TOKENS="$2"
+            shift 2
+            ;;
+        --colora_cache_budget_mb)
+            COLORA_CACHE_BUDGET_MB="$2"
+            shift 2
+            ;;
+        --colora_promote_min_hits)
+            COLORA_PROMOTE_MIN_HITS="$2"
+            shift 2
+            ;;
+        --colora_promote_window)
+            COLORA_PROMOTE_WINDOW="$2"
+            shift 2
+            ;;
+        --colora_max_promote_per_step)
+            COLORA_MAX_PROMOTE_PER_STEP="$2"
+            shift 2
+            ;;
+        --colora_decay)
+            COLORA_DECAY="$2"
+            shift 2
+            ;;
         --adapter_expert_profile)
             MOE_ADAPTER_EXPERT_PROFILING=1
             shift
@@ -134,7 +214,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --help|-h)
-            cat "$0" | grep -E '^[A-Z#]|^[a-zA-Z_]+:'
+            usage
             exit 0
             ;;
         *)
@@ -222,6 +302,17 @@ if [[ "$FORCE_SLOW_LORA_PATH" == "true" ]]; then
     CMD="$CMD --force_slow_lora_path"
 fi
 
+if [[ "$FORCE_SLOW_LORA_PATH" != "true" && "$COMPUTE_DEVICE" == *"moe_compute:hybrid"* ]]; then
+    echo "WARNING: FORCE_SLOW_LORA_PATH is disabled while moe_compute:hybrid is set."
+    echo "         If fused MoE path cannot inject LoRA on your model, results may be invalid."
+fi
+
+CMD="$CMD --colora_cache_budget_mb $COLORA_CACHE_BUDGET_MB \
+    --colora_promote_min_hits $COLORA_PROMOTE_MIN_HITS \
+    --colora_promote_window $COLORA_PROMOTE_WINDOW \
+    --colora_max_promote_per_step $COLORA_MAX_PROMOTE_PER_STEP \
+    --colora_decay $COLORA_DECAY"
+
 # Export environment variables
 export LOADWORKER=$LOADWORKER
 export LIGHTLLM_LOGGING=$LIGHTLLM_LOGGING
@@ -241,6 +332,13 @@ echo "  MOE_MODE=$MOE_MODE"
 echo "  MOCK_PREFILL_LOGITS=$MOCK_PREFILL_LOGITS"
 echo "  MOE_ADAPTER_EXPERT_PROFILING=$MOE_ADAPTER_EXPERT_PROFILING"
 echo "  MOE_ADAPTER_EXPERT_LOG_PATH=$MOE_ADAPTER_EXPERT_LOG_PATH"
+echo "  FORCE_SLOW_LORA_PATH=$FORCE_SLOW_LORA_PATH"
+echo "  COMPUTE_DEVICE=$COMPUTE_DEVICE"
+echo "  COLORA_CACHE_BUDGET_MB=$COLORA_CACHE_BUDGET_MB"
+echo "  COLORA_PROMOTE_MIN_HITS=$COLORA_PROMOTE_MIN_HITS"
+echo "  COLORA_PROMOTE_WINDOW=$COLORA_PROMOTE_WINDOW"
+echo "  COLORA_MAX_PROMOTE_PER_STEP=$COLORA_MAX_PROMOTE_PER_STEP"
+echo "  COLORA_DECAY=$COLORA_DECAY"
 echo ""
 
 

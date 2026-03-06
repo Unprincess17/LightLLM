@@ -10,6 +10,12 @@ from .lora_mem_pool import (
     LoRAAdapterLoader,
     create_lora_mem_pool,
 )
+from .expert_cache import (
+    ExpertCacheKey,
+    ExpertCacheSlotState,
+    MoEExpertCacheConfig,
+    MoEExpertCacheManager,
+)
 
 __all__ = [
     "LoRAMemPool",
@@ -17,4 +23,8 @@ __all__ = [
     "LoRATargetType",
     "LoRAAdapterLoader",
     "create_lora_mem_pool",
+    "ExpertCacheKey",
+    "ExpertCacheSlotState",
+    "MoEExpertCacheConfig",
+    "MoEExpertCacheManager",
 ]

@@ -130,11 +130,42 @@ def make_argument_parser() -> argparse.ArgumentParser:
         type=str,
         default="",
         help="""Configure LoRA storage and compute locations for each component.
-        Format: 'vl_storage:{gpu|cpu},vl_compute:{gpu|cpu|off},attn_storage:{gpu|cpu},attn_compute:{gpu|cpu|off},moe_storage:{gpu|cpu},moe_compute:{gpu|cpu|off}'
+        Format: 'vl_storage:{gpu|cpu},vl_compute:{gpu|cpu|off},attn_storage:{gpu|cpu},attn_compute:{gpu|cpu|off},moe_storage:{gpu|cpu},moe_compute:{gpu|cpu|hybrid|off}'
         Examples:
           'vl_storage:cpu,vl_compute:gpu,attn_storage:gpu,attn_compute:gpu,moe_storage:cpu,moe_compute:cpu'
+          'moe_storage:cpu,moe_compute:hybrid' (COLoRA decode mode: GPU hit + CPU miss)
           'vl:off,attn:gpu,moe:cpu' (sets both storage and compute for each)
         Default: '' (all components use GPU storage and compute)""",
+    )
+    parser.add_argument(
+        "--colora_cache_budget_mb",
+        type=int,
+        default=2048,
+        help="COLoRA GPU hot-expert cache budget (MB).",
+    )
+    parser.add_argument(
+        "--colora_promote_min_hits",
+        type=int,
+        default=2,
+        help="Minimum access count before scheduling expert promotion.",
+    )
+    parser.add_argument(
+        "--colora_promote_window",
+        type=int,
+        default=128,
+        help="Utility window size used by COLoRA promotion scoring.",
+    )
+    parser.add_argument(
+        "--colora_max_promote_per_step",
+        type=int,
+        default=8,
+        help="Maximum number of expert promotions applied per dispatch step.",
+    )
+    parser.add_argument(
+        "--colora_decay",
+        type=float,
+        default=0.9,
+        help="Decay factor for COLoRA utility score updates.",
     )
     parser.add_argument(
         "--force_slow_lora_path",

@@ -190,6 +190,36 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
             return moe_compute.lower() == "cpu"
         return False
 
+    def _new_colora_stats(self) -> Dict[str, float]:
+        return {
+            "colora_hit_tokens": 0,
+            "colora_miss_tokens": 0,
+            "promotion_queue_depth": 0,
+            "cache_hit_rate": 0.0,
+            "cpu_compute_time": 0.0,
+            "gpu_compute_time": 0.0,
+        }
+
+    def _merge_colora_stats(self, agg_stats: Dict[str, float]) -> None:
+        dispatcher = self.lora_dispatcher_
+        if dispatcher is None:
+            return
+
+        pop_stats_fn = getattr(dispatcher, "pop_colora_stats", None)
+        if not callable(pop_stats_fn):
+            return
+
+        stats = pop_stats_fn()
+        if not isinstance(stats, dict):
+            return
+
+        agg_stats["colora_hit_tokens"] += int(stats.get("colora_hit_tokens", 0))
+        agg_stats["colora_miss_tokens"] += int(stats.get("colora_miss_tokens", 0))
+        agg_stats["cpu_compute_time"] += float(stats.get("cpu_compute_time", 0.0))
+        agg_stats["gpu_compute_time"] += float(stats.get("gpu_compute_time", 0.0))
+        agg_stats["promotion_queue_depth"] = int(stats.get("promotion_queue_depth", agg_stats["promotion_queue_depth"]))
+        agg_stats["cache_hit_rate"] = float(stats.get("cache_hit_rate", agg_stats["cache_hit_rate"]))
+
     def _get_study2_profile_prefix(self, expert_id: int, step_idx: int, token_count: int) -> Optional[str]:
         """Build Study2 NVTX prefix for real-model profiling when enabled via env."""
         if os.environ.get("MOE_STUDY2_PROFILE", "0") != "1":
@@ -552,6 +582,7 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
         # 确保 dispatcher 存在且开启了 detached lora 模式
         force_slow = getattr(self, 'force_slow_lora_path', False)
         use_per_expert_lora = (self.use_detached_lora_ and self.lora_dispatcher_ is not None) or force_slow
+        colora_stats = self._new_colora_stats()
 
         # ----------------------------------------------------------------
         # Fast Path: 使用 Fused Kernel (无 LoRA)
@@ -771,6 +802,7 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
                         phase_name="Gate",
                         study2_prefix=study2_prefix,
                     )
+                    self._merge_colora_stats(colora_stats)
                 with NvtxAnnotate("MoE_UpLoRA"):
                     up_lora = self._dispatch_lora_with_optional_coalescing(
                         dispatch_fn=self.lora_dispatcher_.batch_apply_up_lora,
@@ -783,6 +815,7 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
                         phase_name="Up",
                         study2_prefix=study2_prefix,
                     )
+                    self._merge_colora_stats(colora_stats)
 
                 gate_out += gate_lora
                 up_out += up_lora
@@ -808,6 +841,7 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
                         phase_name="Down",
                         study2_prefix=study2_prefix,
                     )
+                    self._merge_colora_stats(colora_stats)
                 down_out += down_lora
 
                 # 4.4.8 Weighted Aggregation (Corrected)
@@ -822,6 +856,19 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
                 # 4.4.9 Cleanup - eagerly free GPU tensor references
                 with NvtxAnnotate("MoE_Cleanup"):
                     del current_weights, w1, w3, w2
+
+        if (colora_stats["colora_hit_tokens"] + colora_stats["colora_miss_tokens"]) > 0:
+            logger.debug(
+                "[COLoRA] layer=%s hit_tokens=%s miss_tokens=%s queue_depth=%s hit_rate=%.4f "
+                "cpu_compute_time=%.6f gpu_compute_time=%.6f",
+                self.layer_num_,
+                colora_stats["colora_hit_tokens"],
+                colora_stats["colora_miss_tokens"],
+                colora_stats["promotion_queue_depth"],
+                colora_stats["cache_hit_rate"],
+                colora_stats["cpu_compute_time"],
+                colora_stats["gpu_compute_time"],
+            )
 
         return final_output.view(num_tokens, hidden_dim)
 
