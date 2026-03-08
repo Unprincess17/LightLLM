@@ -1056,6 +1056,9 @@ class ModeBackend:
                     promote_window=getattr(self.args, "colora_promote_window", 128),
                     max_promote_per_step=getattr(self.args, "colora_max_promote_per_step", 8),
                     decay=getattr(self.args, "colora_decay", 0.9),
+                    miss_policy=getattr(self.args, "colora_miss_policy", "cpu_first"),
+                    queue_high_watermark=getattr(self.args, "colora_promote_window", 128),
+                    promote_cooldown_steps=4,
                 )
                 self.moe_expert_cache_manager = MoEExpertCacheManager(cache_cfg)
                 self.moe_expert_cache_manager.register_projection_pool("gate", self.lora_mem_pool.moe_gate_pool)
@@ -1063,12 +1066,14 @@ class ModeBackend:
                 self.moe_expert_cache_manager.register_projection_pool("down", self.lora_mem_pool.moe_down_pool)
                 self.logger.info(
                     "[COLoRA] Expert cache initialized: budget_mb=%s, promote_min_hits=%s, "
-                    "window=%s, max_promote_per_step=%s, decay=%.4f",
+                    "window=%s, max_promote_per_step=%s, decay=%.4f, miss_policy=%s, queue_hwm=%s",
                     cache_cfg.cache_budget_mb,
                     cache_cfg.promote_min_hits,
                     cache_cfg.promote_window,
                     cache_cfg.max_promote_per_step,
                     cache_cfg.decay,
+                    cache_cfg.miss_policy,
+                    cache_cfg.queue_high_watermark,
                 )
 
             # Set TP rank for sharded weight loading
@@ -1133,13 +1138,32 @@ class ModeBackend:
                 max_rank = rank
 
         num_layers = self.model.config.get("num_hidden_layers", self.model.layers_num)
+        async_fallback_raw = getattr(self.args, "colora_async_fallback", 1)
+        try:
+            async_fallback_enabled = bool(int(async_fallback_raw))
+        except (TypeError, ValueError):
+            async_fallback_enabled = bool(async_fallback_raw)
         for layer_id in range(num_layers):
-            dispatcher = self._create_lora_dispatcher_fn(
+            dispatcher_kwargs = dict(
                 num_layers=1,  # Single layer dispatcher
                 lora_rank=max_rank,
                 lora_alpha=1.0,  # scaling handled separately via a_scaling in pool
-                lora_compute_config=self._lora_compute_config
+                lora_compute_config=effective_lora_compute_config,
+                colora_async_fallback=async_fallback_enabled,
+                colora_cpu_workers=int(getattr(self.args, "colora_cpu_workers", 4)),
+                colora_cpu_queue_depth=int(getattr(self.args, "colora_cpu_queue_depth", 256)),
+                colora_cpu_batch_timeout_us=int(getattr(self.args, "colora_cpu_batch_timeout_us", 50)),
             )
+            try:
+                dispatcher = self._create_lora_dispatcher_fn(**dispatcher_kwargs)
+            except TypeError:
+                # Non-COLoRA dispatchers do not accept async fallback kwargs.
+                dispatcher = self._create_lora_dispatcher_fn(
+                    num_layers=1,
+                    lora_rank=max_rank,
+                    lora_alpha=1.0,
+                    lora_compute_config=self._lora_compute_config,
+                )
             self.lora_dispatchers.append(dispatcher)
 
         self.logger.info(f"[LoRA Backend] Created {len(self.lora_dispatchers)} LoRA dispatchers for batched mode")

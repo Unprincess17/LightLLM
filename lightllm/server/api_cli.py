@@ -168,6 +168,38 @@ def make_argument_parser() -> argparse.ArgumentParser:
         help="Decay factor for COLoRA utility score updates.",
     )
     parser.add_argument(
+        "--colora_miss_policy",
+        type=str,
+        default="cpu_first",
+        choices=["cpu_first", "load_then_run"],
+        help="COLoRA miss handling policy. cpu_first keeps request non-blocking by default.",
+    )
+    parser.add_argument(
+        "--colora_async_fallback",
+        type=int,
+        choices=[0, 1],
+        default=1,
+        help="Enable async CPU fallback for COLoRA hybrid mode (1=enabled, 0=disabled).",
+    )
+    parser.add_argument(
+        "--colora_cpu_workers",
+        type=int,
+        default=4,
+        help="Worker threads for COLoRA async CPU fallback.",
+    )
+    parser.add_argument(
+        "--colora_cpu_queue_depth",
+        type=int,
+        default=256,
+        help="Maximum in-flight COLoRA async CPU fallback tasks before degrading to sync.",
+    )
+    parser.add_argument(
+        "--colora_cpu_batch_timeout_us",
+        type=int,
+        default=50,
+        help="Queue wait budget in microseconds before degrading async fallback submission.",
+    )
+    parser.add_argument(
         "--force_slow_lora_path",
         action="store_true",
         help="""Force use of slow path for LoRA (per-expert computation).

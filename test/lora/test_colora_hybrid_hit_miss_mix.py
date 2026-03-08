@@ -93,3 +93,8 @@ def test_colora_hybrid_mixed_hit_and_miss_tokens():
     stats = dispatcher.pop_colora_stats()
     assert stats["colora_hit_tokens"] > 0
     assert stats["colora_miss_tokens"] > 0
+    assert "cpu_queue_wait_time" in stats
+    assert "d2h_bytes" in stats
+    assert "h2d_bytes" in stats
+    assert "overlap_ratio" in stats
+    assert "fallback_degrade_count" in stats

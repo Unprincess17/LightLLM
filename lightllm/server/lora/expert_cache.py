@@ -28,6 +28,12 @@ class MoEExpertCacheConfig:
     promote_window: int = 128
     max_promote_per_step: int = 8
     decay: float = 0.9
+    # Default COLoRA miss policy: do not block request on promotion.
+    miss_policy: str = "cpu_first"
+    # Promotion queue soft cap. If None, derive from promote_window.
+    queue_high_watermark: Optional[int] = None
+    # Cooldown in schedule steps before same key can be queued again.
+    promote_cooldown_steps: int = 4
 
 
 @dataclass
@@ -37,6 +43,7 @@ class _CacheEntry:
     utility: float
     last_access: float
     access_count: int
+    last_queued_step: int = -1
 
 
 @dataclass
@@ -65,6 +72,11 @@ class MoEExpertCacheManager:
         self._lookup_total = 0
         self._lookup_hits = 0
         self._dropped_promotions = 0
+        self._dropped_promotions_by_queue = 0
+        self._dropped_promotions_by_cooldown = 0
+        self._dropped_promotions_by_no_slot = 0
+        self._dropped_promotions_by_missing_source = 0
+        self._schedule_step = 0
 
     def register_projection_pool(self, projection: str, pool) -> None:
         """Register source CPU pool and allocate GPU cache buffers for one projection."""
@@ -125,6 +137,27 @@ class MoEExpertCacheManager:
     def get_dropped_promotions(self) -> int:
         return self._dropped_promotions
 
+    def get_promotion_drop_breakdown(self) -> Dict[str, int]:
+        return {
+            "total": int(self._dropped_promotions),
+            "queue_high_watermark": int(self._dropped_promotions_by_queue),
+            "cooldown": int(self._dropped_promotions_by_cooldown),
+            "no_slot": int(self._dropped_promotions_by_no_slot),
+            "missing_source": int(self._dropped_promotions_by_missing_source),
+        }
+
+    def _get_queue_high_watermark(self) -> int:
+        queue_limit = max(int(self.config.promote_window), int(self.config.max_promote_per_step), 1)
+        if self.config.queue_high_watermark is None:
+            return queue_limit
+        return max(int(self.config.queue_high_watermark), 1)
+
+    def _promotion_priority(self, entry: _CacheEntry, now_ts: float) -> float:
+        """Higher score means stronger hot-rebound tendency."""
+        age = max(now_ts - entry.last_access, 0.0)
+        rebound = 1.0 / (1.0 + age)
+        return float(entry.utility) + 0.1 * float(entry.access_count) + 2.0 * rebound
+
     def lookup_many(self, keys: List[ExpertCacheKey]) -> Dict[ExpertCacheKey, int]:
         """Return READY slot IDs for keys currently cached on GPU."""
         ready: Dict[ExpertCacheKey, int] = {}
@@ -170,6 +203,7 @@ class MoEExpertCacheManager:
                         utility=1.0,
                         last_access=now_ts,
                         access_count=1,
+                        last_queued_step=-1,
                     )
                     continue
 
@@ -179,9 +213,17 @@ class MoEExpertCacheManager:
                 entry.access_count += 1
 
     def schedule_promotion(self, keys: List[ExpertCacheKey]) -> int:
-        """Queue keys for async promotion if not already READY/LOADING."""
+        """Queue keys for async promotion if not already READY/LOADING.
+
+        Candidates are scored and queued in descending hot-rebound priority.
+        """
         queued = 0
         with self._lock:
+            self._schedule_step += 1
+            now_ts = time.time()
+            cooldown_steps = max(int(self.config.promote_cooldown_steps), 0)
+            candidates_by_projection: Dict[str, List[Tuple[float, ExpertCacheKey, _CacheEntry]]] = {}
+
             for key in keys:
                 state = self._states.get(key.projection)
                 if state is None:
@@ -197,16 +239,33 @@ class MoEExpertCacheManager:
                     continue
                 if entry.access_count < self.config.promote_min_hits:
                     continue
+                if cooldown_steps > 0 and entry.last_queued_step >= 0:
+                    if (self._schedule_step - entry.last_queued_step) < cooldown_steps:
+                        self._dropped_promotions += 1
+                        self._dropped_promotions_by_cooldown += 1
+                        continue
 
-                queue_limit = max(self.config.promote_window, self.config.max_promote_per_step)
-                if len(state.promotion_queue) >= queue_limit:
-                    self._dropped_promotions += 1
+                priority = self._promotion_priority(entry, now_ts)
+                candidates_by_projection.setdefault(key.projection, []).append((priority, key, entry))
+
+            queue_hwm = self._get_queue_high_watermark()
+            for projection, candidates in candidates_by_projection.items():
+                state = self._states.get(projection)
+                if state is None:
                     continue
+                # Hot rebound first.
+                candidates.sort(key=lambda x: x[0], reverse=True)
+                for _, key, entry in candidates:
+                    if len(state.promotion_queue) >= queue_hwm:
+                        self._dropped_promotions += 1
+                        self._dropped_promotions_by_queue += 1
+                        continue
 
-                entry.state = ExpertCacheSlotState.LOADING
-                state.promotion_queue.append(key)
-                state.queued.add(key)
-                queued += 1
+                    entry.state = ExpertCacheSlotState.LOADING
+                    entry.last_queued_step = self._schedule_step
+                    state.promotion_queue.append(key)
+                    state.queued.add(key)
+                    queued += 1
 
         return queued
 
@@ -272,11 +331,14 @@ class MoEExpertCacheManager:
                             if slot_id is None:
                                 entry.state = ExpertCacheSlotState.INVALID
                                 self._dropped_promotions += 1
+                                self._dropped_promotions_by_no_slot += 1
                                 continue
 
                     src_slot = self._get_source_slot(src_pool, key)
                     if src_slot is None:
                         entry.state = ExpertCacheSlotState.INVALID
+                        self._dropped_promotions += 1
+                        self._dropped_promotions_by_missing_source += 1
                         continue
 
                     rank = self._get_adapter_rank(src_pool, key.adapter_idx)

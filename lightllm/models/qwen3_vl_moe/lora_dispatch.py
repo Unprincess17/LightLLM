@@ -19,7 +19,10 @@ import torch
 import os
 import logging
 import time
-from typing import Dict, Optional, Any, List
+import threading
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, Optional, Any, List, Tuple
 
 from lightllm.server.core.objs.lora_compute_config import LoRAComputeConfig
 from lightllm.server.lora.expert_cache import ExpertCacheKey, MoEExpertCacheManager
@@ -97,6 +100,11 @@ class Qwen3VLMoELoRADispatcher:
         # Common settings
         lora_alpha: float = 1.0,
         lora_compute_config: Optional[LoRAComputeConfig] = None,
+        # COLoRA async CPU miss fallback controls
+        colora_async_fallback: bool = True,
+        colora_cpu_workers: int = 4,
+        colora_cpu_queue_depth: int = 256,
+        colora_cpu_batch_timeout_us: int = 50,
     ):
         self.num_layers = num_layers
         self.lora_compute_config = lora_compute_config or LoRAComputeConfig()
@@ -137,6 +145,15 @@ class Qwen3VLMoELoRADispatcher:
         self.gpu_scratchpad_a = None
         self.gpu_scratchpad_b = None
         self.transfer_stream = None
+        self.colora_async_fallback = bool(colora_async_fallback)
+        self.colora_cpu_workers = max(int(colora_cpu_workers), 1)
+        self.colora_cpu_queue_depth = max(int(colora_cpu_queue_depth), 1)
+        self.colora_cpu_batch_timeout_us = max(int(colora_cpu_batch_timeout_us), 0)
+        self._cpu_executor: Optional[ThreadPoolExecutor] = None
+        self._cpu_queue_lock = threading.Lock()
+        self._cpu_inflight = 0
+        self._cpu_group_plan_cache: "OrderedDict[Tuple[int, bytes], Tuple[Tuple[int, Tuple[int, ...]], ...]]" = OrderedDict()
+        self._cpu_group_plan_cache_cap = 256
 
         # Last-call COLoRA stats for decode observability.
         self._last_colora_stats = {
@@ -146,6 +163,15 @@ class Qwen3VLMoELoRADispatcher:
             "cache_hit_rate": 0.0,
             "cpu_compute_time": 0.0,
             "gpu_compute_time": 0.0,
+            "cpu_queue_wait_time": 0.0,
+            "d2h_bytes": 0.0,
+            "h2d_bytes": 0.0,
+            "overlap_ratio": 0.0,
+            "fallback_degrade_count": 0,
+            "cpu_queue_depth": 0,
+            "promotion_drop_total": 0,
+            "promotion_drop_queue_high_watermark": 0,
+            "promotion_drop_cooldown": 0,
         }
 
         # Check if any LoRA is enabled
@@ -230,7 +256,110 @@ class Qwen3VLMoELoRADispatcher:
             "cache_hit_rate": 0.0,
             "cpu_compute_time": 0.0,
             "gpu_compute_time": 0.0,
+            "cpu_queue_wait_time": 0.0,
+            "d2h_bytes": 0.0,
+            "h2d_bytes": 0.0,
+            "overlap_ratio": 0.0,
+            "fallback_degrade_count": 0,
+            "cpu_queue_depth": 0,
+            "promotion_drop_total": 0,
+            "promotion_drop_queue_high_watermark": 0,
+            "promotion_drop_cooldown": 0,
         }
+
+    def _should_use_async_cpu_fallback(self, has_hit: bool) -> bool:
+        # Async fallback only helps if GPU hit-path can overlap with CPU miss compute.
+        return self.colora_async_fallback and has_hit
+
+    def _get_or_create_cpu_executor(self) -> ThreadPoolExecutor:
+        if self._cpu_executor is None:
+            self._cpu_executor = ThreadPoolExecutor(
+                max_workers=self.colora_cpu_workers,
+                thread_name_prefix="colora_cpu",
+            )
+        return self._cpu_executor
+
+    def _reserve_async_queue_slot(self) -> bool:
+        timeout_s = float(self.colora_cpu_batch_timeout_us) / 1_000_000.0
+        deadline = time.perf_counter() + timeout_s
+        while True:
+            with self._cpu_queue_lock:
+                if self._cpu_inflight < self.colora_cpu_queue_depth:
+                    self._cpu_inflight += 1
+                    return True
+            if timeout_s <= 0.0 or time.perf_counter() >= deadline:
+                return False
+            time.sleep(min(0.00001, max(deadline - time.perf_counter(), 0.0)))
+
+    def _release_async_queue_slot(self) -> None:
+        with self._cpu_queue_lock:
+            self._cpu_inflight = max(self._cpu_inflight - 1, 0)
+
+    def _get_cpu_queue_depth(self) -> int:
+        with self._cpu_queue_lock:
+            return int(self._cpu_inflight)
+
+    def _build_cpu_group_plan(self, req_bins: torch.Tensor) -> Tuple[Tuple[int, Tuple[int, ...]], ...]:
+        if req_bins.device.type != "cpu":
+            bins_cpu = req_bins.detach().to(device="cpu", dtype=torch.int32)
+        else:
+            bins_cpu = req_bins.detach().to(dtype=torch.int32)
+        bins_cpu = bins_cpu.contiguous()
+        key = (int(bins_cpu.numel()), bins_cpu.numpy().tobytes())
+
+        plan = self._cpu_group_plan_cache.get(key)
+        if plan is not None:
+            self._cpu_group_plan_cache.move_to_end(key)
+            return plan
+
+        adapter_to_indices: Dict[int, List[int]] = {}
+        for i, bin_idx in enumerate(bins_cpu.tolist()):
+            adapter_to_indices.setdefault(int(bin_idx), []).append(i)
+        plan = tuple((adapter_idx, tuple(indices)) for adapter_idx, indices in adapter_to_indices.items())
+
+        self._cpu_group_plan_cache[key] = plan
+        self._cpu_group_plan_cache.move_to_end(key)
+        if len(self._cpu_group_plan_cache) > self._cpu_group_plan_cache_cap:
+            self._cpu_group_plan_cache.popitem(last=False)
+        return plan
+
+    def _run_cpu_miss_job(
+        self,
+        miss_input: torch.Tensor,
+        buffer_layer_id: int,
+        pool,
+        miss_bins: torch.Tensor,
+    ) -> Tuple[torch.Tensor, float, float]:
+        enqueue_ts = time.perf_counter()
+        if not self._reserve_async_queue_slot():
+            return self._naive_batch_lora(
+                miss_input,
+                buffer_layer_id,
+                pool,
+                miss_bins,
+                force_cpu=True,
+            ), 0.0, time.perf_counter() - enqueue_ts
+
+        def _worker():
+            try:
+                start_ts = time.perf_counter()
+                queue_wait = max(start_ts - enqueue_ts, 0.0)
+                t0 = time.perf_counter()
+                plan = self._build_cpu_group_plan(miss_bins)
+                out = self._naive_batch_lora(
+                    miss_input,
+                    buffer_layer_id,
+                    pool,
+                    miss_bins,
+                    force_cpu=True,
+                    adapter_group_plan=plan,
+                )
+                return out, queue_wait, time.perf_counter() - t0
+            finally:
+                self._release_async_queue_slot()
+
+        future = self._get_or_create_cpu_executor().submit(_worker)
+        return future.result()
 
     def pop_colora_stats(self) -> Dict[str, float]:
         stats = dict(self._last_colora_stats)
@@ -284,6 +413,12 @@ class Qwen3VLMoELoRADispatcher:
         ready_slots = manager.lookup_many(keys)
         miss_keys = [key for key in keys if key not in ready_slots]
         manager.schedule_promotion(miss_keys)
+        if miss_keys and getattr(getattr(manager, "config", None), "miss_policy", "cpu_first") == "load_then_run":
+            manager.apply_completed_promotions()
+            promoted_now = manager.lookup_many(miss_keys)
+            if promoted_now:
+                ready_slots.update(promoted_now)
+                miss_keys = [key for key in miss_keys if key not in promoted_now]
 
         hit_adapters = {key.adapter_idx for key in ready_slots.keys()}
         hit_mask = torch.zeros_like(valid_bins, dtype=torch.bool)
@@ -293,6 +428,49 @@ class Qwen3VLMoELoRADispatcher:
 
         gpu_compute_time = 0.0
         cpu_compute_time = 0.0
+        cpu_queue_wait_time = 0.0
+        d2h_bytes = 0.0
+        h2d_bytes = 0.0
+        fallback_degrade_count = 0
+        miss_future = None
+        async_overlap_used = False
+        miss_pos = None
+        miss_bins = None
+
+        if torch.any(miss_mask):
+            miss_pos = valid_pos.index_select(0, torch.nonzero(miss_mask, as_tuple=False).squeeze(-1))
+            miss_bins = valid_bins.index_select(0, torch.nonzero(miss_mask, as_tuple=False).squeeze(-1))
+            miss_input = input_tensor.index_select(0, miss_pos).contiguous()
+            if miss_input.device.type == "cuda":
+                d2h_bytes += float(miss_input.numel() * miss_input.element_size())
+            h2d_bytes += float(miss_input.shape[0] * pool.value_buffer.shape[2] * miss_input.element_size())
+
+            if self._should_use_async_cpu_fallback(bool(torch.any(hit_mask))):
+                if self._reserve_async_queue_slot():
+                    async_overlap_used = True
+                    enqueue_ts = time.perf_counter()
+                    miss_plan = self._build_cpu_group_plan(miss_bins)
+
+                    def _miss_worker():
+                        try:
+                            start_ts = time.perf_counter()
+                            queue_wait = max(start_ts - enqueue_ts, 0.0)
+                            t0 = time.perf_counter()
+                            miss_out = self._naive_batch_lora(
+                                miss_input,
+                                buffer_layer_id,
+                                pool,
+                                miss_bins,
+                                force_cpu=True,
+                                adapter_group_plan=miss_plan,
+                            )
+                            return miss_out, queue_wait, time.perf_counter() - t0
+                        finally:
+                            self._release_async_queue_slot()
+
+                    miss_future = self._get_or_create_cpu_executor().submit(_miss_worker)
+                else:
+                    fallback_degrade_count += 1
 
         if torch.any(hit_mask):
             hit_pos = valid_pos.index_select(0, torch.nonzero(hit_mask, as_tuple=False).squeeze(-1))
@@ -354,22 +532,49 @@ class Qwen3VLMoELoRADispatcher:
                 # Kernel unavailable or GPU cache not ready: degrade to CPU path.
                 hit_mask = torch.zeros_like(valid_bins, dtype=torch.bool)
                 miss_mask = torch.ones_like(valid_bins, dtype=torch.bool)
+                if miss_pos is None:
+                    miss_pos = valid_pos
+                    miss_bins = valid_bins
+                if miss_future is not None:
+                    cancelled = miss_future.cancel()
+                    if cancelled:
+                        # Task never ran, so worker-side finally won't release queue slot.
+                        self._release_async_queue_slot()
+                    miss_future = None
+                    async_overlap_used = False
+                    fallback_degrade_count += 1
 
         if torch.any(miss_mask):
-            miss_pos = valid_pos.index_select(0, torch.nonzero(miss_mask, as_tuple=False).squeeze(-1))
-            miss_bins = valid_bins.index_select(0, torch.nonzero(miss_mask, as_tuple=False).squeeze(-1))
-            with NvtxAnnotate("COLoRA_CPU_Miss_Path"):
-                t0 = time.perf_counter()
-                miss_input = input_tensor.index_select(0, miss_pos).contiguous()
-                miss_output = self._naive_batch_lora(
-                    miss_input,
-                    buffer_layer_id,
-                    pool,
-                    miss_bins,
-                    force_cpu=True,
-                )
-                output.index_copy_(0, miss_pos, miss_output)
-                cpu_compute_time += time.perf_counter() - t0
+            assert miss_pos is not None and miss_bins is not None
+            if miss_future is not None:
+                with NvtxAnnotate("COLoRA_CPU_Miss_Path_AsyncJoin"):
+                    miss_output, queue_wait, cpu_t = miss_future.result()
+            else:
+                with NvtxAnnotate("COLoRA_CPU_Miss_Path"):
+                    t0 = time.perf_counter()
+                    miss_input = input_tensor.index_select(0, miss_pos).contiguous()
+                    miss_plan = self._build_cpu_group_plan(miss_bins)
+                    miss_output = self._naive_batch_lora(
+                        miss_input,
+                        buffer_layer_id,
+                        pool,
+                        miss_bins,
+                        force_cpu=True,
+                        adapter_group_plan=miss_plan,
+                    )
+                    queue_wait = 0.0
+                    cpu_t = time.perf_counter() - t0
+            output.index_copy_(0, miss_pos, miss_output)
+            cpu_compute_time += cpu_t
+            cpu_queue_wait_time += queue_wait
+
+        overlap_ratio = 0.0
+        if async_overlap_used and cpu_compute_time > 0.0 and gpu_compute_time > 0.0:
+            overlap = min(cpu_compute_time, gpu_compute_time)
+            overlap_ratio = overlap / max(cpu_compute_time + gpu_compute_time, 1e-9)
+        drop_breakdown = {}
+        if hasattr(manager, "get_promotion_drop_breakdown"):
+            drop_breakdown = manager.get_promotion_drop_breakdown()
 
         self._last_colora_stats = {
             "colora_hit_tokens": int(hit_mask.sum().item()),
@@ -378,6 +583,15 @@ class Qwen3VLMoELoRADispatcher:
             "cache_hit_rate": manager.get_hit_rate(),
             "cpu_compute_time": cpu_compute_time,
             "gpu_compute_time": gpu_compute_time,
+            "cpu_queue_wait_time": cpu_queue_wait_time,
+            "d2h_bytes": d2h_bytes,
+            "h2d_bytes": h2d_bytes,
+            "overlap_ratio": overlap_ratio,
+            "fallback_degrade_count": int(fallback_degrade_count),
+            "cpu_queue_depth": self._get_cpu_queue_depth(),
+            "promotion_drop_total": int(drop_breakdown.get("total", 0)),
+            "promotion_drop_queue_high_watermark": int(drop_breakdown.get("queue_high_watermark", 0)),
+            "promotion_drop_cooldown": int(drop_breakdown.get("cooldown", 0)),
         }
         return output
 
@@ -1049,6 +1263,7 @@ class Qwen3VLMoELoRADispatcher:
         pool,
         req_bins: Optional[torch.Tensor] = None,
         force_cpu: bool = False,
+        adapter_group_plan: Optional[Tuple[Tuple[int, Tuple[int, ...]], ...]] = None,
     ) -> torch.Tensor:
         """
         Naive per-request LoRA computation (fallback when BGMV unavailable).
@@ -1086,21 +1301,26 @@ class Qwen3VLMoELoRADispatcher:
         if len(req_bins) > batch_size:
             req_bins = req_bins[:batch_size]
 
-        # Group requests by adapter
-        adapter_to_indices = {}
-        for i, bin_idx in enumerate(req_bins):
-            bin_idx = bin_idx.item()
-            if bin_idx not in adapter_to_indices:
-                adapter_to_indices[bin_idx] = []
-            adapter_to_indices[bin_idx].append(i)
+        # Group requests by adapter (optionally reusing cached grouping plan).
+        if adapter_group_plan is not None:
+            adapter_groups = adapter_group_plan
+        else:
+            adapter_to_indices = {}
+            for i, bin_idx in enumerate(req_bins):
+                bin_idx = bin_idx.item()
+                if bin_idx not in adapter_to_indices:
+                    adapter_to_indices[bin_idx] = []
+                adapter_to_indices[bin_idx].append(i)
+            adapter_groups = tuple((adapter_idx, tuple(indices)) for adapter_idx, indices in adapter_to_indices.items())
 
         # Determine if we should use AVX kernel
         use_avx = (AVX_AVAILABLE and compute_input.device.type == 'cpu' and compute_input.dtype == torch.bfloat16)
 
         # Process each adapter group
-        for adapter_idx, req_indices in adapter_to_indices.items():
+        for adapter_idx, req_indices in adapter_groups:
             if adapter_idx < 0:
                 continue  # Skip requests with no adapter
+            req_indices = list(req_indices)
 
             # Get adapter metadata
             a_start = pool.a_start[adapter_idx].item()
@@ -1207,6 +1427,10 @@ def create_vl_moe_lora_dispatcher(
     lora_rank: int = 64,
     lora_alpha: float = 1.0,
     lora_compute_config: Optional[LoRAComputeConfig] = None,
+    colora_async_fallback: bool = True,
+    colora_cpu_workers: int = 4,
+    colora_cpu_queue_depth: int = 256,
+    colora_cpu_batch_timeout_us: int = 50,
 ) -> Qwen3VLMoELoRADispatcher:
     """
     Factory function to create a VL-MoE LoRA dispatcher with S-LoRA batched mode.
@@ -1239,6 +1463,10 @@ def create_vl_moe_lora_dispatcher(
         vl_fc2_rank=lora_rank,
         lora_alpha=lora_alpha,
         lora_compute_config=lora_compute_config,
+        colora_async_fallback=colora_async_fallback,
+        colora_cpu_workers=colora_cpu_workers,
+        colora_cpu_queue_depth=colora_cpu_queue_depth,
+        colora_cpu_batch_timeout_us=colora_cpu_batch_timeout_us,
     )
 
 

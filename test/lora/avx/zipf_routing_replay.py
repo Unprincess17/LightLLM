@@ -93,11 +93,14 @@ def main():
         mgr.schedule_promotion(misses)
 
         if step % report_every == 0 or step == args.num_steps:
+            drops = mgr.get_promotion_drop_breakdown()
             print(
                 f"step={step} "
                 f"cache_hit_rate={mgr.get_hit_rate():.4f} "
                 f"queue_depth={mgr.get_promotion_queue_depth()} "
-                f"dropped_promotions={mgr.get_dropped_promotions()}"
+                f"dropped_promotions={mgr.get_dropped_promotions()} "
+                f"drop_queue={drops.get('queue_high_watermark', 0)} "
+                f"drop_cooldown={drops.get('cooldown', 0)}"
             )
 
 

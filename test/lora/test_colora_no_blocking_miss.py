@@ -80,3 +80,8 @@ def test_colora_hybrid_miss_path_returns_without_waiting_for_promotion():
     stats = dispatcher.pop_colora_stats()
     assert stats["colora_miss_tokens"] == 2
     assert stats["promotion_queue_depth"] == 0
+    assert "cpu_queue_wait_time" in stats
+    assert "d2h_bytes" in stats
+    assert "h2d_bytes" in stats
+    assert "overlap_ratio" in stats
+    assert "fallback_degrade_count" in stats

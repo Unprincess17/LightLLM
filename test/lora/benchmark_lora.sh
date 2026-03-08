@@ -36,6 +36,11 @@ Server pass-through options:
   --colora_promote_window N
   --colora_max_promote_per_step N
   --colora_decay F
+  --colora_miss_policy STR
+  --colora_async_fallback 0|1
+  --colora_cpu_workers N
+  --colora_cpu_queue_depth N
+  --colora_cpu_batch_timeout_us N
 USAGE
 }
 
@@ -47,7 +52,7 @@ OUTPUT_PREFIX="moe_offload_profile"
 TEST_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEST_SCRIPT="$TEST_SCRIPT_DIR/test_moe_lora_api.py"
 MAX_TOKENS=1
-DECODE_TARGET_TOKENS=8
+DECODE_TARGET_TOKENS=16
 IGNORE_EOS=1
 SERVER_SCRIPT="$TEST_SCRIPT_DIR/start_server.sh"
 SERVER_HOST="localhost"
@@ -74,6 +79,11 @@ COLORA_PROMOTE_MIN_HITS=""
 COLORA_PROMOTE_WINDOW=""
 COLORA_MAX_PROMOTE_PER_STEP=""
 COLORA_DECAY=""
+COLORA_MISS_POLICY=""
+COLORA_ASYNC_FALLBACK=""
+COLORA_CPU_WORKERS=""
+COLORA_CPU_QUEUE_DEPTH=""
+COLORA_CPU_BATCH_TIMEOUT_US=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -113,6 +123,11 @@ while [[ $# -gt 0 ]]; do
         --colora_promote_window) COLORA_PROMOTE_WINDOW="$2"; shift 2 ;;
         --colora_max_promote_per_step) COLORA_MAX_PROMOTE_PER_STEP="$2"; shift 2 ;;
         --colora_decay) COLORA_DECAY="$2"; shift 2 ;;
+        --colora_miss_policy) COLORA_MISS_POLICY="$2"; shift 2 ;;
+        --colora_async_fallback) COLORA_ASYNC_FALLBACK="$2"; shift 2 ;;
+        --colora_cpu_workers) COLORA_CPU_WORKERS="$2"; shift 2 ;;
+        --colora_cpu_queue_depth) COLORA_CPU_QUEUE_DEPTH="$2"; shift 2 ;;
+        --colora_cpu_batch_timeout_us) COLORA_CPU_BATCH_TIMEOUT_US="$2"; shift 2 ;;
         --print_per_request) PRINT_PER_REQUEST=1; shift ;;
         --no_print_per_request) PRINT_PER_REQUEST=0; shift ;;
         --top_k_slowest) TOP_K_SLOWEST="$2"; shift 2 ;;
@@ -177,6 +192,11 @@ echo "Print per-request lines: $PRINT_PER_REQUEST"
 [[ -n "$TP" ]] && echo "Server TP override: $TP"
 [[ -n "$COMPUTE_DEVICE" ]] && echo "Server compute_device override: $COMPUTE_DEVICE"
 [[ -n "$FORCE_SLOW_LORA_PATH" ]] && echo "Server force_slow_lora_path override: $FORCE_SLOW_LORA_PATH"
+[[ -n "$COLORA_MISS_POLICY" ]] && echo "COLoRA miss policy override: $COLORA_MISS_POLICY"
+[[ -n "$COLORA_ASYNC_FALLBACK" ]] && echo "COLoRA async fallback override: $COLORA_ASYNC_FALLBACK"
+[[ -n "$COLORA_CPU_WORKERS" ]] && echo "COLoRA CPU workers override: $COLORA_CPU_WORKERS"
+[[ -n "$COLORA_CPU_QUEUE_DEPTH" ]] && echo "COLoRA CPU queue depth override: $COLORA_CPU_QUEUE_DEPTH"
+[[ -n "$COLORA_CPU_BATCH_TIMEOUT_US" ]] && echo "COLoRA CPU batch timeout (us) override: $COLORA_CPU_BATCH_TIMEOUT_US"
 if [[ -n "$PER_REQUEST_LOG_PATH" ]]; then
     echo "Per-request metrics log: $PER_REQUEST_LOG_PATH"
 else
@@ -251,6 +271,21 @@ if [[ -n "$COLORA_MAX_PROMOTE_PER_STEP" ]]; then
 fi
 if [[ -n "$COLORA_DECAY" ]]; then
     SERVER_ARGS+=(--colora_decay "$COLORA_DECAY")
+fi
+if [[ -n "$COLORA_MISS_POLICY" ]]; then
+    SERVER_ARGS+=(--colora_miss_policy "$COLORA_MISS_POLICY")
+fi
+if [[ -n "$COLORA_ASYNC_FALLBACK" ]]; then
+    SERVER_ARGS+=(--colora_async_fallback "$COLORA_ASYNC_FALLBACK")
+fi
+if [[ -n "$COLORA_CPU_WORKERS" ]]; then
+    SERVER_ARGS+=(--colora_cpu_workers "$COLORA_CPU_WORKERS")
+fi
+if [[ -n "$COLORA_CPU_QUEUE_DEPTH" ]]; then
+    SERVER_ARGS+=(--colora_cpu_queue_depth "$COLORA_CPU_QUEUE_DEPTH")
+fi
+if [[ -n "$COLORA_CPU_BATCH_TIMEOUT_US" ]]; then
+    SERVER_ARGS+=(--colora_cpu_batch_timeout_us "$COLORA_CPU_BATCH_TIMEOUT_US")
 fi
 bash "$SERVER_SCRIPT" "${SERVER_ARGS[@]}" &
 SERVER_PID=$!

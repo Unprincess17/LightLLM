@@ -141,6 +141,11 @@ class StartArgs:
     colora_promote_window: int = field(default=128)
     colora_max_promote_per_step: int = field(default=8)
     colora_decay: float = field(default=0.9)
+    colora_miss_policy: str = field(default="cpu_first")
+    colora_async_fallback: bool = field(default=True)
+    colora_cpu_workers: int = field(default=4)
+    colora_cpu_queue_depth: int = field(default=256)
+    colora_cpu_batch_timeout_us: int = field(default=50)
     # Force slow path for LoRA (per-expert baseline)
     force_slow_lora_path: bool = field(default=False)
     # multi_modal

@@ -29,6 +29,11 @@
 #   --colora_promote_window N          COLoRA utility window
 #   --colora_max_promote_per_step N    COLoRA max promotions per step
 #   --colora_decay F                   COLoRA utility decay
+#   --colora_miss_policy STR           COLoRA miss policy (cpu_first|load_then_run)
+#   --colora_async_fallback 0|1        Enable async CPU fallback in hybrid mode
+#   --colora_cpu_workers N             Async CPU fallback worker threads
+#   --colora_cpu_queue_depth N         Async CPU fallback queue depth
+#   --colora_cpu_batch_timeout_us N    Queue wait budget before sync degrade
 #   --adapter_expert_profile Enable adapter x expert routing profiling log
 #   --adapter_expert_log_path PATH Log path for adapter x expert routing profiling
 #   --help                 Show this help message
@@ -61,6 +66,11 @@ Options:
   --colora_promote_window N
   --colora_max_promote_per_step N
   --colora_decay F
+  --colora_miss_policy STR
+  --colora_async_fallback 0|1
+  --colora_cpu_workers N
+  --colora_cpu_queue_depth N
+  --colora_cpu_batch_timeout_us N
   --adapter_expert_profile
   --adapter_expert_log_path PATH
   --help|-h
@@ -111,11 +121,16 @@ FORCE_SLOW_LORA_PATH=true
 MAX_REQ_TOTAL_LEN=8192
 MEM_FRACTION=0.6
 BATCH_MAX_TOKENS=4096
-COLORA_CACHE_BUDGET_MB=2048
+COLORA_CACHE_BUDGET_MB=8192
 COLORA_PROMOTE_MIN_HITS=2
 COLORA_PROMOTE_WINDOW=128
 COLORA_MAX_PROMOTE_PER_STEP=8
 COLORA_DECAY=0.9
+COLORA_MISS_POLICY="cpu_first"
+COLORA_ASYNC_FALLBACK=1
+COLORA_CPU_WORKERS=4
+COLORA_CPU_QUEUE_DEPTH=256
+COLORA_CPU_BATCH_TIMEOUT_US=50
 
 # Environment variables
 LOADWORKER=8
@@ -203,6 +218,26 @@ while [[ $# -gt 0 ]]; do
             ;;
         --colora_decay)
             COLORA_DECAY="$2"
+            shift 2
+            ;;
+        --colora_miss_policy)
+            COLORA_MISS_POLICY="$2"
+            shift 2
+            ;;
+        --colora_async_fallback)
+            COLORA_ASYNC_FALLBACK="$2"
+            shift 2
+            ;;
+        --colora_cpu_workers)
+            COLORA_CPU_WORKERS="$2"
+            shift 2
+            ;;
+        --colora_cpu_queue_depth)
+            COLORA_CPU_QUEUE_DEPTH="$2"
+            shift 2
+            ;;
+        --colora_cpu_batch_timeout_us)
+            COLORA_CPU_BATCH_TIMEOUT_US="$2"
             shift 2
             ;;
         --adapter_expert_profile)
@@ -311,7 +346,12 @@ CMD="$CMD --colora_cache_budget_mb $COLORA_CACHE_BUDGET_MB \
     --colora_promote_min_hits $COLORA_PROMOTE_MIN_HITS \
     --colora_promote_window $COLORA_PROMOTE_WINDOW \
     --colora_max_promote_per_step $COLORA_MAX_PROMOTE_PER_STEP \
-    --colora_decay $COLORA_DECAY"
+    --colora_decay $COLORA_DECAY \
+    --colora_miss_policy $COLORA_MISS_POLICY \
+    --colora_async_fallback $COLORA_ASYNC_FALLBACK \
+    --colora_cpu_workers $COLORA_CPU_WORKERS \
+    --colora_cpu_queue_depth $COLORA_CPU_QUEUE_DEPTH \
+    --colora_cpu_batch_timeout_us $COLORA_CPU_BATCH_TIMEOUT_US"
 
 # Export environment variables
 export LOADWORKER=$LOADWORKER
@@ -339,6 +379,11 @@ echo "  COLORA_PROMOTE_MIN_HITS=$COLORA_PROMOTE_MIN_HITS"
 echo "  COLORA_PROMOTE_WINDOW=$COLORA_PROMOTE_WINDOW"
 echo "  COLORA_MAX_PROMOTE_PER_STEP=$COLORA_MAX_PROMOTE_PER_STEP"
 echo "  COLORA_DECAY=$COLORA_DECAY"
+echo "  COLORA_MISS_POLICY=$COLORA_MISS_POLICY"
+echo "  COLORA_ASYNC_FALLBACK=$COLORA_ASYNC_FALLBACK"
+echo "  COLORA_CPU_WORKERS=$COLORA_CPU_WORKERS"
+echo "  COLORA_CPU_QUEUE_DEPTH=$COLORA_CPU_QUEUE_DEPTH"
+echo "  COLORA_CPU_BATCH_TIMEOUT_US=$COLORA_CPU_BATCH_TIMEOUT_US"
 echo ""
 
 

@@ -198,6 +198,16 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
             "cache_hit_rate": 0.0,
             "cpu_compute_time": 0.0,
             "gpu_compute_time": 0.0,
+            "cpu_queue_wait_time": 0.0,
+            "d2h_bytes": 0.0,
+            "h2d_bytes": 0.0,
+            "overlap_ratio_sum": 0.0,
+            "overlap_ratio_count": 0,
+            "fallback_degrade_count": 0,
+            "cpu_queue_depth": 0,
+            "promotion_drop_total": 0,
+            "promotion_drop_queue_high_watermark": 0,
+            "promotion_drop_cooldown": 0,
         }
 
     def _merge_colora_stats(self, agg_stats: Dict[str, float]) -> None:
@@ -217,6 +227,22 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
         agg_stats["colora_miss_tokens"] += int(stats.get("colora_miss_tokens", 0))
         agg_stats["cpu_compute_time"] += float(stats.get("cpu_compute_time", 0.0))
         agg_stats["gpu_compute_time"] += float(stats.get("gpu_compute_time", 0.0))
+        agg_stats["cpu_queue_wait_time"] += float(stats.get("cpu_queue_wait_time", 0.0))
+        agg_stats["d2h_bytes"] += float(stats.get("d2h_bytes", 0.0))
+        agg_stats["h2d_bytes"] += float(stats.get("h2d_bytes", 0.0))
+        agg_stats["fallback_degrade_count"] += int(stats.get("fallback_degrade_count", 0))
+        agg_stats["cpu_queue_depth"] = int(stats.get("cpu_queue_depth", agg_stats["cpu_queue_depth"]))
+        agg_stats["promotion_drop_total"] = int(stats.get("promotion_drop_total", agg_stats["promotion_drop_total"]))
+        agg_stats["promotion_drop_queue_high_watermark"] = int(
+            stats.get("promotion_drop_queue_high_watermark", agg_stats["promotion_drop_queue_high_watermark"])
+        )
+        agg_stats["promotion_drop_cooldown"] = int(
+            stats.get("promotion_drop_cooldown", agg_stats["promotion_drop_cooldown"])
+        )
+        overlap_ratio = float(stats.get("overlap_ratio", 0.0))
+        if overlap_ratio > 0.0:
+            agg_stats["overlap_ratio_sum"] += overlap_ratio
+            agg_stats["overlap_ratio_count"] += 1
         agg_stats["promotion_queue_depth"] = int(stats.get("promotion_queue_depth", agg_stats["promotion_queue_depth"]))
         agg_stats["cache_hit_rate"] = float(stats.get("cache_hit_rate", agg_stats["cache_hit_rate"]))
 
@@ -858,9 +884,14 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
                     del current_weights, w1, w3, w2
 
         if (colora_stats["colora_hit_tokens"] + colora_stats["colora_miss_tokens"]) > 0:
+            overlap_ratio_avg = 0.0
+            if colora_stats["overlap_ratio_count"] > 0:
+                overlap_ratio_avg = colora_stats["overlap_ratio_sum"] / float(colora_stats["overlap_ratio_count"])
             logger.debug(
                 "[COLoRA] layer=%s hit_tokens=%s miss_tokens=%s queue_depth=%s hit_rate=%.4f "
-                "cpu_compute_time=%.6f gpu_compute_time=%.6f",
+                "cpu_compute_time=%.6f gpu_compute_time=%.6f cpu_queue_wait=%.6f "
+                "d2h_bytes=%.0f h2d_bytes=%.0f overlap_ratio=%.4f fallback_degrade_count=%s cpu_queue_depth=%s "
+                "promotion_drop_total=%s promotion_drop_queue=%s promotion_drop_cooldown=%s",
                 self.layer_num_,
                 colora_stats["colora_hit_tokens"],
                 colora_stats["colora_miss_tokens"],
@@ -868,6 +899,15 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
                 colora_stats["cache_hit_rate"],
                 colora_stats["cpu_compute_time"],
                 colora_stats["gpu_compute_time"],
+                colora_stats["cpu_queue_wait_time"],
+                colora_stats["d2h_bytes"],
+                colora_stats["h2d_bytes"],
+                overlap_ratio_avg,
+                colora_stats["fallback_degrade_count"],
+                colora_stats["cpu_queue_depth"],
+                colora_stats["promotion_drop_total"],
+                colora_stats["promotion_drop_queue_high_watermark"],
+                colora_stats["promotion_drop_cooldown"],
             )
 
         return final_output.view(num_tokens, hidden_dim)
