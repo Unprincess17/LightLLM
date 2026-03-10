@@ -209,3 +209,91 @@ COLoRA 减少的是**部分权重传输造成的阻塞**，并不消除异构通
 - **CPU fallback queueing time / execution time / transfer time**（把机制解释清楚）
 - **GPU/CPU 利用率与资源占用**
 - **Host memory footprint**（因为用了 CPU 全量副本）
+
+# **7. Case Study：Real Router + LoRA Invocation Trace**
+
+## 目标
+
+用真实 MoE 路由与 LoRA 调用轨迹，构造 `Expert × LoRA` 的真实组合分布，验证：
+
+- `Expert × LoRA` 的交叉稀疏会显著放大 GPU cache miss
+- miss 放大进一步加剧 decode 尾延迟（P90/P99/TPOT）
+- 仅靠 expert 级缓存管理不足以稳定长尾
+
+## 数据来源与采集
+
+**Real router trace（MoE 路由）**
+
+- 选择一个真实 MoE 模型（如 Mixtral / Qwen-MoE / Switch 类），在 decode 阶段记录路由结果
+- 每个 token、每层记录 top-k expert id 与 gate weight
+- 需要保留请求 id、时间戳、层号、batch size、token 位置等信息，用于复现调度与并发
+
+**Real / Synthetic LoRA trace（LoRA 调用）**
+
+- 若有线上日志：记录 LoRA id、请求到达时间、token 数、并发会话长度
+- 若无真实日志：构造合成 trace
+- 合成 trace 建议满足：
+- LoRA 热度服从 Zipf（长尾明显）
+- 具有 burst / session 行为（尾延迟放大更明显）
+
+## Trace 事件格式（建议）
+
+```text
+router_event:
+  t, req_id, layer, token_pos, topk_experts[], topk_weights[], batch_size
+
+lora_event:
+  t, req_id, lora_id, input_len, output_len
+```
+
+## 组合方法（构造 Expert × LoRA）
+
+**Join 规则**
+
+- 以 `req_id` 为键，将 LoRA 调用信息与 router 事件关联
+- 产生 `lora_id + expert_id` 的组合事件
+- 对同一 req 的所有 layer / token 形成真实的专家调用序列
+
+**时间轴一致性**
+
+- 保留原始时间戳，复现 batcher 形成的并发
+- 不做强行对齐，让 tail burst 自然出现
+
+**两类组合场景**
+
+- Independent：LoRA 与 router 独立组合，用于“平均”行为对照
+- Correlated：人为绑定“某些 LoRA 更偏某些 expert”的相关性，用于 worst-case stress
+
+## 实验设计
+
+**对照组**
+
+1. MoE-only（单 LoRA）：仅 router trace，验证专家长尾但无 LoRA 维度
+2. Multi-LoRA-only（dense 模型）：仅 LoRA trace，验证 LoRA 切换但无专家维度
+3. MoE × Multi-LoRA（真实组合）：核心 case study
+
+**系统配置控制**
+
+- 固定 GPU cache 容量
+- 固定预取策略与替换策略
+- 统一 batcher 与 decode 线程模型
+
+## 关键观测指标
+
+- GPU cache miss rate（按 Expert / LoRA-Expert）
+- miss 处理路径占比：阻塞换入 vs CPU fallback
+- PCIe 传输字节与时延
+- TPOT P50/P90/P99（核心 tail latency）
+- LoRA-Expert 热度分布与碎片化程度（访问频率直方图）
+
+## 预期结论（Case Study 的价值）
+
+- `MoE × Multi-LoRA` 的交叉稀疏度明显高于任何单维度变化
+- Expert 级缓存管理虽降低平均 miss，但对尾部 miss 无法稳定消除
+- 需要非阻塞 miss 处理与 fallback 执行来压制 tail latency 放大
+
+## Checklist
+
+- [ ] real router
+- [ ] real / synthetic lora trace
+- [ ] combine into a case study

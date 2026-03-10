@@ -208,6 +208,8 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
             "promotion_drop_total": 0,
             "promotion_drop_queue_high_watermark": 0,
             "promotion_drop_cooldown": 0,
+            "moe_kernel_calls": 0,
+            "moe_kernel_tokens": 0,
         }
 
     def _merge_colora_stats(self, agg_stats: Dict[str, float]) -> None:
@@ -239,6 +241,8 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
         agg_stats["promotion_drop_cooldown"] = int(
             stats.get("promotion_drop_cooldown", agg_stats["promotion_drop_cooldown"])
         )
+        agg_stats["moe_kernel_calls"] += int(stats.get("moe_kernel_calls", 0))
+        agg_stats["moe_kernel_tokens"] += int(stats.get("moe_kernel_tokens", 0))
         overlap_ratio = float(stats.get("overlap_ratio", 0.0))
         if overlap_ratio > 0.0:
             agg_stats["overlap_ratio_sum"] += overlap_ratio
@@ -891,7 +895,8 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
                 "[COLoRA] layer=%s hit_tokens=%s miss_tokens=%s queue_depth=%s hit_rate=%.4f "
                 "cpu_compute_time=%.6f gpu_compute_time=%.6f cpu_queue_wait=%.6f "
                 "d2h_bytes=%.0f h2d_bytes=%.0f overlap_ratio=%.4f fallback_degrade_count=%s cpu_queue_depth=%s "
-                "promotion_drop_total=%s promotion_drop_queue=%s promotion_drop_cooldown=%s",
+                "promotion_drop_total=%s promotion_drop_queue=%s promotion_drop_cooldown=%s "
+                "moe_kernel_calls=%s moe_kernel_tokens=%s",
                 self.layer_num_,
                 colora_stats["colora_hit_tokens"],
                 colora_stats["colora_miss_tokens"],
@@ -908,6 +913,8 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
                 colora_stats["promotion_drop_total"],
                 colora_stats["promotion_drop_queue_high_watermark"],
                 colora_stats["promotion_drop_cooldown"],
+                colora_stats["moe_kernel_calls"],
+                colora_stats["moe_kernel_tokens"],
             )
 
         return final_output.view(num_tokens, hidden_dim)

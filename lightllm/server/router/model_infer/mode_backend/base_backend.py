@@ -1029,6 +1029,26 @@ class ModeBackend:
                     "for expert-level asymmetric pool."
                 )
 
+            moe_compute_mode = (
+                effective_lora_compute_config.get_compute_device("moe")
+                if effective_lora_compute_config is not None
+                else "gpu"
+            )
+            model_module = getattr(self.model, "__module__", "")
+            if "qwen3_vl_moe" in model_module and moe_compute_mode in ("cpu", "hybrid"):
+                try:
+                    from lightllm.models.qwen3_vl_moe.lora_dispatch import is_moe_cpu_kernel_available
+                except Exception as e:
+                    raise RuntimeError(
+                        "MoE-specific CPU kernel import failed while strict MoE CPU/hybrid mode "
+                        f"is enabled (moe_compute={moe_compute_mode})."
+                    ) from e
+                if not bool(is_moe_cpu_kernel_available()):
+                    raise RuntimeError(
+                        "MoE-specific CPU kernel is required for qwen3_vl_moe when "
+                        f"moe_compute={moe_compute_mode}, but it is unavailable."
+                    )
+
             self.lora_mem_pool = create_lora_mem_pool(
                 num_layers=num_layers,
                 pool_size=1024,  # Can hold 1024 adapters

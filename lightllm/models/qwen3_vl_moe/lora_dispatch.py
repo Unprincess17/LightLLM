@@ -62,6 +62,25 @@ try:
 except ImportError:
     AVX_AVAILABLE = False
 
+# Try to import MoE-specific AVX-512 kernel for strict MoE CPU paths.
+try:
+    from lightllm._kernels.lora.moe_lora_cpu_kernel import (
+        moe_batch_lora_gate_avx,
+        moe_batch_lora_up_avx,
+        moe_batch_lora_down_avx,
+        is_available as _moe_avx_is_available,
+    )
+    MOE_AVX_AVAILABLE = bool(_moe_avx_is_available())
+    if MOE_AVX_AVAILABLE:
+        logger.info("MoE-specific AVX-512 BF16 CPU kernel available")
+except Exception:
+    MOE_AVX_AVAILABLE = False
+
+
+def is_moe_cpu_kernel_available() -> bool:
+    """Expose MoE kernel readiness for backend startup checks."""
+    return bool(MOE_AVX_AVAILABLE)
+
 
 class Qwen3VLMoELoRADispatcher:
     """
@@ -172,6 +191,8 @@ class Qwen3VLMoELoRADispatcher:
             "promotion_drop_total": 0,
             "promotion_drop_queue_high_watermark": 0,
             "promotion_drop_cooldown": 0,
+            "moe_kernel_calls": 0,
+            "moe_kernel_tokens": 0,
         }
 
         # Check if any LoRA is enabled
@@ -181,6 +202,10 @@ class Qwen3VLMoELoRADispatcher:
             vl_q_rank > 0, vl_k_rank > 0, vl_v_rank > 0, vl_o_rank > 0,
             vl_fc1_rank > 0, vl_fc2_rank > 0
         ])
+
+        moe_mode = self.lora_compute_config.get_compute_device("moe")
+        if moe_mode in ("cpu", "hybrid"):
+            self._require_moe_cpu_kernel(mode=f"moe_compute={moe_mode}")
 
     def init_batched_mode(
         self,
@@ -248,6 +273,115 @@ class Qwen3VLMoELoRADispatcher:
             return False
         return self.lora_compute_config.should_compute_hybrid("moe")
 
+    def _require_moe_cpu_kernel(self, mode: str) -> None:
+        if not MOE_AVX_AVAILABLE:
+            raise RuntimeError(
+                f"MoE-specific CPU kernel is required for strict {mode} MoE path "
+                "(moe_compute=cpu|hybrid), but it is unavailable."
+            )
+
+    def _select_moe_stage2_kernel(self, projection: str):
+        proj = projection.lower()
+        if proj in ("gate", "up"):
+            return moe_batch_lora_up_avx
+        if proj == "down":
+            return moe_batch_lora_down_avx
+        raise ValueError(f"Unsupported MoE projection '{projection}', expected gate|up|down")
+
+    def _strict_moe_cpu_batch_lora(
+        self,
+        input_tensor: torch.Tensor,
+        layer_id: int,
+        pool,
+        req_bins: Optional[torch.Tensor],
+        projection: str,
+        adapter_group_plan: Optional[Tuple[Tuple[int, Tuple[int, ...]], ...]] = None,
+    ) -> Tuple[torch.Tensor, int, int]:
+        """Strict MoE CPU fallback: force MoE-specific AVX kernel path."""
+        self._require_moe_cpu_kernel(mode=projection)
+
+        if req_bins is None:
+            req_bins = self.req_bins
+        if req_bins is None:
+            return self._get_output_buffer(input_tensor, pool), 0, 0
+
+        original_device = input_tensor.device
+        original_dtype = input_tensor.dtype
+
+        compute_input = input_tensor
+        if compute_input.device.type != "cpu":
+            compute_input = compute_input.to(device="cpu", non_blocking=True)
+        if compute_input.dtype != torch.bfloat16:
+            compute_input = compute_input.to(dtype=torch.bfloat16)
+
+        batch_size = compute_input.shape[0]
+        output_dim = pool.value_buffer.shape[2]
+        output = torch.zeros(batch_size, output_dim, dtype=torch.bfloat16, device="cpu")
+
+        if len(req_bins) > batch_size:
+            req_bins = req_bins[:batch_size]
+
+        if adapter_group_plan is not None:
+            adapter_groups = adapter_group_plan
+        else:
+            adapter_to_indices: Dict[int, List[int]] = {}
+            for i, bin_idx in enumerate(req_bins):
+                idx = int(bin_idx.item())
+                adapter_to_indices.setdefault(idx, []).append(i)
+            adapter_groups = tuple((adapter_idx, tuple(indices)) for adapter_idx, indices in adapter_to_indices.items())
+
+        stage2_kernel = self._select_moe_stage2_kernel(projection)
+        kernel_calls = 0
+        kernel_tokens = 0
+
+        for adapter_idx, req_indices_tuple in adapter_groups:
+            if adapter_idx < 0:
+                continue
+            req_indices = list(req_indices_tuple)
+            if len(req_indices) == 0:
+                continue
+
+            a_start = int(pool.a_start[adapter_idx].item())
+            a_len = int(pool.a_len[adapter_idx].item())
+            a_scaling = float(pool.a_scaling[adapter_idx].item())
+            if hasattr(pool, "a_rank") and len(pool.a_rank) > adapter_idx:
+                a_rank = int(pool.a_rank[adapter_idx].item())
+            else:
+                a_rank = int(a_len)
+
+            loc = a_start + layer_id
+            if loc >= a_start + a_len:
+                continue
+
+            A = pool.key_buffer[loc, :a_rank]
+            B = pool.value_buffer[loc, :a_rank]
+            if A.device.type != "cpu" or A.dtype != torch.bfloat16:
+                A = A.to(device="cpu", dtype=torch.bfloat16)
+            if B.device.type != "cpu" or B.dtype != torch.bfloat16:
+                B = B.to(device="cpu", dtype=torch.bfloat16)
+            if not A.is_contiguous():
+                A = A.contiguous()
+            if not B.is_contiguous():
+                B = B.contiguous()
+
+            batch_input = compute_input[req_indices]
+            if not batch_input.is_contiguous():
+                batch_input = batch_input.contiguous()
+
+            # Stage-1: x @ A^T
+            intermediate = moe_batch_lora_gate_avx(batch_input, A, scaling=1.0)
+            # Stage-2: intermediate @ B, projection-specific kernel.
+            batch_output = stage2_kernel(intermediate, B, scaling=a_scaling)
+            output[req_indices] = batch_output
+
+            kernel_calls += 2
+            kernel_tokens += int(len(req_indices))
+
+        if original_device.type != "cpu" or original_dtype != torch.bfloat16:
+            output = output.to(device=original_device, dtype=original_dtype, non_blocking=True)
+
+        return output, kernel_calls, kernel_tokens
+
     def _reset_colora_stats(self) -> None:
         self._last_colora_stats = {
             "colora_hit_tokens": 0,
@@ -265,6 +399,8 @@ class Qwen3VLMoELoRADispatcher:
             "promotion_drop_total": 0,
             "promotion_drop_queue_high_watermark": 0,
             "promotion_drop_cooldown": 0,
+            "moe_kernel_calls": 0,
+            "moe_kernel_tokens": 0,
         }
 
     def _should_use_async_cpu_fallback(self, has_hit: bool) -> bool:
@@ -329,16 +465,20 @@ class Qwen3VLMoELoRADispatcher:
         buffer_layer_id: int,
         pool,
         miss_bins: torch.Tensor,
+        projection: str,
     ) -> Tuple[torch.Tensor, float, float]:
         enqueue_ts = time.perf_counter()
         if not self._reserve_async_queue_slot():
-            return self._naive_batch_lora(
+            miss_plan = self._build_cpu_group_plan(miss_bins)
+            out, _, _ = self._strict_moe_cpu_batch_lora(
                 miss_input,
                 buffer_layer_id,
                 pool,
                 miss_bins,
-                force_cpu=True,
-            ), 0.0, time.perf_counter() - enqueue_ts
+                projection=projection,
+                adapter_group_plan=miss_plan,
+            )
+            return out, 0.0, time.perf_counter() - enqueue_ts
 
         def _worker():
             try:
@@ -346,12 +486,12 @@ class Qwen3VLMoELoRADispatcher:
                 queue_wait = max(start_ts - enqueue_ts, 0.0)
                 t0 = time.perf_counter()
                 plan = self._build_cpu_group_plan(miss_bins)
-                out = self._naive_batch_lora(
+                out, _, _ = self._strict_moe_cpu_batch_lora(
                     miss_input,
                     buffer_layer_id,
                     pool,
                     miss_bins,
-                    force_cpu=True,
+                    projection=projection,
                     adapter_group_plan=plan,
                 )
                 return out, queue_wait, time.perf_counter() - t0
@@ -382,7 +522,25 @@ class Qwen3VLMoELoRADispatcher:
 
         manager = self.expert_cache_manager
         if manager is None:
-            return self._naive_batch_lora(input_tensor, buffer_layer_id, pool, bins, force_cpu=True)
+            valid_miss_tokens = int((bins >= 0).sum().item()) if bins is not None else 0
+            miss_plan = self._build_cpu_group_plan(bins)
+            miss_out, kernel_calls, kernel_tokens = self._strict_moe_cpu_batch_lora(
+                input_tensor,
+                buffer_layer_id,
+                pool,
+                bins,
+                projection=projection,
+                adapter_group_plan=miss_plan,
+            )
+            self._last_colora_stats.update(
+                {
+                    "colora_hit_tokens": 0,
+                    "colora_miss_tokens": valid_miss_tokens,
+                    "moe_kernel_calls": int(kernel_calls),
+                    "moe_kernel_tokens": int(kernel_tokens),
+                }
+            )
+            return miss_out
 
         manager.apply_completed_promotions()
 
@@ -432,6 +590,8 @@ class Qwen3VLMoELoRADispatcher:
         d2h_bytes = 0.0
         h2d_bytes = 0.0
         fallback_degrade_count = 0
+        moe_kernel_calls = 0
+        moe_kernel_tokens = 0
         miss_future = None
         async_overlap_used = False
         miss_pos = None
@@ -456,15 +616,15 @@ class Qwen3VLMoELoRADispatcher:
                             start_ts = time.perf_counter()
                             queue_wait = max(start_ts - enqueue_ts, 0.0)
                             t0 = time.perf_counter()
-                            miss_out = self._naive_batch_lora(
+                            miss_out, kernel_calls, kernel_tokens = self._strict_moe_cpu_batch_lora(
                                 miss_input,
                                 buffer_layer_id,
                                 pool,
                                 miss_bins,
-                                force_cpu=True,
+                                projection=projection,
                                 adapter_group_plan=miss_plan,
                             )
-                            return miss_out, queue_wait, time.perf_counter() - t0
+                            return miss_out, queue_wait, time.perf_counter() - t0, kernel_calls, kernel_tokens
                         finally:
                             self._release_async_queue_slot()
 
@@ -548,18 +708,18 @@ class Qwen3VLMoELoRADispatcher:
             assert miss_pos is not None and miss_bins is not None
             if miss_future is not None:
                 with NvtxAnnotate("COLoRA_CPU_Miss_Path_AsyncJoin"):
-                    miss_output, queue_wait, cpu_t = miss_future.result()
+                    miss_output, queue_wait, cpu_t, kernel_calls, kernel_tokens = miss_future.result()
             else:
                 with NvtxAnnotate("COLoRA_CPU_Miss_Path"):
                     t0 = time.perf_counter()
                     miss_input = input_tensor.index_select(0, miss_pos).contiguous()
                     miss_plan = self._build_cpu_group_plan(miss_bins)
-                    miss_output = self._naive_batch_lora(
+                    miss_output, kernel_calls, kernel_tokens = self._strict_moe_cpu_batch_lora(
                         miss_input,
                         buffer_layer_id,
                         pool,
                         miss_bins,
-                        force_cpu=True,
+                        projection=projection,
                         adapter_group_plan=miss_plan,
                     )
                     queue_wait = 0.0
@@ -567,6 +727,8 @@ class Qwen3VLMoELoRADispatcher:
             output.index_copy_(0, miss_pos, miss_output)
             cpu_compute_time += cpu_t
             cpu_queue_wait_time += queue_wait
+            moe_kernel_calls += int(kernel_calls)
+            moe_kernel_tokens += int(kernel_tokens)
 
         overlap_ratio = 0.0
         if async_overlap_used and cpu_compute_time > 0.0 and gpu_compute_time > 0.0:
@@ -592,6 +754,8 @@ class Qwen3VLMoELoRADispatcher:
             "promotion_drop_total": int(drop_breakdown.get("total", 0)),
             "promotion_drop_queue_high_watermark": int(drop_breakdown.get("queue_high_watermark", 0)),
             "promotion_drop_cooldown": int(drop_breakdown.get("cooldown", 0)),
+            "moe_kernel_calls": int(moe_kernel_calls),
+            "moe_kernel_tokens": int(moe_kernel_tokens),
         }
         return output
 
@@ -957,7 +1121,14 @@ class Qwen3VLMoELoRADispatcher:
         # Use CPU compute if configured
         if self._should_use_cpu_compute("moe"):
             with NvtxAnnotate("batch_apply_gate_lora_cpu"):
-                return self._naive_batch_lora(input_tensor, buffer_layer_id, pool, bins)
+                out, _, _ = self._strict_moe_cpu_batch_lora(
+                    input_tensor,
+                    buffer_layer_id,
+                    pool,
+                    bins,
+                    projection="gate",
+                )
+                return out
 
         if BGMV_AVAILABLE:
             output = self._get_output_buffer(input_tensor, pool)
@@ -1052,7 +1223,14 @@ class Qwen3VLMoELoRADispatcher:
 
         # Use CPU compute if configured
         if self._should_use_cpu_compute("moe"):
-            return self._naive_batch_lora(input_tensor, buffer_layer_id, pool, bins)
+            out, _, _ = self._strict_moe_cpu_batch_lora(
+                input_tensor,
+                buffer_layer_id,
+                pool,
+                bins,
+                projection="up",
+            )
+            return out
 
         if BGMV_AVAILABLE:
             output = self._get_output_buffer(input_tensor, pool)
@@ -1143,7 +1321,14 @@ class Qwen3VLMoELoRADispatcher:
 
         # Use CPU compute if configured
         if self._should_use_cpu_compute("moe"):
-            return self._naive_batch_lora(input_tensor, buffer_layer_id, pool, bins)
+            out, _, _ = self._strict_moe_cpu_batch_lora(
+                input_tensor,
+                buffer_layer_id,
+                pool,
+                bins,
+                projection="down",
+            )
+            return out
 
         if BGMV_AVAILABLE:
             # Compact dispatcher: CPU storage + GPU compute

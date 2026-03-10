@@ -61,7 +61,7 @@ SERVER_URL="http://$SERVER_HOST:$SERVER_PORT"
 ADAPTER_IDS="lora_dummy_0,lora_dummy_1,lora_dummy_2,lora_dummy_3,lora_dummy_4,lora_dummy_5,lora_dummy_6,lora_dummy_7,lora_dummy_8,lora_dummy_9"
 POISSON_LAMBDA=3.0
 POISSON_SEED=42
-ADAPTER_EXPERT_PROFILE=1
+ADAPTER_EXPERT_PROFILE=0
 ADAPTER_EXPERT_LOG_PATH="/tmp/moe_adapter_expert_profile.log"
 PRINT_PER_REQUEST=0
 TOP_K_SLOWEST=10
@@ -75,15 +75,44 @@ MAX_REQ_TOTAL_LEN=""
 MEM_FRACTION=""
 BATCH_MAX_TOKENS=""
 COLORA_CACHE_BUDGET_MB=""
-COLORA_PROMOTE_MIN_HITS=""
-COLORA_PROMOTE_WINDOW=""
-COLORA_MAX_PROMOTE_PER_STEP=""
+COLORA_PROMOTE_MIN_HITS="1"
+COLORA_PROMOTE_WINDOW="512"
+COLORA_MAX_PROMOTE_PER_STEP="32"
 COLORA_DECAY=""
 COLORA_MISS_POLICY=""
 COLORA_ASYNC_FALLBACK=""
-COLORA_CPU_WORKERS=""
-COLORA_CPU_QUEUE_DEPTH=""
-COLORA_CPU_BATCH_TIMEOUT_US=""
+COLORA_CPU_WORKERS="8"
+COLORA_CPU_QUEUE_DEPTH="512"
+COLORA_CPU_BATCH_TIMEOUT_US="200"
+SERVER_PID=""
+
+terminate_server_tree() {
+    local pid="$1"
+    if [[ -z "$pid" ]]; then
+        return 0
+    fi
+
+    if ! kill -0 "$pid" 2>/dev/null; then
+        return 0
+    fi
+
+    echo "[Cleanup] Stopping server tree rooted at PID $pid..."
+
+    kill -INT "$pid" 2>/dev/null || true
+    for _ in $(seq 1 20); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
+        sleep 1
+    done
+
+    pkill -TERM -P "$pid" 2>/dev/null || true
+    kill -TERM "$pid" 2>/dev/null || true
+    sleep 2
+
+    pkill -KILL -P "$pid" 2>/dev/null || true
+    kill -KILL "$pid" 2>/dev/null || true
+}
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -140,27 +169,30 @@ done
 
 # Cleanup function
 cleanup() {
-    echo "[Cleanup] Sending signal to all processes in group..."
+    echo "[Cleanup] Tearing down benchmark processes..."
     trap - INT TERM EXIT # Disable traps to avoid recursion
 
-    # 1. Send SIGINT to the group. 
-    # This tells nsys to "stop and save" and the server to "gracefully exit."
-    kill -INT -$$ 2>/dev/null
+    if [[ -n "$SERVER_PID" ]]; then
+        # Fast kill - skip the 20-second wait in terminate_server_tree
+        kill -INT "$SERVER_PID" 2>/dev/null || true
+        sleep 2
+        # Hard kill immediately if still running
+        pkill -KILL -P "$SERVER_PID" 2>/dev/null || true
+        kill -KILL "$SERVER_PID" 2>/dev/null || true
+        wait "$SERVER_PID" 2>/dev/null || true
+        SERVER_PID=""
+    fi
 
-    pkill -9 -f "lightllm.server|lightllm::|gunicorn" && \
-    pkill -9 -f "multiprocessing.resource_tracker|multiprocessing.spawn"
-    ipcs -m | awk -v user="$USER" '$3 == user && $6 == "0" && $2 ~ /^[0-9]+$/ {print $2}' | xargs -r -n 1 ipcrm -m
+    # Force kill all remaining processes
+    pkill -9 -f "lightllm.server|lightllm::|gunicorn|python.*api_server" 2>/dev/null || true
+    pkill -9 -f "multiprocessing.resource_tracker|multiprocessing.spawn|multiprocessing.forkserver" 2>/dev/null || true
 
-    echo "[Cleanup] Waiting for nsys to finalize report (max 15s)..."
-    # Wait for the specific nsys process to finish
-    # nsys post-processing can take a while for large MoE models
-    for i in {1..15}; do
-        if ! pgrep -x "nsys" > /dev/null; then
-            echo "[Cleanup] nsys finished."
-            break
-        fi
-        sleep 1
-    done
+    # Fast shared memory cleanup with 5s timeout
+    echo "[Cleanup] Removing shared memory segments..."
+    timeout 5 bash -c 'ipcs -m | awk -v user="$USER" '\''$3 == user && $6 == "0" && $2 ~ /^[0-9]+$/ {print $2}'\'' | xargs -r -n 1 ipcrm -m' 2>/dev/null || true
+
+    echo "[Cleanup] Complete"
+    exit 0 # Force immediate exit to prevent nsys hang
 }
 trap cleanup EXIT
 
@@ -320,43 +352,41 @@ sleep "$SETUP_DELAY"
 # Step 4: Send test request (nsys is now capturing)
 echo "[3/5] Sending test request..."
 echo > benchmark_lora.log
-# python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests 1 2>&1 | tee -a benchmark_lora.log
+REQUEST_COUNTS=(1 1 1 2 4 8 16 32 64 128 256 512 1024 2048)
+# REQUEST_COUNTS=(16)
+for i in "${!REQUEST_COUNTS[@]}"; do
+    num_requests="${REQUEST_COUNTS[$i]}"
+    python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests "$num_requests" 2>&1 | tee -a benchmark_lora.log
+    if (( i < ${#REQUEST_COUNTS[@]} - 1 )); then
+        sleep 5
+    fi
+done
 
-# sleep 5
-# python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests 1 2>&1 | tee -a benchmark_lora.log
+echo "[4/5] Stopping server before exit..."
+terminate_server_tree "$SERVER_PID"
+if [[ -n "$SERVER_PID" ]]; then
+    wait "$SERVER_PID" 2>/dev/null || true
+fi
+SERVER_PID=""
 
-# sleep 5
-# python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests 1 2>&1 | tee -a benchmark_lora.log
+# Extra thorough cleanup to ensure all processes are dead
+echo "[Cleanup] Killing all remaining lightllm and worker processes..."
+pkill -9 -f "lightllm.server|lightllm::|gunicorn|python.*api_server" 2>/dev/null || true
+pkill -9 -f "multiprocessing.resource_tracker|multiprocessing.spawn|multiprocessing.forkserver" 2>/dev/null || true
 
-# sleep 5
-# python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests 2 2>&1 | tee -a benchmark_lora.log
-
-# sleep 5
-# python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests 4 2>&1 | tee -a benchmark_lora.log
-
-# sleep 5
-# python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests 8 2>&1 | tee -a benchmark_lora.log
-
+# Wait for processes to exit and CUDA context to be released
 sleep 5
-python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests 16 2>&1 | tee -a benchmark_lora.log
 
-# sleep 5
-# python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests 32 2>&1 | tee -a benchmark_lora.log
+# Ensure no leftover processes are running
+while pgrep -f "lightllm.server|python.*api_server" >/dev/null; do
+    echo "Waiting for processes to exit..."
+    sleep 2
+done
 
-# sleep 5
-# python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests 64 2>&1 | tee -a benchmark_lora.log
+echo "[5/5] Benchmark complete."
 
-# sleep 5
-# python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests 128 2>&1 | tee -a benchmark_lora.log
+# Disable EXIT trap since we already did full cleanup
+trap - EXIT
 
-# sleep 5
-# python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests 256 2>&1 | tee -a benchmark_lora.log
-
-# sleep 5
-# python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests 512 2>&1 | tee -a benchmark_lora.log
-
-# sleep 5
-# python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests 1024 2>&1 | tee -a benchmark_lora.log
-
-# sleep 5
-# python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests 2048 2>&1 | tee -a benchmark_lora.log
+# Force exit to ensure nsys doesn't hang
+exit 0

@@ -19,6 +19,19 @@ assert _DISPATCH_SPEC is not None and _DISPATCH_SPEC.loader is not None
 _DISPATCH_SPEC.loader.exec_module(dispatch_mod)
 
 
+def _install_fake_moe_kernel(monkeypatch):
+    def _gate(x, A, scaling):
+        return torch.matmul(x, A.t()) * scaling
+
+    def _updown(x, B, scaling):
+        return torch.matmul(x, B) * scaling
+
+    monkeypatch.setattr(dispatch_mod, "MOE_AVX_AVAILABLE", True, raising=False)
+    monkeypatch.setattr(dispatch_mod, "moe_batch_lora_gate_avx", _gate, raising=False)
+    monkeypatch.setattr(dispatch_mod, "moe_batch_lora_up_avx", _updown, raising=False)
+    monkeypatch.setattr(dispatch_mod, "moe_batch_lora_down_avx", _updown, raising=False)
+
+
 
 def _build_cpu_pool_two_adapters(dtype=torch.float16):
     pool = LoRAModulePool.create(
@@ -49,7 +62,8 @@ def _build_cpu_pool_two_adapters(dtype=torch.float16):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="COLoRA GPU hit-path needs CUDA")
 @pytest.mark.skipif(not dispatch_mod.BGMV_AVAILABLE, reason="BGMV kernel is required for GPU hit-path")
-def test_colora_hybrid_mixed_hit_and_miss_tokens():
+def test_colora_hybrid_mixed_hit_and_miss_tokens(monkeypatch):
+    _install_fake_moe_kernel(monkeypatch)
     pool = _build_cpu_pool_two_adapters(dtype=torch.float16)
 
     cache_mgr = MoEExpertCacheManager(
@@ -98,3 +112,5 @@ def test_colora_hybrid_mixed_hit_and_miss_tokens():
     assert "h2d_bytes" in stats
     assert "overlap_ratio" in stats
     assert "fallback_degrade_count" in stats
+    assert stats["moe_kernel_calls"] > 0
+    assert stats["moe_kernel_tokens"] > 0
