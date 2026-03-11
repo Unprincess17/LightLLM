@@ -61,6 +61,31 @@ class ChunkedPrefillBackend(ModeBackend):
         self.classed_req_strict_prefill = False
         return
 
+    def _sync_batched_lora_state_for_current_reqs(self, current_reqs: List[InferReq]) -> None:
+        if not (getattr(self, "lora_support", False) and getattr(self, "use_batched_lora_mode", False)):
+            return
+
+        req_bins = None
+        enable_detached_lora = False
+        if current_reqs:
+            from lightllm.server.router.model_infer.infer_batch import Batch
+
+            batch = Batch(current_reqs)
+            enable_detached_lora = batch.has_lora_adapters()
+            if enable_detached_lora:
+                req_bins = self._prepare_batched_lora_for_batch(batch)
+
+        if not enable_detached_lora:
+            for dispatcher in getattr(self, "lora_dispatchers", []):
+                switch_mode = getattr(dispatcher, "use_single_adapter_mode", None)
+                if callable(switch_mode):
+                    switch_mode()
+
+        for layer_infer in self.model.layers_infer:
+            layer_infer.use_detached_lora_ = enable_detached_lora
+            if hasattr(layer_infer, "set_req_bins"):
+                layer_infer.set_req_bins(req_bins)
+
     def infer_loop(self):
         torch.cuda.set_device(get_current_device_id())
         try:
@@ -80,16 +105,7 @@ class ChunkedPrefillBackend(ModeBackend):
                 # =================================================================
                 if getattr(self, 'lora_support', False) and getattr(self, 'use_batched_lora_mode', False):
                     current_reqs = list(g_infer_context.requests_mapping.values())
-                    if current_reqs:
-                        # Create a Batch object for batched LoRA
-                        from lightllm.server.router.model_infer.infer_batch import Batch
-                        batch = Batch(current_reqs)
-                        if batch.has_lora_adapters():
-                            req_bins = self._prepare_batched_lora_for_batch(batch)
-                            # Set LoRA enabled on all layers
-                            for layer_infer in self.model.layers_infer:
-                                layer_infer.use_detached_lora_ = True
-                                layer_infer.set_req_bins(req_bins)
+                    self._sync_batched_lora_state_for_current_reqs(current_reqs)
                 # =================================================================
 
                 prefill_reqs, decode_reqs = self._get_classed_reqs(

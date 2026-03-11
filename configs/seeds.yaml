@@ -1,0 +1,5 @@
+global_seed: 7
+prompt_corpus_seed: 7
+adapter_mapping_seed: 11
+synthetic_trace_seed: 17
+replay_seed: 23

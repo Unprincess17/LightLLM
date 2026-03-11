@@ -9,6 +9,7 @@
 #   --model_dir PATH       Base model directory (required)
 #   --lora_dir PATH        Single LoRA adapter directory (optional)
 #   --lora_dirs PATHS      Comma-separated LoRA adapter directories (optional)
+#   --no_lora              Disable loading default or explicit LoRA adapters
 #   --port PORT            Server port (default: 8080)
 #   --tp TP                Tensor parallel degree (default: 1)
 #   --host HOST            Server host (default: 127.0.0.1)
@@ -36,6 +37,9 @@
 #   --colora_cpu_batch_timeout_us N    Queue wait budget before sync degrade
 #   --adapter_expert_profile Enable adapter x expert routing profiling log
 #   --adapter_expert_log_path PATH Log path for adapter x expert routing profiling
+#   --router_trace Enable ordered per-token router trace logging
+#   --router_trace_path PATH Log path for ordered router trace JSONL
+#   --router_trace_phases CSV Phase filter for router trace, e.g. 'decode' or 'prefill,decode'
 #   --help                 Show this help message
 #
 # =============================================================================
@@ -50,6 +54,7 @@ Options:
   --model_dir PATH
   --lora_dir PATH
   --lora_dirs PATHS
+  --no_lora
   --port PORT
   --tp TP
   --host HOST
@@ -73,6 +78,9 @@ Options:
   --colora_cpu_batch_timeout_us N
   --adapter_expert_profile
   --adapter_expert_log_path PATH
+  --router_trace
+  --router_trace_path PATH
+  --router_trace_phases CSV
   --help|-h
 USAGE
 }
@@ -88,6 +96,7 @@ for i in {0..9}; do
     DEFAULT_LORA_DIRS+=("/home/shufan/Qwen-VL-FT/work/lora_dummy_${i}")
 done
 LORA_DIR=$(IFS=,; echo "${DEFAULT_LORA_DIRS[*]}")
+USE_LORA=true
 PORT=8040
 TP=2
 HOST="0.0.0.0"
@@ -140,6 +149,9 @@ MOCK_PREFILL_LOGITS="TRUE"
 #MOCK_PREFILL_LOGITS="FALSE"
 MOE_ADAPTER_EXPERT_PROFILING=0
 MOE_ADAPTER_EXPERT_LOG_PATH="/tmp/moe_adapter_expert_profile.log"
+MOE_ROUTER_TRACE=0
+MOE_ROUTER_TRACE_PATH="/tmp/moe_router_trace.jsonl"
+MOE_ROUTER_TRACE_PHASES="prefill,decode"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -150,11 +162,18 @@ while [[ $# -gt 0 ]]; do
             ;;
         --lora_dir)
             LORA_DIR="$2"
+            USE_LORA=true
             shift 2
             ;;
         --lora_dirs)
             LORA_DIR="$2"
+            USE_LORA=true
             shift 2
+            ;;
+        --no_lora)
+            LORA_DIR=""
+            USE_LORA=false
+            shift
             ;;
         --port)
             PORT="$2"
@@ -248,6 +267,18 @@ while [[ $# -gt 0 ]]; do
             MOE_ADAPTER_EXPERT_LOG_PATH="$2"
             shift 2
             ;;
+        --router_trace)
+            MOE_ROUTER_TRACE=1
+            shift
+            ;;
+        --router_trace_path)
+            MOE_ROUTER_TRACE_PATH="$2"
+            shift 2
+            ;;
+        --router_trace_phases)
+            MOE_ROUTER_TRACE_PHASES="$2"
+            shift 2
+            ;;
         --help|-h)
             usage
             exit 0
@@ -273,7 +304,7 @@ if [[ ! -d "$MODEL_DIR" ]]; then
 fi
 
 # Check LoRA directory exists if specified
-if [[ -n "$LORA_DIR" ]]; then
+if [[ "$USE_LORA" == "true" && -n "$LORA_DIR" ]]; then
     IFS=',' read -r -a LORA_DIR_ARRAY <<< "$LORA_DIR"
     ABS_LORA_DIRS=()
     for ADAPTER_DIR in "${LORA_DIR_ARRAY[@]}"; do
@@ -296,7 +327,11 @@ echo "=============================================="
 echo "LightLLM LoRA Server"
 echo "=============================================="
 echo "Base Model: $MODEL_DIR"
-[[ -n "$LORA_DIR" ]] && echo "LoRA Adapter(s): $LORA_DIR"
+if [[ "$USE_LORA" == "true" && -n "$LORA_DIR" ]]; then
+    echo "LoRA Adapter(s): $LORA_DIR"
+else
+    echo "LoRA Adapter(s): disabled"
+fi
 echo "Host: $HOST"
 echo "Port: $PORT"
 echo "TP: $TP"
@@ -321,7 +356,7 @@ CMD="python -m lightllm.server.api_server \
     --mem_fraction $MEM_FRACTION \
     --disable_cudagraph"
 
-if [[ -n "$LORA_DIR" ]]; then
+if [[ "$USE_LORA" == "true" && -n "$LORA_DIR" ]]; then
     CMD="$CMD --lora_dir $LORA_DIR --lora_max_size $LORA_MAX_SIZE"
 fi
 
@@ -360,6 +395,9 @@ export MOE_MODE=$MOE_MODE
 export MOCK_PREFILL_LOGITS=$MOCK_PREFILL_LOGITS
 export MOE_ADAPTER_EXPERT_PROFILING=$MOE_ADAPTER_EXPERT_PROFILING
 export MOE_ADAPTER_EXPERT_LOG_PATH=$MOE_ADAPTER_EXPERT_LOG_PATH
+export MOE_ROUTER_TRACE=$MOE_ROUTER_TRACE
+export MOE_ROUTER_TRACE_PATH=$MOE_ROUTER_TRACE_PATH
+export MOE_ROUTER_TRACE_PHASES=$MOE_ROUTER_TRACE_PHASES
 
 echo ""
 echo "Starting server..."
@@ -372,6 +410,10 @@ echo "  MOE_MODE=$MOE_MODE"
 echo "  MOCK_PREFILL_LOGITS=$MOCK_PREFILL_LOGITS"
 echo "  MOE_ADAPTER_EXPERT_PROFILING=$MOE_ADAPTER_EXPERT_PROFILING"
 echo "  MOE_ADAPTER_EXPERT_LOG_PATH=$MOE_ADAPTER_EXPERT_LOG_PATH"
+echo "  MOE_ROUTER_TRACE=$MOE_ROUTER_TRACE"
+echo "  MOE_ROUTER_TRACE_PATH=$MOE_ROUTER_TRACE_PATH"
+echo "  MOE_ROUTER_TRACE_PHASES=$MOE_ROUTER_TRACE_PHASES"
+echo "  USE_LORA=$USE_LORA"
 echo "  FORCE_SLOW_LORA_PATH=$FORCE_SLOW_LORA_PATH"
 echo "  COMPUTE_DEVICE=$COMPUTE_DEVICE"
 echo "  COLORA_CACHE_BUDGET_MB=$COLORA_CACHE_BUDGET_MB"

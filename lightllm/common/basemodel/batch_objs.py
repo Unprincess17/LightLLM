@@ -21,6 +21,7 @@ class ModelInput:
     prefix_total_token_num: int = None
     input_ids: torch.Tensor = None
     b_req_idx: torch.Tensor = None
+    b_trace_req_id: torch.Tensor = None
     b_mtp_index: torch.Tensor = None
     b_seq_len: torch.Tensor = None
     # 只会在 diverse_mode 下的 decode 阶段真正被使用的参数, 用于记录共享的radix cache中的长度

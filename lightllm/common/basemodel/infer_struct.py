@@ -22,6 +22,7 @@ class InferStateInfo:
         self.batch_size: int = None
         self.total_token_num: int = None
         self.b_req_idx: torch.Tensor = None
+        self.b_trace_req_id: torch.Tensor = None
         self.b_start_loc: torch.Tensor = None
         self.b_ready_cache_len: torch.Tensor = None  # only for prefill prompt cache used.
 

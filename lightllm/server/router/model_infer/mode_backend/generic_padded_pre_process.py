@@ -30,6 +30,7 @@ def padded_prepare_prefill_inputs(
     padded_req_num = dest_batch_size - len(req_objs)
     input_ids = []
     b_req_idx = []
+    b_trace_req_id = []
     b_seq_len = []
     b_q_seq_len = []
     batch_multimodal_params = []
@@ -42,6 +43,7 @@ def padded_prepare_prefill_inputs(
         run_reqs.append(req)
         batch_multimodal_params.append(req.multimodal_params)
         b_req_idx.append(req.req_idx)
+        b_trace_req_id.append(req.req_id)
 
         input_token_ids = req.get_chuncked_input_token_ids()
         b_prefill_has_output.append(False if len(input_token_ids) < req.get_cur_total_len() else True)
@@ -61,6 +63,7 @@ def padded_prepare_prefill_inputs(
     for _ in range(padded_req_num):
         input_ids.append([1])
         b_req_idx.append(g_infer_context.req_manager.HOLD_REQUEST_ID)
+        b_trace_req_id.append(g_infer_context.req_manager.HOLD_REQUEST_ID)
         b_seq_len.append(1)
         b_q_seq_len.append(1)
         b_mtp_index.append(0)
@@ -78,6 +81,7 @@ def padded_prepare_prefill_inputs(
     input_ids = np.concatenate(input_ids, dtype=np.int64)
     input_ids = torch.tensor(input_ids, dtype=torch.int64, device="cpu")
     b_req_idx = torch.tensor(b_req_idx, dtype=torch.int32, device="cpu")
+    b_trace_req_id = torch.tensor(b_trace_req_id, dtype=torch.int64, device="cpu")
     b_seq_len = torch.tensor(b_seq_len, dtype=torch.int32, device="cpu")
     b_mtp_index = torch.tensor(b_mtp_index, dtype=torch.int32, device="cpu")
     b_ready_cache_len = torch.tensor(b_ready_cache_len, dtype=torch.int32, device="cpu")
@@ -110,6 +114,7 @@ def padded_prepare_prefill_inputs(
         input_ids=input_ids,
         mem_indexes_cpu=mem_indexes,
         b_req_idx=b_req_idx,
+        b_trace_req_id=b_trace_req_id,
         b_mtp_index=b_mtp_index,
         b_seq_len=b_seq_len,
         b_ready_cache_len=b_ready_cache_len,
@@ -140,6 +145,7 @@ def padded_prepare_decode_inputs(
     run_reqs = []
     total_token_num = 0
     b_req_idx = []
+    b_trace_req_id = []
     b_mtp_index = []
     b_seq_len = []
     b_q_seq_len = []
@@ -148,6 +154,7 @@ def padded_prepare_decode_inputs(
     for req in req_objs:
         run_reqs.append(req)
         b_req_idx.append(req.req_idx)
+        b_trace_req_id.append(req.req_id)
         seq_len = req.get_cur_total_len()
         assert req.cur_kv_len == seq_len - 1
         b_seq_len.append(seq_len)
@@ -160,6 +167,7 @@ def padded_prepare_decode_inputs(
             seq_len += 1
             total_token_num += seq_len
             b_req_idx.append(req.req_idx)
+            b_trace_req_id.append(req.req_id)
             b_seq_len.append(seq_len)
             b_mtp_index.append(step + 1)
             batch_multimodal_params.append(req.multimodal_params)
@@ -171,6 +179,7 @@ def padded_prepare_decode_inputs(
         seq_len = 2
         total_token_num += seq_len
         b_req_idx.append(g_infer_context.req_manager.HOLD_REQUEST_ID)
+        b_trace_req_id.append(g_infer_context.req_manager.HOLD_REQUEST_ID)
         b_seq_len.append(seq_len)
         b_mtp_index.append(0)
         batch_multimodal_params.append({"images": [], "audios": []})
@@ -179,6 +188,7 @@ def padded_prepare_decode_inputs(
             total_token_num += seq_len
             b_seq_len.append(seq_len)
             b_req_idx.append(g_infer_context.req_manager.HOLD_REQUEST_ID)
+            b_trace_req_id.append(g_infer_context.req_manager.HOLD_REQUEST_ID)
             b_mtp_index.append(step + 1)
             batch_multimodal_params.append({"images": [], "audios": []})
 
@@ -189,6 +199,7 @@ def padded_prepare_decode_inputs(
     max_len_in_batch = max(b_seq_len)
 
     b_req_idx = torch.tensor(b_req_idx, dtype=torch.int32, device="cpu")
+    b_trace_req_id = torch.tensor(b_trace_req_id, dtype=torch.int64, device="cpu")
     b_seq_len = torch.tensor(b_seq_len, dtype=torch.int32, device="cpu")
     b_mtp_index = torch.tensor(b_mtp_index, dtype=torch.int32, device="cpu")
 
@@ -217,6 +228,7 @@ def padded_prepare_decode_inputs(
         input_ids=None,
         mem_indexes_cpu=mem_indexes,
         b_req_idx=b_req_idx,
+        b_trace_req_id=b_trace_req_id,
         b_mtp_index=b_mtp_index,
         b_seq_len=b_seq_len,
         is_prefill=False,

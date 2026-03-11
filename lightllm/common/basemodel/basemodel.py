@@ -285,6 +285,7 @@ class TpPartBaseModel:
         infer_state.prefix_total_token_num = model_input.prefix_total_token_num
         assert model_input.b_req_idx.shape[0] == model_input.b_seq_len.shape[0]
         infer_state.b_req_idx = model_input.b_req_idx
+        infer_state.b_trace_req_id = model_input.b_trace_req_id
         infer_state.b_seq_len = model_input.b_seq_len
         if model_input.is_prefill:
             if model_input.b_ready_cache_len is not None:
@@ -324,6 +325,13 @@ class TpPartBaseModel:
         new_model_input.b_req_idx = F.pad(
             new_model_input.b_req_idx, (0, padded_batch_size), mode="constant", value=self.req_manager.HOLD_REQUEST_ID
         )
+        if new_model_input.b_trace_req_id is not None:
+            new_model_input.b_trace_req_id = F.pad(
+                new_model_input.b_trace_req_id,
+                (0, padded_batch_size),
+                mode="constant",
+                value=self.req_manager.HOLD_REQUEST_ID,
+            )
         new_model_input.b_seq_len = F.pad(new_model_input.b_seq_len, (0, padded_batch_size), mode="constant", value=2)
         new_model_input.mem_indexes = F.pad(
             new_model_input.mem_indexes,
@@ -372,6 +380,13 @@ class TpPartBaseModel:
         new_model_input.b_req_idx = F.pad(
             new_model_input.b_req_idx, (0, 1), mode="constant", value=self.req_manager.HOLD_REQUEST_ID
         )
+        if new_model_input.b_trace_req_id is not None:
+            new_model_input.b_trace_req_id = F.pad(
+                new_model_input.b_trace_req_id,
+                (0, 1),
+                mode="constant",
+                value=self.req_manager.HOLD_REQUEST_ID,
+            )
         new_model_input.b_mtp_index = F.pad(new_model_input.b_mtp_index, (0, 1), mode="constant", value=0)
         new_model_input.b_seq_len = F.pad(new_model_input.b_seq_len, (0, 1), mode="constant", value=padded_token_num)
         new_model_input.b_ready_cache_len = F.pad(new_model_input.b_ready_cache_len, (0, 1), mode="constant", value=0)

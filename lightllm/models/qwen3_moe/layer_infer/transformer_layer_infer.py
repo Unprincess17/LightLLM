@@ -1,6 +1,8 @@
 import os
 import json
 import logging
+import threading
+import fcntl
 import torch
 import torch.functional as F
 import torch.distributed as dist
@@ -16,13 +18,59 @@ from lightllm.models.llama.triton_kernel.rotary_emb import rotary_emb_fwd
 from lightllm.models.llama.triton_kernel.silu_and_mul import silu_and_mul_fwd
 from functools import partial
 from lightllm.utils.log_utils import init_logger
-from lightllm.utils.dist_utils import get_global_world_size
+from lightllm.utils.dist_utils import get_current_rank_in_dp, get_global_world_size
 from lightllm.distributed.communication_op import all_gather_into_tensor, reduce_scatter_tensor
 from lightllm.utils.nvtx_utils import NvtxAnnotate
 
 from lightllm.common.fused_moe.topk_select import select_experts
 
 logger = init_logger(__name__)
+
+_ROUTER_TRACE_LOCK = threading.Lock()
+_ROUTER_TRACE_NEXT_ARRIVAL = 0
+
+
+def _router_trace_writer_enabled() -> bool:
+    try:
+        return get_current_rank_in_dp() == 0
+    except Exception:
+        return True
+
+
+def _router_trace_phase_enabled(is_prefill: bool) -> bool:
+    if os.environ.get("MOE_ROUTER_TRACE", "0") != "1":
+        return False
+
+    raw_phases = os.environ.get("MOE_ROUTER_TRACE_PHASES", "prefill,decode")
+    allowed = {token.strip().lower() for token in raw_phases.split(",") if token.strip()}
+    if not allowed:
+        allowed = {"prefill", "decode"}
+
+    phase = "prefill" if is_prefill else "decode"
+    return "all" in allowed or phase in allowed
+
+
+def _alloc_router_trace_arrival_indices(count: int) -> range:
+    global _ROUTER_TRACE_NEXT_ARRIVAL
+
+    with _ROUTER_TRACE_LOCK:
+        start = _ROUTER_TRACE_NEXT_ARRIVAL
+        _ROUTER_TRACE_NEXT_ARRIVAL += max(int(count), 0)
+    return range(start, start + max(int(count), 0))
+
+
+def _append_router_trace_lines(log_path: str, lines: list[str]) -> None:
+    if not lines:
+        return
+
+    with open(log_path, "a", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            handle.write("\n".join(lines))
+            handle.write("\n")
+            handle.flush()
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
@@ -494,6 +542,96 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
         with open(log_path, "a") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
+    def _expand_req_indices_for_trace(
+        self,
+        infer_state: LlamaInferStateInfo,
+        num_tokens: int,
+    ) -> list[int]:
+        trace_req_ids = None if infer_state is None else getattr(infer_state, "b_trace_req_id", None)
+        source_tensor = trace_req_ids if trace_req_ids is not None else None if infer_state is None else infer_state.b_req_idx
+        if source_tensor is None:
+            return list(range(num_tokens))
+
+        batch_req_idx = source_tensor.detach().view(-1).cpu().tolist()
+        if not getattr(infer_state, "is_prefill", False):
+            return [int(req_idx) for req_idx in batch_req_idx[:num_tokens]]
+
+        if infer_state.b_q_seq_len is None or infer_state.b_start_loc is None:
+            return [int(batch_req_idx[min(i, len(batch_req_idx) - 1)]) for i in range(num_tokens)]
+
+        q_seq_len = infer_state.b_q_seq_len.detach().view(-1).cpu().tolist()
+        start_loc = infer_state.b_start_loc.detach().view(-1).cpu().tolist()
+        expanded = [-1 for _ in range(num_tokens)]
+
+        for req_idx, start, token_count in zip(batch_req_idx, start_loc, q_seq_len):
+            start = int(start)
+            token_count = int(token_count)
+            for offset in range(token_count):
+                token_pos = start + offset
+                if 0 <= token_pos < num_tokens:
+                    expanded[token_pos] = int(req_idx)
+
+        fallback_req_idx = int(batch_req_idx[0]) if batch_req_idx else -1
+        return [req_idx if req_idx >= 0 else fallback_req_idx for req_idx in expanded]
+
+    def _extract_token_positions_for_trace(
+        self,
+        infer_state: LlamaInferStateInfo,
+        num_tokens: int,
+    ) -> list[int]:
+        if infer_state is None or infer_state.position_ids is None:
+            return list(range(num_tokens))
+
+        flat_positions = infer_state.position_ids.detach().view(-1).cpu().tolist()
+        if len(flat_positions) >= num_tokens:
+            return [int(position) for position in flat_positions[:num_tokens]]
+
+        result = [int(position) for position in flat_positions]
+        while len(result) < num_tokens:
+            result.append(len(result))
+        return result
+
+    def _log_router_trace(
+        self,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        num_tokens: int,
+        infer_state: LlamaInferStateInfo,
+    ) -> None:
+        if not _router_trace_writer_enabled():
+            return
+        if not _router_trace_phase_enabled(getattr(infer_state, "is_prefill", False)):
+            return
+
+        if topk_ids is None or topk_weights is None or num_tokens <= 0:
+            return
+
+        topk_ids_cpu = topk_ids.detach().cpu().tolist()
+        topk_weights_cpu = topk_weights.detach().cpu().tolist()
+        req_indices = self._expand_req_indices_for_trace(infer_state, num_tokens)
+        token_positions = self._extract_token_positions_for_trace(infer_state, num_tokens)
+        phase = "prefill" if getattr(infer_state, "is_prefill", False) else "decode"
+        arrival_indices = _alloc_router_trace_arrival_indices(num_tokens)
+        log_path = os.environ.get("MOE_ROUTER_TRACE_PATH", "/tmp/moe_router_trace.jsonl")
+
+        lines = []
+        for token_idx, arrival_idx in enumerate(arrival_indices):
+            topk_experts = [int(expert_id) for expert_id in topk_ids_cpu[token_idx]]
+            topk_scores = [float(score) for score in topk_weights_cpu[token_idx]]
+            record = {
+                "event": "router_trace",
+                "arrival_idx": int(arrival_idx),
+                "req_idx": int(req_indices[token_idx]),
+                "phase": phase,
+                "layer_id": int(self.layer_num_),
+                "token_pos": int(token_positions[token_idx]),
+                "topk_experts": topk_experts,
+                "topk_weights": topk_scores,
+            }
+            lines.append(json.dumps(record, ensure_ascii=True))
+
+        _append_router_trace_lines(log_path, lines)
+
     def _get_local_expert_info(self, layer_weight):
         """Get information about local experts for EP mode.
 
@@ -619,13 +757,15 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
         # ----------------------------------------------------------------
         if not use_per_expert_lora:
             router_logits = layer_weight.moe_gate.mm(hidden_states)
-            # Profiling-only: explicitly compute top-k assignments to build
-            # adapter x expert routing counts in fast path.
-            if (
+            adapter_profile_enabled = (
                 os.environ.get("MOE_ADAPTER_EXPERT_PROFILING", "0") == "1"
                 and self.req_bins_ is not None
-            ):
-                _, fast_topk_ids = select_experts(
+            )
+            router_trace_enabled = _router_trace_phase_enabled(getattr(infer_state, "is_prefill", False))
+
+            # Profiling-only: explicitly compute top-k assignments in fast path.
+            if adapter_profile_enabled or router_trace_enabled:
+                fast_topk_weights, fast_topk_ids = select_experts(
                     hidden_states=hidden_states,
                     router_logits=router_logits,
                     correction_bias=getattr(layer_weight.experts, "e_score_correction_bias", None),
@@ -636,13 +776,21 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
                     num_expert_group=None,
                     scoring_func=getattr(layer_weight.experts, "scoring_func", "softmax"),
                 )
-                self._log_adapter_expert_distribution(
-                    topk_ids=fast_topk_ids,
-                    req_bins=self.req_bins_,
-                    num_experts=layer_weight.experts.n_routed_experts,
-                    num_tokens=num_tokens,
-                    infer_state=infer_state,
-                )
+                if adapter_profile_enabled:
+                    self._log_adapter_expert_distribution(
+                        topk_ids=fast_topk_ids,
+                        req_bins=self.req_bins_,
+                        num_experts=layer_weight.experts.n_routed_experts,
+                        num_tokens=num_tokens,
+                        infer_state=infer_state,
+                    )
+                if router_trace_enabled:
+                    self._log_router_trace(
+                        topk_ids=fast_topk_ids,
+                        topk_weights=fast_topk_weights,
+                        num_tokens=num_tokens,
+                        infer_state=infer_state,
+                    )
             layer_weight.experts.experts(
                 hidden_states,
                 router_logits=router_logits,
@@ -682,6 +830,12 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
             topk_ids=topk_ids,
             req_bins=self.req_bins_,
             num_experts=layer_weight.experts.n_routed_experts,
+            num_tokens=num_tokens,
+            infer_state=infer_state,
+        )
+        self._log_router_trace(
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
             num_tokens=num_tokens,
             infer_state=infer_state,
         )
@@ -935,11 +1089,14 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
             )
             router_logits = router_logits + gate_lora
 
-        if (
+        adapter_profile_enabled = (
             os.environ.get("MOE_ADAPTER_EXPERT_PROFILING", "0") == "1"
             and self.req_bins_ is not None
-        ):
-            _, edp_topk_ids = select_experts(
+        )
+        router_trace_enabled = _router_trace_phase_enabled(getattr(infer_state, "is_prefill", False))
+
+        if adapter_profile_enabled or router_trace_enabled:
+            edp_topk_weights, edp_topk_ids = select_experts(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
                 correction_bias=getattr(layer_weight.experts, "e_score_correction_bias", None),
@@ -950,13 +1107,21 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
                 num_expert_group=None,
                 scoring_func=getattr(layer_weight.experts, "scoring_func", "softmax"),
             )
-            self._log_adapter_expert_distribution(
-                topk_ids=edp_topk_ids,
-                req_bins=self.req_bins_,
-                num_experts=layer_weight.experts.n_routed_experts,
-                num_tokens=token_num,
-                infer_state=infer_state,
-            )
+            if adapter_profile_enabled:
+                self._log_adapter_expert_distribution(
+                    topk_ids=edp_topk_ids,
+                    req_bins=self.req_bins_,
+                    num_experts=layer_weight.experts.n_routed_experts,
+                    num_tokens=token_num,
+                    infer_state=infer_state,
+                )
+            if router_trace_enabled:
+                self._log_router_trace(
+                    topk_ids=edp_topk_ids,
+                    topk_weights=edp_topk_weights,
+                    num_tokens=token_num,
+                    infer_state=infer_state,
+                )
 
         ep_output = layer_weight.experts.experts(
             hidden_states,

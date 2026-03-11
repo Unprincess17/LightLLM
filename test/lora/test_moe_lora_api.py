@@ -31,6 +31,7 @@ from collections import Counter
 
 DEFAULT_URL = "http://localhost:8040"
 DEFAULT_MODEL = "Qwen3-VL-30B-A3B-Instruct"
+DEFAULT_NUM_REQUESTS = 1
 
 
 def parse_args():
@@ -91,7 +92,16 @@ def parse_args():
         help="Random seed for Poisson adapter sampling",
     )
     parser.add_argument("--mode", type=str, default="detached", choices=["merged", "detached"], help="LoRA mode")
-    parser.add_argument("--num_requests", type=int, default=1, help="Number of requests to send")
+    parser.add_argument("--num_requests", type=int, default=DEFAULT_NUM_REQUESTS, help="Number of requests to send")
+    parser.add_argument(
+        "--adapter_trace_path",
+        type=str,
+        default=None,
+        help=(
+            "Optional JSONL path with explicit per-request adapter assignments. "
+            "Rows are consumed in arrival order and should include adapter_id."
+        ),
+    )
     parser.add_argument(
         "--print_per_request",
         action="store_true",
@@ -144,6 +154,34 @@ def parse_adapter_pool(single_adapter_id: str, adapter_ids: Optional[List[str]])
         seen.add(adapter_id)
         deduped.append(adapter_id)
     return deduped
+
+
+def load_explicit_adapter_trace(trace_path: str, limit: Optional[int] = None) -> List[Optional[str]]:
+    """Load adapter IDs from a JSONL trace ordered by arrival_idx, then req_idx."""
+    rows = []
+    with open(trace_path, "r", encoding="utf-8") as trace_file:
+        for line_num, line in enumerate(trace_file, start=1):
+            line = line.strip()
+            if not line:
+                continue
+
+            payload = json.loads(line)
+            if not isinstance(payload, dict):
+                raise ValueError(f"adapter trace row {line_num} is not a JSON object")
+            if "adapter_id" not in payload:
+                raise ValueError(f"adapter trace row {line_num} is missing adapter_id")
+
+            arrival_idx = int(payload.get("arrival_idx", line_num - 1))
+            req_idx = int(payload.get("req_idx", line_num - 1))
+            adapter_token = payload.get("adapter_id")
+            adapter_id = None if adapter_token is None or _is_base_model_token(str(adapter_token)) else str(adapter_token)
+            rows.append((arrival_idx, req_idx, adapter_id))
+
+    rows.sort(key=lambda item: (item[0], item[1]))
+    adapter_ids = [adapter_id for _arrival_idx, _req_idx, adapter_id in rows]
+    if limit is not None:
+        return adapter_ids[:limit]
+    return adapter_ids
 
 
 def _sample_poisson_value(poisson_lambda: float, rng: random.Random) -> int:
@@ -670,12 +708,27 @@ def main():
     args = parse_args()
     effective_max_tokens = resolve_effective_max_tokens(args.max_tokens, args.decode_target_tokens)
     adapter_pool = parse_adapter_pool(args.adapter_id, args.adapter_ids)
-    batch_adapter_ids = build_poisson_adapter_ids(
-        num_requests=args.num_requests,
-        adapter_pool=adapter_pool,
-        poisson_lambda=args.poisson_lambda,
-        poisson_seed=args.poisson_seed,
-    )
+    explicit_adapter_trace: Optional[List[Optional[str]]] = None
+    effective_num_requests = args.num_requests
+    if args.adapter_trace_path:
+        explicit_adapter_trace = load_explicit_adapter_trace(args.adapter_trace_path)
+        if not explicit_adapter_trace:
+            raise ValueError(f"adapter trace is empty: {args.adapter_trace_path}")
+        if effective_num_requests == DEFAULT_NUM_REQUESTS:
+            effective_num_requests = len(explicit_adapter_trace)
+        if effective_num_requests > len(explicit_adapter_trace):
+            raise ValueError(
+                f"adapter trace has only {len(explicit_adapter_trace)} requests, "
+                f"but --num_requests={effective_num_requests}"
+            )
+        batch_adapter_ids = explicit_adapter_trace[:effective_num_requests]
+    else:
+        batch_adapter_ids = build_poisson_adapter_ids(
+            num_requests=effective_num_requests,
+            adapter_pool=adapter_pool,
+            poisson_lambda=args.poisson_lambda,
+            poisson_seed=args.poisson_seed,
+        )
     vision_adapter_id = batch_adapter_ids[0] if batch_adapter_ids else None
 
     print("=" * 60)
@@ -692,14 +745,17 @@ def main():
         "Adapter Pool: "
         + ", ".join(_format_adapter_id(adapter_id) for adapter_id in adapter_pool)
     )
-    print(f"Poisson lambda: {args.poisson_lambda}")
-    print(f"Poisson seed: {args.poisson_seed}")
+    if args.adapter_trace_path:
+        print(f"Adapter trace: {args.adapter_trace_path}")
+    else:
+        print(f"Poisson lambda: {args.poisson_lambda}")
+        print(f"Poisson seed: {args.poisson_seed}")
     adapter_counts = Counter(_format_adapter_id(adapter_id) for adapter_id in batch_adapter_ids)
     print(
         "Batch adapter distribution: "
         + ", ".join(f"{adapter}:{count}" for adapter, count in adapter_counts.items())
     )
-    print(f"Num requests (Target Batch Size): {args.num_requests}")
+    print(f"Num requests (Target Batch Size): {effective_num_requests}")
     print("=" * 60)
 
     client = MoELoRAPIClient(args.url, args.model)
@@ -721,8 +777,8 @@ def main():
     # Concurrent Batch generation with Cache Evasion
     # if args.num_requests > 1:
     # Prepend a unique ID to each prompt to bypass the RadixAttention prefix cache
-    prompts = [f"[Req-{i}] {args.prompt}" for i in range(args.num_requests)]
-    
+    prompts = [f"[Req-{i}] {args.prompt}" for i in range(effective_num_requests)]
+
     test_batch_generation(
         client,
         prompts,

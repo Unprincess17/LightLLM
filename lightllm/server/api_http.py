@@ -59,6 +59,7 @@ from .api_models import (
     CompletionResponse,
 )
 from .build_prompt import build_prompt, init_tokenizer
+from .health_utils import build_lightweight_health_status
 
 logger = init_logger(__name__)
 
@@ -123,7 +124,8 @@ def liveness():
 @app.get("/readiness")
 @app.post("/readiness")
 def readiness():
-    return {"status": "ok"}
+    status_code, payload = build_lightweight_health_status(g_objs.args, g_objs.httpserver_manager)
+    return JSONResponse(payload, status_code=status_code)
 
 
 @app.get("/get_model_name")
@@ -133,21 +135,32 @@ def get_model_name():
 
 
 @app.get("/healthz", summary="Check server health")
-@app.get("/health", summary="Check server health")
-@app.head("/health", summary="Check server health")
-async def healthcheck(request: Request):
-    if g_objs.args.run_mode == "pd_master":
-        return JSONResponse({"message": "Ok"}, status_code=200)
+@app.post("/healthz", summary="Check server health")
+@app.head("/healthz", summary="Check server health")
+async def lightweight_healthcheck(request: Request):
+    status_code, payload = build_lightweight_health_status(g_objs.args, g_objs.httpserver_manager)
+    return JSONResponse(payload, status_code=status_code)
 
-    if os.environ.get("DEBUG_HEALTHCHECK_RETURN_FAIL") == "true":
-        return JSONResponse({"message": "Error"}, status_code=503)
+
+@app.get("/health", summary="Check server health")
+@app.post("/health", summary="Check server health")
+@app.head("/health", summary="Check server health")
+async def deep_healthcheck(request: Request):
+    status_code, payload = build_lightweight_health_status(g_objs.args, g_objs.httpserver_manager)
+    if status_code != 200:
+        payload["check"] = "deep"
+        return JSONResponse(payload, status_code=status_code)
+    if g_objs.args.run_mode == "pd_master":
+        return JSONResponse({"message": "Ok", "check": "deep"}, status_code=200)
+
     from lightllm.utils.health_check import health_check, health_obj
 
     health_task = asyncio.create_task(health_check(g_objs.args, g_objs.httpserver_manager, None))
     if not health_obj.is_health():
         await health_task
     return JSONResponse(
-        {"message": "Ok" if health_obj.is_health() else "Error"}, status_code=200 if health_obj.is_health() else 503
+        {"message": "Ok" if health_obj.is_health() else "Error", "check": "deep"},
+        status_code=200 if health_obj.is_health() else 503,
     )
 
 

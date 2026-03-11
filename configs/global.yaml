@@ -1,0 +1,47 @@
+artifacts:
+  root_dir: artifacts
+
+paths:
+  sharegpt_v3: /home/shufan/ShareGPT_V3_unfiltered_cleaned_split.json
+  azure_trace: /home/shufan/maf2/AzureFunctionsInvocationTraceForTwoWeeksJan2021.txt
+  model_dir: /home/shufan/.cache/huggingface/hub/models--Qwen--Qwen3-VL-30B-A3B-Instruct/snapshots/9c4b90e1e4ba969fd3b5378b57d966d725f1b86c
+  router_server_launcher: test/lora/start_server.sh
+  dummy_lora_dirs:
+    - /home/shufan/Qwen-VL-FT/work/lora_dummy_0
+    - /home/shufan/Qwen-VL-FT/work/lora_dummy_1
+    - /home/shufan/Qwen-VL-FT/work/lora_dummy_2
+    - /home/shufan/Qwen-VL-FT/work/lora_dummy_3
+    - /home/shufan/Qwen-VL-FT/work/lora_dummy_4
+    - /home/shufan/Qwen-VL-FT/work/lora_dummy_5
+    - /home/shufan/Qwen-VL-FT/work/lora_dummy_6
+    - /home/shufan/Qwen-VL-FT/work/lora_dummy_7
+    - /home/shufan/Qwen-VL-FT/work/lora_dummy_8
+    - /home/shufan/Qwen-VL-FT/work/lora_dummy_9
+
+case_study:
+  default_run_id: router_lora_case_v1
+  model_name: Qwen3-VL-30B-A3B-Instruct
+  primary_adapter_cardinality: 32
+  adapter_cardinalities:
+    - 8
+    - 32
+    - 128
+  prompt_corpus:
+    max_requests: 512
+    max_history_turns: 6
+    min_prompt_tokens: 32
+    max_prompt_tokens: 4096
+    min_decode_tokens: 16
+    max_decode_tokens: 256
+    prompt_hist_bucket_size: 128
+  azure_trace:
+    session_gap_ms: 300000
+    top_tenants_to_report: 50
+  router_trace:
+    host: http://127.0.0.1:8040
+    port: 8040
+    health_path: /healthz
+    request_timeout_s: 180
+    startup_timeout_s: 900
+    router_trace_phases: prefill,decode
+    tp: 2
