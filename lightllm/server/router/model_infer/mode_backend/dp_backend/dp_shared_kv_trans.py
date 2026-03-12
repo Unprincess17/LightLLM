@@ -130,6 +130,12 @@ class DPKVSharedMoudle:
             if self.backend.is_master_in_dp:
                 trans_task.req.shm_req.shm_cur_kv_len = trans_task.req.cur_kv_len
 
+    def cleanup_shared_memory(self):
+        if self.shared_req_infos is not None:
+            self.shared_req_infos.destroy()
+            self.shared_req_infos = None
+        return
+
 
 @dataclasses.dataclass
 class TransTask:

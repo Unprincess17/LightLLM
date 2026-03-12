@@ -1,9 +1,8 @@
 import ctypes
 import numpy as np
-from multiprocessing import shared_memory
 from typing import List, Optional
 from lightllm.utils.log_utils import init_logger
-from lightllm.utils.auto_shm_cleanup import register_posix_shm_for_cleanup
+from lightllm.utils.shm_utils import create_or_link_shm, destroy_shared_memory
 
 logger = init_logger(__name__)
 
@@ -13,15 +12,7 @@ class IntList(object):
         self.capacity: int = capacity
         byte_size = np.dtype(np.int32).itemsize * (self.capacity + 1)
         shm_name = name
-        shm = _create_shm(name=shm_name, byte_size=byte_size)
-        self.shm = shm
-
-        if self.shm.size != byte_size:
-            logger.info(f"size not same, unlink lock shm {self.shm.name} and create again")
-            self.shm.close()
-            self.shm.unlink()
-            self.shm = None
-            self.shm = _create_shm(name=shm_name, byte_size=byte_size)
+        self.shm = _create_shm(name=shm_name, byte_size=byte_size)
 
         self.arr = np.ndarray((self.capacity + 1), dtype=np.int32, buffer=self.shm.buf)
         if init_shm_data:
@@ -52,6 +43,17 @@ class IntList(object):
         self.arr[-1] = 0
         return ans
 
+    def detach(self):
+        if self.shm is not None:
+            self.arr = None
+            destroy_shared_memory(self.shm)
+            self.shm = None
+        return
+
+    def destroy(self):
+        self.detach()
+        return
+
 
 class ShmLinkedList(object):
     def __init__(self, name: str, item_class: "_LinkedListItem.__class__", capacity: int, init_shm_data: bool):
@@ -59,15 +61,7 @@ class ShmLinkedList(object):
         # add head and tail node.
         byte_size = ctypes.sizeof(item_class) * (self.capacity + 2)
         shm_name = name
-        shm = _create_shm(name=shm_name, byte_size=byte_size)
-        self.shm = shm
-
-        if self.shm.size != byte_size:
-            logger.info(f"size not same, unlink lock shm {self.shm.name} and create again")
-            self.shm.close()
-            self.shm.unlink()
-            self.shm = None
-            self.shm = _create_shm(name=shm_name, byte_size=byte_size)
+        self.shm = _create_shm(name=shm_name, byte_size=byte_size)
         # 构建 hash table 表
         self.linked_items: List[_LinkedListItem] = (item_class * (self.capacity + 2)).from_buffer(self.shm.buf)
         # 如果不转变存储，set_list_obj 的对象上绑定的非shm信息在下一次从 shm 中获取对象时将丢失
@@ -121,6 +115,22 @@ class ShmLinkedList(object):
             return None
         head_item.del_self_from_list()
         return head_item
+
+    def detach(self):
+        if hasattr(self, "head"):
+            self.head = None
+        if hasattr(self, "tail"):
+            self.tail = None
+        if hasattr(self, "linked_items"):
+            self.linked_items = None
+        if self.shm is not None:
+            destroy_shared_memory(self.shm)
+            self.shm = None
+        return
+
+    def destroy(self):
+        self.detach()
+        return
 
 
 class ShmDict(object):
@@ -221,6 +231,16 @@ class ShmDict(object):
             logger.warning(f"shm dict not contain key {key}")
         return
 
+    def detach(self):
+        if hasattr(self, "link_items") and self.link_items is not None:
+            self.link_items.detach()
+            self.link_items = None
+        return
+
+    def destroy(self):
+        self.detach()
+        return
+
 
 class _LinkedListItem(ctypes.Structure):
     _pack_ = 4
@@ -291,12 +311,6 @@ class _HashLinkItem(_LinkedListItem):
 
 
 def _create_shm(name: str, byte_size: int, auto_cleanup: bool = False):
-    try:
-        shm = shared_memory.SharedMemory(name=name, create=True, size=byte_size)
-        if auto_cleanup:
-            register_posix_shm_for_cleanup(name)
-        logger.info(f"create lock shm {name}")
-    except:
-        shm = shared_memory.SharedMemory(name=name, create=False, size=byte_size)
-        logger.info(f"link lock shm {name}")
+    shm = create_or_link_shm(name=name, expected_size=byte_size, auto_cleanup=auto_cleanup)
+    logger.info(f"{'create' if getattr(shm, '_lightllm_owner', False) else 'link'} lock shm {name}")
     return shm

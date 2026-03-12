@@ -34,6 +34,18 @@ class RpcShmParams:
         func_name, args = pickle.loads(self.shm.buf[4 : 4 + bytes_len])
         return func_name, args
 
+    def detach(self):
+        if self.shm is not None:
+            from lightllm.utils.shm_utils import destroy_shared_memory
+
+            destroy_shared_memory(self.shm)
+            self.shm = None
+        return
+
+    def destroy(self):
+        self.detach()
+        return
+
 
 class RpcShmResults:
     def __init__(self):
@@ -53,6 +65,18 @@ class RpcShmResults:
         bytes_len = self.shm.buf.cast("i")[0]
         func_name, ret = pickle.loads(self.shm.buf[4 : 4 + bytes_len])
         return func_name, ret
+
+    def detach(self):
+        if self.shm is not None:
+            from lightllm.utils.shm_utils import destroy_shared_memory
+
+            destroy_shared_memory(self.shm)
+            self.shm = None
+        return
+
+    def destroy(self):
+        self.detach()
+        return
 
 
 class ShmSyncStatusArray:
@@ -88,3 +112,18 @@ class ShmSyncStatusArray:
 
     def run_finished1(self):
         return len(np.unique(self.arr1)) == 1
+
+    def detach(self):
+        if self.shm is not None:
+            from lightllm.utils.shm_utils import destroy_shared_memory
+
+            self.arr1 = None
+            self.arr0 = None
+            self.arr = None
+            destroy_shared_memory(self.shm)
+            self.shm = None
+        return
+
+    def destroy(self):
+        self.detach()
+        return

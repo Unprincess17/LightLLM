@@ -11,6 +11,7 @@ from .embed_cache.manager import start_cache_manager
 from lightllm.utils.log_utils import init_logger
 from lightllm.utils.envs_utils import set_env_start_args, set_unique_server_name, get_unique_server_name
 from lightllm.utils.envs_utils import get_lightllm_gunicorn_time_out_seconds, get_lightllm_gunicorn_keep_alive
+from lightllm.utils.shm_registry import cleanup_stale_registered_shm
 from .detokenization.manager import start_detokenization_process
 from .router.manager import start_router_process
 from lightllm.utils.process_check import is_process_active
@@ -66,6 +67,7 @@ def normal_or_p_d_start(args):
     args: StartArgs = args
 
     set_unique_server_name(args)
+    cleanup_stale_registered_shm()
 
     if not args.disable_shm_warning:
         check_recommended_shm_size(args)
@@ -383,6 +385,7 @@ def normal_or_p_d_start(args):
 
 def pd_master_start(args):
     set_unique_server_name(args)
+    cleanup_stale_registered_shm()
     if args.run_mode != "pd_master":
         return
 

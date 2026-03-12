@@ -4,7 +4,7 @@ from lightllm.server.core.objs.atomic_lock import AtomicShmLock
 from lightllm.utils.envs_utils import get_env_start_args
 from lightllm.utils.envs_utils import get_unique_server_name
 from lightllm.utils.log_utils import init_logger
-from lightllm.utils.shm_utils import create_or_link_shm
+from lightllm.utils.shm_utils import create_or_link_shm, destroy_shared_memory
 
 LIGHTLLM_REQS_BUFFER_BYTE_SIZE = int(os.getenv("LIGHTLLM_REQS_BUFFER_BYTE_SIZE", 64 * 1024 * 1024))  # 默认64M buf
 
@@ -56,4 +56,18 @@ class ShmObjsIOBuffer:
         self.int_view = self.shm.buf.cast("i")
         # 前4个字节是特殊的计数用途，router写入后，被各个推理进程在拿去所有数据后，减1后归0
         self.int_view[0] = 0
+        return
+
+    def detach(self):
+        if self.lock is not None:
+            self.lock.detach()
+            self.lock = None
+        if self.shm is not None:
+            self.int_view = None
+            destroy_shared_memory(self.shm)
+            self.shm = None
+        return
+
+    def destroy(self):
+        self.detach()
         return

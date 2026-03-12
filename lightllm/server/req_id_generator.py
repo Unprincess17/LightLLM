@@ -30,6 +30,7 @@ class ReqIDGenerator:
         self.current_id.arr[0] = 0
         self.current_id.arr[1] = 0
         self.lock = AtomicShmLock(f"{get_unique_server_name()}_req_id_gen_lock")
+        self._sync_shm = None
         self._wait_all_workers_ready()
         logger.info("ReqIDGenerator init finished")
 
@@ -37,10 +38,10 @@ class ReqIDGenerator:
         from lightllm.utils.envs_utils import get_unique_server_name
         from lightllm.server.core.objs.shm_array import ShmArray
 
-        _sync_shm = ShmArray(
+        self._sync_shm = ShmArray(
             f"{get_unique_server_name()}_httpworker_start_sync", (self.args.httpserver_workers,), dtype=np.int64
         )
-        _sync_shm.create_shm()
+        self._sync_shm.create_shm()
         # 等待所有 httpserver 的 worker 启动完成，防止重新初始化对应的请求id 对应的shm
         try_count = 0
         while len(_find_sibling_processes()) + 1 != self.args.httpserver_workers:
@@ -58,9 +59,9 @@ class ReqIDGenerator:
         assert len(pids) == self.args.httpserver_workers
         pids = sorted(pids)
         index = pids.index(cur_p_id)
-        _sync_shm.arr[index] = cur_p_id
+        self._sync_shm.arr[index] = cur_p_id
         try_count = 0
-        while not all(a == b for a, b in zip(pids, _sync_shm.arr)):
+        while not all(a == b for a, b in zip(pids, self._sync_shm.arr)):
             time.sleep(0.1)
             try_count += 1
             if try_count > 120:
@@ -103,6 +104,18 @@ class ReqIDGenerator:
             id = self.current_id.arr[0]
             self.current_id.arr[0] += MAX_BEST_OF
         return id
+
+    def cleanup_shared_memory(self):
+        if hasattr(self, "_sync_shm") and self._sync_shm is not None:
+            self._sync_shm.destroy()
+            self._sync_shm = None
+        if hasattr(self, "lock") and self.lock is not None:
+            self.lock.destroy()
+            self.lock = None
+        if hasattr(self, "current_id") and self.current_id is not None:
+            self.current_id.destroy()
+            self.current_id = None
+        return
 
 
 def convert_sub_id_to_group_id(sub_req_id):

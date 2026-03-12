@@ -15,6 +15,7 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 from lightllm.server.multimodal_params import MultimodalParams, ImageItem
 from .model_infer.model_rpc import start_model_process, VisualModelRpcClient
 from lightllm.utils.log_utils import init_logger
+from lightllm.utils.auto_shm_cleanup import register_cleanup_callback
 from lightllm.utils.graceful_utils import graceful_registry
 from lightllm.utils.process_check import start_parent_check_thread
 from lightllm.utils.envs_utils import get_unique_server_name
@@ -59,6 +60,7 @@ class VisualManager:
         self.visual_model_rpc_ports = visual_model_rpc_ports
         self.send_batch_size = args.visual_send_batch_size
         self.shm_req_manager = ShmReqManager()
+        register_cleanup_callback(self.cleanup_shared_memory)
 
     async def wait_to_model_ready(self):
 
@@ -201,6 +203,12 @@ class VisualManager:
             model_rpc.rpc_server_process.kill()
         for model_rpc in self.model_rpcs:
             model_rpc.rpc_server_process.join()
+        return
+
+    def cleanup_shared_memory(self):
+        if hasattr(self, "shm_req_manager") and self.shm_req_manager is not None:
+            self.shm_req_manager.destroy()
+            self.shm_req_manager = None
         return
 
 

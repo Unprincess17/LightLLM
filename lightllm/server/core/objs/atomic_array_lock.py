@@ -2,7 +2,7 @@ import asyncio
 import atomics
 from multiprocessing import shared_memory
 from lightllm.utils.log_utils import init_logger
-from lightllm.utils.shm_utils import create_or_link_shm
+from lightllm.utils.shm_utils import create_or_link_shm, destroy_shared_memory
 
 logger = init_logger(__name__)
 
@@ -22,28 +22,40 @@ class AtomicShmArrayLock:
         assert lock_index < self.lock_num
         return AtomicLockItem(self, lock_index)
 
+    def detach(self):
+        if self.shm is not None:
+            destroy_shared_memory(self.shm)
+            self.shm = None
+        return
+
+    def destroy(self):
+        self.detach()
+        return
+
 
 class AtomicLockItem:
     def __init__(self, context: AtomicShmArrayLock, index: int):
         self.context = context
         self.index = index
-        self._buf = context.shm.buf[index * 4 : (index + 1) * 4]
+
+    def _get_buf(self):
+        return self.context.shm.buf[self.index * 4 : (self.index + 1) * 4]
 
     def try_acquire(self) -> bool:
-        with atomics.atomicview(self._buf, atype=atomics.INT) as a:
+        with atomics.atomicview(self._get_buf(), atype=atomics.INT) as a:
             return a.cmpxchg_weak(0, 1)
 
     def release(self):
-        with atomics.atomicview(self._buf, atype=atomics.INT) as a:
+        with atomics.atomicview(self._get_buf(), atype=atomics.INT) as a:
             a.store(0)
 
     def __enter__(self):
-        with atomics.atomicview(buffer=self._buf, atype=atomics.INT) as a:
+        with atomics.atomicview(buffer=self._get_buf(), atype=atomics.INT) as a:
             while not a.cmpxchg_weak(0, 1):
                 pass
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        with atomics.atomicview(buffer=self._buf, atype=atomics.INT) as a:
+        with atomics.atomicview(buffer=self._get_buf(), atype=atomics.INT) as a:
             while not a.cmpxchg_weak(1, 0):
                 pass
         return False

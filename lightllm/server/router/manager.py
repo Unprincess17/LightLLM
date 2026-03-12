@@ -31,6 +31,7 @@ from lightllm.server.router.token_load import TokenLoad
 from lightllm.server.metrics.manager import MetricClient
 from lightllm.common.basemodel.infer_lock import g_router_lock
 from lightllm.common.kv_cache_mem_manager import ReadOnlyStaticsMemoryManager
+from lightllm.utils.auto_shm_cleanup import register_cleanup_callback
 from lightllm.utils.graceful_utils import graceful_registry
 from lightllm.utils.process_check import start_parent_check_thread
 from lightllm.utils.envs_utils import get_unique_server_name
@@ -132,6 +133,31 @@ class RouterManager:
                 adapter_name = os.path.basename(os.path.normpath(abs_dir))
                 lora_manager.register_lora_dir(abs_dir, adapter_name)
                 logger.info(f"[LoRA] Startup registered adapter: {adapter_name} -> {abs_dir}")
+        register_cleanup_callback(self.cleanup_shared_memory)
+        return
+
+    def cleanup_shared_memory(self):
+        if hasattr(self, "cpu_cache_client") and self.cpu_cache_client is not None:
+            self.cpu_cache_client.cleanup_shared_memory()
+            self.cpu_cache_client = None
+        if hasattr(self, "read_only_statics_mem_manager") and self.read_only_statics_mem_manager is not None:
+            self.read_only_statics_mem_manager.cleanup_shared_memory()
+            self.read_only_statics_mem_manager = None
+        if hasattr(self, "shm_reqs_io_buffer") and self.shm_reqs_io_buffer is not None:
+            self.shm_reqs_io_buffer.destroy()
+            self.shm_reqs_io_buffer = None
+        if hasattr(self, "shared_token_load") and self.shared_token_load is not None:
+            self.shared_token_load.cleanup_shared_memory()
+            self.shared_token_load = None
+        if hasattr(self, "radix_cache_client") and self.radix_cache_client is not None:
+            self.radix_cache_client.cleanup_shared_memory()
+            self.radix_cache_client = None
+        if hasattr(self, "model_rpc_client") and self.model_rpc_client is not None:
+            self.model_rpc_client.cleanup_shared_memory()
+            self.model_rpc_client = None
+        if hasattr(self, "shm_req_manager") and self.shm_req_manager is not None:
+            self.shm_req_manager.destroy()
+            self.shm_req_manager = None
         return
 
     async def wait_to_model_ready(self):

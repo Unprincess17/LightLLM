@@ -63,6 +63,12 @@ class InferStateLock:
     def get_group_wait_mark(self):
         return self.lock_tp_infos.arr[-1]
 
+    def cleanup_shared_memory(self):
+        if self.lock_tp_infos is not None:
+            self.lock_tp_infos.destroy()
+            self.lock_tp_infos = None
+        return
+
 
 @dataclass
 class G_Infer_Lock:

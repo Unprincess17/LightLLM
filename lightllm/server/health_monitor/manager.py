@@ -44,12 +44,26 @@ def health_monitor(url, all_process_ids):
 
         # 先kill父进程的子进程
         for pid in all_process_ids[1:]:
-            os.kill(pid, signal.SIGKILL)
-            logger.debug(f"Killing process with PID: {pid}")
+            os.kill(pid, signal.SIGTERM)
+            logger.debug(f"Sending SIGTERM to process with PID: {pid}")
+
+        time.sleep(2)
+        for pid in all_process_ids[1:]:
+            try:
+                os.kill(pid, signal.SIGKILL)
+                logger.debug(f"Killing process with PID: {pid}")
+            except ProcessLookupError:
+                pass
 
         # 杀父进程
-        os.kill(all_process_ids[0], signal.SIGKILL)
-        logger.debug(f"Killing process with PID: {all_process_ids[0]}")
+        os.kill(all_process_ids[0], signal.SIGTERM)
+        logger.debug(f"Sending SIGTERM to process with PID: {all_process_ids[0]}")
+        time.sleep(1)
+        try:
+            os.kill(all_process_ids[0], signal.SIGKILL)
+            logger.debug(f"Killing process with PID: {all_process_ids[0]}")
+        except ProcessLookupError:
+            pass
 
         # 自 kill
         sys.exit(-1)

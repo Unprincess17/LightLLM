@@ -30,6 +30,7 @@ from lightllm.server.router.model_infer.mode_backend.redundancy_expert_manager i
 from lightllm.server.core.objs import RpcShmParams, RpcShmResults, ShmSyncStatusArray
 from lightllm.server.core.objs.start_args_type import StartArgs
 from lightllm.utils.log_utils import init_logger
+from lightllm.utils.auto_shm_cleanup import register_cleanup_callback
 from lightllm.utils.graceful_utils import graceful_registry
 from lightllm.utils.process_check import start_parent_check_thread
 from lightllm.utils.envs_utils import get_unique_server_name
@@ -65,6 +66,7 @@ class ModelRpcServer:
         self.rank = rank
         self.rank_in_node = rank_in_node
         logger.info(f"Initialized RPC server for rank {self.rank}.")
+        register_cleanup_callback(self.cleanup_shared_memory)
 
         self.rpc_loop_thread = threading.Thread(target=self.rpc_loop, daemon=True)
         self.rpc_loop_thread.start()
@@ -101,6 +103,7 @@ class ModelRpcServer:
 
             if error_count >= 1:
                 logger.error("infer process error to exit")
+                self.cleanup_shared_memory()
                 os._exit(-1)
 
         return
@@ -179,6 +182,53 @@ class ModelRpcServer:
     def get_max_total_token_num(self):
         return self.backend.get_max_total_token_num()
 
+    def cleanup_shared_memory(self):
+        if hasattr(self, "backend") and self.backend is not None:
+            backend_model = getattr(self.backend, "model", None)
+            if backend_model is not None and getattr(backend_model, "mem_manager", None) is not None:
+                backend_model.mem_manager.cleanup_shared_memory()
+            if getattr(self.backend, "multi_level_cache_module", None) is not None:
+                self.backend.multi_level_cache_module.cpu_cache_client.cleanup_shared_memory()
+                self.backend.multi_level_cache_module = None
+            if getattr(self.backend, "shm_req_manager", None) is not None:
+                self.backend.shm_req_manager.destroy()
+                self.backend.shm_req_manager = None
+            if getattr(self.backend, "shm_nixl_trans_io_buffer", None) is not None:
+                self.backend.shm_nixl_trans_io_buffer.destroy()
+                self.backend.shm_nixl_trans_io_buffer = None
+            if getattr(self.backend, "shm_reqs_io_buffer", None) is not None:
+                self.backend.shm_reqs_io_buffer.destroy()
+                self.backend.shm_reqs_io_buffer = None
+            if getattr(self.backend, "radix_cache", None) is not None:
+                self.backend.radix_cache.cleanup_shared_memory()
+                self.backend.radix_cache = None
+            if getattr(self.backend, "dp_kv_shared_module", None) is not None:
+                self.backend.dp_kv_shared_module.cleanup_shared_memory()
+                self.backend.dp_kv_shared_module = None
+            try:
+                from lightllm.server.router.model_infer.infer_batch import g_infer_context
+                g_infer_context.cleanup_shared_memory()
+            except Exception:
+                pass
+            try:
+                from lightllm.common.basemodel.infer_lock import g_infer_state_lock
+
+                if getattr(g_infer_state_lock, "obj", None) is not None:
+                    g_infer_state_lock.obj.cleanup_shared_memory()
+                    g_infer_state_lock.obj = None
+            except Exception:
+                pass
+        if hasattr(self, "rpc_shm_sync_status") and self.rpc_shm_sync_status is not None:
+            self.rpc_shm_sync_status.destroy()
+            self.rpc_shm_sync_status = None
+        if hasattr(self, "rpc_shm_results") and self.rpc_shm_results is not None:
+            self.rpc_shm_results.destroy()
+            self.rpc_shm_results = None
+        if hasattr(self, "rpc_shm_params") and self.rpc_shm_params is not None:
+            self.rpc_shm_params.destroy()
+            self.rpc_shm_params = None
+        return
+
 
 class ModelRpcClient:
     def __init__(self, rpc_event, rpc_finished_event):
@@ -208,6 +258,15 @@ class ModelRpcClient:
         func_name, ret = self.rpc_shm_results.read_func_result()
         assert func_name == "get_max_total_token_num"
         return ret
+
+    def cleanup_shared_memory(self):
+        if hasattr(self, "rpc_shm_results") and self.rpc_shm_results is not None:
+            self.rpc_shm_results.destroy()
+            self.rpc_shm_results = None
+        if hasattr(self, "rpc_shm_params") and self.rpc_shm_params is not None:
+            self.rpc_shm_params.destroy()
+            self.rpc_shm_params = None
+        return
 
 
 def _init_env(

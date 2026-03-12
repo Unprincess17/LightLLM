@@ -8,8 +8,8 @@ from .shm_objs import ShmDict, ShmLinkedList, _LinkedListItem, IntList
 from lightllm.server.core.objs import AtomicShmLock
 from lightllm.utils.kv_cache_utils import (
     calcu_cpu_cache_meta,
-    create_shm_kv_cache_ptr,
-    attach_shm_kv_cache_ptr,
+    create_shm_kv_cache_handle,
+    attach_shm_kv_cache_handle,
     register_shm_ptr_to_pin,
 )
 
@@ -26,6 +26,8 @@ class CpuKvCacheClient(object):
         # to do here need calcu from from settings.
         self.kv_cache_tensor_meta = calcu_cpu_cache_meta()
         self.page_num: int = self.kv_cache_tensor_meta.page_num
+        self.shm_handle = None
+        self.cpu_kv_cache_numpy = None
         self.lock = AtomicShmLock(lock_name=f"{get_unique_server_name()}_cpu_kv_cache_client_lock")
         self._create_cpu_status_list(init_shm_data)
 
@@ -275,11 +277,14 @@ class CpuKvCacheClient(object):
         return
 
     def _create_shm_cpu_kv_cache(self):
-        shm_ptr = create_shm_kv_cache_ptr(
+        self.shm_handle = create_shm_kv_cache_handle(
             key=self.args.cpu_kv_cache_shm_id, size=self.kv_cache_tensor_meta.calcu_size()
         )
-        numpy_array = np.frombuffer(
-            memoryview((ctypes.c_uint8 * self.kv_cache_tensor_meta.calcu_size()).from_address(shm_ptr)), dtype=np.uint8
+        self.cpu_kv_cache_numpy = np.frombuffer(
+            memoryview(
+                (ctypes.c_uint8 * self.kv_cache_tensor_meta.calcu_size()).from_address(self.shm_handle.shm_addr)
+            ),
+            dtype=np.uint8,
         )
         # 将 NumPy 数组转换为 PyTorch 张量
         shape = (
@@ -290,17 +295,23 @@ class CpuKvCacheClient(object):
             self.kv_cache_tensor_meta.get_merged_head_dim(),
         )
         self.cpu_kv_cache_tensor = (
-            torch.from_numpy(numpy_array).view(dtype=self.kv_cache_tensor_meta.data_type).view(shape)
+            torch.from_numpy(self.cpu_kv_cache_numpy).view(dtype=self.kv_cache_tensor_meta.data_type).view(shape)
         )
         return
 
     def _attach_shm_cpu_kv_cache(self):
-        shm_ptr = attach_shm_kv_cache_ptr(
+        self.shm_handle = attach_shm_kv_cache_handle(
             key=self.args.cpu_kv_cache_shm_id, size=self.kv_cache_tensor_meta.calcu_size()
         )
-        handle = register_shm_ptr_to_pin(shm_ptr=shm_ptr, size=self.kv_cache_tensor_meta.calcu_size())
-        numpy_array = np.frombuffer(
-            memoryview((ctypes.c_uint8 * self.kv_cache_tensor_meta.calcu_size()).from_address(shm_ptr)), dtype=np.uint8
+        handle = register_shm_ptr_to_pin(
+            shm_ptr=self.shm_handle.shm_addr, size=self.kv_cache_tensor_meta.calcu_size()
+        )
+        self.shm_handle.bind_pin_handle(handle)
+        self.cpu_kv_cache_numpy = np.frombuffer(
+            memoryview(
+                (ctypes.c_uint8 * self.kv_cache_tensor_meta.calcu_size()).from_address(self.shm_handle.shm_addr)
+            ),
+            dtype=np.uint8,
         )
         shape = (
             self.kv_cache_tensor_meta.page_num,
@@ -310,14 +321,38 @@ class CpuKvCacheClient(object):
             self.kv_cache_tensor_meta.get_merged_head_dim(),
         )
         self.cpu_kv_cache_tensor = (
-            torch.from_numpy(numpy_array).view(dtype=self.kv_cache_tensor_meta.data_type).view(shape)
+            torch.from_numpy(self.cpu_kv_cache_numpy).view(dtype=self.kv_cache_tensor_meta.data_type).view(shape)
         )
-        assert shm_ptr == self.cpu_kv_cache_tensor.data_ptr()
+        assert self.shm_handle.shm_addr == self.cpu_kv_cache_tensor.data_ptr()
 
         # test code
         # self.cpu_kv_cache_tensor = torch.zeros_like(self.cpu_kv_cache_tensor, device="cpu", pin_memory=True)
         # self.cpu_kv_cache_tensor = torch.zeros_like(self.cpu_kv_cache_tensor, device="cuda")
         return handle
+
+    def cleanup_shared_memory(self):
+        if hasattr(self, "offload_page_indexes") and self.offload_page_indexes is not None:
+            self.offload_page_indexes.destroy()
+            self.offload_page_indexes = None
+        if hasattr(self, "page_hash_dict") and self.page_hash_dict is not None:
+            self.page_hash_dict.destroy()
+            self.page_hash_dict = None
+        if hasattr(self, "page_items") and self.page_items is not None:
+            self.page_items.destroy()
+            self.page_items = None
+        if hasattr(self, "lock") and self.lock is not None:
+            self.lock.destroy()
+            self.lock = None
+        if hasattr(self, "attach_shm_handle"):
+            self.attach_shm_handle = None
+        if hasattr(self, "cpu_kv_cache_tensor"):
+            self.cpu_kv_cache_tensor = None
+        if hasattr(self, "cpu_kv_cache_numpy"):
+            self.cpu_kv_cache_numpy = None
+        if self.shm_handle is not None:
+            self.shm_handle.destroy()
+            self.shm_handle = None
+        return
 
 
 class _CpuPageStatus(_LinkedListItem):

@@ -85,3 +85,12 @@ class TokenLoad:
             return True
         else:
             return False
+
+    def cleanup_shared_memory(self):
+        if hasattr(self, "shared_token_infos") and self.shared_token_infos is not None:
+            self.shared_token_infos.destroy()
+            self.shared_token_infos = None
+        if hasattr(self, "shared_token_load") and self.shared_token_load is not None:
+            self.shared_token_load.destroy()
+            self.shared_token_load = None
+        return

@@ -6,7 +6,11 @@ from typing import Optional, List
 from lightllm.utils.envs_utils import get_env_start_args
 from lightllm.utils.log_utils import init_logger
 from lightllm.utils.embed_utils import calcu_embed_cache_meta
-from lightllm.utils.kv_cache_utils import create_shm_kv_cache_ptr, attach_shm_kv_cache_ptr, register_shm_ptr_to_pin
+from lightllm.utils.kv_cache_utils import (
+    attach_shm_kv_cache_handle,
+    create_shm_kv_cache_handle,
+    register_shm_ptr_to_pin,
+)
 
 logger = init_logger(__name__)
 
@@ -21,6 +25,8 @@ class CpuEmbedCacheClient(object):
         # to do here need calcu from from settings.
         self.embed_cache_tensor_meta = calcu_embed_cache_meta()
         self.token_num: int = self.embed_cache_tensor_meta.token_num
+        self.shm_handle = None
+        self.cpu_embed_cache_numpy = None
 
         if create_meta_data:
             self.token_index_manager = MemoryManager(total_size=self.token_num)
@@ -48,13 +54,18 @@ class CpuEmbedCacheClient(object):
         )
 
     def _create_shm_embed_kv_cache(self):
-        shm_ptr = create_shm_kv_cache_ptr(
+        self.shm_handle = create_shm_kv_cache_handle(
             key=self.args.multi_modal_cache_shm_id, size=self.embed_cache_tensor_meta.calcu_size()
         )
-        handle = register_shm_ptr_to_pin(shm_ptr=shm_ptr, size=self.embed_cache_tensor_meta.calcu_size())
+        handle = register_shm_ptr_to_pin(
+            shm_ptr=self.shm_handle.shm_addr, size=self.embed_cache_tensor_meta.calcu_size()
+        )
+        self.shm_handle.bind_pin_handle(handle)
         handle.wait()
-        numpy_array = np.frombuffer(
-            memoryview((ctypes.c_uint8 * self.embed_cache_tensor_meta.calcu_size()).from_address(shm_ptr)),
+        self.cpu_embed_cache_numpy = np.frombuffer(
+            memoryview(
+                (ctypes.c_uint8 * self.embed_cache_tensor_meta.calcu_size()).from_address(self.shm_handle.shm_addr)
+            ),
             dtype=np.uint8,
         )
         # 将 NumPy 数组转换为 PyTorch 张量
@@ -64,18 +75,23 @@ class CpuEmbedCacheClient(object):
             self.embed_cache_tensor_meta.hidden_size,
         )
         self.cpu_embed_cache_tensor = (
-            torch.from_numpy(numpy_array).view(dtype=self.embed_cache_tensor_meta.data_type).view(shape)
+            torch.from_numpy(self.cpu_embed_cache_numpy).view(dtype=self.embed_cache_tensor_meta.data_type).view(shape)
         )
         return
 
     def _attach_shm_cpu_embed_cache(self):
-        shm_ptr = attach_shm_kv_cache_ptr(
+        self.shm_handle = attach_shm_kv_cache_handle(
             key=self.args.multi_modal_cache_shm_id, size=self.embed_cache_tensor_meta.calcu_size()
         )
-        handle = register_shm_ptr_to_pin(shm_ptr=shm_ptr, size=self.embed_cache_tensor_meta.calcu_size())
+        handle = register_shm_ptr_to_pin(
+            shm_ptr=self.shm_handle.shm_addr, size=self.embed_cache_tensor_meta.calcu_size()
+        )
+        self.shm_handle.bind_pin_handle(handle)
         handle.wait()
-        numpy_array = np.frombuffer(
-            memoryview((ctypes.c_uint8 * self.embed_cache_tensor_meta.calcu_size()).from_address(shm_ptr)),
+        self.cpu_embed_cache_numpy = np.frombuffer(
+            memoryview(
+                (ctypes.c_uint8 * self.embed_cache_tensor_meta.calcu_size()).from_address(self.shm_handle.shm_addr)
+            ),
             dtype=np.uint8,
         )
         shape = (
@@ -84,10 +100,20 @@ class CpuEmbedCacheClient(object):
             self.embed_cache_tensor_meta.hidden_size,
         )
         self.cpu_embed_cache_tensor = (
-            torch.from_numpy(numpy_array).view(dtype=self.embed_cache_tensor_meta.data_type).view(shape)
+            torch.from_numpy(self.cpu_embed_cache_numpy).view(dtype=self.embed_cache_tensor_meta.data_type).view(shape)
         )
-        assert shm_ptr == self.cpu_embed_cache_tensor.data_ptr()
+        assert self.shm_handle.shm_addr == self.cpu_embed_cache_tensor.data_ptr()
         return None
+
+    def cleanup_shared_memory(self):
+        if hasattr(self, "cpu_embed_cache_tensor"):
+            self.cpu_embed_cache_tensor = None
+        if hasattr(self, "cpu_embed_cache_numpy"):
+            self.cpu_embed_cache_numpy = None
+        if self.shm_handle is not None:
+            self.shm_handle.destroy()
+            self.shm_handle = None
+        return
 
 
 class MemoryBlock:

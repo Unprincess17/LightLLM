@@ -434,6 +434,12 @@ class MemoryManager:
             rank_in_dp=rank_in_dp,
         )
 
+    def cleanup_shared_memory(self):
+        if hasattr(self, "shared_can_use_token_num") and self.shared_can_use_token_num is not None:
+            self.shared_can_use_token_num.destroy()
+            self.shared_can_use_token_num = None
+        return
+
     def write_to_shm(self, req_manager):
         """
         将 mem manager 写入到 shm中，方便pd分离等特性直接从中读取，不依赖进程间队列。
@@ -467,6 +473,7 @@ class MemoryManager:
             for obj_bytes in obj_bytes_array:
                 shm.buf[start_index : start_index + obj_size] = obj_bytes
                 start_index += obj_size
+            shm.close()
 
     @staticmethod
     def loads_from_shm(rank_in_node: int) -> "MemoryManager":
@@ -507,3 +514,9 @@ class ReadOnlyStaticsMemoryManager:
         if self.is_multinode_tp:
             return self.shared_tp_infos[0].get_value()
         return self.shared_tp_infos[dp_rank_in_node].get_value()
+
+    def cleanup_shared_memory(self):
+        for shared_info in self.shared_tp_infos:
+            shared_info.destroy()
+        self.shared_tp_infos = []
+        return

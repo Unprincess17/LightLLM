@@ -6,6 +6,7 @@ import queue
 import torch.multiprocessing as mp
 from typing import List, Dict, Union, Callable, Optional
 from lightllm.utils.log_utils import init_logger
+from lightllm.utils.auto_shm_cleanup import register_cleanup_callback
 from lightllm.server.pd_io_struct import NIXLChunckedTransTaskRet
 from lightllm.server.core.objs import StartArgs
 from lightllm.server.core.objs.shm_objs_io_buffer import ShmObjsIOBuffer
@@ -48,9 +49,16 @@ class BaseKVMoveManager:
 
         # 通过 io buffer 将命令写入到推理进程中
         self.shm_nixl_trans_io_buffer = ShmObjsIOBuffer(tail_str="nixl")
+        register_cleanup_callback(self.cleanup_shared_memory)
 
         for func in [self.task_dispatcher_loop, self.task_ret_upload_loop, self.check_trans_process_loop]:
             threading.Thread(target=func, daemon=True).start()
+        return
+
+    def cleanup_shared_memory(self):
+        if hasattr(self, "shm_nixl_trans_io_buffer") and self.shm_nixl_trans_io_buffer is not None:
+            self.shm_nixl_trans_io_buffer.destroy()
+            self.shm_nixl_trans_io_buffer = None
         return
 
     # ==================================================================================

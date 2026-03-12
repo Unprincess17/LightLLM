@@ -147,6 +147,7 @@ class Req(ctypes.Structure):
         self.index_in_shm_mem: int = self.index_in_shm_mem
         self.ref_count: int = self.ref_count
         self.recv_time: float = time.time()
+        self.destroy_owned_prompt_logprob_shm()
 
         self.request_id = request_id
         self.group_req_id = convert_sub_id_to_group_id(request_id)
@@ -164,6 +165,7 @@ class Req(ctypes.Structure):
         self.can_released_mark = False
         self.reward_score = math.nan
         self.cumlogprob = 0.0
+        self._cache_prompt_metadata = None
         if isinstance(sample_param, SamplingParams):
             self.sample_params = sample_param
         else:
@@ -191,6 +193,29 @@ class Req(ctypes.Structure):
 
         # Initialize LoRA adapter ID (0 means no adapter)
         self.adapter_id = adapter_id
+        return
+
+    def _cleanup_prompt_logprob_shm(self, destroy: bool):
+        for attr_name in ("shm_prompt_ids", "shm_logprobs"):
+            shm_array = getattr(self, attr_name, None)
+            if shm_array is None:
+                continue
+            try:
+                if destroy:
+                    shm_array.destroy()
+                else:
+                    shm_array.detach()
+            finally:
+                setattr(self, attr_name, None)
+        self._cache_prompt_metadata = None
+        return
+
+    def detach_local_prompt_logprob_shm(self):
+        self._cleanup_prompt_logprob_shm(destroy=False)
+        return
+
+    def destroy_owned_prompt_logprob_shm(self):
+        self._cleanup_prompt_logprob_shm(destroy=True)
         return
 
     def post_init(self):

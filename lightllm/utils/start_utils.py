@@ -43,18 +43,6 @@ class SubmoduleManager:
     def terminate_all_processes(self):
         from lightllm.utils.envs_utils import get_env_start_args
 
-        def kill_recursive(proc):
-            try:
-                parent = psutil.Process(proc.pid)
-                children = parent.children(recursive=True)
-                for child in children:
-                    logger.info(f"Killing child process {child.pid}")
-                    child.kill()
-                logger.info(f"Killing parent process {proc.pid}")
-                parent.kill()
-            except psutil.NoSuchProcess:
-                logger.warning(f"Process {proc.pid} does not exist.")
-
         for proc in self.processes:
             if proc.is_alive():
                 kill_recursive(proc)
@@ -101,12 +89,19 @@ def start_submodule_processes(start_funcs=[], start_args=[]):
 def kill_recursive(proc):
     try:
         parent = psutil.Process(proc.pid)
-        children = parent.children(recursive=True)
-        for child in children:
-            logger.info(f"Killing child process {child.pid}")
-            child.kill()
-        logger.info(f"Killing parent process {proc.pid}")
-        parent.kill()
+        all_processes = parent.children(recursive=True)
+        all_processes.append(parent)
+
+        for process in all_processes:
+            logger.info(f"Sending SIGTERM to process {process.pid}")
+            process.terminate()
+
+        gone, alive = psutil.wait_procs(all_processes, timeout=10)
+        for process in alive:
+            logger.warning(f"Escalating to SIGKILL for process {process.pid}")
+            process.kill()
+
+        psutil.wait_procs(alive, timeout=5)
     except psutil.NoSuchProcess:
         logger.warning(f"Process {proc.pid} does not exist.")
 

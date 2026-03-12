@@ -16,6 +16,7 @@ from ..tokenizer import get_tokenizer
 import pickle
 import time
 from lightllm.utils.log_utils import init_logger
+from lightllm.utils.auto_shm_cleanup import register_cleanup_callback
 from lightllm.utils.envs_utils import get_unique_server_name
 
 logger = init_logger(__name__)
@@ -41,6 +42,7 @@ class DeTokenizationManager:
         self._init_get_token_id_to_token_str()
         self.is_pd_decode_mode = self.args.run_mode == "decode"
         self.shm_req_manager = ShmReqManager()
+        register_cleanup_callback(self.cleanup_shared_memory)
 
     def _init_get_token_id_to_token_str(self):
         self.token_id_to_token = {token_id: token for token, token_id in self.tokenizer.get_vocab().items()}
@@ -161,8 +163,15 @@ class DeTokenizationManager:
         for decode_req in finished_reqs:
             decode_req.req.can_released_mark = True
             # logger.info(f"detoken release req id {decode_req.req.request_id}")
+            decode_req.req.detach_local_prompt_logprob_shm()
             self.shm_req_manager.put_back_req_obj(decode_req.req)
             self.req_id_to_out.pop(decode_req.request_id, None)
+        return
+
+    def cleanup_shared_memory(self):
+        if hasattr(self, "shm_req_manager") and self.shm_req_manager is not None:
+            self.shm_req_manager.destroy()
+            self.shm_req_manager = None
         return
 
 

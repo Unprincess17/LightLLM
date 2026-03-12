@@ -1,7 +1,6 @@
 import ctypes
 import numpy as np
 from lightllm.utils.envs_utils import get_unique_server_name
-from multiprocessing import shared_memory
 from lightllm.utils.log_utils import init_logger
 from .req import Req, ChunkedPrefillReq, TokenHealingReq
 from .shm_array import ShmArray
@@ -9,8 +8,9 @@ from .atomic_array_lock import AtomicShmArrayLock, AtomicLockItem
 from .atomic_lock import AtomicShmLock
 from .start_args_type import StartArgs
 from typing import List
+from lightllm.utils.auto_shm_cleanup import register_cleanup_callback
 from lightllm.utils.envs_utils import get_env_start_args
-from lightllm.utils.shm_utils import create_or_link_shm
+from lightllm.utils.shm_utils import create_or_link_shm, destroy_shared_memory
 
 logger = init_logger(__name__)
 
@@ -27,6 +27,7 @@ class ShmReqManager:
         self.init_to_req_locks()
         self.init_manager_lock()
         self.init_alloc_state_shm()
+        register_cleanup_callback(self.cleanup_shared_memory)
         return
 
     def get_req_class_type(self):
@@ -42,13 +43,6 @@ class ShmReqManager:
 
     def init_reqs_shm(self):
         self._init_reqs_shm()
-
-        if self.reqs_shm.size != self.req_shm_byte_size:
-            logger.info(f"size not same, unlink lock shm {self.reqs_shm.name} and create again")
-            self.reqs_shm.close()
-            self.reqs_shm.unlink()
-            self.reqs_shm = None
-            self._init_reqs_shm()
 
     def _init_reqs_shm(self):
         shm_name = f"{get_unique_server_name()}_req_shm_total"
@@ -139,8 +133,36 @@ class ShmReqManager:
     async def async_put_back_req_obj(self, req: Req):
         return self.put_back_req_obj(req)
 
+    def cleanup_shared_memory(self):
+        if hasattr(self, "reqs") and self.reqs is not None:
+            for req in self.reqs:
+                req.destroy_owned_prompt_logprob_shm()
+            self.reqs = None
+        if hasattr(self, "alloc_state_shm") and self.alloc_state_shm is not None:
+            self.alloc_state_shm.destroy()
+            self.alloc_state_shm = None
+        if hasattr(self, "linked_req_manager") and self.linked_req_manager is not None:
+            self.linked_req_manager.destroy()
+            self.linked_req_manager = None
+        if hasattr(self, "manager_lock") and self.manager_lock is not None:
+            self.manager_lock.destroy()
+            self.manager_lock = None
+        if hasattr(self, "reqs_lock") and self.reqs_lock is not None:
+            self.reqs_lock.destroy()
+            self.reqs_lock = None
+        if hasattr(self, "reqs_shm") and self.reqs_shm is not None:
+            destroy_shared_memory(self.reqs_shm)
+            self.reqs_shm = None
+        if hasattr(self, "proc_private_get_state"):
+            self.proc_private_get_state = None
+        return
+
+    def destroy(self):
+        self.cleanup_shared_memory()
+        return
+
     def __del__(self):
-        self.reqs = None
+        self.cleanup_shared_memory()
 
 
 class ReqLinkedListManager:
@@ -185,3 +207,10 @@ class ReqLinkedListManager:
             idx = self._values[idx, self.NEXT_INDEX]
 
         return count == self.size - 1
+
+    def destroy(self):
+        if self._shm_array is not None:
+            self._values = None
+            self._shm_array.destroy()
+            self._shm_array = None
+        return

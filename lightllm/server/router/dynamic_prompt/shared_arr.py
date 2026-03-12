@@ -4,7 +4,7 @@
 import numpy as np
 from multiprocessing import shared_memory
 from lightllm.utils.log_utils import init_logger
-from lightllm.utils.shm_utils import create_or_link_shm
+from lightllm.utils.shm_utils import create_or_link_shm, destroy_shared_memory
 
 logger = init_logger(__name__)
 
@@ -15,6 +15,17 @@ class SharedArray:
         dest_size = np.prod(shape) * dtype_byte_num
         self.shm = create_or_link_shm(name, dest_size)
         self.arr = np.ndarray(shape, dtype=dtype, buffer=self.shm.buf)
+
+    def detach(self):
+        if self.shm is not None:
+            self.arr = None
+            destroy_shared_memory(self.shm)
+            self.shm = None
+        return
+
+    def destroy(self):
+        self.detach()
+        return
 
 
 class SharedInt(SharedArray):

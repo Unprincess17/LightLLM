@@ -23,6 +23,7 @@ from lightllm.utils.infer_utils import set_random_seed
 from lightllm.utils.dist_utils import init_vision_distributed_env
 from lightllm.utils.graceful_utils import graceful_registry
 from lightllm.utils.envs_utils import get_env_start_args
+from lightllm.utils.auto_shm_cleanup import register_cleanup_callback
 from lightllm.server.embed_cache.embed_cache_client import CpuEmbedCacheClient
 
 
@@ -84,6 +85,7 @@ class VisualModelRpcServer(rpyc.Service):
             self.model.load_model(weight_dir)
             self.model = self.model.cuda()
             self.cpu_embed_cache_client = CpuEmbedCacheClient(create_meta_data=False, init_shm_data=True)
+            register_cleanup_callback(self.cleanup_shared_memory)
         except Exception as e:
             print("#" * 16)
             print("load model error:", str(e), e, type(e))
@@ -93,6 +95,12 @@ class VisualModelRpcServer(rpyc.Service):
             raise e
 
         set_random_seed(2147483647)
+        return
+
+    def cleanup_shared_memory(self):
+        if hasattr(self, "cpu_embed_cache_client") and self.cpu_embed_cache_client is not None:
+            self.cpu_embed_cache_client.cleanup_shared_memory()
+            self.cpu_embed_cache_client = None
         return
 
     # @calculate_time(show=True, min_cost_ms=150)

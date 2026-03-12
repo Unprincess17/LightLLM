@@ -6,6 +6,7 @@ from transformers.configuration_utils import PretrainedConfig
 from lightllm.models.whisper.whisper_audio import WhisperAudioModel
 from lightllm.server.multimodal_params import AudioItem
 from lightllm.utils.infer_utils import set_random_seed
+from lightllm.utils.auto_shm_cleanup import register_cleanup_callback
 from lightllm.server.embed_cache.embed_cache_client import CpuEmbedCacheClient
 
 
@@ -38,6 +39,7 @@ class AudioModelRpcServer(rpyc.Service):
             set_current_device_id(torch.cuda.current_device())
 
             self.cpu_embed_cache_client = CpuEmbedCacheClient(create_meta_data=False, init_shm_data=False)
+            register_cleanup_callback(self.cleanup_shared_memory)
         except Exception as e:
             print("#" * 16)
             print("load model error:", str(e), e, type(e))
@@ -47,6 +49,12 @@ class AudioModelRpcServer(rpyc.Service):
             raise e
 
         set_random_seed(2147483647)
+        return
+
+    def cleanup_shared_memory(self):
+        if hasattr(self, "cpu_embed_cache_client") and self.cpu_embed_cache_client is not None:
+            self.cpu_embed_cache_client.cleanup_shared_memory()
+            self.cpu_embed_cache_client = None
         return
 
     # @calculate_time(show=True, min_cost_ms=150)

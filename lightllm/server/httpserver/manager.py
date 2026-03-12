@@ -36,6 +36,7 @@ from lightllm.utils.statics_utils import MovingAverage
 from lightllm.utils.config_utils import get_vocab_size
 from lightllm.utils.envs_utils import get_unique_server_name
 from lightllm.utils.error_utils import NixlPrefillNodeStopGenToken
+from lightllm.utils.auto_shm_cleanup import register_cleanup_callback
 from rpyc.utils.classic import obtain
 
 logger = init_logger(__name__)
@@ -121,6 +122,22 @@ class HttpServerManager:
         # If the timemark is not updated for a pre-set time, a prob request will be sent to the backend.
         self.latest_success_infer_time_mark = SharedInt(f"{get_unique_server_name()}_latest_success_infer_time_mark")
         self.latest_success_infer_time_mark.set_value(int(time.time()))
+        register_cleanup_callback(self.cleanup_shared_memory)
+        return
+
+    def cleanup_shared_memory(self):
+        if hasattr(self, "latest_success_infer_time_mark") and self.latest_success_infer_time_mark is not None:
+            self.latest_success_infer_time_mark.destroy()
+            self.latest_success_infer_time_mark = None
+        if hasattr(self, "id_gen") and self.id_gen is not None:
+            self.id_gen.cleanup_shared_memory()
+            self.id_gen = None
+        if hasattr(self, "shm_req_manager") and self.shm_req_manager is not None:
+            self.shm_req_manager.destroy()
+            self.shm_req_manager = None
+        if hasattr(self, "_shm_lock_pool") and self._shm_lock_pool is not None:
+            self._shm_lock_pool.destroy()
+            self._shm_lock_pool = None
         return
 
     @staticmethod
@@ -745,6 +762,7 @@ class HttpServerManager:
             for req_status in release_req_status:
                 self.req_id_to_out_inf.pop(req_status.group_req_objs.group_req_id, None)
                 for req in req_status.group_req_objs.shm_req_objs:
+                    req.destroy_owned_prompt_logprob_shm()
                     await self.shm_req_manager.async_put_back_req_obj(req)
                     await self.shm_req_manager.async_release_req_index(req.index_in_shm_mem)
                 await self._release_multimodal_resources(req_status.group_req_objs.multimodal_params)

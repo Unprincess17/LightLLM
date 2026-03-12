@@ -1,7 +1,9 @@
 from multiprocessing import shared_memory
+from multiprocessing import resource_tracker
 from filelock import FileLock
 from lightllm.utils.log_utils import init_logger
 from lightllm.utils.auto_shm_cleanup import register_posix_shm_for_cleanup
+from lightllm.utils.shm_registry import register_posix_shm, unregister_posix_shm
 
 logger = init_logger(__name__)
 
@@ -46,8 +48,9 @@ def _force_create_shm(name, expected_size, auto_cleanup):
 
     # 创建新的共享内存
     shm = shared_memory.SharedMemory(name=name, create=True, size=expected_size)
-    if auto_cleanup:
-        register_posix_shm_for_cleanup(name)
+    _mark_shared_memory_owner(shm, is_owner=True)
+    register_posix_shm_for_cleanup(name)
+    register_posix_shm(name)
     return shm
 
 
@@ -56,6 +59,8 @@ def _force_link_shm(name, expected_size):
     如果 expected_size 为 -1, 则不进行link的size校验比对"""
     try:
         shm = shared_memory.SharedMemory(name=name)
+        _mark_shared_memory_owner(shm, is_owner=False)
+        _untrack_attached_shared_memory(shm)
         # 验证大小
         if expected_size != -1 and shm.size != expected_size:
             shm.close()
@@ -75,3 +80,39 @@ def _smart_create_or_link_shm(name, expected_size, auto_cleanup):
         pass
 
     return _force_create_shm(name=name, expected_size=expected_size, auto_cleanup=auto_cleanup)
+
+
+def _mark_shared_memory_owner(shm: shared_memory.SharedMemory, is_owner: bool) -> shared_memory.SharedMemory:
+    shm._lightllm_owner = is_owner
+    shm._lightllm_untracked = False
+    return shm
+
+
+def _untrack_attached_shared_memory(shm: shared_memory.SharedMemory) -> None:
+    if getattr(shm, "_lightllm_owner", False):
+        return
+    if getattr(shm, "_lightllm_untracked", False):
+        return
+    try:
+        resource_tracker.unregister(shm._name, "shared_memory")
+        shm._lightllm_untracked = True
+    except Exception as e:
+        logger.warning(f"failed to unregister shared_memory {shm.name} from resource_tracker: {e}")
+
+
+def is_shm_owner(shm: shared_memory.SharedMemory) -> bool:
+    return bool(getattr(shm, "_lightllm_owner", False))
+
+
+def destroy_shared_memory(shm: shared_memory.SharedMemory | None) -> None:
+    if shm is None:
+        return
+    try:
+        if is_shm_owner(shm):
+            try:
+                shm.unlink()
+            except FileNotFoundError:
+                pass
+            unregister_posix_shm(shm.name)
+    finally:
+        shm.close()

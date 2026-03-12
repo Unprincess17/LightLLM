@@ -16,6 +16,7 @@ from lightllm.server.core.objs.io_objs import GroupReqIndexes
 from lightllm.utils.graceful_utils import graceful_registry
 from .cpu_cache_client import CpuKvCacheClient
 from lightllm.utils.log_utils import init_logger
+from lightllm.utils.auto_shm_cleanup import register_cleanup_callback
 from lightllm.utils.process_check import start_parent_check_thread
 from lightllm.utils.envs_utils import get_unique_server_name
 
@@ -58,6 +59,16 @@ class MultiLevelKVCacheManager:
             )
             self.disk_cache_thread = threading.Thread(target=self.disk_cache_worker.run, daemon=True)
             self.disk_cache_thread.start()
+        register_cleanup_callback(self.cleanup_shared_memory)
+        return
+
+    def cleanup_shared_memory(self):
+        if hasattr(self, "cpu_cache_client") and self.cpu_cache_client is not None:
+            self.cpu_cache_client.cleanup_shared_memory()
+            self.cpu_cache_client = None
+        if hasattr(self, "shm_req_manager") and self.shm_req_manager is not None:
+            self.shm_req_manager.destroy()
+            self.shm_req_manager = None
         return
 
     def cpu_cache_hanle_loop(self):

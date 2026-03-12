@@ -353,7 +353,10 @@ async def kv_move_status(websocket: WebSocket):
 @app.on_event("shutdown")
 async def shutdown():
     logger.info("Received signal to shutdown. Performing graceful shutdown...")
-    await asyncio.sleep(3)
+    await asyncio.sleep(1)
+
+    if g_objs.httpserver_manager is not None and hasattr(g_objs.httpserver_manager, "cleanup_shared_memory"):
+        g_objs.httpserver_manager.cleanup_shared_memory()
 
     # 杀掉所有子进程
     import psutil
@@ -362,7 +365,13 @@ async def shutdown():
     parent = psutil.Process(os.getpid())
     children = parent.children(recursive=True)
     for child in children:
-        os.kill(child.pid, signal.SIGKILL)
+        os.kill(child.pid, signal.SIGTERM)
+    await asyncio.sleep(2)
+    for child in parent.children(recursive=True):
+        try:
+            os.kill(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
     logger.info("Graceful shutdown completed.")
     return
 

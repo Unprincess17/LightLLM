@@ -125,6 +125,15 @@ class RadixCache:
         )
         self.tree_total_tokens_num.arr[0] = 0
 
+    def cleanup_shared_memory(self):
+        if self.tree_total_tokens_num is not None:
+            self.tree_total_tokens_num.destroy()
+            self.tree_total_tokens_num = None
+        if self.refed_tokens_num is not None:
+            self.refed_tokens_num.destroy()
+            self.refed_tokens_num = None
+        return
+
     def insert(self, key, value=None) -> Tuple[int, Optional[TreeNode]]:
         if value is None:
             value = key
@@ -530,6 +539,15 @@ class _RadixCacheReadOnlyClient:
     def get_unrefed_tokens_num(self):
         return self.tree_total_tokens_num.arr[0] - self.refed_tokens_num.arr[0]
 
+    def cleanup_shared_memory(self):
+        if self.tree_total_tokens_num is not None:
+            self.tree_total_tokens_num.destroy()
+            self.tree_total_tokens_num = None
+        if self.refed_tokens_num is not None:
+            self.refed_tokens_num.destroy()
+            self.refed_tokens_num = None
+        return
+
 
 class RadixCacheReadOnlyClient:
     def __init__(self, unique_name, total_token_num, node_world_size, dp_world_size):
@@ -546,3 +564,9 @@ class RadixCacheReadOnlyClient:
 
     def get_unrefed_tokens_num(self, dp_rank_in_node):
         return self.dp_rank_clients[dp_rank_in_node].get_unrefed_tokens_num()
+
+    def cleanup_shared_memory(self):
+        for client in self.dp_rank_clients:
+            client.cleanup_shared_memory()
+        self.dp_rank_clients = []
+        return

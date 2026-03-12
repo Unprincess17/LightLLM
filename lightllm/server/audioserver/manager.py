@@ -15,6 +15,7 @@ from lightllm.server.core.objs.io_objs.group_req import GroupReqIndexes
 from lightllm.server.core.objs.shm_req_manager import ShmReqManager, StartArgs
 from lightllm.server.multimodal_params import AudioItem
 from .model_infer.model_rpc import start_model_process, AudioModelRpcClient
+from lightllm.utils.auto_shm_cleanup import register_cleanup_callback
 from lightllm.utils.graceful_utils import graceful_registry
 from lightllm.utils.envs_utils import get_unique_server_name
 from rpyc.utils.classic import obtain
@@ -50,6 +51,7 @@ class AudioManager:
         self.trust_remote_code = args.trust_remote_code
         self.args = args
         self.shm_req_manager = ShmReqManager()
+        register_cleanup_callback(self.cleanup_shared_memory)
 
     async def wait_to_model_ready(self):
 
@@ -147,6 +149,12 @@ class AudioManager:
             model_rpc.rpc_server_process.kill()
         for model_rpc in self.model_rpcs:
             model_rpc.rpc_server_process.join()
+        return
+
+    def cleanup_shared_memory(self):
+        if hasattr(self, "shm_req_manager") and self.shm_req_manager is not None:
+            self.shm_req_manager.destroy()
+            self.shm_req_manager = None
         return
 
 

@@ -63,6 +63,12 @@ class InferenceContext:
         self.cpu_embed_cache_client = CpuEmbedCacheClient(create_meta_data=False, init_shm_data=False)
         return
 
+    def cleanup_shared_memory(self):
+        if self.cpu_embed_cache_client is not None:
+            self.cpu_embed_cache_client.cleanup_shared_memory()
+            self.cpu_embed_cache_client = None
+        return
+
     def get_overlap_stream(self) -> torch.cuda.Stream:
         if self.overlap_stream is None:
             self.overlap_stream = torch.cuda.Stream()
@@ -166,6 +172,7 @@ class InferenceContext:
             free_req_index.append(req.req_idx)
             # logger.info(f"infer release req id {req.shm_req.request_id}")
             req.shm_req.shm_infer_released = True
+            req.shm_req.detach_local_prompt_logprob_shm()
             self.shm_req_manager.put_back_req_obj(req.shm_req)
 
         free_token_index = custom_cat(free_token_index)

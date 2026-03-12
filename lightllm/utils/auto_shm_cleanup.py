@@ -5,7 +5,7 @@ import signal
 import threading
 import psutil
 from multiprocessing import shared_memory
-from typing import Set, Optional
+from typing import Callable, Optional
 from lightllm.utils.log_utils import init_logger
 
 logger = init_logger(__name__)
@@ -25,6 +25,7 @@ class AutoShmCleanup:
         self.registered_shm_ids = []
         # POSIX
         self.registered_posix_shm_names = []
+        self.cleanup_callbacks: list[Callable[[], None]] = []
         self.signal_handlers_registered = False
         self._register_handlers_for_cleanup()
 
@@ -55,10 +56,25 @@ class AutoShmCleanup:
         parent = psutil.Process(os.getpid())
         # 递归拿到所有子进程并终止
         for ch in parent.children(recursive=True):
-            ch.kill()
+            try:
+                ch.terminate()
+            except Exception:
+                pass
+        psutil.wait_procs(parent.children(recursive=True), timeout=2)
+        for ch in parent.children(recursive=True):
+            try:
+                ch.kill()
+            except Exception:
+                pass
 
     def _cleanup(self):
         """清理：System V 执行 IPC_RMID，POSIX 执行 unlink。"""
+        for callback in self.cleanup_callbacks:
+            try:
+                callback()
+            except Exception as e:
+                logger.warning(f"cleanup callback failed: {e}")
+
         removed_sysv = 0
         IPC_RMID = 0
         for shmid in self.registered_shm_ids:
@@ -113,6 +129,10 @@ class AutoShmCleanup:
         self.registered_posix_shm_names.append(name)
         return
 
+    def register_cleanup_callback(self, callback: Callable[[], None]):
+        self.cleanup_callbacks.append(callback)
+        return
+
 
 # 全局自动清理器实例
 _auto_cleanup = None
@@ -133,3 +153,7 @@ def register_sysv_shm_for_cleanup(key: int, shmid: Optional[int] = None):
 
 def register_posix_shm_for_cleanup(name: str):
     get_auto_cleanup().register_posix_shm(name)
+
+
+def register_cleanup_callback(callback: Callable[[], None]):
+    get_auto_cleanup().register_cleanup_callback(callback)

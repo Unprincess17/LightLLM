@@ -1,6 +1,7 @@
 import torch
 import ctypes
 import dataclasses
+import errno
 import os
 import xxhash
 import threading
@@ -25,8 +26,9 @@ from lightllm.common.kv_cache_mem_manager import (
 
 from typing import List, Tuple, Optional
 from tqdm import tqdm
-from lightllm.utils.auto_shm_cleanup import register_sysv_shm_for_cleanup
+from lightllm.utils.auto_shm_cleanup import register_cleanup_callback, register_sysv_shm_for_cleanup
 from lightllm.utils.dist_utils import get_current_device_id
+from lightllm.utils.shm_registry import register_sysv_shm, unregister_sysv_shm
 
 logger = init_logger(__name__)
 
@@ -157,13 +159,72 @@ class CpuKVCacheMeta:
         ) // self.data_type.itemsize
 
 
-@lru_cache(maxsize=None)
-def create_shm_kv_cache_ptr(key: int, size: int) -> int:
+def _get_sysv_libc():
     libc = ctypes.CDLL("/usr/lib/x86_64-linux-gnu/libc.so.6", use_errno=True)
     libc.shmget.argtypes = (ctypes.c_long, ctypes.c_size_t, ctypes.c_int)
     libc.shmget.restype = ctypes.c_int
     libc.shmat.argtypes = (ctypes.c_int, ctypes.c_void_p, ctypes.c_int)
     libc.shmat.restype = ctypes.c_void_p
+    libc.shmdt.argtypes = (ctypes.c_void_p,)
+    libc.shmdt.restype = ctypes.c_int
+    libc.shmctl.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_void_p)
+    libc.shmctl.restype = ctypes.c_int
+    return libc
+
+
+@dataclasses.dataclass
+class SystemVShmHandle:
+    key: int
+    shmid: int
+    shm_addr: int
+    size: int
+    is_owner: bool
+    pin_handle: Optional["AsyncRegistrationHandle"] = None
+    _closed: bool = False
+    _destroyed: bool = False
+
+    def bind_pin_handle(self, pin_handle: Optional["AsyncRegistrationHandle"]) -> None:
+        self.pin_handle = pin_handle
+
+    def close(self) -> None:
+        if self._closed:
+            return
+
+        if self.pin_handle is not None:
+            try:
+                self.pin_handle.unregister()
+            except Exception as e:
+                logger.warning(f"failed to unregister pinned host memory for shm key={self.key}: {e}")
+            self.pin_handle = None
+
+        if self.shm_addr:
+            libc = _get_sysv_libc()
+            ret = libc.shmdt(ctypes.c_void_p(self.shm_addr))
+            if ret != 0:
+                err = ctypes.get_errno()
+                logger.warning(f"shmdt failed for shm key={self.key}, shmid={self.shmid}, errno={err}")
+            self.shm_addr = 0
+
+        self._closed = True
+
+    def destroy(self) -> None:
+        if self._destroyed:
+            return
+        self._destroyed = True
+        self.close()
+        if not self.is_owner:
+            return
+
+        unregister_sysv_shm(key=self.key, shmid=self.shmid)
+        libc = _get_sysv_libc()
+        ret = libc.shmctl(self.shmid, 0, None)
+        if ret != 0:
+            err = ctypes.get_errno()
+            logger.warning(f"IPC_RMID failed for shm key={self.key}, shmid={self.shmid}, errno={err}")
+
+
+def _create_or_attach_shm_handle(key: int, size: int, create: bool) -> SystemVShmHandle:
+    libc = _get_sysv_libc()
 
     requested_size = size
     use_hugetlb = enable_huge_page()
@@ -182,7 +243,9 @@ def create_shm_kv_cache_ptr(key: int, size: int) -> int:
             pass
         return 2 * 1024 * 1024  # fallback 2MB
 
-    shmflg = 0o666 | 0o1000  # 权限和 IPC_CREAT 标志
+    IPC_CREAT = 0o1000
+    IPC_EXCL = 0o2000
+    shmflg = 0o666 | IPC_CREAT  # 权限和 IPC_CREAT 标志
     if use_hugetlb:
         # 向上对齐到大页大小
         huge_sz = _get_default_hugepage_size()
@@ -196,45 +259,75 @@ def create_shm_kv_cache_ptr(key: int, size: int) -> int:
         size_to_alloc = requested_size
         logger.info(f"Using regular pages, requested={requested_size}, alloc={size_to_alloc}")
 
-    shmid = libc.shmget(key, size_to_alloc, shmflg)
-    hugepages_num = (size_to_alloc + 1024 * 1024 * 1024 - 1) // (1024 * 1024 * 1024)
-    if shmid < 0:
-        err = ctypes.get_errno()
-        if use_hugetlb:
-            raise Exception(
-                f"shmget with SHM_HUGETLB failed (errno={err}). Falling back to regular pages."
-                f"You may need to configure hugepages manually, e.g.,"
-                f"sudo sed -i 's/^GRUB_CMDLINE_LINUX=\"/& default_hugepagesz=1G \
-                    hugepagesz=1G hugepages={hugepages_num}/' /etc/default/grub"
-                f"sudo update-grub"
-                f"sudo reboot"
-            )
+    is_owner = False
+    if create:
+        shmid = libc.shmget(key, size_to_alloc, shmflg | IPC_EXCL)
+        hugepages_num = (size_to_alloc + 1024 * 1024 * 1024 - 1) // (1024 * 1024 * 1024)
+        if shmid < 0:
+            err = ctypes.get_errno()
+            if err == errno.EEXIST:
+                create = False
+                shmid = libc.shmget(key, 0, 0)
+                if shmid < 0:
+                    err = ctypes.get_errno()
+                    raise Exception(f"Error locating existing shared memory (errno={err})")
+            else:
+                if use_hugetlb:
+                    raise Exception(
+                        f"shmget with SHM_HUGETLB failed (errno={err}). Falling back to regular pages."
+                        f"You may need to configure hugepages manually, e.g.,"
+                        f"sudo sed -i 's/^GRUB_CMDLINE_LINUX=\"/& default_hugepagesz=1G \
+                            hugepagesz=1G hugepages={hugepages_num}/' /etc/default/grub"
+                        f"sudo update-grub"
+                        f"sudo reboot"
+                    )
+                raise Exception(f"Error creating regular shared memory (errno={err})")
         else:
-            raise Exception(f"Error creating regular shared memory (errno={err})")
+            is_owner = True
+            register_sysv_shm_for_cleanup(key, shmid)
+            register_sysv_shm(key, shmid)
+    else:
+        shmid = libc.shmget(key, 0, 0)
+        if shmid < 0:
+            shmid = libc.shmget(key, size, 0)
+        if shmid < 0:
+            err = ctypes.get_errno()
+            raise Exception(f"Error locating existing shared memory (errno={err})")
 
-    register_sysv_shm_for_cleanup(key, shmid)
-    logger.info(f"Shared memory ID: {shmid}")
-
-    # 附加共享内存
     shm_addr = libc.shmat(shmid, ctypes.c_void_p(0), 0)
     if shm_addr == ctypes.c_void_p(-1).value:
-        raise Exception("Error attaching shared memory")
-    logger.info(f"Shared cpu kv cache tensor memory at address: {shm_addr}")
+        err = ctypes.get_errno()
+        raise Exception(f"Error attaching shared memory (errno={err})")
 
-    # Best-effort memory prefaulting in background to speed up subsequent cudaHostRegister
-    def _pre_warm_memory():
-        page_size = _get_default_hugepage_size() if use_hugetlb else 4096
-        arr = np.ctypeslib.as_array(ctypes.cast(shm_addr, ctypes.POINTER(ctypes.c_uint8)), shape=(size_to_alloc,))
-        volatile_sum = int(arr[::page_size].sum())
-        logger.info(f"pre warmed shared memory pages successfully, checksum={volatile_sum})")
+    handle = SystemVShmHandle(key=key, shmid=shmid, shm_addr=shm_addr, size=size, is_owner=is_owner)
+    register_cleanup_callback(handle.destroy if is_owner else handle.close)
+    logger.info(f"Attached to SHM key={key}, shmid={shmid}, addr={shm_addr}, owner={is_owner}")
 
-    th = threading.Thread(target=_pre_warm_memory, name=f"cpu_cache_pre_warm_{key}", daemon=True)
-    th.start()
+    if is_owner:
+        def _pre_warm_memory():
+            page_size = _get_default_hugepage_size() if use_hugetlb else 4096
+            arr = np.ctypeslib.as_array(ctypes.cast(shm_addr, ctypes.POINTER(ctypes.c_uint8)), shape=(size_to_alloc,))
+            volatile_sum = int(arr[::page_size].sum())
+            logger.info(f"pre warmed shared memory pages successfully, checksum={volatile_sum})")
 
-    return shm_addr
+        th = threading.Thread(target=_pre_warm_memory, name=f"cpu_cache_pre_warm_{key}", daemon=True)
+        th.start()
+
+    return handle
 
 
-@lru_cache(maxsize=None)
+def create_shm_kv_cache_handle(key: int, size: int) -> SystemVShmHandle:
+    return _create_or_attach_shm_handle(key=key, size=size, create=True)
+
+
+def attach_shm_kv_cache_handle(key: int, size: int) -> SystemVShmHandle:
+    return _create_or_attach_shm_handle(key=key, size=size, create=False)
+
+
+def create_shm_kv_cache_ptr(key: int, size: int) -> int:
+    return create_shm_kv_cache_handle(key=key, size=size).shm_addr
+
+
 def register_shm_ptr_to_pin(shm_ptr: int, size: int) -> "AsyncRegistrationHandle":
     """Start async cudaHostRegister on the given [shm_ptr, shm_ptr+size) and return a handle."""
     chunk_bytes = 128 * 1024 * 1024  # 128M性能最好
@@ -245,33 +338,38 @@ def register_shm_ptr_to_pin(shm_ptr: int, size: int) -> "AsyncRegistrationHandle
         tasks.append((offset, seg_len))
         offset += seg_len
 
-    handle = AsyncRegistrationHandle(total_tasks=len(tasks))
+    handle = AsyncRegistrationHandle(total_tasks=len(tasks), shm_ptr=shm_ptr, size=size, tasks=tasks)
 
     def _worker():
-        cuda = ctypes.CDLL("/usr/local/cuda/targets/x86_64-linux/lib/libcudart.so")
-        cuda.cudaHostRegister.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint]
-        cuda.cudaHostRegister.restype = ctypes.c_int
-        cuda.cudaHostGetDevicePointer.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_int]
-        cuda.cudaHostGetDevicePointer.restype = ctypes.c_int
+        try:
+            cuda = ctypes.CDLL("/usr/local/cuda/targets/x86_64-linux/lib/libcudart.so")
+            cuda.cudaHostRegister.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint]
+            cuda.cudaHostRegister.restype = ctypes.c_int
+            cuda.cudaHostGetDevicePointer.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_int]
+            cuda.cudaHostGetDevicePointer.restype = ctypes.c_int
 
-        cudaHostRegisterFlag = 3
+            cudaHostRegisterFlag = 3
 
-        torch.cuda.set_device(get_current_device_id())
-        # TODO 这个地方的分块注册是否具备合法性和合理性。
-        for offset, seg_len in tasks:
-            ptr = ctypes.c_void_p(shm_ptr + offset)
-            r = cuda.cudaHostRegister(ptr, ctypes.c_size_t(seg_len), cudaHostRegisterFlag)
-            if r != 0:
-                raise Exception(f"cudaHostRegister failed with error code {r}, prefer to use hugetlb")
-            handle.task_count += 1
+            torch.cuda.set_device(get_current_device_id())
+            # TODO 这个地方的分块注册是否具备合法性和合理性。
+            for offset, seg_len in tasks:
+                ptr = ctypes.c_void_p(shm_ptr + offset)
+                r = cuda.cudaHostRegister(ptr, ctypes.c_size_t(seg_len), cudaHostRegisterFlag)
+                if r != 0:
+                    raise Exception(f"cudaHostRegister failed with error code {r}, prefer to use hugetlb")
+                handle.task_count += 1
 
-        device_ptr = ctypes.c_void_p()
-        host_ptr = ctypes.c_void_p(shm_ptr)
-        res = cuda.cudaHostGetDevicePointer(ctypes.byref(device_ptr), host_ptr, 0)
-        if res != 0:
-            raise Exception(f"cudaHostGetDevicePointer failed with error code {res}")
-        assert host_ptr.value == device_ptr.value
-        handle.tasks_finished.set()
+            device_ptr = ctypes.c_void_p()
+            host_ptr = ctypes.c_void_p(shm_ptr)
+            res = cuda.cudaHostGetDevicePointer(ctypes.byref(device_ptr), host_ptr, 0)
+            if res != 0:
+                raise Exception(f"cudaHostGetDevicePointer failed with error code {res}")
+            assert host_ptr.value == device_ptr.value
+            handle.registered = True
+        except Exception as e:
+            handle.error = e
+        finally:
+            handle.tasks_finished.set()
 
     th = threading.Thread(target=_worker, name=f"cpu_cache_register_{shm_ptr}", daemon=True)
     handle.thread = th
@@ -285,11 +383,17 @@ class AsyncRegistrationHandle:
     - wait(): blocks until registration finishes, prints tqdm progress, and returns device pointer (int).
     """
 
-    def __init__(self, total_tasks: int):
+    def __init__(self, total_tasks: int, shm_ptr: int, size: int, tasks: list[tuple[int, int]]):
         self.total_tasks = total_tasks
         self.task_count = 0
         self.thread: Optional[threading.Thread] = None
         self.tasks_finished = threading.Event()
+        self.shm_ptr = shm_ptr
+        self.size = size
+        self.tasks = tasks
+        self.error: Optional[Exception] = None
+        self.registered = False
+        self.unregistered = False
 
     def wait(self):
         """Block until the async registration completes. Only here we print tqdm progress."""
@@ -311,29 +415,44 @@ class AsyncRegistrationHandle:
         if self.thread is not None and self.thread.is_alive():
             self.thread.join()
 
+        if self.error is not None:
+            raise self.error
+
         return
 
+    def unregister(self):
+        if self.unregistered:
+            return
 
-@lru_cache(maxsize=None)
+        try:
+            self.wait()
+        except Exception as e:
+            logger.warning(f"skip cudaHostUnregister because registration failed for shm_ptr={self.shm_ptr}: {e}")
+            self.unregistered = True
+            return
+
+        if not self.registered:
+            self.unregistered = True
+            return
+
+        cuda = ctypes.CDLL("/usr/local/cuda/targets/x86_64-linux/lib/libcudart.so")
+        cuda.cudaHostUnregister.argtypes = [ctypes.c_void_p]
+        cuda.cudaHostUnregister.restype = ctypes.c_int
+
+        torch.cuda.set_device(get_current_device_id())
+        failed_offsets = []
+        for offset, _ in self.tasks:
+            ptr = ctypes.c_void_p(self.shm_ptr + offset)
+            res = cuda.cudaHostUnregister(ptr)
+            if res != 0:
+                failed_offsets.append((offset, res))
+
+        if failed_offsets:
+            failed_offsets_str = ", ".join(f"offset={offset} err={res}" for offset, res in failed_offsets)
+            raise Exception(f"cudaHostUnregister failed for shm_ptr={self.shm_ptr}: {failed_offsets_str}")
+
+        self.unregistered = True
+
+
 def attach_shm_kv_cache_ptr(key: int, size: int) -> int:
-    libc = ctypes.CDLL("/usr/lib/x86_64-linux-gnu/libc.so.6", use_errno=True)
-    libc.shmget.argtypes = (ctypes.c_long, ctypes.c_size_t, ctypes.c_int)
-    libc.shmget.restype = ctypes.c_int
-    libc.shmat.argtypes = (ctypes.c_int, ctypes.c_void_p, ctypes.c_int)
-    libc.shmat.restype = ctypes.c_void_p
-
-    # Try to locate an existing SHM without creating a new one
-    shmid = libc.shmget(key, 0, 0)
-    if shmid < 0:
-        shmid = libc.shmget(key, size, 0)
-    if shmid < 0:
-        err = ctypes.get_errno()
-        raise Exception(f"Error locating existing shared memory (errno={err})")
-
-    shm_addr = libc.shmat(shmid, ctypes.c_void_p(0), 0)
-    if shm_addr == ctypes.c_void_p(-1).value:
-        err = ctypes.get_errno()
-        raise Exception(f"Error attaching shared memory (errno={err})")
-
-    logger.info(f"Attached to SHM key={key}, shmid={shmid}, addr={shm_addr}")
-    return shm_addr
+    return attach_shm_kv_cache_handle(key=key, size=size).shm_addr

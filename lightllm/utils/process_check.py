@@ -20,6 +20,14 @@ def kill_child_processes(parent_pid):
     parent = psutil.Process(parent_pid)
     for child in parent.children(recursive=True):
         try:
+            os.kill(child.pid, signal.SIGTERM)
+            logger.warning(f"send SIGTERM pid {child.pid}")
+        except BaseException as e:
+            logger.warning(f"kill pid {child.pid} failed {str(e)}")
+
+    time.sleep(2)
+    for child in parent.children(recursive=True):
+        try:
             os.kill(child.pid, signal.SIGKILL)
             logger.warning(f"kill pid {child.pid}")
         except BaseException as e:
@@ -32,6 +40,8 @@ def check_parent_alive():
         if not is_process_active(parent_pid):
             logger.warning(f"parent is dead, kill self {os.getpid()}")
             kill_child_processes(os.getpid())
+            os.kill(os.getpid(), signal.SIGTERM)
+            time.sleep(1)
             os.kill(os.getpid(), signal.SIGKILL)
 
         time.sleep(10)
