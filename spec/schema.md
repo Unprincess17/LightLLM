@@ -15,6 +15,7 @@ Stage directories used in the first implementation:
 - `prompt_corpus`
 - `adapter_trace`
 - `router_trace`
+- `joined_trace`
 
 ## Naming Conventions
 
