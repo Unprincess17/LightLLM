@@ -37,6 +37,20 @@ case_study:
   azure_trace:
     session_gap_ms: 300000
     top_tenants_to_report: 50
+  replay_cache:
+    policy: lru
+    budget_grid:
+      - 0
+      - 128
+      - 256
+      - 512
+      - 1024
+      - 2048
+      - 4096
+      - 8192
+      - 16384
+      - 32768
+      - 65536
   router_trace:
     host: http://127.0.0.1:8040
     port: 8040

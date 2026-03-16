@@ -80,6 +80,7 @@ class ConditionAccessBuffer:
 class StreamBuildResult:
     condition_buffers: Dict[str, ConditionAccessBuffer]
     per_request_unique_counts: Dict[str, List[int]]
+    request_event_counts: List[int]
     request_count: int
     total_events: int
     position_field_counts: Dict[str, int]
@@ -282,8 +283,10 @@ def build_access_streams(
 
     per_request_unique_counts = {condition: [] for condition in CONDITION_ORDER}
     request_sets = {condition: set() for condition in CONDITION_ORDER}
+    request_event_counts: List[int] = []
     request_count = 0
     current_req_idx: Optional[int] = None
+    current_request_event_count = 0
     current_position_field: Optional[str] = None
     position_field_counts: Dict[str, int] = {}
     invariant_checked_fields: List[str] = []
@@ -321,6 +324,8 @@ def build_access_streams(
             for condition in CONDITION_ORDER:
                 per_request_unique_counts[condition].append(len(request_sets[condition]))
                 request_sets[condition].clear()
+            request_event_counts.append(current_request_event_count)
+            current_request_event_count = 0
             request_count += 1
             current_req_idx = req_idx
 
@@ -338,6 +343,7 @@ def build_access_streams(
         request_sets[CONDITION_EXPERT_ONLY].add(expert_object_id)
         request_sets[CONDITION_JOINT_INDEP].add(indep_object_id)
         request_sets[CONDITION_JOINT_CORR].add(corr_object_id)
+        current_request_event_count += 1
 
         if progress_every > 0 and rows_seen % progress_every == 0:
             print(f"materialized {rows_seen}/{total_events} aligned access objects")
@@ -351,6 +357,7 @@ def build_access_streams(
         for condition in CONDITION_ORDER:
             per_request_unique_counts[condition].append(len(request_sets[condition]))
             request_sets[condition].clear()
+        request_event_counts.append(current_request_event_count)
         request_count += 1
 
     condition_buffers = {}
@@ -365,6 +372,7 @@ def build_access_streams(
     return StreamBuildResult(
         condition_buffers=condition_buffers,
         per_request_unique_counts=per_request_unique_counts,
+        request_event_counts=request_event_counts,
         request_count=request_count,
         total_events=total_events,
         position_field_counts=position_field_counts,
