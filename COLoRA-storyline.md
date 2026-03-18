@@ -1,13 +1,22 @@
 # **1. 这个工作准备解决的主要问题？**
 
-在 **Prefill-Decode (PD) 分离** 的在线推理部署中，当模型同时具备：
+在 **Prefill-Decode (PD) 分离** 的在线推理部署中，当一个 decode worker 同时服务：
 
-- **MoE 架构**（动态专家路由，参数规模大、访问长尾），以及
+- **MoE 基座模型**：专家路由动态、访问分布偏斜且具有长尾；
 - **Multi-LoRA（多任务微调分支；或者emerging 多租户）**
+- **Multi-LoRA 请求流**：多个 adapter 并发活跃，带来更细粒度的参数区分和更高的对象基数；
 
-时，Decode 节点会面临一个突出的系统瓶颈：
+系统会面临一个比传统 expert-only serving 更棘手的问题：
 
-**有限 GPU 显存需要同时容纳 KV cache、基座模型运行态以及部分活跃 LoRA/MoE 参数，导致显存竞争加剧；一旦参数换入换出频繁，PCIe 传输开销会显著拉高尾延迟。**
+> 真正需要管理和缓存的对象，不再只是 expert，而是 expert–LoRA 联合单元；这会显著扩大并碎片化有效 working set，使 decode 阶段更早进入 miss 频繁、tail-sensitive 的执行区间。
+
+在这一场景下，有限 GPU 显存不仅需要容纳 KV cache 和基座模型运行态，还需要容纳部分活跃的 expert–LoRA 参数单元。
+一旦联合对象的局部性被打散，decode worker 将频繁遭遇参数 miss；若系统仍默认采用阻塞式“换入 GPU 后执行（load-then-run）”，则 PCIe 传输与安装延迟会直接暴露在单请求关键路径上，并显著放大 tail latency。
+
+因此，本文要解决的核心问题不是泛泛的“显存不够”，而是：
+
+> **在 MoE + Multi-LoRA 的 decode 场景下，如何在 expert–LoRA 粒度下管理参数驻留，并在 miss 不可避免时，以更稳定的方式处理长尾访问，从而降低 P99 tail latency。**
+
 
 ## 系统边界
 
@@ -21,95 +30,179 @@
 
 # **2. 目前他人工作在此问题上的局限/缺点？**
 
-现有 Multi-LoRA serving 系统（如 MLSys’24 S-LoRA / EuroSys’25 VaLoRA ）在其目标场景下表现优秀，但其设计重点通常是：
+现有 Multi-LoRA serving 系统（如 MLSys’24 S-LoRA / EuroSys’25 VaLoRA ）在其目标场景下已经展示了很强的参数管理与切换能力，但其设计假设通常更接近：
 
-- LoRA 粒度的参数管理与切换；
-- 以 GPU 计算为主；
-- Host memory 主要作为容量扩展层（参数暂存/预取源）。
+- 以 LoRA 粒度 为主进行驻留与切换管理；
+- 以 GPU 为唯一主要执行位置；
+- 将 host memory 主要视为 容量扩展层 / 参数暂存层 / 预取源。
 
-当上述设计直接迁移到 **MoE + Multi-LoRA @ Decode** 场景时，会出现两类不匹配：
+这类设计在纯 Multi-LoRA 或非 MoE 场景下是合理的，但直接迁移到 **MoE + Multi-LoRA @ Decode** 时，会出现两个根本性不匹配。
 
-1. **粒度不匹配（LoRA-level vs. Expert-level）**
-    
-    MoE 路由使参数访问呈现更强的动态稀疏性与长尾性。若仍以粗粒度管理参数驻留，可能导致：
-    
-    - 热 LoRA 中包含冷 Expert，造成显存利用率下降；
-    - 为避免浪费而细化到按 Expert 加载时，又引入频繁 cache miss 与传输抖动。
-2. **执行范式不匹配（“仅搬运权重到 GPU”）**
-    
-    对于 decode 阶段中部分低并发、碎片化的专家调用，继续坚持“权重搬到 GPU 再算”，可能使时延更受制于：
-    
-    - 权重传输与调度开销，
-    - 而非实际计算本身。
+1. **对象粒度不匹配：expert-only 或 LoRA-only 抽象都会低估真实 working set**
+
+    在 MoE 场景中，请求访问不是静态激活整个 LoRA，也不是均匀访问全部 expert，而是由 router 在 token / layer 级动态选择少量专家。
+
+    一旦引入 Multi-LoRA，请求真正访问的参数对象就不再是“一个 LoRA”或“一个 expert”，而是更细粒度的 expert–LoRA 联合单元。
+
+    如果仍用粗粒度对象做驻留管理，会带来两类问题：
+
+    - 按 LoRA 管理过粗：热点 LoRA 中可能包含大量冷 expert，浪费 VRAM；
+
+    - 按 expert 管理又不完整：忽略 LoRA 维度会错误高估复用，低估缓存压力。
+
+    换言之，expert-only 抽象会系统性低估联合 key space 下的 working-set size 和 miss 风险。
+
+2. **执行范式不匹配：将 miss 一律视为“搬到 GPU 再算”并不总是合理**
+
+    传统 offloading 思路隐含一个默认前提：
+
+    当某个参数单元不在 GPU 上时，合理的处理方式是 先把它搬入 GPU，再执行计算。
+
+    但在 decode 阶段，这一前提并不总成立。原因在于：
+
+    - 请求 batch 小、token 粒度细，难以摊薄固定开销；
+    - 长尾 expert–LoRA 单元往往低频、突发、弱复用；
+    - 对这类冷对象，阻塞式 promotion 的成本可能大于其后续复用收益；
+    - 因而 tail latency 往往更受制于 数据搬运与调度等待，而不只是算子本身。
         
-        这类路径在 tail latency 上尤其敏感。
-        
+因此，现有“GPU-only execution + host as spill space”的范式，在 MoE + Multi-LoRA decode 下并不充分。
 
-# **3. 我们的主要想法/思路是什么？对此，我们面临什么技术挑战？**
+# **3. Case Study 告诉了我们什么？**
+为了更具体地理解这一问题，我们构建了一个 trace-driven case study：
+将 真实 MoE router trace 与 半真实的 LoRA invocation trace 结合，比较三种访问建模方式：
 
-## 核心洞察 - 异构双执行路径？
+- B0：expert-only；B0：仅专家模型；
+- B1：expert×LoRA（independent）；
+- B2：expert×LoRA（correlated）。
 
-在 decode 节点中，并非所有 expert 调用都值得采用同一种执行路径。
+这个 case study 并不是为了证明“LoRA 多了肯定更慢”这样显然的结论，而是为了回答：
 
-对于高频访问的 expert，GPU 执行仍然更合适；
+> **引入 expert–LoRA 联合对象后，系统问题的性质究竟发生了什么变化？**
 
-而对于低频、突发、长尾 expert，**将权重搬入 GPU 的代价**在某些情况下可能高于**直接在 CPU 侧完成该 expert 计算并回传激活值**的代价。
+结果表明，变化并不只是“对象更多了”，而是出现了三个更关键的现象。
 
-因此，与其把 host memory 仅视作“更慢的显存扩展”，不如将其同时视作：
+1. **联合 keying 会很早将系统推入更碎片化的 locality regime**
 
-- **参数驻留层**（full replica / cold storage）和
-- **可参与计算的执行层**（CPU fallback executor）。
+相较于 expert-only 建模，expert–LoRA 联合建模的访问分布明显更平、更长尾，热点覆盖率显著下降；
+即使 expert 本身仍有偏斜访问，联合对象空间也会因 LoRA 维度的引入而被显著切碎。
 
-## 总体思路
+这意味着：
+> **系统不能再依赖 expert-only 热点直觉来估计驻留压力。**
 
-COLoRA 在 decode worker 内采用一种 **异构双路径执行策略**：
+2. **问题主要集中在 tail requests，而不是所有请求都均匀变差**
 
-- **GPU 路径**：服务热点 expert（低延迟、高吞吐）
-- **CPU 路径**：作为 cache miss / 长尾 expert 的 fallback 执行路径（避免阻塞式权重换入）
+进一步分析发现，尾部请求并不是“略微多 miss 一点”，而是会触碰 远多于平均请求 的 cold joint objects。
+也就是说，性能恶化并非均匀分布，而是高度集中在一小部分 unlucky requests 上。
 
-配合：
+这说明系统真正需要处理的，不只是 average locality 下降，而是：
 
-- expert 级别的非对称缓存管理（GPU hot cache + CPU full replica），以及
-- 轻量化 CPU 算子 + 通信/计算重叠机制，
+> **tail request 会反复遭遇长尾冷对象，导致 miss 成为结构性而非偶发性事件。**
 
-目标不是“消灭”PCIe 成本，而是**在长尾路由场景下，用更稳定的 fallback 路径替代高抖动的阻塞式权重换入，从而改善 tail latency。**
+3. **tail penalty 出现得很早，而且会长期维持在高位平台**
 
-## 技术挑战：
+更重要的是，随着 modeled LoRA cardinality 从极小规模开始增长，P99 penalty 会很早出现并迅速抬升；
+之后即使继续增加 LoRA 数量，其 tail penalty 往往不是无限制线性增长，而是进入一个 **持续的高位平台**。
 
-### 挑战一：二维交叉热点下的缓存粒度与 miss 放大效应
+这一点的含义是：
 
-在 MoE 路由与 Multi-LoRA 并发共同作用下，参数访问热点分布呈现 `LoRA × Expert` 的交叉偏斜特征。并且长尾 expert 的到达具有较高不确定性，预取可降低平均 miss 但难以消除尾部 miss。
+> **问题不是“等规模特别大了再考虑”，而是 一旦进入 expert–LoRA fragmentation regime，系统就必须面对结构性的 miss-handling 压力。**
 
-- 粗粒度（例如按 LoRA 或更大块）缓存管理容易造成 VRAM 浪费；
-- 细粒度（按 Expert）虽更精确，但 miss 更频繁；
-- 若 miss 处理采用阻塞式换入（load-then-run），decode 阶段的单 token 延迟容易出现长尾放大。
+因此，这个 case study 的真正 takeaway 不是“tail latency 很高”，而是：
 
-**核心需求**：需要一种既能细粒度管理 LoRA expert，又不把 miss 直接转化为阻塞等待的机制。
+> **在 expert–LoRA 粒度下，decode worker 的瓶颈已经从单纯的 miss avoidance，转变为如何稳定处理不可避免的长尾 miss。**
 
-### 挑战二：CPU fallback 路径的微小计算效率问题
+这也直接引出了本文的设计动机。
 
-将冷专家计算下沉到 CPU 并不自动带来收益。decode 场景常见的问题是：
+# **4. 我们的主要想法是什么？**
 
-- batch size 小，
-- 调用碎片化，
-- 路由动态变化，
-- 框架级 dispatch / kernel launch / tensor orchestration 开销占比高。
+**核心洞察：并非所有 expert-LoRA 调用都值得走同一条执行路径**
 
-**核心需求**：CPU 路径必须有足够低的固定开销，否则 fallback 只会把“传输延迟”换成“框架调度延迟”。
+case study 表明，在 decode worker 中，一旦 expert–LoRA 联合对象的长尾访问成为结构性现象，系统就不能再把所有 miss 都视为同一种事件统一处理。
 
-### 挑战三：异构双路径引入的同步与流水线气泡
+对于 **高频、可复用的热点 expert–LoRA** 单元，保持 GPU 驻留并走 GPU 路径仍然是最优选择；
 
-当同一层内部分 expert 在 GPU、部分在 CPU 执行时，会引入额外的：
+但对于 **低频、突发、弱复用的冷单元**，若一律采用阻塞式“换入 GPU 后执行”，请求 tail latency 往往会被绑在最慢的 promotion 路径上。
+对这类对象而言，**将权重搬入 GPU 的代价**在某些情况下可能高于**直接在 CPU 上完成该单元计算并回传激活值的代价。**
 
-- 激活值传输（CPU<->GPU），
-- 结果合并同步点，
-- CPU/GPU 时间线耦合。
+因此，本文的关键判断是：
 
-如果处理不当，GPU 可能因等待 CPU 返回而空转，抵消 fallback 带来的收益。
+> **host memory 不应只被视为更慢的显存扩展层，还应被视为一个可参与 miss-time 计算的辅助执行层。**
 
-**核心需求**：需要在可行的数据依赖边界内尽量重叠通信与计算，并控制 CPU 路径的排队与抖动。
+这意味着系统设计的重点不再只是“哪些对象该留在 GPU 上”，还包括：
 
-# **4. 我们工作的主要方法是什么，以及三个主要的创新点？**
+> **当长尾 miss 不可避免时，系统应该如何处理这些 miss。**
+
+
+# **5. COLoRA 的总体思路是什么？**
+
+基于上述观察，COLoRA 在 decode worker 中采用一种 **面向 expert–LoRA 联合对象的异构双路径执行策略**：
+
+- **GPU 路径**：服务热点、可复用的 expert–LoRA 单元；
+
+- **CPU 路径**：作为 cache miss / 长尾冷单元的 fallback 执行路径，避免请求在 miss 时一律阻塞等待权重换入。
+
+配合两类关键机制：
+
+- **非对称内存池与细粒度驻留管理**：GPU 维护容量受限的 hot expert–LoRA cache，CPU 内存维护 full replica / cold storage；
+
+- **轻量级 CPU 执行与通信-计算重叠**：尽量将 CPU fallback 的固定开销压低，并减少其对 GPU 主时间线的阻塞。
+
+COLoRA 的目标不是消灭 PCIe 代价，也不是让 CPU 替代 GPU 做主计算；
+它要做的是：
+
+> **在 expert–LoRA fragmentation 下，用更稳定、可控的 fallback 路径替代高抖动的阻塞式 promotion，从而改善 decode 阶段的 tail latency。**
+
+# **6. 这一路径面临哪些技术挑战？**
+
+## 挑战一：联合 key space 膨胀下的细粒度驻留管理
+
+在 MoE 路由和 Multi-LoRA 并发共同作用下，访问热点不再只呈现 expert 偏斜，而是表现为 **expert × LoRA 的联合偏斜**。
+
+这会带来两个直接后果：
+
+- 粗粒度管理（按 LoRA 或更大块）会显著浪费 VRAM；
+
+- 细粒度管理（按 expert–LoRA 单元）虽然更精确，但也会让 miss 更频繁、更碎片化。
+
+因此，系统必须在有限 GPU 空间下识别并维持一个足够小但足够有效的热点集合，同时避免频繁 churn 和无效 promotion。
+
+**核心需求**：需要一种在 expert–LoRA 粒度下进行驻留管理的机制，既能利用细粒度带来的精确性，又不会让系统因为对象数爆炸而陷入过度 thrashing。
+
+## 挑战二：如何把 miss-handling 从“阻塞式换入”变成“可控 fallback”
+
+case study 的关键启示是：
+在 expert–LoRA fragmentation regime 下，miss 并不是偶发异常，而是结构性存在。
+
+因此，系统不能把 miss 一律等同于 “load-then-run”。
+尤其在 decode 路径上，某些冷对象的未来复用很弱，阻塞式 promotion 未必划算。
+
+但 CPU fallback 也不是天然高效的：
+
+- decode 阶段 batch 小、调用碎片化；
+
+- CPU 算子容易被框架 dispatch / tensor orchestration 固定开销吞掉；
+
+- 若 fallback 成本本身过高，只是把“传输延迟”换成了“CPU 调度延迟”。
+
+**核心需求**：需要一个低固定开销的 CPU fallback 执行路径，使其真正成为一种比阻塞式 promotion 更稳定的 miss-time 响应方式。
+
+## 挑战三：双执行路径下的同步、重叠与尾部稳定性
+
+一旦同一层内的部分 expert–LoRA 单元在 GPU 执行、部分在 CPU 执行，系统就会引入额外的：
+
+- 激活值在 CPU/GPU 间传输，
+
+- 异构路径的结果合并与同步，
+
+- CPU 与 GPU 时间线的耦合，
+
+- CPU fallback 队列自身的抖动。
+
+如果处理不当，GPU 可能因为等待 CPU 返回而空转，或者 CPU fallback 本身成为新的 tail source，从而抵消设计收益。
+
+**核心需求：**：需要在可行的数据依赖边界内最大化通信与计算重叠，并控制 CPU 路径排队与同步成本，使 dual-path 真正改善 tail latency，而不是引入新的瓶颈。
+
+# **7. 我们工作的主要方法是什么，以及三个主要的创新点？**
 
 ## 方法概述
 
