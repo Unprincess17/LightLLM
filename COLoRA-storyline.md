@@ -232,16 +232,15 @@ COLoRA 是一个面向 **decode worker** 的异构推理执行引擎。它通过
 
 这并不试图在绝对 FLOPs 上超过 GPU，而是使 CPU fallback 在 **长尾、低频、时延敏感** 的调用上成为可用且稳定的替代路径。
 
-### 创新点 3：异构双路径下的重叠执行与流水线化调度
+### 创新点 3：基于时间局部性的投机发射与无死锁流水线 / Temporal-Locality-Based Speculative Dispatch for Maximizing Heterogeneous Overlap
 
 **(调度创新，重点是“减少等待”)**
 
-我们将 CPU fallback 的计算与数据传输封装为可异步调度的执行单元，并在满足数据依赖的前提下，尽可能与 GPU 侧主路径执行重叠。与此同时，在 CPU 内部对多个专家任务进行轻量流水化，以降低 cache miss 和调度抖动造成的尾部放大。
+- 挑战 (Challenge)： 即使 CPU Fallback 算子的固定开销已被极度压缩，若系统严格遵循层级同步语义（Layer-wise Synchronization），GPU 依然会因等待异构侧的结果（PCIe 传输 + CPU 计算）而产生空转气泡，这部分等待时间仍可能成为新的尾延迟来源。
+- 设计 (Design)： 利用大模型解码阶段（Decoding Phase）连续 Token 在 MoE 路由选择上的强时间局部性 (Strong Temporal Locality)，我们在底层推理引擎的调度循环中引入了轻量级的投机发射机制 (Speculative Dispatch)。
+- 机制 (Mechanism)： 在处理第 $L$ 层时，系统利用上一解码步的路由状态作为启发式预测，通过独立的非阻塞流 (Non-blocking Stream) 提前将当前激活值派发至 CPU 启动 LoRA 计算。当 GPU 推进至该层的规约点 (Reduction point) 时，再进行结果的延迟绑定 (Late-binding) 或状态回退。
 
-该设计的目标是：
-
-- **减少**异构路径带来的同步等待，
-- 提高双路径并行时的时间线稳定性。
+- 收益 (Benefit)： 该机制有效打破了异构路径间的严格顺序依赖。在真实的路由命中率下，它能够将绝大部分的 CPU 传输与计算延迟隐藏 (Hide/Mask) 在 GPU 执行 Base FFN 的主时间线之下，从而显著缓解 (Significantly Mitigate) 阻塞式 Cache Miss 带来的长尾惩罚，提升双路径流水线的整体并发度。
 
 # **5. 我们最重要的创新是什么？我们工作主要的局限性是什么？**
 
