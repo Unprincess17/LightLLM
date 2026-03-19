@@ -6,13 +6,14 @@ This document explains what [speculative_dispatch_ppl.py](/home/shufan/LightLLM-
 
 The script is a standalone offline probe for the COLoRA-style speculative dispatch idea on Hugging Face MoE checkpoints.
 
-It evaluates this hybrid approximation during teacher-forced causal LM scoring:
+It evaluates this partial-overlap approximation during teacher-forced causal LM scoring:
 
 1. At layer `L`, compute the current token routing `E_L^t`.
 2. Compare it against the previous token routing at the same layer, `E_L^{t-1}`.
-3. If the routed expert sets match under `same_set`, replace the routed-expert input for token `t` with the stale activation from the previous layer, `X_{L-1}^t`.
+3. For the routed experts in the intersection `E_L^t ∩ E_L^{t-1}`, use the stale activation from the previous layer, `X_{L-1}^t`.
+4. For the newly routed experts in `E_L^t \ E_L^{t-1}`, keep the exact current activation `X_L^t`.
 
-So the trigger is in the time dimension, but the approximation payload is in the space dimension.
+So the trigger is in the time dimension, but the approximation payload is now mixed per expert within the same token.
 
 The script also has a `router_trace.jsonl` analysis mode so you can verify whether your online PPL experiment is using the same locality definition as your offline traces.
 
@@ -24,8 +25,8 @@ For the teacher-forced PPL path, it prints:
 - `Speculative PPL`
 - `Delta PPL`
 - `Matched-Token Rate`
-- `Swapped-Token Rate`
-- `Any-Overlap Token Rate`
+- `Partial-Swap Token Rate`
+- `Swapped-Expert Rate`
 - `Average Expert Overlap`
 
 For the trace-analysis path, it prints two different locality notions:
@@ -51,16 +52,16 @@ For the trace-analysis path, it prints two different locality notions:
 - `Clean PPL`
   Perplexity from the exact model with no speculative swap.
 - `Speculative PPL`
-  Perplexity from the patched model using the hybrid time-space approximation.
+  Perplexity from the patched model using the partial-overlap hybrid approximation.
 - `Delta PPL`
   `Speculative PPL - Clean PPL`. Positive means the approximation hurt perplexity.
 
 - `Matched-Token Rate`
-  Fraction of candidate token-layer positions where the same-layer previous-token routing matched under `same_set`. This is the trigger rate for the current speculative policy.
-- `Swapped-Token Rate`
-  Fraction of candidate token-layer positions where the routed expert input was actually replaced by stale `X_{L-1}^t`. In the current implementation this should equal `Matched-Token Rate`.
-- `Any-Overlap Token Rate`
-  Fraction of candidate token-layer positions where `E_L^t` and `E_L^{t-1}` share at least one routed expert, even if the full top-k sets do not match.
+  Fraction of candidate token-layer positions where `E_L^t` and `E_L^{t-1}` match exactly under `same_set`. This is now a diagnostic exact-match statistic, not the actual partial-reuse trigger.
+- `Partial-Swap Token Rate`
+  Fraction of candidate token-layer positions where at least one routed expert reused stale `X_{L-1}^t`.
+- `Swapped-Expert Rate`
+  Fraction of candidate expert assignments that reused stale `X_{L-1}^t`. This is the online metric that corresponds most closely to overlap hit rate.
 - `Average Expert Overlap`
   The mean number of shared experts between `E_L^t` and `E_L^{t-1}` across all candidate token-layer positions.
 
@@ -94,8 +95,9 @@ The current patch logic in [speculative_dispatch_ppl.py](/home/shufan/LightLLM-i
 - Layer `0` never swaps, because there is no `X_{L-1}`.
 - Token `t=0` only becomes a candidate if the previous global token is available from the previous scoring window.
 - Tokens `t>0` compare their routing against token `t-1` at the same layer.
-- The match rule is `same_set`, implemented by sorting the top-k expert IDs before equality testing.
-- If the match fires, only the routed expert input is replaced by stale `prev_hidden_flat[t]`.
+- For each routed expert in token `t`, if that expert also appeared in token `t-1` at the same layer, that expert branch uses stale `prev_hidden_flat[t]`.
+- For each newly routed expert not present in token `t-1`, that expert branch uses the true current hidden state.
+- The `same_set` rule is retained only for exact-match diagnostics and reporting.
 - Shared or dense experts remain on the exact current hidden state path.
 
 ## Requirements
@@ -106,7 +108,11 @@ The script expects:
 - `transformers`
 - `requests`
 
-The default model path is already configured to the local Qwen3-VL MoE checkpoint: `bash/home/shufan/.cache/huggingface/hub/models--Qwen--Qwen3-VL-30B-A3B-Instruct/snapshots/9c4b90e1e4ba969fd3b5378b57d966d725f1b86c`
+The default model path is already configured to the local Qwen3-VL MoE checkpoint:
+
+```text
+/home/shufan/.cache/huggingface/hub/models--Qwen--Qwen3-VL-30B-A3B-Instruct/snapshots/9c4b90e1e4ba969fd3b5378b57d966d725f1b86c
+```
 
 Supported model types:
 
@@ -195,13 +201,15 @@ python tools/speculative_dispatch_ppl.py \
 
 The routing trace and the teacher-forced PPL run only align if they use the same locality definition and comparable input distribution.
 
-Correct comparison:
+Correct comparisons:
 
 - Compare the online `Matched-Token Rate` against the offline `Same-Layer Previous-Token / Same-Set Rate`.
+- Compare the online `Swapped-Expert Rate` against the offline `Same-Layer Previous-Token / Mean Overlap Hit Rate`.
 
-Incorrect comparison:
+Incorrect comparisons:
 
 - Do not compare the online `Matched-Token Rate` against the offline `Adjacent-Layer Same-Token / Same-Set Rate`.
+- Do not compare the online `Swapped-Expert Rate` against the offline `Adjacent-Layer Same-Token / Mean Overlap Hit Rate`.
 
 Also note:
 
@@ -232,18 +240,19 @@ Measured output:
 - `Evaluated Tokens: 8192`
 - `Predicted Tokens: 8176`
 - `Clean PPL: 6.677874`
-- `Speculative PPL: 6.732866`
-- `Delta PPL: +0.054992`
-- `Matched-Token Rate: 0.56% (2159/384977)`
-- `Swapped-Token Rate: 0.56% (2159/384977)`
-- `Any-Overlap Token Rate: 94.89% (365320/384977)`
-- `Average Expert Overlap: 3.5673`
+- `Speculative PPL: 9.835621`
+- `Delta PPL: +3.157747`
+- `Matched-Token Rate: 0.53% (2050/384977)`
+- `Partial-Swap Token Rate: 94.97% (365622/384977)`
+- `Swapped-Expert Rate: 44.76% (1378610/3079816)`
+- `Average Expert Overlap: 3.5810`
 
 Interpretation:
 
-- On this default WikiText-style run, the hybrid approximation slightly degrades perplexity.
-- The live `Matched-Token Rate` is only `0.56%`, far below the ShareGPT trace `Same-Set Rate` of `11.88%`.
-- That gap is expected because the trace came from ShareGPT decode traffic, while this run used the default WikiText fallback corpus.
+- On this default WikiText-style run, the partial-overlap approximation substantially degrades perplexity.
+- The live `Matched-Token Rate` is only `0.53%`, far below the ShareGPT trace `Same-Set Rate` of `11.88%`.
+- The live `Swapped-Expert Rate` is `44.76%`, below the ShareGPT trace mean overlap hit rate of `72.23%`.
+- Those gaps are expected because the trace came from ShareGPT decode traffic, while this run used the default WikiText fallback corpus.
 
 ### ShareGPT Router Trace
 
@@ -279,19 +288,21 @@ Adjacent-layer same-token locality:
 - `Average Expert Overlap: 0.4837`
 - `Mean Overlap Hit Rate: 6.05%`
 
-These numbers explain the earlier debugging result:
+These numbers explain both the earlier debugging result and the revised overlap policy:
 
 - the original cross-layer patch logic naturally produced `Matched-Token Rate = 0%`
 - the ShareGPT `72%` number comes from same-layer previous-token overlap, not adjacent-layer equality
+- under the revised overlap policy, the relevant trace-side reuse metric is `Mean Overlap Hit Rate: 72.23%`
 
 ### Current Expectation For The Updated PPL Patch
 
-With the new hybrid time-space patch:
+With the revised partial-overlap patch:
 
-- the online match trigger now uses the same routing notion as the ShareGPT trace
+- the online exact-match statistic uses the same same-layer previous-token notion as the ShareGPT trace
 - the `Matched-Token Rate` should be compared against the trace `Same-Set Rate: 11.88%`
+- the `Swapped-Expert Rate` should be compared against the trace `Mean Overlap Hit Rate: 72.23%`
 - the actual PPL delta depends strongly on the evaluation corpus
-- on the default WikiText fallback run, the measured `Delta PPL` was `+0.054992`
+- on the default WikiText fallback run, the measured `Delta PPL` was `+3.157747`
 
 ## Useful Flags
 
@@ -318,7 +329,7 @@ Use this sequence:
 
 1. Run `--trace_only` to confirm the target locality metric.
 2. Run the PPL probe on your chosen text corpus.
-3. Check whether `Matched-Token Rate` is in the same regime as the trace `Same-Set Rate`.
+3. Check whether `Matched-Token Rate` is in the same regime as the trace `Same-Set Rate`, and whether `Swapped-Expert Rate` is in the same regime as the trace `Mean Overlap Hit Rate`.
 4. If it is not, inspect the corpus mismatch first before changing the patch logic again.
 5. Only then interpret `Delta PPL` as evidence about the speculative approximation.
 

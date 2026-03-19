@@ -4,8 +4,9 @@
 This script is intended for offline validation of speculative dispatch ideas on
 HF MoE checkpoints. For Qwen3-VL-MoE, it runs the model in text-only mode and
 patches the text decoder MoE block so routed experts consume stale
-layer-(L-1) activations when the current layer's routed expert set for token t
-matches token (t-1) at the same layer.
+layer-(L-1) activations for the routed experts shared by token t and token
+(t-1) at the same layer, while newly routed experts stay on the exact current
+layer activation.
 """
 
 from __future__ import annotations
@@ -45,9 +46,9 @@ SUPPORTED_BLOCK_CLASS_NAMES = {
 @dataclass
 class PatchStats:
     candidate_token_layers: int = 0
+    candidate_expert_assignments: int = 0
     matched_token_layers: int = 0
     swapped_token_layers: int = 0
-    any_overlap_token_layers: int = 0
     overlap_expert_count: int = 0
     patched_layer_calls: int = 0
 
@@ -61,10 +62,10 @@ class PatchStats:
             return 0.0
         return self.swapped_token_layers / self.candidate_token_layers
 
-    def any_overlap_rate(self) -> float:
-        if self.candidate_token_layers == 0:
+    def swapped_expert_rate(self) -> float:
+        if self.candidate_expert_assignments == 0:
             return 0.0
-        return self.any_overlap_token_layers / self.candidate_token_layers
+        return self.overlap_expert_count / self.candidate_expert_assignments
 
     def average_overlap(self) -> float:
         if self.candidate_token_layers == 0:
@@ -79,6 +80,18 @@ class EvalResult:
     predicted_tokens: int
     stats: Optional[PatchStats] = None
     debug_report: Optional[dict] = None
+
+
+@dataclass
+class DispatchPlan:
+    prev_hidden_flat: Optional[torch.Tensor]
+    previous_token_router_indices: torch.Tensor
+    candidate_mask: torch.Tensor
+    reuse_assignment_mask: torch.Tensor
+    exact_match_mask: torch.Tensor
+    ordered_match_mask: torch.Tensor
+    top1_match_mask: torch.Tensor
+    overlap_counts: torch.Tensor
 
 
 @dataclass
@@ -273,9 +286,9 @@ class RoutedExpertStalePatch:
     def stats(self) -> PatchStats:
         return PatchStats(
             candidate_token_layers=self._stats.candidate_token_layers,
+            candidate_expert_assignments=self._stats.candidate_expert_assignments,
             matched_token_layers=self._stats.matched_token_layers,
             swapped_token_layers=self._stats.swapped_token_layers,
-            any_overlap_token_layers=self._stats.any_overlap_token_layers,
             overlap_expert_count=self._stats.overlap_expert_count,
             patched_layer_calls=self._stats.patched_layer_calls,
         )
@@ -284,14 +297,14 @@ class RoutedExpertStalePatch:
         return {
             "aggregate": {
                 "candidate_token_layers": self._stats.candidate_token_layers,
+                "candidate_expert_assignments": self._stats.candidate_expert_assignments,
                 "matched_token_layers": self._stats.matched_token_layers,
                 "swapped_token_layers": self._stats.swapped_token_layers,
-                "any_overlap_token_layers": self._stats.any_overlap_token_layers,
                 "overlap_expert_count": self._stats.overlap_expert_count,
                 "patched_layer_calls": self._stats.patched_layer_calls,
                 "matched_rate": self._stats.matched_rate(),
                 "swapped_rate": self._stats.swapped_rate(),
-                "any_overlap_rate": self._stats.any_overlap_rate(),
+                "swapped_expert_rate": self._stats.swapped_expert_rate(),
                 "average_overlap": self._stats.average_overlap(),
             },
             "per_layer": [
@@ -317,17 +330,27 @@ class RoutedExpertStalePatch:
             routing_weights, router_indices = torch.topk(routing_weights, module.top_k, dim=-1)
             routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
             routing_weights = routing_weights.to(hidden_flat.dtype)
-            router_weights = torch.zeros_like(router_logits).scatter_(1, router_indices, routing_weights)
-
-            effective_hidden_flat = self._maybe_swap(
+            dispatch_plan = self._prepare_dispatch_plan(
                 layer_idx=layer_idx,
                 hidden_flat=hidden_flat,
                 router_indices=router_indices,
                 batch_size=batch_size,
                 sequence_length=sequence_length,
             )
-            effective_hidden_states = effective_hidden_flat.reshape(batch_size, sequence_length, hidden_dim)
-            routed_out = module.experts(effective_hidden_states, router_weights, router_indices)
+            if dispatch_plan.prev_hidden_flat is None or not bool(dispatch_plan.reuse_assignment_mask.any().item()):
+                router_weights = torch.zeros_like(router_logits).scatter_(1, router_indices, routing_weights)
+                hidden_states = hidden_flat.reshape(batch_size, sequence_length, hidden_dim)
+                routed_out = module.experts(hidden_states, router_weights, router_indices)
+            else:
+                routed_out = self._dispatch_qwen3_vl_experts(
+                    module=module,
+                    hidden_flat=hidden_flat,
+                    routing_weights=routing_weights,
+                    router_indices=router_indices,
+                    dispatch_plan=dispatch_plan,
+                    batch_size=batch_size,
+                    sequence_length=sequence_length,
+                )
             self._update_previous(
                 layer_idx=layer_idx,
                 hidden_flat=hidden_flat,
@@ -357,28 +380,22 @@ class RoutedExpertStalePatch:
                 routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
             routing_weights = routing_weights.to(hidden_flat.dtype)
 
-            final_hidden_states = torch.zeros(
-                (batch_size * sequence_length, hidden_dim),
-                dtype=hidden_flat.dtype,
-                device=hidden_flat.device,
-            )
-            expert_mask = torch.nn.functional.one_hot(router_indices, num_classes=module.num_experts).permute(2, 1, 0)
-            effective_hidden_flat = self._maybe_swap(
+            dispatch_plan = self._prepare_dispatch_plan(
                 layer_idx=layer_idx,
                 hidden_flat=hidden_flat,
                 router_indices=router_indices,
                 batch_size=batch_size,
                 sequence_length=sequence_length,
             )
-
-            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero(as_tuple=False)
-            for expert_idx_tensor in expert_hit:
-                expert_idx = int(expert_idx_tensor.item())
-                expert_layer = module.experts[expert_idx]
-                idx, top_x = torch.where(expert_mask[expert_idx].squeeze(0))
-                current_state = effective_hidden_flat[None, top_x].reshape(-1, hidden_dim)
-                current_hidden_states = expert_layer(current_state) * routing_weights[top_x, idx, None]
-                final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_flat.dtype))
+            final_hidden_states = self._dispatch_qwen_sparse_experts(
+                module=module,
+                hidden_flat=hidden_flat,
+                routing_weights=routing_weights,
+                router_indices=router_indices,
+                dispatch_plan=dispatch_plan,
+                batch_size=batch_size,
+                sequence_length=sequence_length,
+            )
 
             if hasattr(module, "shared_expert") and hasattr(module, "shared_expert_gate"):
                 shared_expert_output = module.shared_expert(hidden_flat)
@@ -397,31 +414,44 @@ class RoutedExpertStalePatch:
 
         return patched_forward
 
-    def _maybe_swap(
+    def _prepare_dispatch_plan(
         self,
         layer_idx: int,
         hidden_flat: torch.Tensor,
         router_indices: torch.Tensor,
         batch_size: int,
         sequence_length: int,
-    ) -> torch.Tensor:
+    ) -> DispatchPlan:
         self._stats.patched_layer_calls += 1
         prev_hidden_flat = self._shared_state["prev_hidden_flat"]
         prev_layer_idx = self._shared_state["prev_layer_idx"]
+        zero_token_mask = torch.zeros(router_indices.shape[0], dtype=torch.bool, device=router_indices.device)
+        zero_assignment_mask = torch.zeros_like(router_indices, dtype=torch.bool)
+        empty_previous_router = router_indices.detach().clone()
         if (
             layer_idx == 0
             or prev_hidden_flat is None
             or prev_layer_idx != layer_idx - 1
             or prev_hidden_flat.shape != hidden_flat.shape
         ):
-            return hidden_flat
+            return DispatchPlan(
+                prev_hidden_flat=None,
+                previous_token_router_indices=empty_previous_router,
+                candidate_mask=zero_token_mask,
+                reuse_assignment_mask=zero_assignment_mask,
+                exact_match_mask=zero_token_mask.clone(),
+                ordered_match_mask=zero_token_mask.clone(),
+                top1_match_mask=zero_token_mask.clone(),
+                overlap_counts=torch.zeros(router_indices.shape[0], dtype=torch.int64, device=router_indices.device),
+            )
 
         if prev_hidden_flat.device != hidden_flat.device:
             prev_hidden_flat = prev_hidden_flat.to(hidden_flat.device, non_blocking=True)
         (
             candidate_mask,
             previous_token_router_indices,
-            match_mask,
+            reuse_assignment_mask,
+            exact_match_mask,
             ordered_match_mask,
             top1_match_mask,
             overlap_counts,
@@ -434,31 +464,128 @@ class RoutedExpertStalePatch:
 
         candidate_count = int(candidate_mask.sum().item())
         if candidate_count == 0:
-            return hidden_flat
-        matched_count = int(match_mask.sum().item())
+            return DispatchPlan(
+                prev_hidden_flat=prev_hidden_flat,
+                previous_token_router_indices=previous_token_router_indices,
+                candidate_mask=candidate_mask,
+                reuse_assignment_mask=reuse_assignment_mask,
+                exact_match_mask=exact_match_mask,
+                ordered_match_mask=ordered_match_mask,
+                top1_match_mask=top1_match_mask,
+                overlap_counts=overlap_counts,
+            )
+        matched_count = int(exact_match_mask.sum().item())
         any_overlap_count = int((overlap_counts > 0).sum().item())
         overlap_expert_count = int(overlap_counts.sum().item())
         self._stats.candidate_token_layers += candidate_count
+        self._stats.candidate_expert_assignments += candidate_count * int(router_indices.shape[1])
         self._stats.matched_token_layers += matched_count
-        self._stats.swapped_token_layers += matched_count
-        self._stats.any_overlap_token_layers += any_overlap_count
+        self._stats.swapped_token_layers += any_overlap_count
         self._stats.overlap_expert_count += overlap_expert_count
         self._record_layer_debug(
             layer_idx=layer_idx,
             batch_size=batch_size,
             sequence_length=sequence_length,
             candidate_mask=candidate_mask,
+            reuse_assignment_mask=reuse_assignment_mask,
             current_router_indices=router_indices,
             previous_router_indices=previous_token_router_indices,
-            match_mask=match_mask,
+            match_mask=exact_match_mask,
+            ordered_match_mask=ordered_match_mask,
+            top1_match_mask=top1_match_mask,
+            overlap_counts=overlap_counts,
+        )
+        return DispatchPlan(
+            prev_hidden_flat=prev_hidden_flat,
+            previous_token_router_indices=previous_token_router_indices,
+            candidate_mask=candidate_mask,
+            reuse_assignment_mask=reuse_assignment_mask,
+            exact_match_mask=exact_match_mask,
             ordered_match_mask=ordered_match_mask,
             top1_match_mask=top1_match_mask,
             overlap_counts=overlap_counts,
         )
 
-        if matched_count == 0:
-            return hidden_flat
-        return torch.where(match_mask[:, None], prev_hidden_flat, hidden_flat)
+    def _dispatch_qwen3_vl_experts(
+        self,
+        module: torch.nn.Module,
+        hidden_flat: torch.Tensor,
+        routing_weights: torch.Tensor,
+        router_indices: torch.Tensor,
+        dispatch_plan: DispatchPlan,
+        batch_size: int,
+        sequence_length: int,
+    ) -> torch.Tensor:
+        hidden_dim = hidden_flat.shape[-1]
+        final_hidden_states = torch.zeros(
+            (batch_size * sequence_length, hidden_dim),
+            dtype=hidden_flat.dtype,
+            device=hidden_flat.device,
+        )
+        expert_mask = torch.nn.functional.one_hot(router_indices, num_classes=module.num_experts).permute(2, 1, 0)
+        expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero(as_tuple=False)
+        for expert_idx_tensor in expert_hit:
+            expert_idx = int(expert_idx_tensor.item())
+            idx, top_x = torch.where(expert_mask[expert_idx].squeeze(0))
+            assignment_reuse_mask = dispatch_plan.reuse_assignment_mask[top_x, idx]
+            current_state = self._select_assignment_hidden_states(
+                hidden_flat=hidden_flat,
+                prev_hidden_flat=dispatch_plan.prev_hidden_flat,
+                token_indices=top_x,
+                assignment_reuse_mask=assignment_reuse_mask,
+            )
+            gate_up = current_state @ module.experts.gate_up_proj[expert_idx]
+            gate, up = gate_up.chunk(2, dim=-1)
+            expert_output = (up * module.experts.act_fn(gate)) @ module.experts.down_proj[expert_idx]
+            weighted_output = expert_output * routing_weights[top_x, idx, None]
+            final_hidden_states.index_add_(0, top_x, weighted_output.to(hidden_flat.dtype))
+        return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+
+    def _dispatch_qwen_sparse_experts(
+        self,
+        module: torch.nn.Module,
+        hidden_flat: torch.Tensor,
+        routing_weights: torch.Tensor,
+        router_indices: torch.Tensor,
+        dispatch_plan: DispatchPlan,
+        batch_size: int,
+        sequence_length: int,
+    ) -> torch.Tensor:
+        hidden_dim = hidden_flat.shape[-1]
+        final_hidden_states = torch.zeros(
+            (batch_size * sequence_length, hidden_dim),
+            dtype=hidden_flat.dtype,
+            device=hidden_flat.device,
+        )
+        expert_mask = torch.nn.functional.one_hot(router_indices, num_classes=module.num_experts).permute(2, 1, 0)
+        expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero(as_tuple=False)
+        for expert_idx_tensor in expert_hit:
+            expert_idx = int(expert_idx_tensor.item())
+            expert_layer = module.experts[expert_idx]
+            idx, top_x = torch.where(expert_mask[expert_idx].squeeze(0))
+            assignment_reuse_mask = dispatch_plan.reuse_assignment_mask[top_x, idx]
+            current_state = self._select_assignment_hidden_states(
+                hidden_flat=hidden_flat,
+                prev_hidden_flat=dispatch_plan.prev_hidden_flat,
+                token_indices=top_x,
+                assignment_reuse_mask=assignment_reuse_mask,
+            )
+            current_hidden_states = expert_layer(current_state) * routing_weights[top_x, idx, None]
+            final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_flat.dtype))
+        return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+
+    @staticmethod
+    def _select_assignment_hidden_states(
+        hidden_flat: torch.Tensor,
+        prev_hidden_flat: Optional[torch.Tensor],
+        token_indices: torch.Tensor,
+        assignment_reuse_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        current_states = hidden_flat[token_indices]
+        if prev_hidden_flat is None or not bool(assignment_reuse_mask.any().item()):
+            return current_states
+        stale_states = prev_hidden_flat[token_indices]
+        return torch.where(assignment_reuse_mask[:, None], stale_states, current_states)
 
     def _update_previous(
         self,
@@ -485,7 +612,7 @@ class RoutedExpertStalePatch:
         router_indices: torch.Tensor,
         batch_size: int,
         sequence_length: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         top_k = int(router_indices.shape[-1])
         router_by_token = router_indices.reshape(batch_size, sequence_length, top_k)
         previous_router_by_token = torch.empty_like(router_by_token)
@@ -513,22 +640,27 @@ class RoutedExpertStalePatch:
 
         candidate_mask = candidate_by_token.reshape(-1)
         previous_router_flat = previous_router_by_token.reshape(-1, top_k)
-        match_mask = torch.zeros_like(candidate_mask)
+        reuse_assignment_mask = torch.zeros_like(router_indices, dtype=torch.bool)
+        exact_match_mask = torch.zeros_like(candidate_mask)
         ordered_match_mask = torch.zeros_like(candidate_mask)
         top1_match_mask = torch.zeros_like(candidate_mask)
         overlap_counts = torch.zeros(candidate_mask.shape[0], dtype=torch.int64, device=router_indices.device)
         if candidate_mask.any():
             current_candidates = router_indices[candidate_mask]
             previous_candidates = previous_router_flat[candidate_mask]
-            match_mask[candidate_mask] = self._same_set_mask(current_candidates, previous_candidates)
+            pairwise_equal = current_candidates[:, :, None] == previous_candidates[:, None, :]
+            candidate_reuse_assignment_mask = pairwise_equal.any(dim=-1)
+            reuse_assignment_mask[candidate_mask] = candidate_reuse_assignment_mask
+            exact_match_mask[candidate_mask] = self._same_set_mask(current_candidates, previous_candidates)
             ordered_match_mask[candidate_mask] = torch.eq(current_candidates, previous_candidates).all(dim=-1)
             top1_match_mask[candidate_mask] = torch.eq(current_candidates[:, 0], previous_candidates[:, 0])
-            overlap_counts[candidate_mask] = self._overlap_counts(current_candidates, previous_candidates)
+            overlap_counts[candidate_mask] = candidate_reuse_assignment_mask.sum(dim=-1)
 
         return (
             candidate_mask,
             previous_router_flat,
-            match_mask,
+            reuse_assignment_mask,
+            exact_match_mask,
             ordered_match_mask,
             top1_match_mask,
             overlap_counts,
@@ -581,6 +713,7 @@ class RoutedExpertStalePatch:
         batch_size: int,
         sequence_length: int,
         candidate_mask: torch.Tensor,
+        reuse_assignment_mask: torch.Tensor,
         current_router_indices: torch.Tensor,
         previous_router_indices: torch.Tensor,
         match_mask: torch.Tensor,
@@ -648,6 +781,7 @@ class RoutedExpertStalePatch:
             global_token_idx = None if window_begin is None else int(window_begin) + token_offset
             current = current_router_indices[token_idx].detach().cpu()
             previous = previous_router_indices[token_idx].detach().cpu()
+            reused_slot_mask = reuse_assignment_mask[token_idx].detach().cpu()
             self._debug_samples.append(
                 {
                     "window_idx": window_idx,
@@ -663,6 +797,9 @@ class RoutedExpertStalePatch:
                     "previous_token_router_indices": previous.tolist(),
                     "sorted_current_router_indices": torch.sort(current).values.tolist(),
                     "sorted_previous_token_router_indices": torch.sort(previous).values.tolist(),
+                    "reused_slot_mask": reused_slot_mask.tolist(),
+                    "reused_expert_ids": current[reused_slot_mask].tolist(),
+                    "fresh_expert_ids": current[~reused_slot_mask].tolist(),
                     "overlap_count": int(overlap_counts[token_idx].item()),
                     "ordered_match": bool(ordered_match_mask[token_idx].item()),
                     "top1_match": bool(top1_match_mask[token_idx].item()),
@@ -757,7 +894,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="same_set",
         choices=["same_set"],
-        help="Routing match criterion between token t and token t-1 at the same layer.",
+        help="Exact-set routing comparison rule retained for diagnostics between token t and token t-1.",
     )
     parser.add_argument(
         "--local_files_only",
@@ -1279,10 +1416,10 @@ def main() -> None:
     print(f"Speculative PPL: {speculative.ppl:.6f}")
     print(f"Delta PPL: {speculative.ppl - clean.ppl:+.6f}")
     print(f"Matched-Token Rate: {format_rate(stats.matched_token_layers, stats.candidate_token_layers)}")
-    print(f"Swapped-Token Rate: {format_rate(stats.swapped_token_layers, stats.candidate_token_layers)}")
-    print(f"Any-Overlap Token Rate: {format_rate(stats.any_overlap_token_layers, stats.candidate_token_layers)}")
+    print(f"Partial-Swap Token Rate: {format_rate(stats.swapped_token_layers, stats.candidate_token_layers)}")
+    print(f"Swapped-Expert Rate: {format_rate(stats.overlap_expert_count, stats.candidate_expert_assignments)}")
     print(f"Average Expert Overlap: {stats.average_overlap():.4f}")
-    if stats.matched_token_layers == 0 and stats.any_overlap_token_layers > 0:
+    if stats.matched_token_layers == 0 and stats.swapped_token_layers > 0:
         print(
             "Warning: consecutive tokens at the same layer shared some routed experts but never matched on the full "
             "top-k set. Compare this rate against the trace's Same-Layer Previous-Token statistics."
