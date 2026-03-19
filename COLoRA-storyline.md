@@ -100,7 +100,7 @@
 
 > **tail request 会反复遭遇长尾冷对象，导致 miss 成为结构性而非偶发性事件。**
 
-1. **tail penalty 出现得很早，而且会长期维持在高位平台**
+3. **tail penalty 出现得很早，而且会长期维持在高位平台**
 
 更重要的是，随着 modeled LoRA cardinality 从极小规模开始增长，P99 penalty 会很早出现并迅速抬升；
 之后即使继续增加 LoRA 数量，其 tail penalty 往往不是无限制线性增长，而是进入一个 **持续的高位平台**。
