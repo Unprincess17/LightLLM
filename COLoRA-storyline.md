@@ -67,13 +67,13 @@
     - 对这类冷对象，阻塞式 promotion 的成本可能大于其后续复用收益；
     - 因而 tail latency 往往更受制于 数据搬运与调度等待，而不只是算子本身。
         
-因此，现有“GPU-only execution + host as spill space”的范式，在 MoE + Multi-LoRA decode 下并不充分。
+因此，现有“GPU-only execution + host as spill space”的范式，在 MoE + Multi-LoRA decode 下并不充分。我们面对的不是“如何把已有缓存做得更激进”这样一个渐进式问题，而是一个范式级问题：**当 miss 成为结构性事件时，系统是否还应该把所有 miss 统一处理成 GPU promotion？**
 
 # **3. Case Study 告诉了我们什么？**
 为了更具体地理解这一问题，我们构建了一个 trace-driven case study：
 将 真实 MoE router trace 与 半真实的 LoRA invocation trace 结合，比较三种访问建模方式：
 
-- B0：expert-only；B0：仅专家模型；
+- B0：expert-only；
 - B1：expert×LoRA（independent）；
 - B2：expert×LoRA（correlated）。
 
@@ -86,7 +86,7 @@
 1. **联合 keying 会很早将系统推入更碎片化的 locality regime**
 
 相较于 expert-only 建模，expert–LoRA 联合建模的访问分布明显更平、更长尾，热点覆盖率显著下降；
-即使 expert 本身仍有偏斜访问，联合对象空间也会因 LoRA 维度的引入而被显著切碎。
+即使 expert 本身仍然有明显偏斜，LoRA 维度的引入也会把原本集中在少数 expert 上的热点切分成更多、更细、访问更不稳定的联合对象。
 
 这意味着：
 > **系统不能再依赖 expert-only 热点直觉来估计驻留压力。**
@@ -100,7 +100,7 @@
 
 > **tail request 会反复遭遇长尾冷对象，导致 miss 成为结构性而非偶发性事件。**
 
-3. **tail penalty 出现得很早，而且会长期维持在高位平台**
+1. **tail penalty 出现得很早，而且会长期维持在高位平台**
 
 更重要的是，随着 modeled LoRA cardinality 从极小规模开始增长，P99 penalty 会很早出现并迅速抬升；
 之后即使继续增加 LoRA 数量，其 tail penalty 往往不是无限制线性增长，而是进入一个 **持续的高位平台**。
@@ -115,7 +115,7 @@
 
 这些观察共同指向了一个关键结论：
 
-> **在 expert–LoRA fragmentation regime 下，单纯依赖 miss-avoidance（如更激进缓存或预取）已难以从根本上缓解 tail latency。**
+> **在 expert–LoRA fragmentation regime 下，单纯依赖 miss-avoidance（如更激进缓存或预取）已难以从根本上缓解 tail latency。
 
 原因在于：
 
@@ -129,30 +129,17 @@
 
 # **4. 我们的主要想法是什么？**
 
-**核心洞察：并非所有 expert-LoRA 调用都值得走同一条执行路径**
+在 decode 场景中，expert–LoRA 调用呈现出显著的长尾与弱复用特征，使得一次 cache miss 的代价往往无法通过后续访问有效摊薄。
 
-case study 表明，在 decode worker 中，一旦 expert–LoRA 联合对象的长尾访问成为结构性现象，系统就不能再把所有 miss 都视为同一种事件统一处理。
+因此，cache miss 不应再被视为一个固定流程（即“换入后执行”），而应被视为一个**延迟权衡问题**：系统需要在不同执行方式之间，根据对象的访问特征动态选择更合适的处理路径，其核心在于不同路径在“数据迁移成本”与“计算成本”之间的权衡。
 
-对于 **高频、可复用的热点 expert–LoRA** 单元，保持 GPU 驻留并走 GPU 路径仍然是最优选择；
+换言之：
 
-但对于 **低频、突发、弱复用的冷单元**，若一律采用阻塞式“换入 GPU 后执行”，请求 tail latency 往往会被绑在最慢的 promotion 路径上。
-对这类对象而言，可以将 miss-handling 视为一个延迟权衡问题：
+> **miss-handling 从“数据搬运问题”转变为“执行路径选择问题”。**
 
-* **GPU 路径**：PCIe 传输 + GPU 执行（但需阻塞等待权重到达）
-* **CPU 路径**：直接在 host 侧执行（无迁移，但计算能力较弱）
+这一转变意味着，系统设计的核心不再只是“哪些对象应驻留在 GPU 上”，还包括：
 
-在 decode 场景中，由于 batch 小、调用碎片化，PCIe 传输与调度延迟往往难以摊薄。对于低频冷对象，其复用间隔通常较长（i.e., large reuse distance），导致一次权重迁移的成本难以在后续调用中被有效摊薄（amortize），从而使得：
-
-> **“搬入 GPU 再执行”在延迟上不一定优于“直接在 CPU 执行”。**
-
-因此，本文的关键判断是：
-
-> **host memory 不应只被视为更慢的显存扩展层，还应被视为一个可参与 miss-time 计算的辅助执行层。**
-
-这意味着系统设计的重点不再只是“哪些对象该留在 GPU 上”，还包括：
-
-> **当长尾 miss 不可避免时，系统应该如何处理这些 miss。**
-
+> **当长尾 miss 不可避免时，应如何以更可控的方式处理这些 miss。**
 
 # **5. COLoRA 的总体思路是什么？**
 
