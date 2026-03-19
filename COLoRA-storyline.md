@@ -13,9 +13,9 @@
 在这一场景下，有限 GPU 显存不仅需要容纳 KV cache 和基座模型运行态，还需要容纳部分活跃的 expert–LoRA 参数单元。
 一旦联合对象的局部性被打散，decode worker 将频繁遭遇参数 miss；若系统仍默认采用阻塞式“换入 GPU 后执行（load-then-run）”，则 PCIe 传输与安装延迟会直接暴露在单请求关键路径上，并显著放大 tail latency。
 
-因此，本文要解决的核心问题不是泛泛的“显存不够”，而是：
+因此，本文要解决的核心问题不是泛泛的“显存不够”，而是一个更具结构性的执行与代价权衡问题：
 
-> **在 MoE + Multi-LoRA 的 decode 场景下，如何在 expert–LoRA 粒度下管理参数驻留，并在 miss 不可避免时，以更稳定的方式处理长尾访问，从而降低 P99 tail latency。**
+> **在 MoE + Multi-LoRA 的 decode 场景下，如何在 expert–LoRA 粒度下管理参数驻留，并在 miss 不可避免时，在“权重迁移 + GPU执行”与“原地 CPU 执行”之间做出代价感知（cost-aware）的选择，从而降低 P99 tail latency。**
 
 
 ## 系统边界
@@ -27,6 +27,8 @@
 - 全局调度器的 admission control。
 
 我们假设上层调度器已将请求分配至某个 decode worker；本文解决的是该 worker 内部如何在 **GPU VRAM 与 CPU 内存/算力** 间协同，以降低 decode 阶段的尾延迟并提升资源利用效率。
+
+我们假设 CPU 内存足以容纳完整的 expert–LoRA 参数副本。
 
 # **2. 目前他人工作在此问题上的局限/缺点？**
 
@@ -111,7 +113,19 @@
 
 > **在 expert–LoRA 粒度下，decode worker 的瓶颈已经从单纯的 miss avoidance，转变为如何稳定处理不可避免的长尾 miss。**
 
-这也直接引出了本文的设计动机。
+这些观察共同指向了一个关键结论：
+
+> **在 expert–LoRA fragmentation regime 下，单纯依赖 miss-avoidance（如更激进缓存或预取）已难以从根本上缓解 tail latency。**
+
+原因在于：
+
+* 联合 key space 膨胀使得有效 working set 超出 GPU 容量，缓存无法覆盖；
+* tail request 所触及的对象具有高度不稳定性，难以被预取或预测；
+* tail penalty 呈平台化特征，说明问题并不会随资源增加自然消失。
+
+因此，系统瓶颈从“如何避免 miss”，转变为：
+
+> **当 miss 成为结构性事件时，如何以更稳定的方式处理 miss 本身。**
 
 # **4. 我们的主要想法是什么？**
 
@@ -122,7 +136,14 @@ case study 表明，在 decode worker 中，一旦 expert–LoRA 联合对象的
 对于 **高频、可复用的热点 expert–LoRA** 单元，保持 GPU 驻留并走 GPU 路径仍然是最优选择；
 
 但对于 **低频、突发、弱复用的冷单元**，若一律采用阻塞式“换入 GPU 后执行”，请求 tail latency 往往会被绑在最慢的 promotion 路径上。
-对这类对象而言，**将权重搬入 GPU 的代价**在某些情况下可能高于**直接在 CPU 上完成该单元计算并回传激活值的代价。**
+对这类对象而言，可以将 miss-handling 视为一个延迟权衡问题：
+
+* **GPU 路径**：PCIe 传输 + GPU 执行（但需阻塞等待权重到达）
+* **CPU 路径**：直接在 host 侧执行（无迁移，但计算能力较弱）
+
+在 decode 场景中，由于 batch 小、调用碎片化，PCIe 传输与调度延迟往往难以摊薄。对于低频冷对象，其复用间隔通常较长（i.e., large reuse distance），导致一次权重迁移的成本难以在后续调用中被有效摊薄（amortize），从而使得：
+
+> **“搬入 GPU 再执行”在延迟上不一定优于“直接在 CPU 执行”。**
 
 因此，本文的关键判断是：
 
@@ -151,6 +172,8 @@ COLoRA 的目标不是消灭 PCIe 代价，也不是让 CPU 替代 GPU 做主计
 它要做的是：
 
 > **在 expert–LoRA fragmentation 下，用更稳定、可控的 fallback 路径替代高抖动的阻塞式 promotion，从而改善 decode 阶段的 tail latency。**
+
+此外，需要指出的是，COLoRA 并不在所有场景下引入额外复杂性：当访问局部性较高或 GPU 容量足以覆盖活跃对象时，系统将自然退化为 GPU-only 执行路径，从而避免不必要的异构执行与调度开销。
 
 # **6. 这一路径面临哪些技术挑战？**
 
@@ -206,7 +229,14 @@ case study 的关键启示是：
 
 ## 方法概述
 
-COLoRA 是一个面向 **decode worker** 的异构推理执行引擎。它通过 **expert 级非对称缓存** 和 **CPU fallback 执行路径**，在 expert 粒度上动态选择 GPU 或 CPU 执行，以降低 MoE-LoRA 长尾路由导致的阻塞式权重换入开销；同时通过轻量化 CPU 算子与基于时间局部性的感知层级投机发射机制，减少 fallback 带来的同步代价。
+COLoRA 是一个面向 **decode worker** 的异构推理执行引擎。它在 **expert–LoRA 联合粒度** 下进行参数管理，并通过：
+
+* **非对称缓存（GPU hot cache + CPU full replica）**
+* **CPU fallback 执行路径**
+
+在运行时动态选择 GPU 或 CPU 执行，以降低 MoE + Multi-LoRA 场景下长尾访问导致的阻塞式权重换入开销。
+
+在执行层面，CPU fallback 仅负责 **LoRA residual 分支（低秩增量）** 的计算，而 base expert 主路径始终保持在 GPU 上执行，以避免对主干精度与吞吐造成影响。
 
 ## **三个主要创新点：**
 
@@ -236,18 +266,21 @@ COLoRA 是一个面向 **decode worker** 的异构推理执行引擎。它通过
 
 **(调度创新，重点是“减少异构等待”)**
 
+**直观而言，该机制的核心是：利用时间局部性预测提前启动 CPU fallback 计算，并在同步点按需“绑定”其结果，从而将异构执行从串行依赖转化为重叠执行。**
+
 - 挑战 (Challenge)： 即使 CPU Fallback 算子的固定开销已被显著压缩，若系统仍严格遵循层级同步语义（layer-wise synchronization），GPU 在规约点前仍需等待异构侧结果返回，而这部分等待通常由 PCIe 传输、CPU 执行与结果回传共同构成，容易进一步演化为新的尾延迟来源。
 
   更关键的是，若希望在规约点之前提前启动 CPU 路径，系统不仅需要预测下一步可能复用的 expert，还需要为其提供可提前消费的 activation 近似输入；否则所谓 speculative dispatch 只能停留在“预取权重”，无法真正重叠计算。
 
-- 设计 (Design)： 基于真实 trace 揭示的 MoE 路由强时间局部性及其 U 型层级分布特征，我们设计了感知层级的投机发射机制（layer-aware speculative dispatch）。
+- 设计 (Design)： 基于真实 trace 揭示的 MoE 路由强时间局部性及其 U 型层级分布特征（即浅层与深层具有更高的路由稳定性，而中间层波动更大），我们设计了感知层级的投机发射机制（layer-aware speculative dispatch）。
 其核心思想是：在高时间局部性、且路由预测更稳定的层区，系统允许对LoRA fallback 增量路径进行受控的投机启动；而在预测置信度较低的层区则自动关闭该机制，回退至常规执行。
 
-- 机制 (Mechanism)： 在解码步 $t$ 处理第 $L$ 层时，系统利用前一解码步在对应层的路由状态作为启发式预测信号。对于浅层与深层等高置信区，系统通过独立非阻塞流，提前将当前请求所需的 LoRA-fallback 任务派发至 CPU，并允许其基于可获得的近似输入尽早启动；当 GPU 推进至该层规约点（reduction point）时，再对异构侧返回结果执行延迟绑定（late binding），只在预测命中且结果有效时完成合并。对于中间层等低置信区，则自适应禁用投机发射，以避免无效计算与额外扰动。
+- 机制 (Mechanism)： 在解码步 $t$ 处理第 $L$ 层时，系统利用前一解码步在对应层的路由状态作为启发式预测信号。对于浅层与深层等高置信区，系统通过独立非阻塞流，提前将当前请求所需的 LoRA-fallback 任务派发至 CPU，并允许其基于上一解码步的 activation 近似值尽早启动计算；在 GPU 推进至该层规约点时，再对 CPU 路径返回结果执行延迟绑定（late binding）：仅当预测命中且结果有效时才参与最终合并，否则直接丢弃。，只在预测命中且结果有效时完成合并。对于中间层等低置信区，则自适应禁用投机发射，以避免无效计算与额外扰动。
 
   为控制精度风险，该机制不作用于 base FFN 主路径。我们的 micro-benchmark 显示，若在 base expert branch 上直接使用 stale activation，困惑度退化明显，说明该近似不适合主干计算。基于这一观察，COLoRA 将投机执行严格限定在 LoRA residual path：即仅对增量式 adapter 修正项进行提前计算，而 base output 仍保持精确执行。由于 LoRA 分支相对于 base 主干通常具有更小的数值贡献，这种受限近似更有可能在可接受精度损失下换取有效的异构重叠。
 
 - 收益 (Benefit)： 该机制打破了 GPU 与 CPU 路径之间“到点再启动、启动后阻塞等待”的串行依赖，使 CPU 传输与计算更大概率被隐藏在 GPU 执行 base path 的主时间线之下。与传统阻塞式 cache miss 处理相比，它能够显著缓解异构返回造成的长尾等待，提升双路径流水线的并发度与资源利用率，并在不改变主干精确语义的前提下，为 LoRA-fallback miss 提供更积极的尾延迟优化空间。
+  因此，该机制本质上将 CPU fallback 从“被动响应 miss”转变为“可提前调度的异步执行单元”。
 
 # **5. 我们最重要的创新是什么？我们工作主要的局限性是什么？**
 
@@ -309,90 +342,5 @@ COLoRA 减少的是**部分权重传输造成的阻塞**，并不消除异构通
 - **GPU/CPU 利用率与资源占用**
 - **Host memory footprint**（因为用了 CPU 全量副本）
 
-# **7. Case Study：Real Router + LoRA Invocation Trace**
 
-## 目标
 
-用真实 MoE 路由与 LoRA 调用轨迹，构造 `Expert × LoRA` 的真实组合分布，验证：
-
-- `Expert × LoRA` 的交叉稀疏会显著放大 GPU cache miss
-- miss 放大进一步加剧 decode 尾延迟（P90/P99/TPOT）
-- 仅靠 expert 级缓存管理不足以稳定长尾
-
-## 数据来源与采集
-
-**Real router trace（MoE 路由）**
-
-- 选择一个真实 MoE 模型（如 Mixtral / Qwen-MoE / Switch 类），在 decode 阶段记录路由结果
-- 每个 token、每层记录 top-k expert id 与 gate weight
-- 需要保留请求 id、时间戳、层号、batch size、token 位置等信息，用于复现调度与并发
-
-**Real / Synthetic LoRA trace（LoRA 调用）**
-
-- 若有线上日志：记录 LoRA id、请求到达时间、token 数、并发会话长度
-- 若无真实日志：构造合成 trace
-- 合成 trace 建议满足：
-- LoRA 热度服从 Zipf（长尾明显）
-- 具有 burst / session 行为（尾延迟放大更明显）
-
-## Trace 事件格式（建议）
-
-```text
-router_event:
-  t, req_id, layer, token_pos, topk_experts[], topk_weights[], batch_size
-
-lora_event:
-  t, req_id, lora_id, input_len, output_len
-```
-
-## 组合方法（构造 Expert × LoRA）
-
-**Join 规则**
-
-- 以 `req_id` 为键，将 LoRA 调用信息与 router 事件关联
-- 产生 `lora_id + expert_id` 的组合事件
-- 对同一 req 的所有 layer / token 形成真实的专家调用序列
-
-**时间轴一致性**
-
-- 保留原始时间戳，复现 batcher 形成的并发
-- 不做强行对齐，让 tail burst 自然出现
-
-**两类组合场景**
-
-- Independent：LoRA 与 router 独立组合，用于“平均”行为对照
-- Correlated：人为绑定“某些 LoRA 更偏某些 expert”的相关性，用于 worst-case stress
-
-## 实验设计
-
-**对照组**
-
-1. MoE-only（单 LoRA）：仅 router trace，验证专家长尾但无 LoRA 维度
-2. Multi-LoRA-only（dense 模型）：仅 LoRA trace，验证 LoRA 切换但无专家维度
-3. MoE × Multi-LoRA（真实组合）：核心 case study
-
-**系统配置控制**
-
-- 固定 GPU cache 容量
-- 固定预取策略与替换策略
-- 统一 batcher 与 decode 线程模型
-
-## 关键观测指标
-
-- GPU cache miss rate（按 Expert / LoRA-Expert）
-- miss 处理路径占比：阻塞换入 vs CPU fallback
-- PCIe 传输字节与时延
-- TPOT P50/P90/P99（核心 tail latency）
-- LoRA-Expert 热度分布与碎片化程度（访问频率直方图）
-
-## 预期结论（Case Study 的价值）
-
-- `MoE × Multi-LoRA` 的交叉稀疏度明显高于任何单维度变化
-- Expert 级缓存管理虽降低平均 miss，但对尾部 miss 无法稳定消除
-- 需要非阻塞 miss 处理与 fallback 执行来压制 tail latency 放大
-
-## Checklist
-
-- [ ] real router
-- [ ] real / synthetic lora trace
-- [ ] combine into a case study
