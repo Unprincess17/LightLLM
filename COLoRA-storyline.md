@@ -232,15 +232,22 @@ COLoRA 是一个面向 **decode worker** 的异构推理执行引擎。它通过
 
 这并不试图在绝对 FLOPs 上超过 GPU，而是使 CPU fallback 在 **长尾、低频、时延敏感** 的调用上成为可用且稳定的替代路径。
 
-### 创新点 3：基于时间局部性的投机发射与无死锁流水线 / Temporal-Locality-Based Speculative Dispatch for Maximizing Heterogeneous Overlap
+### 创新点 3：基于时间局部性的投机发射与延迟绑定流水线 / Temporal-Locality-Guided Speculative Dispatch with Late Binding for Heterogeneous Overlap
 
-**(调度创新，重点是“减少等待”)**
+**(调度创新，重点是“减少异构等待”)**
 
-- 挑战 (Challenge)： 即使 CPU Fallback 算子的固定开销已被极度压缩，若系统严格遵循层级同步语义（Layer-wise Synchronization），GPU 依然会因等待异构侧的结果（PCIe 传输 + CPU 计算）而产生空转气泡，这部分等待时间仍可能成为新的尾延迟来源。
-- 设计 (Design)： 基于真实 Trace 揭示的 MoE 路由强时间局部性（全局约 72% 命中率）及其 U 型层级分布特征，我们设计了感知层级的投机发射机制 (Layer-Aware Speculative Dispatch)。
-- 机制 (Mechanism)： 在处理第 $L$ 层时，对于浅层与深层等高预测置信区，系统利用上一解码步的路由状态作为启发式预测，通过独立的非阻塞流提前将当前激活值派发至 CPU 启动计算；在中间层等低置信区则自适应回退。当 GPU 推进至该层的规约点 (Reduction point) 时，再进行结果的延迟绑定 (Late-binding)。
+- 挑战 (Challenge)： 即使 CPU Fallback 算子的固定开销已被显著压缩，若系统仍严格遵循层级同步语义（layer-wise synchronization），GPU 在规约点前仍需等待异构侧结果返回，而这部分等待通常由 PCIe 传输、CPU 执行与结果回传共同构成，容易进一步演化为新的尾延迟来源。
 
-- 收益 (Benefit)： 该机制有效打破了异构路径间的严格顺序依赖。在真实的路由命中率下，它能够将绝大部分的 CPU 传输与计算延迟隐藏 (Hide/Mask) 在 GPU 执行 Base FFN 的主时间线之下，从而显著缓解 (Significantly Mitigate) 阻塞式 Cache Miss 带来的长尾惩罚，提升双路径流水线的整体并发度。
+  更关键的是，若希望在规约点之前提前启动 CPU 路径，系统不仅需要预测下一步可能复用的 expert，还需要为其提供可提前消费的 activation 近似输入；否则所谓 speculative dispatch 只能停留在“预取权重”，无法真正重叠计算。
+
+- 设计 (Design)： 基于真实 trace 揭示的 MoE 路由强时间局部性及其 U 型层级分布特征，我们设计了感知层级的投机发射机制（layer-aware speculative dispatch）。
+其核心思想是：在高时间局部性、且路由预测更稳定的层区，系统允许对LoRA fallback 增量路径进行受控的投机启动；而在预测置信度较低的层区则自动关闭该机制，回退至常规执行。
+
+- 机制 (Mechanism)： 在解码步 $t$ 处理第 $L$ 层时，系统利用前一解码步在对应层的路由状态作为启发式预测信号。对于浅层与深层等高置信区，系统通过独立非阻塞流，提前将当前请求所需的 LoRA-fallback 任务派发至 CPU，并允许其基于可获得的近似输入尽早启动；当 GPU 推进至该层规约点（reduction point）时，再对异构侧返回结果执行延迟绑定（late binding），只在预测命中且结果有效时完成合并。对于中间层等低置信区，则自适应禁用投机发射，以避免无效计算与额外扰动。
+
+  为控制精度风险，该机制不作用于 base FFN 主路径。我们的 micro-benchmark 显示，若在 base expert branch 上直接使用 stale activation，困惑度退化明显，说明该近似不适合主干计算。基于这一观察，COLoRA 将投机执行严格限定在 LoRA residual path：即仅对增量式 adapter 修正项进行提前计算，而 base output 仍保持精确执行。由于 LoRA 分支相对于 base 主干通常具有更小的数值贡献，这种受限近似更有可能在可接受精度损失下换取有效的异构重叠。
+
+- 收益 (Benefit)： 该机制打破了 GPU 与 CPU 路径之间“到点再启动、启动后阻塞等待”的串行依赖，使 CPU 传输与计算更大概率被隐藏在 GPU 执行 base path 的主时间线之下。与传统阻塞式 cache miss 处理相比，它能够显著缓解异构返回造成的长尾等待，提升双路径流水线的并发度与资源利用率，并在不改变主干精确语义的前提下，为 LoRA-fallback miss 提供更积极的尾延迟优化空间。
 
 # **5. 我们最重要的创新是什么？我们工作主要的局限性是什么？**
 
