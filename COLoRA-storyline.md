@@ -206,7 +206,7 @@ case study 的关键启示是：
 
 ## 方法概述
 
-COLoRA 是一个面向 **decode worker** 的异构推理执行引擎。它通过 **expert 级非对称缓存** 和 **CPU fallback 执行路径**，在 expert 粒度上动态选择 GPU 或 CPU 执行，以降低 MoE-LoRA 长尾路由导致的阻塞式权重换入开销；同时通过轻量化 CPU 算子与异构重叠执行，减少 fallback 带来的同步代价。
+COLoRA 是一个面向 **decode worker** 的异构推理执行引擎。它通过 **expert 级非对称缓存** 和 **CPU fallback 执行路径**，在 expert 粒度上动态选择 GPU 或 CPU 执行，以降低 MoE-LoRA 长尾路由导致的阻塞式权重换入开销；同时通过轻量化 CPU 算子与基于时间局部性的感知层级投机发射机制，减少 fallback 带来的同步代价。
 
 ## **三个主要创新点：**
 
@@ -237,8 +237,8 @@ COLoRA 是一个面向 **decode worker** 的异构推理执行引擎。它通过
 **(调度创新，重点是“减少等待”)**
 
 - 挑战 (Challenge)： 即使 CPU Fallback 算子的固定开销已被极度压缩，若系统严格遵循层级同步语义（Layer-wise Synchronization），GPU 依然会因等待异构侧的结果（PCIe 传输 + CPU 计算）而产生空转气泡，这部分等待时间仍可能成为新的尾延迟来源。
-- 设计 (Design)： 利用大模型解码阶段（Decoding Phase）连续 Token 在 MoE 路由选择上的强时间局部性 (Strong Temporal Locality)，我们在底层推理引擎的调度循环中引入了轻量级的投机发射机制 (Speculative Dispatch)。
-- 机制 (Mechanism)： 在处理第 $L$ 层时，系统利用上一解码步的路由状态作为启发式预测，通过独立的非阻塞流 (Non-blocking Stream) 提前将当前激活值派发至 CPU 启动 LoRA 计算。当 GPU 推进至该层的规约点 (Reduction point) 时，再进行结果的延迟绑定 (Late-binding) 或状态回退。
+- 设计 (Design)： 基于真实 Trace 揭示的 MoE 路由强时间局部性（全局约 72% 命中率）及其 U 型层级分布特征，我们设计了感知层级的投机发射机制 (Layer-Aware Speculative Dispatch)。
+- 机制 (Mechanism)： 在处理第 $L$ 层时，对于浅层与深层等高预测置信区，系统利用上一解码步的路由状态作为启发式预测，通过独立的非阻塞流提前将当前激活值派发至 CPU 启动计算；在中间层等低置信区则自适应回退。当 GPU 推进至该层的规约点 (Reduction point) 时，再进行结果的延迟绑定 (Late-binding)。
 
 - 收益 (Benefit)： 该机制有效打破了异构路径间的严格顺序依赖。在真实的路由命中率下，它能够将绝大部分的 CPU 传输与计算延迟隐藏 (Hide/Mask) 在 GPU 执行 Base FFN 的主时间线之下，从而显著缓解 (Significantly Mitigate) 阻塞式 Cache Miss 带来的长尾惩罚，提升双路径流水线的整体并发度。
 
