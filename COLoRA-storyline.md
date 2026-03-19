@@ -286,58 +286,210 @@ COLoRA 是一个面向 **decode worker** 的异构推理执行引擎。它在 **
 
 ## 最重要创新
 
-COLoRA 的关键贡献不是“把 CPU 当成第二个 GPU”，而是提出并实现了一种 **面向 MoE 长尾路由的非阻塞 miss 处理范式**：
+COLoRA 的关键贡献不在于简单引入 CPU 参与计算，而在于提出了一种 **面向长尾 miss 的执行范式转变（miss-handling paradigm shift）**：
 
-> 在 decode 场景下，系统不再将 cache miss 一律转化为“参数换入等待”，而是通过“GPU hot cache + CPU full replica + CPU fallback execution”的异构双路径机制，将 miss 的代价从高抖动的阻塞式权重传输，转化为更可控的 fallback 计算与激活传输路径，并通过重叠调度进一步降低对 tail latency 的影响。
-> 
+> **将 cache miss 从“必须通过参数迁移解决的问题”，重构为“可以通过异构执行路径吸收的运行时事件”。**
 
-# 主要的局限性：
+具体而言，在 decode 场景下，传统系统将 miss 统一转化为阻塞式“load-then-run”，使 PCIe 传输与调度延迟直接暴露在关键路径上；而 COLoRA 通过：
+
+* GPU hot cache（服务高复用对象）
+* CPU full replica（提供无迁移执行能力）
+* CPU fallback execution（处理低复用长尾调用）
+
+构建了一种 **双路径执行模型（dual-path execution model）**，使得：
+
+> cache miss 不再必然转化为阻塞等待，而是可以被转化为 **可调度、可重叠的计算路径**。
+
+这一转变将系统优化重点从“尽量避免 miss”转向“稳定处理不可避免的 miss”，从而在 MoE + Multi-LoRA 的长尾访问场景下显著改善 tail latency。
+
+## 主要的局限性：
 
 ## 局限 1：收益依赖于路由长尾程度与 CPU fallback 负载占比
 
-COLoRA 的优势主要体现在：
+COLoRA 的性能优势依赖于如下条件成立：
 
-- 热点专家可稳定驻留 GPU，
-- 冷门专家访问相对稀疏、
-- CPU fallback 不形成持续排队。
+* 热点 expert–LoRA 单元能够稳定驻留 GPU；
+* 冷对象访问呈现低频、分散特征；
+* CPU fallback 调用比例处于可控范围内。
 
-当出现大规模突发冷路由、或 CPU fallback 比例持续升高时，CPU 侧排队与传输开销可能突破可重叠窗口，导致 tail latency 收益下降，甚至引入额外等待。
+当请求模式发生变化，例如：
+
+* 大规模突发冷路由（burst of cold accesses），或
+* fallback 比例持续升高，
+
+CPU 侧可能形成排队，且其执行与传输开销无法被 GPU 主路径有效重叠，从而削弱 tail latency 改善效果，甚至引入新的尾部等待。
+
+> 本质上，该系统依赖于“热-冷分离 + fallback 稀疏”的结构性假设。
 
 ## 局限 2：CPU 路径优化存在硬件依赖性
 
-CPU fallback 算子的最佳配置（如向量化策略、任务分组大小、线程绑定方式）与 CPU 微架构、NUMA 拓扑、缓存层级密切相关。当前实现主要通过离线 profiling 选取参数，运行时自适应能力有限。
+CPU fallback 的性能高度依赖于底层硬件与系统配置，包括：
+
+* CPU 微架构（向量宽度、缓存层级）
+* NUMA 拓扑
+* 线程调度与绑定策略
+
+当前实现主要依赖离线 profiling 确定参数（如分块大小、线程布局），运行时自适应能力有限。因此，在不同硬件平台或资源竞争环境下，fallback 路径性能可能出现显著波动。
 
 ## 局限 3：仍然受限于异构通信与系统拓扑
 
-COLoRA 减少的是**部分权重传输造成的阻塞**，并不消除异构通信成本。对于高 hidden dimension、复杂 PCIe/NUMA 拓扑，或与其他通信流量（例如系统内其他 DMA/KV 相关传输）争用链路的场景，激活值往返仍可能成为重要限制因素。
+COLoRA 减少的是**阻塞式权重迁移带来的延迟暴露**，但并未消除异构通信成本。
+
+在以下场景中：
+
+* hidden dimension 较大（激活体积高）
+* PCIe / NUMA 拓扑复杂
+* 与其他通信流量（如 KV cache 传输）竞争带宽
+
+CPU 与 GPU 间的激活传输仍可能成为瓶颈，从而限制整体收益。
 
 # **9. 我们工作主要的比较对象是什么？主要的衡量指标是什么？**
 
+## **评估设置概述**
+
+我们的主要评估场景为 **Multi-LoRA @ Decode**，即多个 LoRA adapter 并发活跃，并在 decode 阶段产生细粒度 expert–LoRA 参数访问的典型部署模式。这一设置对应实际多租户推理服务中最容易出现 **working set 膨胀与访问碎片化** 的场景。
+
+同时，为了验证方法的适用范围与鲁棒性，我们额外考虑以下两类扩展设置：
+
+* **Single-LoRA 场景（对照）**：用于评估在无多租户干扰、参数复用更强时，COLoRA 是否仍能保持稳定性能或自然退化为 GPU-only 执行；
+* **Prefill-Decode 未分离场景（扩展分析）**：用于分析在 unified serving 下，prefill 负载对 CPU fallback 路径与异构调度的潜在影响（通过受控负载注入与资源竞争模拟进行分析）。
+
+> 这些扩展设置的目标不是改变问题定义，而是验证 COLoRA 的设计是否依赖于特定部署假设。
+
+---
+
 ## **比较对象：**
 
-（multi-lora为主, single-lora辅助；pd不分离？）
+为了全面评估 COLoRA 的有效性，我们设计了以下三类基线：
 
-为了隔离各模块贡献，评估应包含三类基线：
+1. **Optimized GPU-only Multi-LoRA/MoE baseline（强基线）**
 
-1. **GPU-only Multi-LoRA/MoE Serving baseline（强基线）**
-    
-    代表主流“参数尽量在 GPU 执行”的范式，并配备合理的预取/缓存策略。
-    
-2. **Expert-granular GPU-only baseline（细粒度增强基线）**
-    
-    用于验证：仅靠 expert 级缓存管理是否足以解决 decode 的尾延迟问题。
-    
-3. **COLoRA 系列消融（机制拆解）**
-    - w/o CPU fallback（miss 改为阻塞换入）
-    - w/o overlap（同步执行）
-    - w/o optimized CPU kernels（使用通用框架路径）
+   代表当前主流部署范式，在 GPU 上执行所有计算，并配备：
 
-## **衡量指标：**
+   * 合理的缓存策略（LoRA / expert-aware）
+   * 预取与调度优化
 
-- **TPOT（平均 / P90 / P99）**：核心指标，反映 decode 时延与长尾
-- **Throughput（req/s 或 tok/s）**
-- **TTFT**：验证 decode 优化是否引入 prefill/调度副作用（若端到端评估）
-- **GPU cache miss rate / miss handling breakdown**（阻塞换入 vs CPU fallback）
-- **CPU fallback queueing time / execution time / transfer time**（把机制解释清楚）
-- **GPU/CPU 利用率与资源占用**
-- **Host memory footprint**（因为用了 CPU 全量副本）
+   该基线用于衡量：**在不引入异构执行的前提下，系统所能达到的最优性能。**
+
+
+2. **Fine-grained GPU-only baseline（粒度增强基线）**
+
+   在 GPU-only 框架下引入 expert–LoRA 粒度的缓存与调度策略，用于验证：
+
+   > **仅依赖更细粒度的驻留管理，是否足以缓解 fragmentation 带来的 tail latency 问题。**
+
+
+3. **COLoRA 消融实验（机制拆解）**
+
+   用于隔离各组件贡献：
+
+   * w/o CPU fallback（全部 miss 采用阻塞换入）
+   * w/o overlap（禁用异构重叠）
+   * w/o optimized CPU kernels（使用通用框架路径）
+
+---
+
+## **扩展对照实验（适用性验证）**
+
+为了验证 COLoRA 的设计是否依赖于 multi-LoRA fragmentation，我们进一步设计以下对照实验：
+
+### - Single-LoRA 场景
+
+仅启用单一 LoRA adapter，使参数访问具有更强的复用性与稳定性。
+
+该实验用于验证：
+
+* CPU fallback 触发比例是否显著下降
+* 系统是否自然退化为 GPU-only 执行路径
+* 是否引入额外调度或通信开销
+
+> 该结果用于说明：COLoRA 在低 fragmentation 场景下不会带来负面影响。
+
+### - Unified Serving 场景（Prefill-Decode 未分离）
+
+通过引入受控的 prefill 负载，与 decode 请求共享 GPU 与 CPU 资源，用于分析：
+
+* CPU fallback 与 prefill 计算之间的资源竞争
+* 异构路径重叠是否被打破
+* tail latency 是否受到额外扰动
+
+该实验主要用于定性分析 COLoRA 在非理想部署条件下的表现。
+
+
+## **衡量指标**
+
+我们使用以下指标评估系统性能：
+
+---
+
+### - 延迟指标（核心）
+
+* **TPOT（平均 / P90 / P99）**
+  衡量 decode 阶段每 token 生成延迟，是本文的核心指标
+
+---
+
+### - 吞吐指标
+
+* **Throughput（req/s 或 tok/s）**
+  衡量系统整体处理能力
+
+---
+
+### - 端到端指标
+
+* **TTFT（Time-To-First-Token）**
+  用于验证 decode 优化是否对 prefill 或整体调度产生副作用
+
+---
+
+### - miss 行为分析
+
+* **GPU cache miss rate**
+* **miss handling breakdown（阻塞换入 vs CPU fallback）**
+
+用于回答：
+
+> tail latency 的变化是否来自 miss-handling 机制本身
+
+---
+
+### - CPU fallback 细粒度分析
+
+* **CPU fallback queueing time**
+* **CPU execution time**
+* **activation transfer time（CPU↔GPU）**
+
+用于解释：
+
+> fallback 路径是否成为新的瓶颈
+
+---
+
+### - 资源利用率
+
+* **GPU utilization / SM occupancy**
+* **CPU utilization**
+
+用于评估：
+
+> 异构执行是否提升整体资源利用效率
+
+---
+
+### - 内存开销
+
+* **Host memory footprint（CPU 全量副本）**
+
+用于量化：
+
+> COLoRA 引入的额外资源成本
+
+---
+
+## **评估目标总结**
+
+上述指标共同用于回答两个核心问题：
+
+1. **COLoRA 是否显著降低 decode 阶段的 tail latency？**
+2. **这种改善是否来源于 miss-handling 范式转变，而非其他系统因素？**
