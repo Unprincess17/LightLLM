@@ -166,51 +166,35 @@ COLoRA 的目标不是消灭 PCIe 代价，也不是让 CPU 替代 GPU 做主计
 
 ## 挑战一：联合 key space 膨胀下的细粒度驻留管理
 
-在 MoE 路由和 Multi-LoRA 并发共同作用下，访问热点不再只呈现 expert 偏斜，而是表现为 **expert × LoRA 的联合偏斜**。
+在 MoE 路由与 Multi-LoRA 并发作用下，访问模式不再仅表现为 expert 偏斜，而是呈现为 **expert × LoRA 的联合偏斜**，显著扩大了有效工作集。
 
-这会带来两个直接后果：
+- 粗粒度管理（按 LoRA 或更大块）会造成显著 VRAM 浪费；
+- 细粒度管理（按 expert–LoRA 单元）虽更精确，但会引入更高频率且更碎片化的 cache miss。
 
-- 粗粒度管理（按 LoRA 或更大块）会显著浪费 VRAM；
+因此，系统需要在有限 GPU 空间内维持一个紧凑而有效的热点集合，同时抑制由频繁替换带来的系统不稳定性（如 churn 与无效 promotion）。
 
-- 细粒度管理（按 expert–LoRA 单元）虽然更精确，但也会让 miss 更频繁、更碎片化。
+**核心需求**：需要一种能够在 expert–LoRA 粒度下进行高效驻留管理，并抑制频繁替换与无效迁移的机制，在精确性与稳定性之间取得平衡。
 
-因此，系统必须在有限 GPU 空间下识别并维持一个足够小但足够有效的热点集合，同时避免频繁 churn 和无效 promotion。
+## 挑战二：如何将 miss-handling 从“阻塞式换入”转变为“可控 fallback”
 
-**核心需求**：需要一种在 expert–LoRA 粒度下进行驻留管理的机制，既能利用细粒度带来的精确性，又不会让系统因为对象数爆炸而陷入过度 thrashing。
+case study 表明，在 expert–LoRA fragmentation regime 下，cache miss 并非偶发，而是结构性存在。
 
-## 挑战二：如何把 miss-handling 从“阻塞式换入”变成“可控 fallback”
+因此，系统不能再将 miss 一律处理为“load-then-run”。尤其在 decode 场景中，部分冷对象的复用概率较低，阻塞式 promotion 的收益有限。
 
-case study 的关键启示是：
-在 expert–LoRA fragmentation regime 下，miss 并不是偶发异常，而是结构性存在。
+然而，CPU fallback 也面临挑战：
 
-因此，系统不能把 miss 一律等同于 “load-then-run”。
-尤其在 decode 路径上，某些冷对象的未来复用很弱，阻塞式 promotion 未必划算。
+* decode 阶段调用高度碎片化，使 CPU 路径的固定开销难以摊薄；
+* 若 fallback 本身效率不足，只是将“数据传输延迟”转化为另一种执行路径上的延迟。
 
-但 CPU fallback 也不是天然高效的：
-
-- decode 阶段 batch 小、调用碎片化；
-
-- CPU 算子容易被框架 dispatch / tensor orchestration 固定开销吞掉；
-
-- 若 fallback 成本本身过高，只是把“传输延迟”换成了“CPU 调度延迟”。
-
-**核心需求**：需要一个低固定开销的 CPU fallback 执行路径，使其真正成为一种比阻塞式 promotion 更稳定的 miss-time 响应方式。
+**核心需求**：需要构建一个低固定开销的 CPU fallback 执行路径，使其能够稳定替代阻塞式 promotion，成为更可控的 miss-time 响应机制。
 
 ## 挑战三：双执行路径下的同步、重叠与尾部稳定性
 
-一旦同一层内的部分 expert–LoRA 单元在 GPU 执行、部分在 CPU 执行，系统就会引入额外的：
+当同一层内的 expert–LoRA 单元在 GPU 与 CPU 上分布执行时，系统将引入跨设备通信、异构执行路径的同步依赖，以及 CPU/GPU 时间线之间的耦合与排队抖动。
 
-- 激活值在 CPU/GPU 间传输，
+若处理不当，这些因素可能导致 GPU 等待 CPU 返回而产生空转，或使 CPU fallback 本身成为新的 tail latency 来源，从而抵消设计收益。
 
-- 异构路径的结果合并与同步，
-
-- CPU 与 GPU 时间线的耦合，
-
-- CPU fallback 队列自身的抖动。
-
-如果处理不当，GPU 可能因为等待 CPU 返回而空转，或者 CPU fallback 本身成为新的 tail source，从而抵消设计收益。
-
-**核心需求：**：需要在可行的数据依赖边界内最大化通信与计算重叠，并控制 CPU 路径排队与同步成本，使 dual-path 真正改善 tail latency，而不是引入新的瓶颈。
+**核心需求**：需要在数据依赖允许的范围内最大化通信与计算的重叠，并控制 CPU 路径的排队与同步开销，使 dual-path 执行能够稳定改善 tail latency，而非引入新的瓶颈。
 
 # **7. 我们工作的主要方法是什么，以及三个主要的创新点？**
 
