@@ -242,45 +242,77 @@ COLoRA 是一个面向 **decode worker** 的异构推理执行引擎。它在 **
 
 ### 创新点 1：LoRA-Expert 交叉粒度的非对称内存池与非阻塞 miss 处理
 
-- 在 GPU 侧维护容量受限的 **hot LoRA-Expert cache**，以 `(LoRA_a, Expert_b)` 交叉单元作为缓存与驻留管理的最小粒度；
-- 在 CPU 内存中维护对应 **LoRA-Expert 单元权重的全量只读副本**，作为冷数据驻留层与 fallback 执行的数据来源；
-- 当某个 `(LoRA_a, Expert_b)` 单元发生 GPU cache miss 时，系统不再默认采用阻塞式“换入后执行（load-then-run）”，而是可按运行时状态选择：
-    - 对具有热点回升趋势的单元进行异步提升（promotion）至 GPU cache；
-    - 对当前请求直接走 CPU fallback 路径完成该单元对应的 LoRA 计算，避免请求在 miss 上阻塞等待权重换入。
+*(Memory policy，核心是“让 miss 不再阻塞”)*
 
-该机制使 **cache miss 不再必然转化为请求阻塞**，从而将 miss 代价从高抖动的阻塞式权重迁移，转化为更可控的异构执行路径，并为改善 decode 阶段的尾延迟提供空间。
+我们提出一种面向 MoE LoRA 场景的 **LoRA-Expert 交叉粒度内存管理机制**，并将 cache miss 从“阻塞事件”转化为“可调度事件”。
 
-### 创新点 2：面向 decode 稀疏调用模式的低开销 CPU fallback 算子
+- 在 GPU 侧维护容量受限的 **hot LoRA-Expert cache**，以 `(LoRA_a, Expert_b)` 作为最小驻留单元；
+- 在 CPU 内存中维护对应单元的 **全量只读副本**，作为冷数据层与 fallback 执行来源；
+- 当发生 GPU cache miss 时，系统不再采用阻塞式 load-then-run，而是基于运行时状态进行选择：
 
-**(计算路径创新，重点是“降低固定开销”)**
+  - 对具有热点回升趋势的单元执行 **异步提升（promotion）** 至 GPU cache；；
+  - 对当前请求直接走 **CPU fallback 执行路径**。
 
-我们为 CPU fallback 路径实现了针对小批量/碎片化 expert 调用优化的轻量算子路径（基于 AVX 的微内核与更轻的调度封装），目标是降低：
+该机制的关键在于：
 
-- 框架 dispatch 开销，
-- 小张量组织开销，
-- 微型 GEMV/GEMM 的固定成本。
+> **cache miss 不再必然转化为请求阻塞，而是被转化为异构执行路径的调度选择。**
 
-这并不试图在绝对 FLOPs 上超过 GPU，而是使 CPU fallback 在 **长尾、低频、时延敏感** 的调用上成为可用且稳定的替代路径。
+从而将 miss 的代价从高抖动的权重迁移延迟，转化为更可控的计算与传输开销，为 decode 场景下的尾延迟优化提供基础。
+
+### 创新点 2：面向 decode 长尾调用模式的低开销 CPU fallback 执行机制
+
+*(Compute viability，核心是“让 fallback 变得可用”)*
+
+为使 CPU fallback 路径在 decode 场景下真正成为可行选择，我们设计了一条 **面向小批量、碎片化 expert 调用的低固定开销执行路径**。
+
+具体而言，我们通过轻量化算子实现（如基于 AVX 的微内核）与更精简的调度封装，系统性降低：
+
+- 框架级 dispatch 开销，
+- 小张量组织与调度成本，
+- 微型 GEMV/GEMM 的固定启动开销。
+
+该设计的目标并非提升 CPU 的峰值计算能力，而是：
+
+> **压缩 CPU fallback 的固定成本，使其在低频、长尾、时延敏感的调用中具备稳定且可接受的执行代价。**
+
+这一点是整个系统成立的关键前提：
+
+> 若 fallback 路径本身开销不可控，则“非阻塞 miss”将退化为另一种形式的尾延迟来源。
+
+因此，该机制本质上提供了一个 **可用（viable）且稳定的 fallback 执行基础**。
 
 ### 创新点 3：基于时间局部性的投机发射与延迟绑定流水线 / Temporal-Locality-Guided Speculative Dispatch with Late Binding for Heterogeneous Overlap
 
-**(调度创新，重点是“减少异构等待”)**
+*(Scheduling policy，核心是“让 fallback 被重叠”)*
 
-**直观而言，该机制的核心是：利用时间局部性预测提前启动 CPU fallback 计算，并在同步点按需“绑定”其结果，从而将异构执行从串行依赖转化为重叠执行。**
+在具备非阻塞 miss 与可行 fallback 的基础上，我们进一步提出一种 **基于时间局部性的投机调度机制**，用于消除 CPU/GPU 异构路径之间的同步等待。
 
-- 挑战 (Challenge)： 即使 CPU Fallback 算子的固定开销已被显著压缩，若系统仍严格遵循层级同步语义（layer-wise synchronization），GPU 在规约点前仍需等待异构侧结果返回，而这部分等待通常由 PCIe 传输、CPU 执行与结果回传共同构成，容易进一步演化为新的尾延迟来源。
+核心思想是：
 
-  更关键的是，若希望在规约点之前提前启动 CPU 路径，系统不仅需要预测下一步可能复用的 expert，还需要为其提供可提前消费的 activation 近似输入；否则所谓 speculative dispatch 只能停留在“预取权重”，无法真正重叠计算。
+> **利用 decode 过程中的时间局部性，提前启动 CPU fallback 计算，并在需要时再决定是否使用其结果（late binding）。**
 
-- 设计 (Design)： 基于真实 trace 揭示的 MoE 路由强时间局部性及其 U 型层级分布特征（即浅层与深层具有更高的路由稳定性，而中间层波动更大），我们设计了感知层级的投机发射机制（layer-aware speculative dispatch）。
-其核心思想是：在高时间局部性、且路由预测更稳定的层区，系统允许对LoRA fallback 增量路径进行受控的投机启动；而在预测置信度较低的层区则自动关闭该机制，回退至常规执行。
+具体而言：
 
-- 机制 (Mechanism)： 在解码步 $t$ 处理第 $L$ 层时，系统利用前一解码步在对应层的路由状态作为启发式预测信号。对于浅层与深层等高置信区，系统通过独立非阻塞流，提前将当前请求所需的 LoRA-fallback 任务派发至 CPU，并允许其基于上一解码步的 activation 近似值尽早启动计算；在 GPU 推进至该层规约点时，再对 CPU 路径返回结果执行延迟绑定（late binding）：仅当预测命中且结果有效时才参与最终合并，否则直接丢弃。，只在预测命中且结果有效时完成合并。对于中间层等低置信区，则自适应禁用投机发射，以避免无效计算与额外扰动。
+- 基于真实 trace 观察到的 **MoE 路由时间局部性及其层级分布特征**，系统对不同层采用自适应策略：
 
-  为控制精度风险，该机制不作用于 base FFN 主路径。我们的 micro-benchmark 显示，若在 base expert branch 上直接使用 stale activation，困惑度退化明显，说明该近似不适合主干计算。基于这一观察，COLoRA 将投机执行严格限定在 LoRA residual path：即仅对增量式 adapter 修正项进行提前计算，而 base output 仍保持精确执行。由于 LoRA 分支相对于 base 主干通常具有更小的数值贡献，这种受限近似更有可能在可接受精度损失下换取有效的异构重叠。
+  - 在浅层与深层等高稳定区，启用 **投机发射（speculative dispatch）**；
+  - 在中间层等低置信区，关闭投机，回退至常规执行；
+- 在解码步 *t* 处理第 *L* 层时：
 
-- 收益 (Benefit)： 该机制打破了 GPU 与 CPU 路径之间“到点再启动、启动后阻塞等待”的串行依赖，使 CPU 传输与计算更大概率被隐藏在 GPU 执行 base path 的主时间线之下。与传统阻塞式 cache miss 处理相比，它能够显著缓解异构返回造成的长尾等待，提升双路径流水线的并发度与资源利用率，并在不改变主干精确语义的前提下，为 LoRA-fallback miss 提供更积极的尾延迟优化空间。
-  因此，该机制本质上将 CPU fallback 从“被动响应 miss”转变为“可提前调度的异步执行单元”。
+  - 利用前一时刻的路由状态进行预测；
+  - 将潜在需要的 LoRA fallback 任务提前派发至 CPU 并启动计算；
+- 在 GPU 执行至该层同步点时，通过 **延迟绑定（late binding）** 决定：
+
+  - 若预测命中，则合并 CPU 结果；
+  - 若预测失败，则直接丢弃。
+
+为控制精度风险，该机制仅作用于 **LoRA residual path**，而不影响 base FFN 主路径的精确计算。
+
+该机制带来的关键变化是：
+
+> 将 CPU fallback 从“被动响应 miss”转变为“可提前调度的异步执行单元”，并将其执行时间隐藏在 GPU 主路径之下。
+
+从而显著减少异构路径之间的同步等待，提高流水线重叠程度，并进一步优化尾延迟表现。
 
 # **8. 我们最重要的创新是什么？我们工作主要的局限性是什么？**
 
