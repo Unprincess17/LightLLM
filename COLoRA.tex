@@ -234,18 +234,21 @@ The key contributions of this work are:
 \subsection{Serving Setting and System Boundary}
 \label{subsec:setting}
 
-We study decode execution at the level of a single worker, where MoE routing and multi-LoRA adaptation interact to produce highly fragmented parameter access.
-This level is where resource contention becomes most directly observable: GPU memory must simultaneously accommodate KV cache, backbone execution, and dynamically accessed LoRA residuals, while requests exhibit heterogeneous and time-varying access patterns.
-We therefore focus on this local execution context. This fragmentation arises within individual decode steps and is not alleviated by cluster-level routing, making it fundamentally local.
+We study decode execution within a single worker, where MoE routing and multi-LoRA adaptation interact to produce highly fragmented parameter access.
+At this level, resource contention becomes explicit: GPU memory must simultaneously accommodate KV cache, backbone execution, and dynamically accessed LoRA residuals under heterogeneous and time-varying request patterns.
+
+We therefore focus on this local execution context and do not consider cluster-level routing or global placement. The resulting fragmentation arises within individual decode steps and cannot be alleviated by higher-level scheduling, making it a fundamentally local systems problem.
 
 \subsection{Joint Expert--Adapter as the Natural Management Unit}
 \label{subsec:joint-object}
 
 The key question is what the system should treat as the unit of management.
-In dense models with a single adapter, adapter-level management is sufficient because most tokens share the same adapted weights. In MoE models, however, each token activates only a small routed subset of experts. Once multiple adapters are introduced, the worker repeatedly accesses LoRA residuals tied to specific expert--adapter pairs, rather than entire adapters or experts.
 
-This leads to a necessary abstraction: accurately capturing access behavior requires operating at the granularity of joint expert--adapter objects.Adapter-level management is too coarse, as it retains many unused expert slices alongside a small hot subset, while expert-level management is incomplete because it ignores adapter diversity and overestimates reuse.
-The system must therefore reason about joint objects. In COLoRA, this abstraction is materialized as projection-specific cache entries keyed by (\mathit{projection}, \mathit{adapter}, \mathit{layer}, \mathit{expert}).
+In dense models with a single adapter, adapter-level management suffices because most tokens share the same adapted weights. In MoE models, however, each token activates only a small routed subset of experts. With multiple adapters, accesses concentrate on LoRA residuals tied to specific expert--adapter pairs, rather than entire adapters or experts.
+
+This leads to a necessary abstraction: the system must operate at the granularity of joint expert--adapter objects to accurately capture access behavior. Adapter-level management is too coarse, retaining many unused expert slices, while expert-level management is incomplete, ignoring adapter diversity and overestimating reuse.
+
+In COLoRA, this abstraction is materialized as projection-specific cache entries keyed by $(\mathit{projection}, \allowbreak \mathit{adapter}, \allowbreak \mathit{layer}, \allowbreak \mathit{expert})$.
 
 \subsection{Joint Objects Fragment Decode Locality}
 \label{subsec:case-study}
@@ -275,33 +278,23 @@ The system must therefore reason about joint objects. In COLoRA, this abstractio
   }
   \label{fig:system}
 \end{figure*}
+We establish the failure mode via trace-driven replay on a fixed MoE routing trace under three object definitions:
+\texttt{B0} uses expert-only keys $(\mathit{layer}, \mathit{expert})$.
+\texttt{B1} uses joint keys $(\mathit{layer}, \mathit{expert}, \mathit{adapter})$ with adapter identity sampled independently of expert routing.
+\texttt{B2} uses the same joint keys under correlated assignment, where certain adapters are more likely to co-occur with specific experts.
 
-We establish the failure mode via trace-driven replay. Using a fixed MoE routing trace, we evaluate three object definitions: 
-\texttt{B0} uses expert-only keys $(\mathit{layer}, \mathit{expert})$, 
-\texttt{B1} uses joint keys $(\mathit{layer}, \mathit{expert}, \mathit{adapter})$ with an independent adapter assignment, where adapter identity is sampled independently of expert routing.
-\texttt{B2} uses the same joint keys under a correlated assignment, where certain adapters are more likely to co-occur with specific experts, reflecting workload-level specialization.
-
-These two mappings represent lower- and upper-bound interaction patterns between experts and adapters, allowing us to bracket realistic workload behavior.
-
-Figures~\ref{fig:locality} and~\ref{fig:system} together illustrate a two-stage failure: joint-object modeling first fragments locality, and this locality degradation then translates into increased cache misses and tail latency.
+Figures~\ref{fig:locality} and~\ref{fig:system} illustrate a two-stage failure: joint-object modeling first fragments locality, which then translates into higher miss rates and tail latency.
 
 \paragraph{Popularity becomes less concentrated.}
-As shown in Fig.~\ref{fig:locality}(a), introducing joint keys significantly flattens the popularity distribution. The top 1000 objects account for 89.1\% of accesses under expert-only modeling, but only 40.7\% and 32.6\% under joint modeling. This implies that the hot set becomes less dominant, directly reducing the effectiveness of any bounded GPU cache.
+As shown in Fig.~\ref{fig:locality}(a), joint keys significantly flatten the popularity distribution: the top 1000 objects account for 89.1\% of accesses under expert-only modeling, but only 40.7\% and 32.6\% under joint modeling. The hot set therefore becomes less dominant, reducing the effectiveness of any bounded GPU cache.
 
 \paragraph{Temporal locality weakens in the tail.}
-Fig.~\ref{fig:locality}(b) shows that joint modeling increases reuse distance and cold-start frequency. The finite P99 reuse distance grows from 1{,}393 to 2{,}041 and 4{,}521 events, while cold first touches increase substantially. These effects concentrate in the tail, where long reuse distances directly translate into latency spikes.
+Fig.~\ref{fig:locality}(b) shows that joint modeling increases reuse distance and cold-start frequency. The P99 reuse distance grows from 1{,}393 to 2{,}041 and 4{,}521 events, while cold first touches also rise substantially. These effects concentrate in the tail, where long reuse distances directly translate into latency spikes.
 
 \paragraph{Locality loss amplifies misses and tail latency.}
-As shown in Fig.~\ref{fig:system}(a), miss rates increase significantly under the same cache budget. More importantly, Fig.~\ref{fig:system}(b) shows that tail requests access up to an order of magnitude more cold objects than average requests. This implies that locality degradation not only increases average miss rate, but also concentrates misses in tail requests, amplifying tail latency.
+As shown in Fig.~\ref{fig:system}(a), miss rates increase significantly under the same cache budget. More importantly, Fig.~\ref{fig:system}(b) shows that tail requests access up to an order of magnitude more cold objects than average requests. Locality degradation therefore not only increases average miss rate, but also concentrates misses in tail requests, amplifying tail latency.
 
-These results indicate that locality degradation is inherent to joint-object modeling and cannot be effectively mitigated by cache scaling alone.
-
-\subsection{Implication for System Design}
-\label{subsec:takeaway}
-
-These observations lead to one conclusion: In MoE multi-LoRA decode serving, cache misses are inherent to the joint-object regime rather than rare anomalies.
-System design should therefore not assume that caching can eliminate most important misses. A more realistic objective is to keep the reusable hot set on GPU while making unavoidable misses inexpensive and predictable.
-This reframes miss handling as an execution-path problem rather than a pure data-placement problem, motivating a heterogeneous design.
+These results imply that locality degradation is inherent to joint-object modeling and cannot be effectively mitigated by cache scaling alone.
 
 \section{Challenges}
 \label{sec:challenges}
