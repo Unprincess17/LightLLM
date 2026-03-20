@@ -484,7 +484,13 @@ def plot_fig3_cache_curve(cache_curve_path: Path, output_path: Path) -> tuple[pl
     ax.set_ylabel("Miss rate")
     ax.set_title("Miss-Rate Curve Under a Shared Cache Budget")
     ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{100.0 * value:g}%"))
-    ax.legend(loc="lower left", frameon=False)
+    ax.legend(
+        loc="upper right",
+        frameon=True,
+        framealpha=0.95,
+        facecolor="white",
+        edgecolor="#D7DCE0",
+    )
 
     row_b0_2048 = single_row(rows, condition="expert_only", cache_budget="2048")
     row_b1_2048 = single_row(rows, condition="joint_indep", cache_budget="2048")
@@ -494,19 +500,6 @@ def plot_fig3_cache_curve(cache_curve_path: Path, output_path: Path) -> tuple[pl
     ratio_b1_2048 = float(row_b1_2048["miss_rate"]) / float(row_b0_2048["miss_rate"])
     ratio_b2_2048 = float(row_b2_2048["miss_rate"]) / float(row_b0_2048["miss_rate"])
     ratio_b2_8192 = float(row_b2_8192["miss_rate"]) / float(row_b0_8192["miss_rate"])
-    ax.text(
-        0.03,
-        0.08,
-        "\n".join(
-            [
-                f"2048 objs: B1 {ratio_b1_2048:.1f}x B0, B2 {ratio_b2_2048:.1f}x B0",
-                f"8192 objs: B2 {ratio_b2_8192:.0f}x B0 while B0 is at its cold floor",
-            ]
-        ),
-        transform=ax.transAxes,
-        fontsize=9,
-        bbox={"facecolor": "white", "edgecolor": "#D7DCE0", "boxstyle": "round,pad=0.3"},
-    )
 
     caption = (
         "Cache replay under a shared LRU budget shows that joint modeling amplifies misses after the expert-only "
@@ -600,7 +593,13 @@ def plot_fig4_num_loras_vs_p99(num_loras_path: Path, output_path: Path) -> tuple
     ax.set_xlabel("Number of modeled LoRAs")
     ax.set_ylabel("P99 latency gap vs. B0 (ms)")
     ax.set_title(f"Tail Penalty Onset and Plateau ({selected_budget} objects)")
-    ax.legend(loc="upper left", frameon=False)
+    ax.legend(
+        loc="upper left",
+        frameon=True,
+        framealpha=0.95,
+        facecolor="white",
+        edgecolor="#D7DCE0",
+    )
     plateau_text = (
         f"Plateau zone: >= {plateau_start} LoRAs\n"
         f"Mean plateau gap: {format_ms(plateau_mean_joint_gap)}"
