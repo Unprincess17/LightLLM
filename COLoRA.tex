@@ -148,7 +148,7 @@
 %% The abstract is a short summary of the work to be presented in the
 %% article.
 \begin{abstract}
-  TODO
+This draft focuses on the problem formulation and design of COLoRA. The implementation and evaluation are still in progress.
 \end{abstract}
 
 %%
@@ -182,7 +182,7 @@
 %%
 %% Keywords. The author(s) should pick words that accurately describe
 %% the work being presented. Separate the keywords with commas.
-\keywords{TODO}
+\keywords{MoE inference, LoRA serving, heterogeneous execution}
 %% A "teaser" image appears between the author and affiliation
 %% information and the body of the document, and typically spans the
 %% page.
@@ -194,9 +194,9 @@
 %   \label{fig:teaser}
 % \end{teaserfigure}
 
-\received{20 February 2007}
-\received[revised]{12 March 2009}
-\received[accepted]{5 June 2009}
+% \received{20 February 2007}
+% \received[revised]{12 March 2009}
+% \received[accepted]{5 June 2009}
 
 %%
 %% This command processes the author and affiliation and title
@@ -463,266 +463,266 @@ When locality is strong and the working set fits in GPU memory, most requests hi
 
 This adaptive behavior ensures that COLoRA improves performance in fragmented regimes while remaining efficient in well-behaved workloads.
 
-\section{Implementation}
-\label{sec:implementation}
-TODO:WIP
+% \section{Implementation}
+% \label{sec:implementation}
+% TODO:WIP
 
-\section{Evaluation}
-\label{sec:evaluation}
-TODO:WIP
+% \section{Evaluation}
+% \label{sec:evaluation}
+% TODO:WIP
 
-We evaluate COLoRA along five dimensions that correspond directly to the claims made in this paper. In particular, we ask the following questions:
+% We evaluate COLoRA along five dimensions that correspond directly to the claims made in this paper. In particular, we ask the following questions:
 
-\begin{itemize}
-\item \textbf{RQ1: End-to-end latency.} Does COLoRA reduce end-to-end decode latency under multi-LoRA workloads?
-\item \textbf{RQ2: Tail latency.} How much does COLoRA improve P95/P99 latency under long-tail expert--adapter access patterns?
-\item \textbf{RQ3: Miss handling.} How effective is COLoRA's non-blocking miss path, which combines a GPU hot cache with CPU fallback, relative to conventional load-then-run execution?
-\item \textbf{RQ4: Component contribution.} What performance gain is attributable to each major component, including CPU fallback and speculative dispatch?
-\item \textbf{RQ5: System behavior.} How does COLoRA affect cache hit rate, miss cost, overlap efficiency, and overall resource utilization?
-\end{itemize}
+% \begin{itemize}
+% \item \textbf{RQ1: End-to-end latency.} Does COLoRA reduce end-to-end decode latency under multi-LoRA workloads?
+% \item \textbf{RQ2: Tail latency.} How much does COLoRA improve P95/P99 latency under long-tail expert--adapter access patterns?
+% \item \textbf{RQ3: Miss handling.} How effective is COLoRA's non-blocking miss path, which combines a GPU hot cache with CPU fallback, relative to conventional load-then-run execution?
+% \item \textbf{RQ4: Component contribution.} What performance gain is attributable to each major component, including CPU fallback and speculative dispatch?
+% \item \textbf{RQ5: System behavior.} How does COLoRA affect cache hit rate, miss cost, overlap efficiency, and overall resource utilization?
+% \end{itemize}
 
-\subsection{Hardware and System Configuration}
-\label{Configuration}
-All experiments are conducted on a single server with the following configuration:
+% \subsection{Hardware and System Configuration}
+% \label{Configuration}
+% All experiments are conducted on a single server with the following configuration:
 
-\begin{itemize}
-\item \textbf{GPU:} A100 80GB / RTX 6000
-\item \textbf{CPU:} Intel Xeon Gold 5520+ (1 socket, 28 physical cores, 56 hardware threads, AVX-512 support)
-\item \textbf{Memory:} 376GB RAM
-\item \textbf{Interconnect:} PCIe Gen4 / NVLink
-\end{itemize}
+% \begin{itemize}
+% \item \textbf{GPU:} A100 80GB / RTX 6000
+% \item \textbf{CPU:} Intel Xeon Gold 5520+ (1 socket, 28 physical cores, 56 hardware threads, AVX-512 support)
+% \item \textbf{Memory:} 376GB RAM
+% \item \textbf{Interconnect:} PCIe Gen4 / NVLink
+% \end{itemize}
 
-Unless otherwise noted, the CPU fallback path uses AVX-512-optimized kernels.
-
-
-\subsection{Models and Workloads}
-\label{subsec:workloads}
-We instantiate COLoRA on the public \textbf{Qwen3-VL-30B-A3B-Instruct} checkpoint. Although Qwen3-VL is a multimodal model, our evaluation targets its MoE text decoder because COLoRA operates on decode-time expert--adapter management. The evaluated decoder has 48 layers, hidden size 2048, 128 routed experts per layer, and top-8 routing for each token at every sparse layer. For adapter experiments, we use rank-16 LoRA modules applied to the attention and MLP projections, including the MoE gate, up, and down projections.
-
-All workloads target the decode worker in a PD-separated serving pipeline. We collect real decode-phase routing traces by replaying a fixed corpus of 512 ShareGPT V3 requests through the model and recording the router-selected experts at each token. We then pair this routing stream with semi-realistic adapter-invocation traces derived from the Azure Functions workload trace, which preserves realistic tenant-arrival skew while allowing controlled variation in adapter-side multiplexing.
-
-Unless otherwise specified, we evaluate both independent and correlated tenant-to-adapter mappings and sweep the active adapter cardinality over $\{8, 32, 128\}$. We further vary the decode batch size (typically 1--4) and the request concurrency at the decode worker to test how COLoRA behaves as joint expert--adapter fragmentation and system contention increase together.
-
-\subsection{Baselines}
-\label{subsec:baselines}
-
-The main comparison should include an optimized GPU-only baseline that keeps GPU as the only execution target and uses the best available caching and prefetching policy. A second baseline should adopt joint-object cache management but still resolve misses by blocking promotion, which isolates the value of heterogeneous miss handling from the value of finer-grained residency alone. Finally, the paper should include COLoRA ablations, including at least variants without CPU fallback, without asynchronous overlap, and without the optimized MoE CPU kernel path.
-
-% We compare COLoRA with the following baselines:
-
-% GPU-Only:
-% All LoRA–expert weights reside on GPU. No offloading.
-
-% Naive Offload (Load-Then-Run):
-% On a cache miss, weights are synchronously transferred from CPU to GPU before execution.
-
-% [Optional] Static Partitioning:
-% A static subset of LoRA–expert pairs is pinned in GPU memory.
-
-\subsection{End-to-End Latency}
-\label{subsec:e2e-lat}
-
-% The primary latency metric should be TPOT at mean, P90, and P99 because the paper is fundamentally about decode stability. Throughput is also necessary to show that tail-latency gains are not purchased with unacceptable aggregate slowdown. TTFT should be reported as well to verify that decode-side changes do not create obvious collateral damage in the broader serving path.
-
-We first evaluate whether COLoRA improves end-to-end decoding latency.
-% TODO:
-Figure X shows the average and tail latency (P95/P99) across different workloads.
-
-COLoRA reduces average latency by up to X\% and P99 latency by up to Y\% compared to Naive Offload.
-
-This improvement comes from avoiding blocking weight transfers on cache misses.
-
-Instead of stalling on load-then-run, COLoRA executes miss requests via CPU fallback,
-thereby converting latency spikes into more stable execution paths.
-
-\subsection{Tail Latency Reduction}
-\label{subsec:tail-lat}
-
-% The evaluation should also expose the runtime mechanics that explain the end-to-end behavior. At minimum, the paper should report cache hit rate and miss breakdown, CPU queue depth and queue wait, CPU compute time, GPU compute time, overlap ratio, promotion-drop breakdown, and host memory footprint. These measurements let the paper demonstrate whether COLoRA improves P99 because it changes miss handling in the intended way, rather than because of an unrelated system effect.
-
-We analyze the impact of COLoRA on tail latency under skewed access patterns.
-
-Under high LoRA concurrency, Naive Offload exhibits significant tail amplification,
-with P99 latency increasing sharply.
-
-COLoRA reduces P99 latency by up to X\times.
-
-This is because COLoRA decouples cache miss from request blocking.
-
-Long-tail accesses no longer incur full transfer latency,
-but are instead handled via CPU fallback with bounded overhead.
-
-% �� 关键词要反复打：
-
-% “decoupling miss from blocking”
-
-% “bounded miss cost”
-
-\subsection{Effectiveness of Non-Blocking Miss Handling}
-\label{subsec:miss-handling}
-We evaluate how COLoRA’s miss handling policy affects system behavior.
-
-Metrics need to report:
-
-miss rate
-
-miss latency
-
-fallback ratio
-
-COLoRA significantly reduces effective miss penalty.
-
-While the miss rate remains similar, the average miss cost decreases by X\%,
-as many misses are served via CPU fallback instead of blocking transfers.
-
-This demonstrates that optimizing miss handling policy is as important as improving cache hit rate.
-
-Even when misses are unavoidable, COLoRA ensures they are handled in a non-blocking manner.
-
-\subsection{Breakdown Analysis}
-\label{subsec:breakdown}
-We break down end-to-end latency into major components.
-
-TODO: figures
-
-stacked bar:
-
-GPU compute
-
-CPU fallback
-
-transfer
-
-idle/wait
-
-COLoRA reduces idle time caused by blocking transfers.
-
-Although CPU fallback introduces additional compute,
-it overlaps with GPU execution and avoids long stalls.
-
-\subsection{Ablation Study}
-\label{subsec:ablation}
-We evaluate the contribution of each component.
-
-- Full COLoRA
-- w/o fallback (always load-then-run)
-- w/o speculative dispatch
-
-Removing fallback significantly increases tail latency,
-confirming its role in mitigating miss-induced stalls.
-
-Speculative dispatch further improves performance by overlapping CPU and GPU execution.
-
-% “救命 checklist”
-
-% 要保证：
-
-% ✅ 有 end-to-end latency 图
-% ✅ 有 P99 改善
-% ✅ 有 baseline 对比
-% ✅ 有 1–2 个 insight（不是纯图）
-
-% ============================ GPT Notes ============================
-% Compact outline:
-% - The paper targets PD-separated decode workers that serve an MoE base
-%   model together with many concurrently active LoRA adapters.
-% - The core observation is that the effective managed object is no longer
-%   an expert or an adapter alone, but a joint expert-adapter object whose
-%   locality is much weaker and more fragmented.
-% - A trace-driven case study shows a consistent chain: flatter popularity,
-%   worse temporal locality, higher miss rates under the same budget, and a
-%   tail penalty that turns on early once the system leaves the single-LoRA
-%   regime.
-% - The resulting systems problem is not just cache sizing. It is how to
-%   handle unavoidable misses without exposing weight migration on the decode
-%   critical path.
-% - COLoRA addresses this problem with an asymmetric memory hierarchy,
-%   CPU-first non-blocking miss handling, selective asynchronous promotion,
-%   and overlapped heterogeneous execution.
-% - The evaluation should focus on P99 TPOT, throughput, miss-handling
-%   breakdown, and the cost profile of the CPU fallback path.
-%
-% Reverse outline:
-% - Introduction thesis: joint-object fragmentation makes decode misses
-%   structural, so the system must optimize miss handling, not just miss
-%   avoidance.
-% - Introduction paragraph 1: PD-separated MoE multi-LoRA decode serving is
-%   tail-sensitive.
-% - Introduction paragraph 2: the managed object becomes a joint
-%   expert-adapter object.
-% - Introduction paragraph 3: the case study shows flatter popularity, worse
-%   locality, and early tail turn-on.
-% - Introduction paragraph 4: GPU-only load-then-run is a poor default once
-%   cold misses become structural.
-% - Introduction paragraph 5: COLoRA handles hot and cold objects
-%   differently through a dual-path runtime.
-% - Background thesis: the joint-object view changes both the memory problem
-%   and the execution problem.
-% - Challenges thesis: the runtime must control residency churn, CPU fallback
-%   cost, and heterogeneous synchronization together.
-% - Design thesis: COLoRA keeps hot objects on GPU, executes cold misses from
-%   CPU, and only promotes when reuse signals justify it.
-%
-% Self-review checklist:
-% - Clarity: Each section has an explicit thesis sentence and stable
-%   terminology around joint expert-adapter object, GPU hot cache, and CPU
-%   fallback.
-% - Flow: The story moves from setting -> failure mode -> evidence -> design
-%   question -> design overview.
-% - Terminology consistency: The paper reasons about logical joint objects
-%   and notes that the implementation realizes them as projection-specific
-%   entries.
-% - Unsupported claims: The draft avoids claiming measured end-to-end gains
-%   that are not yet written down.
-% - Missing evidence: The final paper still needs full end-to-end COLoRA
-%   results, especially TPOT/P99 comparisons against strong GPU-only
-%   baselines and ablations for queue control and CPU kernels.
-%
-% Claim-evidence map:
-% - Claim: In MoE multi-LoRA decode serving, the effective managed object is
-%   a joint expert-adapter object rather than an expert or adapter alone.
-%   Evidence: The request needs LoRA residuals only for the experts selected
-%   by the router; the implementation also keys GPU residency by projection,
-%   adapter, layer, and expert. Status: supported.
-% - Claim: Joint-object modeling significantly fragments popularity and
-%   weakens temporal locality. Evidence: Top-1000 access coverage drops from
-%   89.1% to 40.7% and 32.6%; finite P99 reuse distance grows from 1,393 to
-%   2,041 and 4,521; cold first touches rise from 1.0 to 9.7 and 13.6 per
-%   10k events. Status: supported.
-% - Claim: Under the same cache budget, joint-object fragmentation amplifies
-%   misses enough to become a tail-latency problem. Evidence: At 2048
-%   objects, miss rate rises from 0.00159 in B0 to 0.01095 and 0.01476 in
-%   B1/B2; the 8192-object sweep shows a P99 latency-proxy penalty of
-%   411.7 ms by four LoRAs and a broad high plateau afterward. Status:
-%   supported.
-% - Claim: Tail requests are dominated by cold joint-object touches rather
-%   than by a uniform slowdown across all requests. Evidence: At the
-%   65536-object cold-miss floor, average requests touch 83.6 and 116.8 cold
-%   joint objects, while P95+ tail requests touch 912.8 and 1154.0. Status:
-%   supported.
-% - Claim: COLoRA's key design shift is to treat a miss as an execution-path
-%   decision instead of a mandatory blocking promotion event. Evidence: The
-%   runtime maintains a GPU hot cache plus a CPU full replica; the configured
-%   default miss policy is cpu_first; misses can execute immediately on CPU
-%   while promotion is queued asynchronously for future reuse. Status:
-%   supported.
-% - Claim: CPU fallback is plausible only if the runtime keeps the fixed cost
-%   of sparse decode misses low. Evidence: The implementation includes
-%   MoE-specific CPU kernels, adapter-grouped miss execution, asynchronous CPU
-%   queueing, and explicit queue/overlap counters. Status: supported for
-%   mechanism, needs end-to-end performance evidence for effect.
-% - Claim: Overlap between GPU hits and CPU misses is an important part of
-%   the design rather than an implementation detail. Evidence: The hybrid
-%   path tracks CPU compute time, GPU compute time, queue wait, overlap
-%   ratio, and fallback degradations; mixed hit-miss tests exercise this
-%   path. Status: supported for mechanism, needs end-to-end performance
-%   evidence for effect.
+% Unless otherwise noted, the CPU fallback path uses AVX-512-optimized kernels.
 
 
+% \subsection{Models and Workloads}
+% \label{subsec:workloads}
+% We instantiate COLoRA on the public \textbf{Qwen3-VL-30B-A3B-Instruct} checkpoint. Although Qwen3-VL is a multimodal model, our evaluation targets its MoE text decoder because COLoRA operates on decode-time expert--adapter management. The evaluated decoder has 48 layers, hidden size 2048, 128 routed experts per layer, and top-8 routing for each token at every sparse layer. For adapter experiments, we use rank-16 LoRA modules applied to the attention and MLP projections, including the MoE gate, up, and down projections.
 
-\section{Related Work}
-\section{Conclusion}
+% All workloads target the decode worker in a PD-separated serving pipeline. We collect real decode-phase routing traces by replaying a fixed corpus of 512 ShareGPT V3 requests through the model and recording the router-selected experts at each token. We then pair this routing stream with semi-realistic adapter-invocation traces derived from the Azure Functions workload trace, which preserves realistic tenant-arrival skew while allowing controlled variation in adapter-side multiplexing.
 
+% Unless otherwise specified, we evaluate both independent and correlated tenant-to-adapter mappings and sweep the active adapter cardinality over $\{8, 32, 128\}$. We further vary the decode batch size (typically 1--4) and the request concurrency at the decode worker to test how COLoRA behaves as joint expert--adapter fragmentation and system contention increase together.
+
+% \subsection{Baselines}
+% \label{subsec:baselines}
+
+% The main comparison should include an optimized GPU-only baseline that keeps GPU as the only execution target and uses the best available caching and prefetching policy. A second baseline should adopt joint-object cache management but still resolve misses by blocking promotion, which isolates the value of heterogeneous miss handling from the value of finer-grained residency alone. Finally, the paper should include COLoRA ablations, including at least variants without CPU fallback, without asynchronous overlap, and without the optimized MoE CPU kernel path.
+
+% % We compare COLoRA with the following baselines:
+
+% % GPU-Only:
+% % All LoRA–expert weights reside on GPU. No offloading.
+
+% % Naive Offload (Load-Then-Run):
+% % On a cache miss, weights are synchronously transferred from CPU to GPU before execution.
+
+% % [Optional] Static Partitioning:
+% % A static subset of LoRA–expert pairs is pinned in GPU memory.
+
+% \subsection{End-to-End Latency}
+% \label{subsec:e2e-lat}
+
+% % The primary latency metric should be TPOT at mean, P90, and P99 because the paper is fundamentally about decode stability. Throughput is also necessary to show that tail-latency gains are not purchased with unacceptable aggregate slowdown. TTFT should be reported as well to verify that decode-side changes do not create obvious collateral damage in the broader serving path.
+
+% We first evaluate whether COLoRA improves end-to-end decoding latency.
+% % TODO:
+% Figure X shows the average and tail latency (P95/P99) across different workloads.
+
+% COLoRA reduces average latency by up to X\% and P99 latency by up to Y\% compared to Naive Offload.
+
+% This improvement comes from avoiding blocking weight transfers on cache misses.
+
+% Instead of stalling on load-then-run, COLoRA executes miss requests via CPU fallback,
+% thereby converting latency spikes into more stable execution paths.
+
+% \subsection{Tail Latency Reduction}
+% \label{subsec:tail-lat}
+
+% % The evaluation should also expose the runtime mechanics that explain the end-to-end behavior. At minimum, the paper should report cache hit rate and miss breakdown, CPU queue depth and queue wait, CPU compute time, GPU compute time, overlap ratio, promotion-drop breakdown, and host memory footprint. These measurements let the paper demonstrate whether COLoRA improves P99 because it changes miss handling in the intended way, rather than because of an unrelated system effect.
+
+% We analyze the impact of COLoRA on tail latency under skewed access patterns.
+
+% Under high LoRA concurrency, Naive Offload exhibits significant tail amplification,
+% with P99 latency increasing sharply.
+
+% COLoRA reduces P99 latency by up to X\times.
+
+% This is because COLoRA decouples cache miss from request blocking.
+
+% Long-tail accesses no longer incur full transfer latency,
+% but are instead handled via CPU fallback with bounded overhead.
+
+% % �� 关键词要反复打：
+
+% % “decoupling miss from blocking”
+
+% % “bounded miss cost”
+
+% \subsection{Effectiveness of Non-Blocking Miss Handling}
+% \label{subsec:miss-handling}
+% We evaluate how COLoRA’s miss handling policy affects system behavior.
+
+% Metrics need to report:
+
+% miss rate
+
+% miss latency
+
+% fallback ratio
+
+% COLoRA significantly reduces effective miss penalty.
+
+% While the miss rate remains similar, the average miss cost decreases by X\%,
+% as many misses are served via CPU fallback instead of blocking transfers.
+
+% This demonstrates that optimizing miss handling policy is as important as improving cache hit rate.
+
+% Even when misses are unavoidable, COLoRA ensures they are handled in a non-blocking manner.
+
+% \subsection{Breakdown Analysis}
+% \label{subsec:breakdown}
+% We break down end-to-end latency into major components.
+
+% TODO: figures
+
+% stacked bar:
+
+% GPU compute
+
+% CPU fallback
+
+% transfer
+
+% idle/wait
+
+% COLoRA reduces idle time caused by blocking transfers.
+
+% Although CPU fallback introduces additional compute,
+% it overlaps with GPU execution and avoids long stalls.
+
+% \subsection{Ablation Study}
+% \label{subsec:ablation}
+% We evaluate the contribution of each component.
+
+% - Full COLoRA
+% - w/o fallback (always load-then-run)
+% - w/o speculative dispatch
+
+% Removing fallback significantly increases tail latency,
+% confirming its role in mitigating miss-induced stalls.
+
+% Speculative dispatch further improves performance by overlapping CPU and GPU execution.
+
+% % “救命 checklist”
+
+% % 要保证：
+
+% % ✅ 有 end-to-end latency 图
+% % ✅ 有 P99 改善
+% % ✅ 有 baseline 对比
+% % ✅ 有 1–2 个 insight（不是纯图）
+
+% % ============================ GPT Notes ============================
+% % Compact outline:
+% % - The paper targets PD-separated decode workers that serve an MoE base
+% %   model together with many concurrently active LoRA adapters.
+% % - The core observation is that the effective managed object is no longer
+% %   an expert or an adapter alone, but a joint expert-adapter object whose
+% %   locality is much weaker and more fragmented.
+% % - A trace-driven case study shows a consistent chain: flatter popularity,
+% %   worse temporal locality, higher miss rates under the same budget, and a
+% %   tail penalty that turns on early once the system leaves the single-LoRA
+% %   regime.
+% % - The resulting systems problem is not just cache sizing. It is how to
+% %   handle unavoidable misses without exposing weight migration on the decode
+% %   critical path.
+% % - COLoRA addresses this problem with an asymmetric memory hierarchy,
+% %   CPU-first non-blocking miss handling, selective asynchronous promotion,
+% %   and overlapped heterogeneous execution.
+% % - The evaluation should focus on P99 TPOT, throughput, miss-handling
+% %   breakdown, and the cost profile of the CPU fallback path.
+% %
+% % Reverse outline:
+% % - Introduction thesis: joint-object fragmentation makes decode misses
+% %   structural, so the system must optimize miss handling, not just miss
+% %   avoidance.
+% % - Introduction paragraph 1: PD-separated MoE multi-LoRA decode serving is
+% %   tail-sensitive.
+% % - Introduction paragraph 2: the managed object becomes a joint
+% %   expert-adapter object.
+% % - Introduction paragraph 3: the case study shows flatter popularity, worse
+% %   locality, and early tail turn-on.
+% % - Introduction paragraph 4: GPU-only load-then-run is a poor default once
+% %   cold misses become structural.
+% % - Introduction paragraph 5: COLoRA handles hot and cold objects
+% %   differently through a dual-path runtime.
+% % - Background thesis: the joint-object view changes both the memory problem
+% %   and the execution problem.
+% % - Challenges thesis: the runtime must control residency churn, CPU fallback
+% %   cost, and heterogeneous synchronization together.
+% % - Design thesis: COLoRA keeps hot objects on GPU, executes cold misses from
+% %   CPU, and only promotes when reuse signals justify it.
+% %
+% % Self-review checklist:
+% % - Clarity: Each section has an explicit thesis sentence and stable
+% %   terminology around joint expert-adapter object, GPU hot cache, and CPU
+% %   fallback.
+% % - Flow: The story moves from setting -> failure mode -> evidence -> design
+% %   question -> design overview.
+% % - Terminology consistency: The paper reasons about logical joint objects
+% %   and notes that the implementation realizes them as projection-specific
+% %   entries.
+% % - Unsupported claims: The draft avoids claiming measured end-to-end gains
+% %   that are not yet written down.
+% % - Missing evidence: The final paper still needs full end-to-end COLoRA
+% %   results, especially TPOT/P99 comparisons against strong GPU-only
+% %   baselines and ablations for queue control and CPU kernels.
+% %
+% % Claim-evidence map:
+% % - Claim: In MoE multi-LoRA decode serving, the effective managed object is
+% %   a joint expert-adapter object rather than an expert or adapter alone.
+% %   Evidence: The request needs LoRA residuals only for the experts selected
+% %   by the router; the implementation also keys GPU residency by projection,
+% %   adapter, layer, and expert. Status: supported.
+% % - Claim: Joint-object modeling significantly fragments popularity and
+% %   weakens temporal locality. Evidence: Top-1000 access coverage drops from
+% %   89.1% to 40.7% and 32.6%; finite P99 reuse distance grows from 1,393 to
+% %   2,041 and 4,521; cold first touches rise from 1.0 to 9.7 and 13.6 per
+% %   10k events. Status: supported.
+% % - Claim: Under the same cache budget, joint-object fragmentation amplifies
+% %   misses enough to become a tail-latency problem. Evidence: At 2048
+% %   objects, miss rate rises from 0.00159 in B0 to 0.01095 and 0.01476 in
+% %   B1/B2; the 8192-object sweep shows a P99 latency-proxy penalty of
+% %   411.7 ms by four LoRAs and a broad high plateau afterward. Status:
+% %   supported.
+% % - Claim: Tail requests are dominated by cold joint-object touches rather
+% %   than by a uniform slowdown across all requests. Evidence: At the
+% %   65536-object cold-miss floor, average requests touch 83.6 and 116.8 cold
+% %   joint objects, while P95+ tail requests touch 912.8 and 1154.0. Status:
+% %   supported.
+% % - Claim: COLoRA's key design shift is to treat a miss as an execution-path
+% %   decision instead of a mandatory blocking promotion event. Evidence: The
+% %   runtime maintains a GPU hot cache plus a CPU full replica; the configured
+% %   default miss policy is cpu_first; misses can execute immediately on CPU
+% %   while promotion is queued asynchronously for future reuse. Status:
+% %   supported.
+% % - Claim: CPU fallback is plausible only if the runtime keeps the fixed cost
+% %   of sparse decode misses low. Evidence: The implementation includes
+% %   MoE-specific CPU kernels, adapter-grouped miss execution, asynchronous CPU
+% %   queueing, and explicit queue/overlap counters. Status: supported for
+% %   mechanism, needs end-to-end performance evidence for effect.
+% % - Claim: Overlap between GPU hits and CPU misses is an important part of
+% %   the design rather than an implementation detail. Evidence: The hybrid
+% %   path tracks CPU compute time, GPU compute time, queue wait, overlap
+% %   ratio, and fallback degradations; mixed hit-miss tests exercise this
+% %   path. Status: supported for mechanism, needs end-to-end performance
+% %   evidence for effect.
+
+
+
+% \section{Related Work}
+% \section{Conclusion}
+\clearpage
 \bibliographystyle{plain}
 \bibliography{COLoRA-reference}
 
