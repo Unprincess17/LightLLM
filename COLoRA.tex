@@ -248,7 +248,7 @@ In dense models with a single adapter, adapter-level management suffices because
 
 This leads to a necessary abstraction: the system must operate at the granularity of joint expert--adapter objects to accurately capture access behavior. Adapter-level management is too coarse, retaining many unused expert slices, while expert-level management is incomplete, ignoring adapter diversity and overestimating reuse.
 
-In COLoRA, this abstraction is materialized as projection-specific cache entries keyed by $(\mathit{projection}, \allowbreak \mathit{adapter}, \allowbreak \mathit{layer}, \allowbreak \mathit{expert})$.
+In COLoRA, this abstraction is materialized as projection-specific cache entries keyed by (\mathit{projection}, \mathit{adapter}, \mathit{layer}, \mathit{expert}).
 
 \subsection{Joint Objects Fragment Decode Locality}
 \label{subsec:case-study}
@@ -299,22 +299,33 @@ These results imply that locality degradation is inherent to joint-object modeli
 \section{Challenges}
 \label{sec:challenges}
 
-The above observations define a new systems problem, but turning that problem statement into a useful runtime still requires solving three technical challenges.
+The above observations reveal a fundamental shift in the role of caching. 
+Under joint-object modeling, locality degradation makes cache misses both frequent and concentrated in the tail, implying that misses are no longer rare events to be hidden, but a dominant factor that must be explicitly managed.
 
-\subsection{Challenge 1: Fine-Grained Residency Without Unstable Churn}
+This reframes the problem: instead of minimizing misses, the system must decide how to handle unavoidable misses in a latency-critical decode path. Turning this insight into a practical runtime requires addressing three challenges.
+
+\subsection{Challenge 1: Fine-Grained Residency Without Runaway Churn}
 \label{subsec:challenge-residency}
 
-The first challenge is to manage residency at the right granularity without making the cache thrash itself to death. Joint-object management is necessary for precision, but finer granularity also means more distinct keys, more misses, and more opportunities to waste bandwidth on objects that never become hot again. A practical design therefore needs to preserve joint-object precision while filtering out low-value promotions and suppressing repeated requeueing of the same cold object. Otherwise, the control path degenerates into churn rather than useful adaptation.
+Joint-object modeling flattens the popularity distribution, weakening the dominance of any small hot set. This makes coarse-grained residency ineffective, but fine-grained management introduces a new problem: a rapidly expanding key space with unstable reuse.
 
-\subsection{Challenge 2: Making CPU Fallback Viable at Decode Granularity}
-\label{subsec:challenge-cpu}
+Naively caching at joint-object granularity leads to frequent insertions of low-reuse objects, repeated evictions, and wasted bandwidth on objects that never become hot again. The system must therefore preserve fine-grained precision while suppressing low-value promotions and avoiding repeated re-admission of cold objects. Otherwise, the cache degenerates into churn rather than improving locality.
 
-The second challenge is that ``just run the miss on CPU'' is not automatically a good idea. Decode misses are small, irregular, and latency-sensitive. Their batch sizes are often too small to amortize framework overhead, tensor reshaping, or generic BLAS startup costs. If the fallback path is not explicitly optimized for this regime, CPU execution simply replaces one form of tail latency with another. The system therefore needs a CPU miss path whose fixed cost is low enough to be competitive for cold, low-reuse objects.
+\subsection{Challenge 2: Handling Misses Without Blocking the Critical Path}
+\label{subsec:challenge-miss}
 
-\subsection{Challenge 3: Overlapping Two Execution Paths Without Creating a New Tail}
+In this regime, many misses correspond to low-reuse objects whose cost cannot be amortized. Temporal locality weakens in the tail, causing reuse distances to grow and cold accesses to increase. As a result, many misses correspond to objects that are unlikely to be reused in the near future.
+
+In this regime, the traditional load-then-run strategy becomes inefficient: blocking on weight transfer for low-reuse objects directly translates into tail latency. The system must therefore provide an alternative miss-handling path that can serve cold objects without stalling the decode pipeline, while keeping the fixed cost of this path low enough to remain competitive at small, irregular batch sizes.
+
+\subsection{Challenge 3: Overlapping Heterogeneous Execution Without Creating a New Tail}
 \label{subsec:challenge-overlap}
 
-The third challenge is synchronization. A dual-path runtime introduces new interactions between GPU execution, CPU execution, and host--device transfers. If the GPU has to stall for the CPU at every miss, the design collapses back into a serialized pipeline. If the CPU queue becomes overloaded, fallback itself becomes the new tail bottleneck. The runtime must therefore overlap GPU hits with CPU misses when dependencies allow it, while exposing enough queueing and overlap state to keep the tail understandable and controllable.
+Locality loss not only increases miss frequency, but also concentrates misses in tail requests, making miss handling itself a latency-critical component.
+
+A dual-path design introduces new interactions between GPU execution, CPU execution, and host--device transfers. If GPU execution stalls on every miss, the system collapses back into a serialized pipeline. Conversely, if fallback processing becomes overloaded, it becomes a new tail bottleneck.
+
+The system must therefore overlap GPU hits with miss handling whenever dependencies allow, while controlling queueing and resource contention so that the tail remains predictable rather than shifting across execution paths.
 
 \section{Design Overview}
 \label{sec:design-overview}
@@ -322,9 +333,13 @@ The third challenge is synchronization. A dual-path runtime introduces new inter
 \subsection{Core Idea}
 \label{subsec:core-idea}
 
-COLoRA is built around one simple idea: in the joint-object regime, a miss should not automatically force the request to wait for GPU promotion. Instead, the runtime should separate the hot-set problem from the cold-miss problem. The hot set should remain on the GPU because reuse justifies residency. The cold set should remain executable from CPU memory so that an individual miss can be handled immediately, even if the object is not worth promoting yet.
+The case study shows that under joint-object modeling, cache misses are both frequent and concentrated in the tail, making them unavoidable and latency-critical. As a result, the system can no longer treat misses as rare events to be hidden, but must explicitly decide how to handle them.
 
-At a high level, COLoRA combines three mechanisms. First, it uses an asymmetric memory hierarchy with a bounded GPU hot cache and a CPU-resident full replica. Second, it uses CPU-first miss handling for the current request and decouples promotion into an asynchronous, selective background action. Third, it overlaps GPU hits with CPU misses whenever both appear in the same dispatch, so the fallback path can hide behind useful GPU work instead of serializing it.
+COLoRA is built on a simple principle: a miss should not automatically trigger blocking promotion. Instead, miss handling should be treated as an execution-path decision. For each joint object, the system dynamically chooses between executing from the hot GPU cache or serving the request from the cold layer without waiting.
+
+This principle leads to three requirements: (1) maintaining a precise hot set without inducing cache churn, (2) handling misses without blocking the critical decode path, and (3) overlapping heterogeneous execution so that miss handling does not become the new tail bottleneck.
+
+COLoRA implements these requirements through three corresponding mechanisms: a selective joint-object residency policy, a non-blocking miss-handling path with CPU execution, and an overlap-aware runtime that coordinates GPU hits and CPU misses.
 
 \subsection{Asymmetric Joint-Object Memory Hierarchy}
 \label{subsec:memory-hierarchy}
