@@ -333,46 +333,66 @@ The system must therefore overlap GPU hits with miss handling whenever dependenc
 \subsection{Core Idea}
 \label{subsec:core-idea}
 
-The case study shows that under joint-object modeling, cache misses are both frequent and concentrated in the tail, making them unavoidable and latency-critical. As a result, the system can no longer treat misses as rare events to be hidden, but must explicitly decide how to handle them.
+Under joint-object modeling, cache misses become unavoidable and latency-critical, requiring explicit miss handling rather than relying on caching to hide them.
 
-COLoRA is built on a simple principle: a miss should not automatically trigger blocking promotion. Instead, miss handling should be treated as an execution-path decision. For each joint object, the system dynamically chooses between executing from the hot GPU cache or serving the request from the cold layer without waiting.
+These observations shift the problem from data placement to execution-path selection: instead of always blocking on promotion, the system must decide whether to execute immediately from the cold layer or to invest in future reuse.
 
-This principle leads to three requirements: (1) maintaining a precise hot set without inducing cache churn, (2) handling misses without blocking the critical decode path, and (3) overlapping heterogeneous execution so that miss handling does not become the new tail bottleneck.
+This shift imposes three constraints: (1) maintaining a precise hot set without inducing churn, (2) handling misses without blocking the critical decode path, and (3) overlapping heterogeneous execution so that miss handling does not become the new tail bottleneck.
 
-COLoRA implements these requirements through three corresponding mechanisms: a selective joint-object residency policy, a non-blocking miss-handling path with CPU execution, and an overlap-aware runtime that coordinates GPU hits and CPU misses.
+COLoRA satisfies these constraints through three mechanisms: selective joint-object residency, non-blocking miss handling via CPU execution, and overlap-aware heterogeneous execution.
 
-\subsection{Asymmetric Joint-Object Memory Hierarchy}
+\subsection{Selective Joint-Object Residency}
 \label{subsec:memory-hierarchy}
 
-COLoRA manages LoRA residual weights with an asymmetric memory hierarchy. GPU memory is treated as a scarce hot cache that should hold only reusable joint objects. CPU memory holds the complete read-only source pool for all joint objects and therefore acts as both the cold layer and the execution source for fallback. This asymmetry is important because it removes write-back complexity from eviction and ensures that an evicted object remains immediately executable from host memory.
+COLoRA maintains a stable hot set by selectively promoting joint objects while suppressing low-value cache churn.
 
-The GPU cache is populated selectively rather than eagerly. Each joint object maintains lightweight utility state derived from recent accesses, and promotion decisions are filtered through minimum-hit thresholds, bounded promotion queues, and cooldown windows. Intuitively, COLoRA promotes objects that show a plausible hot rebound, while suppressing repeated queue traffic for objects that remain cold. This policy is designed to preserve cache precision under the enlarged key space without letting promotion traffic dominate the worker.
+To address Challenge~\ref{subsec:challenge-residency}, COLoRA uses an asymmetric memory hierarchy: GPU memory serves as a bounded hot cache for reusable joint objects, while CPU memory maintains a full read-only replica that acts as both the cold layer and the execution source for misses.
 
-\subsection{CPU-First Non-Blocking Miss Handling}
+Flattened popularity under joint-object modeling weakens hot-set dominance, making naive fine-grained caching unstable. Without filtering, frequent insertions of low-reuse objects lead to repeated eviction and re-admission, degenerating into churn.
+
+COLoRA therefore performs selective promotion. Each joint object maintains lightweight utility signals derived from recent accesses, and promotion is gated by minimum-hit thresholds, bounded queues, and cooldown windows. This preserves fine-grained precision while preventing promotion traffic from overwhelming the system.
+
+\subsection{Non-Blocking Miss Handling}
 \label{subsec:cpu-first}
 
-On the execution path, COLoRA distinguishes between the dense expert backbone and the sparse LoRA residual. The dense base expert computation remains on GPU. Only the expert-specific LoRA residual is allowed to use the heterogeneous path. This split is crucial because it limits the scope of fallback to the incremental computation that caused the residency problem in the first place, rather than moving the entire MoE layer off GPU.
+COLoRA serves misses without blocking the decode path by executing directly from the cold layer.
 
-When a joint object hits in the GPU cache, COLoRA serves it through the regular GPU LoRA path. When it misses, the current request takes a CPU fallback path by default instead of blocking on promotion. The runtime may still enqueue the missed object for promotion, but promotion is treated as an optimization for future requests, not a prerequisite for the current one. This is the central paradigm shift of the design: the system no longer interprets every miss as ``move weight first, execute later.'' It interprets a miss as ``execute now from the cold layer, and only promote if reuse signals justify it.''
+To address Challenge~\ref{subsec:challenge-miss}, COLoRA avoids blocking on promotion for low-reuse objects. Under degraded temporal locality, many misses correspond to objects whose reuse is too distant to amortize transfer cost. In this regime, load-then-run directly converts transfer latency into tail latency.
 
-\subsection{Low-Overhead CPU Fallback for Sparse Decode Misses}
+COLoRA instead executes misses immediately. When a joint object misses in the GPU cache, the request is served through a CPU execution path rather than waiting for promotion. Promotion is treated as an asynchronous optimization for future requests rather than a prerequisite for serving the current one.
+
+The dense expert backbone remains on GPU, while only the sparse LoRA residual uses the heterogeneous path. This confines miss handling to the component responsible for fragmentation, minimizing disruption to the main execution flow.
+
+\subsection{Low-Overhead Miss Execution Path}
 \label{subsec:cpu-fallback}
 
-The CPU fallback path is explicitly engineered for the small and irregular shapes that appear in decode. Instead of relying only on generic framework operators, COLoRA groups miss work by adapter, uses MoE-specific CPU kernels when available, and keeps the per-miss control path compact. The implementation already exposes AVX-512 BF16 kernels specialized for the gate, up, and down phases of MoE LoRA execution, which matches the paper's requirement that CPU fallback be a viable latency path rather than a correctness-only fallback.
+COLoRA ensures that the fallback execution path is fast enough to make non-blocking miss handling viable.
 
-This design choice should be framed carefully in the paper. The claim is not that CPU is generally faster than GPU. The claim is that for cold decode misses with poor reuse, the fixed cost of blocking promotion can exceed the fixed cost of executing the residual directly on CPU. COLoRA wins only if the fallback path stays cheap enough to make that trade favorable on the tail.
+Decode misses are small, irregular, and latency-sensitive, making generic framework execution inefficient due to high fixed overhead. COLoRA therefore implements a specialized execution path tailored to this regime.
 
-\subsection{Overlapped Heterogeneous Execution}
+Miss work is grouped by adapter, lightweight kernels are used when available, and the control path is kept compact. The implementation exposes AVX-512 BF16 kernels for the gate, up, and down projections, reducing dispatch overhead and improving efficiency for small tensor shapes.
+
+The goal is not to outperform GPU execution, but to ensure that for cold, low-reuse objects, immediate execution is cheaper than blocking on promotion.
+
+\subsection{Overlap-Aware Heterogeneous Execution}
 \label{subsec:overlap}
 
-The final piece is overlap. Mixed batches often contain both GPU-cache hits and misses. COLoRA exploits this structure by launching CPU miss work asynchronously when useful GPU hit work is available, then joining the miss result only at the point where the residual output must be merged. This organization lets CPU compute, GPU compute, and host--device movement proceed concurrently when the batch structure allows it.
+COLoRA overlaps GPU execution with miss handling to prevent non-blocking execution from becoming a new tail bottleneck.
 
-The runtime also keeps explicit control signals for this path, including promotion queue depth, CPU queue depth, queueing time, overlap ratio, fallback degradations, and promotion-drop causes. These counters matter for an ASPLOS paper because they make the system explainable under load. If COLoRA helps, the paper can attribute the benefit to fewer blocking promotions and better overlap. If it stops helping, the same counters can reveal whether the cause is CPU queue buildup, insufficient GPU hit work, or a pathological cold burst.
+To address Challenge~\ref{subsec:challenge-overlap}, COLoRA exploits mixed batches containing both GPU-cache hits and misses. Without overlap, non-blocking miss handling degenerates into a serialized pipeline, where the CPU path becomes the new critical path.
 
-\subsection{Expected Benefit and Graceful Degradation}
+COLoRA launches miss execution asynchronously when independent GPU work is available and synchronizes only when the residual output is required. This allows CPU computation, GPU computation, and data movement to proceed concurrently.
+
+The runtime also tracks signals such as promotion queue depth, CPU queue depth, queueing delay, and overlap ratio, enabling the system to remain explainable and to identify when contention or insufficient overlap limits performance.
+
+\subsection{Behavior Under Different Locality Regimes}
 \label{subsec:graceful-degradation}
 
-COLoRA is not designed to force heterogeneity into every workload. If locality is strong and the active joint objects fit comfortably in GPU memory, the system should naturally behave close to a GPU-only runtime because most requests hit the hot cache and the CPU path rarely triggers. The design matters precisely in the fragmented regime identified by the case study, where cold misses are common enough that a stable miss-time fallback is more valuable than ever more aggressive blocking promotion.
+COLoRA adapts to workload locality rather than enforcing heterogeneity.
+
+When locality is strong and the working set fits in GPU memory, most requests hit in the hot cache and execution behaves similarly to a GPU-only system. As locality degrades and misses become frequent, the system transitions to heterogeneous execution, using non-blocking miss handling and overlap to stabilize tail latency.
+
+This adaptive behavior ensures that COLoRA improves performance in fragmented regimes while remaining efficient in well-behaved workloads.
 
 
 \section{Scope and Limitations}
