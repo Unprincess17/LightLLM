@@ -335,11 +335,11 @@ The system must therefore overlap GPU hits with miss handling whenever dependenc
 
 Under joint-object modeling, cache misses become unavoidable and latency-critical, requiring explicit miss handling rather than relying on caching to hide them.
 
-These observations shift the problem from data placement to execution-path selection: instead of always blocking on promotion, the system must decide whether to execute immediately from the cold layer or to invest in future reuse.
+These observations shift the problem from data placement to execution-path selection: instead of always blocking on promotion, the system must decide whether to serve a miss immediately from the cold layer or to invest in future reuse through promotion.
 
 This shift imposes three constraints: (1) maintaining a precise hot set without inducing churn, (2) handling misses without blocking the critical decode path, and (3) overlapping heterogeneous execution so that miss handling does not become the new tail bottleneck.
 
-COLoRA satisfies these constraints through three mechanisms: selective joint-object residency, non-blocking miss handling via CPU execution, and overlap-aware heterogeneous execution.
+COLoRA satisfies these constraints through three mechanisms: selective joint-object residency, non-blocking miss handling with a cold-layer execution path, and overlap-aware heterogeneous execution.
 
 \subsection{Selective Joint-Object Residency}
 \label{subsec:memory-hierarchy}
@@ -357,22 +357,20 @@ COLoRA therefore performs selective promotion. Each joint object maintains light
 
 COLoRA serves misses without blocking the decode path by executing directly from the cold layer.
 
-To address Challenge~\ref{subsec:challenge-miss}, COLoRA avoids blocking on promotion for low-reuse objects. Under degraded temporal locality, many misses correspond to objects whose reuse is too distant to amortize transfer cost. In this regime, load-then-run directly converts transfer latency into tail latency.
+To address Challenge~\ref{subsec:challenge-miss}, COLoRA avoids blocking on promotion for low-reuse objects. Under degraded temporal locality, many misses correspond to objects whose reuse is too distant to amortize promotion cost. In this regime, blocking load-then-run exposes promotion latency directly on the critical path.
 
-COLoRA instead executes misses immediately. When a joint object misses in the GPU cache, the request is served through a CPU execution path rather than waiting for promotion. Promotion is treated as an asynchronous optimization for future requests rather than a prerequisite for serving the current one.
+COLoRA instead serves misses immediately. When a joint object misses in the GPU cache, the request is routed to a cold-layer execution path rather than waiting for promotion. Promotion is treated as an asynchronous optimization for future requests rather than a prerequisite for serving the current one.
 
 The dense expert backbone remains on GPU, while only the sparse LoRA residual uses the heterogeneous path. This confines miss handling to the component responsible for fragmentation, minimizing disruption to the main execution flow.
 
 \subsection{Analytical Regime for Non-Blocking Miss Handling}
 \label{subsec:analytical-model}
 
-We use a lightweight latency model to identify the regime in which non-blocking CPU fallback reduces the exposed critical-path latency of serving a miss relative to blocking GPU promotion.
+We use a lightweight latency model to characterize the regime in which non-blocking fallback reduces the exposed critical-path latency of a miss relative to blocking GPU promotion.
 
-Consider a miss on a joint object $j$. Let $W_j$ denote the size of the LoRA residual weights that must be transferred under blocking promotion. Let $A_j$ and $O_j$ denote the activation and output sizes of the fallback path. In decode, batch sizes are small and sequence length is typically one, so $A_j$ and $O_j$ scale with per-token activations, whereas $W_j$ scales with the weights of the missed joint object.
+Consider a miss on joint object $j$, where $W_j$ denotes the missed weight size and $A_j, O_j$ denote the activation and output sizes of the fallback path. In decode, batch sizes are small and sequence length is typically one, so $A_j$ and $O_j$ scale with per-token activations, whereas $W_j$ scales with the missed object weights.
 
-We decompose the exposed latency of the two paths as follows.
-
-\paragraph{Blocking promotion path.}
+The exposed latency of the blocking promotion path is
 \begin{equation}
 T_{\mathrm{block}}(j)
 =
@@ -383,9 +381,8 @@ T_{\mathrm{gpu}}(j)
 T_{\mathrm{stall}}(j),
 \label{eq:blocking-path}
 \end{equation}
-where $T_{\mathrm{xfer}}^{w}(j)$ is the host-to-device transfer cost of the missed weights, $T_{\mathrm{gpu}}(j)$ is the GPU execution cost after promotion, and $T_{\mathrm{stall}}(j)$ is the blocking-side delay exposed on the critical path, including queueing, synchronization, and promotion-side cache-management overheads when they lie on the critical path.
+where $T_{\mathrm{xfer}}^{w}(j)$ is the host-to-device weight transfer cost, $T_{\mathrm{gpu}}(j)$ is the GPU execution cost after promotion, and $T_{\mathrm{stall}}(j)$ is the blocking-side delay exposed on the critical path, including queueing, synchronization, and promotion-side cache-management overheads when they lie on the critical path.
 
-\paragraph{CPU fallback path.}
 \begin{equation}
 T_{\mathrm{fb}}(j)
 =
@@ -398,8 +395,7 @@ T_{\mathrm{merge}}(j)
 T_{\mathrm{overlap}}(j),
 \label{eq:fallback-path}
 \end{equation}
-where $T_{\mathrm{xfer}}^{a}(j)$ is the activation-side transfer cost, including both request-side activation transfer and result return, $T_{\mathrm{cpu}}(j)$ is the CPU execution cost, including CPU-side dispatch
-and kernel wake-up overheads, $T_{\mathrm{merge}}(j)$ is the rejoin overhead, and $T_{\mathrm{overlap}}(j)$ is the portion hidden under independent GPU work.
+where $T_{\mathrm{xfer}}^{a}(j)$ is the activation-side transfer cost, including activation transfer and result return, $T_{\mathrm{cpu}}(j)$ is the CPU execution cost including dispatch and kernel wake-up overheads, $T_{\mathrm{merge}}(j)$ is the rejoin overhead, and $T_{\mathrm{overlap}}(j)$ is the portion hidden under independent GPU work.
 
 COLoRA prefers fallback when
 \begin{equation}
@@ -407,7 +403,7 @@ T_{\mathrm{fb}}(j) < T_{\mathrm{block}}(j).
 \label{eq:fallback-better}
 \end{equation}
 
-To make the transfer terms explicit, we approximate
+We approximate the transfer terms as
 \begin{align}
 T_{\mathrm{xfer}}^{w}(j)
 &\approx
@@ -417,46 +413,42 @@ T_{\mathrm{xfer}}^{a}(j)
 2\alpha + \frac{A_j + O_j}{B_{\mathrm{pcie}}},
 \label{eq:transfer-model}
 \end{align}
-where $\alpha$ is the fixed host-device transfer overhead and $B_{\mathrm{pcie}}$ is the effective transfer bandwidth. Under small-batch decode, $A_j + O_j$ is often much smaller than $W_j$.
+where $\alpha$ is the fixed host-device transfer overhead and $B_{\mathrm{pcie}}$ is the effective transfer bandwidth.
 
-Importantly, raw transfer cost alone does not necessarily favor fallback, since activation-side service incurs a round-trip transfer while promotion transfers weights only once. COLoRA instead targets the regime in which blocking-side waiting and overlap effects dominate the exposed latency of a cold miss.
+Raw transfer cost alone does not necessarily favor fallback, since activation-side service incurs a round-trip transfer whereas promotion transfers weights only once. COLoRA instead targets the regime in which blocking-side delay and overlap effects dominate the exposed latency of a cold miss.
 
-Substituting these terms, fallback is favored when
+Substituting the transfer terms, fallback is favored when
 \begin{equation}
+\begin{split}
 \bigl(T_{\mathrm{xfer}}^{a}(j) - T_{\mathrm{xfer}}^{w}(j)\bigr)
-+
-\bigl(T_{\mathrm{cpu}}(j) - T_{\mathrm{gpu}}(j)\bigr)
-+
-T_{\mathrm{merge}}(j)
--
-T_{\mathrm{overlap}}(j)
--
-T_{\mathrm{stall}}(j)
-< 0.
++ \bigl(T_{\mathrm{cpu}}(j) - T_{\mathrm{gpu}}(j)\bigr) \\
++ T_{\mathrm{merge}}(j)
+- T_{\mathrm{overlap}}(j)
+- T_{\mathrm{stall}}(j)
+< 0 .
+\end{split}
 \label{eq:decode-regime}
 \end{equation}
 
-Equation~\ref{eq:decode-regime} characterizes the regime targeted by COLoRA. For cold misses with weak near-term reuse, blocking promotion forces the current request to pay the transfer cost immediately, while any benefit is deferred to future requests that may never arrive soon enough to amortize it. By contrast, fallback serves the current miss directly through the cold layer, pays only for activation-side transfer, and may additionally hide part of its cost through overlap.
-
-Importantly, COLoRA does not require the CPU path to have lower raw compute latency than the GPU path in isolation. It only requires the fallback path to incur lower \emph{exposed} latency than blocking promotion for cold, low-reuse misses.
+Equation~\ref{eq:decode-regime} characterizes the regime targeted by COLoRA: cold misses with weak near-term reuse, where blocking promotion exposes cost immediately while deferring benefit to future requests, whereas fallback serves the current miss directly and may additionally hide part of its cost through overlap. COLoRA therefore requires only lower \emph{exposed} latency than blocking promotion, not lower raw compute latency than GPU execution.
 
 \subsection{Low-Overhead Miss Execution Path}
 \label{subsec:cpu-fallback}
 
-COLoRA ensures that the fallback execution path is fast enough to make non-blocking miss handling viable.
+COLoRA ensures that the fallback path is efficient enough to make non-blocking miss handling viable in the decode regime.
 
 Decode misses are small, irregular, and latency-sensitive, making generic framework execution inefficient due to high fixed overhead. COLoRA therefore implements a specialized execution path tailored to this regime.
 
 Miss work is grouped by adapter, lightweight kernels are used when available, and the control path is kept compact. The implementation exposes AVX-512 BF16 kernels for the gate, up, and down projections, reducing dispatch overhead and improving efficiency for small tensor shapes.
 
-The goal is not to outperform GPU execution, but to ensure that for cold, low-reuse objects, immediate execution is cheaper than blocking on promotion.
+The goal is not to outperform GPU execution in general, but to ensure that for cold, low-reuse objects, fallback incurs lower exposed miss latency than blocking promotion.
 
 \subsection{Overlap-Aware Heterogeneous Execution}
 \label{subsec:overlap}
 
-COLoRA overlaps GPU execution with miss handling to prevent non-blocking execution from becoming a new tail bottleneck.
+COLoRA overlaps GPU execution with miss handling to reduce the exposed cost of heterogeneous execution and prevent fallback from becoming a new tail bottleneck.
 
-To address Challenge~\ref{subsec:challenge-overlap}, COLoRA exploits mixed batches containing both GPU-cache hits and misses. Without overlap, non-blocking miss handling degenerates into a serialized pipeline, where the CPU path becomes the new critical path.
+To address Challenge~\ref{subsec:challenge-overlap}, COLoRA exploits mixed batches containing both GPU-cache hits and misses. Without overlap, non-blocking miss handling degenerates into a serialized pipeline, where the fallback path becomes the new critical path.
 
 COLoRA launches miss execution asynchronously when independent GPU work is available and synchronizes only when the residual output is required. This allows CPU computation, GPU computation, and data movement to proceed concurrently.
 
