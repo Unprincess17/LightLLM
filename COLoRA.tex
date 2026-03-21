@@ -471,17 +471,13 @@ When locality is strong and the working set fits in GPU memory, most requests hi
 
 This adaptive behavior ensures that COLoRA improves performance in fragmented regimes while remaining efficient in well-behaved workloads.
 
-
-\section{Scope and Limitations}
-\label{sec:limitations}
-
-COLoRA assumes that CPU memory can hold the complete joint-object source pool. This assumption should be stated explicitly because the design depends on a CPU-resident full replica as the cold layer.
-
-COLoRA is most attractive when the workload exhibits a hot--cold split: a reusable GPU-resident head plus a sparse cold tail. If the cold fraction becomes too large, CPU queueing can erode the benefit. Likewise, COLoRA reduces exposure to blocking promotion, but it does not eliminate host--device transfer costs or hardware sensitivity in the CPU path. NUMA placement, CPU vector support, and contention still matter.
+\section{Implementation}
+\label{sec:implementation}
+TODO:WIP
 
 \section{Evaluation}
 \label{sec:evaluation}
-
+TODO:WIP
 We evaluate COLoRA along five dimensions that correspond directly to the claims made in this paper. In particular, we ask the following questions:
 
 \begin{itemize}
