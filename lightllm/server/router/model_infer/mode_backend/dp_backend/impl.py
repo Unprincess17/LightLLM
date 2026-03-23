@@ -183,7 +183,10 @@ class DPChunkedPrefillBackend(ModeBackend):
         return
 
     def decode_normal(self, event_pack: OverlapEventPack, decode_reqs: List[InferReq]):
-        model_input, run_reqs, padded_req_num = padded_prepare_decode_inputs(req_objs=decode_reqs)
+        decode_step_id = self._alloc_decode_step_id()
+        model_input, run_reqs, padded_req_num = padded_prepare_decode_inputs(
+            req_objs=decode_reqs, decode_step_id=decode_step_id
+        )
         model_input: ModelInput = model_input
         run_reqs_num = len(run_reqs)
         with torch.cuda.stream(g_infer_context.get_overlap_stream()):
@@ -292,6 +295,7 @@ class DPChunkedPrefillBackend(ModeBackend):
         return
 
     def decode_overlap(self, event_pack: OverlapEventPack, decode_reqs: List[InferReq]):
+        decode_step_id = self._alloc_decode_step_id()
         (
             model_input0,
             run_reqs0,
@@ -299,7 +303,7 @@ class DPChunkedPrefillBackend(ModeBackend):
             model_input1,
             run_reqs1,
             _,
-        ) = padded_overlap_prepare_decode_inputs(req_objs=decode_reqs)
+        ) = padded_overlap_prepare_decode_inputs(req_objs=decode_reqs, decode_step_id=decode_step_id)
         model_input0: ModelInput = model_input0
         model_input1: ModelInput = model_input1
 
@@ -415,7 +419,8 @@ class DPChunkedPrefillBackend(ModeBackend):
         return
 
     def decode_mtp(self, event_pack: OverlapEventPack, decode_reqs: List[InferReq]):
-        model_input, run_reqs, _ = padded_prepare_decode_inputs(decode_reqs)
+        decode_step_id = self._alloc_decode_step_id()
+        model_input, run_reqs, _ = padded_prepare_decode_inputs(decode_reqs, decode_step_id=decode_step_id)
         b_mtp_index_cpu = model_input.b_mtp_index
         req_num = len(run_reqs)
 
@@ -713,6 +718,7 @@ class DPChunkedPrefillBackend(ModeBackend):
         return
 
     def decode_overlap_mtp(self, event_pack: OverlapEventPack, decode_reqs: List[InferReq]):
+        decode_step_id = self._alloc_decode_step_id()
         (
             model_input0,
             run_reqs0,
@@ -720,7 +726,7 @@ class DPChunkedPrefillBackend(ModeBackend):
             model_input1,
             run_reqs1,
             _,
-        ) = padded_overlap_prepare_decode_inputs(decode_reqs)
+        ) = padded_overlap_prepare_decode_inputs(decode_reqs, decode_step_id=decode_step_id)
         req_num0, req_num1 = len(run_reqs0), len(run_reqs1)
         all_next_token_ids = []
         b_mtp_index_cpu0 = model_input0.b_mtp_index

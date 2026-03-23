@@ -285,7 +285,9 @@ class TpPartBaseModel:
         infer_state.prefix_total_token_num = model_input.prefix_total_token_num
         assert model_input.b_req_idx.shape[0] == model_input.b_seq_len.shape[0]
         infer_state.b_req_idx = model_input.b_req_idx
+        infer_state.b_adapter_bin = model_input.b_adapter_bin
         infer_state.b_trace_req_id = model_input.b_trace_req_id
+        infer_state.decode_step_id = model_input.decode_step_id
         infer_state.b_seq_len = model_input.b_seq_len
         if model_input.is_prefill:
             if model_input.b_ready_cache_len is not None:
@@ -333,6 +335,10 @@ class TpPartBaseModel:
                 value=self.req_manager.HOLD_REQUEST_ID,
             )
         new_model_input.b_seq_len = F.pad(new_model_input.b_seq_len, (0, padded_batch_size), mode="constant", value=2)
+        if new_model_input.b_adapter_bin is not None:
+            new_model_input.b_adapter_bin = F.pad(
+                new_model_input.b_adapter_bin, (0, padded_batch_size), mode="constant", value=-1
+            )
         new_model_input.mem_indexes = F.pad(
             new_model_input.mem_indexes,
             (0, padded_batch_size),

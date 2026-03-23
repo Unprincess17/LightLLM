@@ -22,7 +22,9 @@ class InferStateInfo:
         self.batch_size: int = None
         self.total_token_num: int = None
         self.b_req_idx: torch.Tensor = None
+        self.b_adapter_bin: torch.Tensor = None
         self.b_trace_req_id: torch.Tensor = None
+        self.decode_step_id: Optional[int] = None
         self.b_start_loc: torch.Tensor = None
         self.b_ready_cache_len: torch.Tensor = None  # only for prefill prompt cache used.
 
@@ -121,6 +123,7 @@ class InferStateInfo:
                 attr_ = getattr(self, attr_name, None)
                 if attr_ is not None and attr_.data_ptr() != attr_value.data_ptr():
                     attr_.copy_(attr_value, non_blocking=True)
+        self.decode_step_id = new_infer_state.decode_step_id
         return
 
     def prefill_dp_balance(self, input_ids: torch.Tensor):

@@ -20,9 +20,9 @@ import os
 import logging
 import time
 import threading
-from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, Optional, Any, List, Tuple
+from collections import OrderedDict, deque
+from concurrent.futures import CancelledError, ThreadPoolExecutor
+from typing import Callable, Deque, Dict, Optional, Any, List, NamedTuple, Set, Tuple
 
 from lightllm.server.core.objs.lora_compute_config import LoRAComputeConfig
 from lightllm.server.lora.expert_cache import ExpertCacheKey, MoEExpertCacheManager
@@ -80,6 +80,36 @@ except Exception:
 def is_moe_cpu_kernel_available() -> bool:
     """Expose MoE kernel readiness for backend startup checks."""
     return bool(MOE_AVX_AVAILABLE)
+
+
+class SpecJobKey(NamedTuple):
+    layer_id: int
+    decode_step_id: int
+    op_kind: str
+    adapter_bin: int
+    expert_id: int
+    row_group_sig: Tuple[Tuple[int, int], ...]
+
+
+class SpecJobHandle:
+    __slots__ = (
+        "key",
+        "future",
+        "submitted_at",
+        "retired_at",
+        "bound_at",
+        "retire_reason",
+        "stale",
+    )
+
+    def __init__(self, key: SpecJobKey, future: Any, submitted_at: Optional[float] = None):
+        self.key = key
+        self.future = future
+        self.submitted_at = time.perf_counter() if submitted_at is None else float(submitted_at)
+        self.retired_at: Optional[float] = None
+        self.bound_at: Optional[float] = None
+        self.retire_reason: Optional[str] = None
+        self.stale = False
 
 
 class Qwen3VLMoELoRADispatcher:
@@ -173,6 +203,11 @@ class Qwen3VLMoELoRADispatcher:
         self._cpu_inflight = 0
         self._cpu_group_plan_cache: "OrderedDict[Tuple[int, bytes], Tuple[Tuple[int, Tuple[int, ...]], ...]]" = OrderedDict()
         self._cpu_group_plan_cache_cap = 256
+        self._spec_lock = threading.Lock()
+        self._spec_current_step_id: Optional[int] = None
+        self._spec_active_jobs: Dict[SpecJobKey, SpecJobHandle] = {}
+        self._spec_active_job_keys_by_step: Dict[int, Set[SpecJobKey]] = {}
+        self._spec_retired_jobs: Deque[SpecJobHandle] = deque()
 
         # Last-call COLoRA stats for decode observability.
         self._last_colora_stats = {
@@ -415,12 +450,17 @@ class Qwen3VLMoELoRADispatcher:
             )
         return self._cpu_executor
 
-    def _reserve_async_queue_slot(self) -> bool:
+    def _reserve_async_queue_slot(self, reserve_slots: int = 0) -> bool:
+        reserve_slots = max(int(reserve_slots), 0)
+        usable_depth = max(self.colora_cpu_queue_depth - reserve_slots, 0)
+        if usable_depth <= 0:
+            return False
+
         timeout_s = float(self.colora_cpu_batch_timeout_us) / 1_000_000.0
         deadline = time.perf_counter() + timeout_s
         while True:
             with self._cpu_queue_lock:
-                if self._cpu_inflight < self.colora_cpu_queue_depth:
+                if self._cpu_inflight < usable_depth:
                     self._cpu_inflight += 1
                     return True
             if timeout_s <= 0.0 or time.perf_counter() >= deadline:
@@ -434,6 +474,213 @@ class Qwen3VLMoELoRADispatcher:
     def _get_cpu_queue_depth(self) -> int:
         with self._cpu_queue_lock:
             return int(self._cpu_inflight)
+
+    def _remove_spec_handle_locked(self, key: SpecJobKey) -> Optional[SpecJobHandle]:
+        handle = self._spec_active_jobs.pop(key, None)
+        if handle is None:
+            return None
+
+        step_keys = self._spec_active_job_keys_by_step.get(int(key.decode_step_id))
+        if step_keys is not None:
+            step_keys.discard(key)
+            if not step_keys:
+                self._spec_active_job_keys_by_step.pop(int(key.decode_step_id), None)
+        return handle
+
+    def _retire_spec_handle_locked(self, handle: SpecJobHandle, reason: str) -> None:
+        if handle.retired_at is not None:
+            return
+
+        self._remove_spec_handle_locked(handle.key)
+        handle.stale = True
+        handle.retire_reason = str(reason)
+        handle.retired_at = time.perf_counter()
+
+        future = handle.future
+        if future is not None and hasattr(future, "cancel"):
+            try:
+                future.cancel()
+            except Exception:
+                pass
+
+        self._spec_retired_jobs.append(handle)
+
+    def begin_spec_step(self, decode_step_id: int) -> Dict[str, int]:
+        retired = 0
+        step_id = int(decode_step_id)
+        with self._spec_lock:
+            stale_steps = [active_step for active_step in self._spec_active_job_keys_by_step.keys() if active_step != step_id]
+            for active_step in stale_steps:
+                keys = tuple(self._spec_active_job_keys_by_step.get(active_step, ()))
+                for key in keys:
+                    handle = self._spec_active_jobs.get(key)
+                    if handle is None:
+                        continue
+                    self._retire_spec_handle_locked(handle, reason="step_advanced")
+                    retired += 1
+
+            self._spec_current_step_id = step_id
+            self._spec_active_job_keys_by_step.setdefault(step_id, set())
+
+        reap_stats = self.reap_retired()
+        return {
+            "retired_active": int(retired),
+            "reaped_retired": int(reap_stats["reaped_retired"]),
+            "pending_retired": int(reap_stats["pending_retired"]),
+        }
+
+    def end_spec_step(self, decode_step_id: int) -> Dict[str, int]:
+        retired = 0
+        step_id = int(decode_step_id)
+        with self._spec_lock:
+            keys = tuple(self._spec_active_job_keys_by_step.get(step_id, ()))
+            for key in keys:
+                handle = self._spec_active_jobs.get(key)
+                if handle is None:
+                    continue
+                self._retire_spec_handle_locked(handle, reason="step_end")
+                retired += 1
+
+            if self._spec_current_step_id == step_id:
+                self._spec_current_step_id = None
+
+        reap_stats = self.reap_retired()
+        return {
+            "retired_active": int(retired),
+            "reaped_retired": int(reap_stats["reaped_retired"]),
+            "pending_retired": int(reap_stats["pending_retired"]),
+        }
+
+    def reap_retired(self) -> Dict[str, int]:
+        reaped = 0
+        pending: Deque[SpecJobHandle] = deque()
+        with self._spec_lock:
+            while self._spec_retired_jobs:
+                handle = self._spec_retired_jobs.popleft()
+                future = handle.future
+                if future is None:
+                    reaped += 1
+                    continue
+
+                is_done = True
+                if hasattr(future, "done"):
+                    try:
+                        is_done = bool(future.done())
+                    except Exception:
+                        is_done = True
+
+                if not is_done:
+                    pending.append(handle)
+                    continue
+
+                if hasattr(future, "result"):
+                    try:
+                        future.result(timeout=0)
+                    except TypeError:
+                        try:
+                            future.result()
+                        except Exception:
+                            pass
+                    except CancelledError:
+                        pass
+                    except Exception:
+                        pass
+                reaped += 1
+
+            self._spec_retired_jobs = pending
+            pending_count = len(self._spec_retired_jobs)
+
+        return {
+            "reaped_retired": int(reaped),
+            "pending_retired": int(pending_count),
+        }
+
+    def try_admit_spec_job(
+        self,
+        key: SpecJobKey,
+        submit_fn: Callable[[], Any],
+    ) -> Optional[SpecJobHandle]:
+        if not callable(submit_fn):
+            raise TypeError("submit_fn must be callable")
+
+        self.reap_retired()
+
+        with self._spec_lock:
+            current_step_id = self._spec_current_step_id
+            if current_step_id is not None and int(key.decode_step_id) != int(current_step_id):
+                return None
+
+            existing = self._spec_active_jobs.get(key)
+            if existing is not None:
+                return existing
+
+            if not self._reserve_async_queue_slot(reserve_slots=1):
+                return None
+
+            try:
+                future = submit_fn()
+                if future is None:
+                    raise RuntimeError("submit_fn returned None for speculative job")
+                if not hasattr(future, "add_done_callback"):
+                    raise TypeError("speculative job future must support add_done_callback")
+                future.add_done_callback(lambda _f: self._release_async_queue_slot())
+                handle = SpecJobHandle(key=key, future=future)
+                self._spec_active_jobs[key] = handle
+                self._spec_active_job_keys_by_step.setdefault(int(key.decode_step_id), set()).add(key)
+                return handle
+            except Exception:
+                self._release_async_queue_slot()
+                raise
+
+    def try_bind_gate_up_job(self, key: SpecJobKey) -> Optional[Any]:
+        if key.op_kind != "gate_up":
+            raise ValueError(f"try_bind_gate_up_job expects op_kind='gate_up', got '{key.op_kind}'")
+
+        self.reap_retired()
+
+        with self._spec_lock:
+            handle = self._spec_active_jobs.get(key)
+            if handle is None:
+                return None
+
+            future = handle.future
+            is_done = False
+            if hasattr(future, "done"):
+                try:
+                    is_done = bool(future.done())
+                except Exception:
+                    is_done = False
+
+            if not is_done:
+                self._retire_spec_handle_locked(handle, reason="bind_not_ready")
+                return None
+
+        try:
+            if hasattr(future, "result"):
+                try:
+                    result = future.result(timeout=0)
+                except TypeError:
+                    result = future.result()
+            else:
+                result = future
+        except CancelledError:
+            with self._spec_lock:
+                active = self._spec_active_jobs.get(key)
+                if active is not None:
+                    self._retire_spec_handle_locked(active, reason="bind_cancelled")
+            return None
+        except Exception:
+            with self._spec_lock:
+                active = self._spec_active_jobs.get(key)
+                if active is not None:
+                    self._retire_spec_handle_locked(active, reason="bind_failed")
+            return None
+
+        with self._spec_lock:
+            active = self._remove_spec_handle_locked(key)
+            if active is not None:
+                active.bound_at = time.perf_counter()
+        return result
 
     def _build_cpu_group_plan(self, req_bins: torch.Tensor) -> Tuple[Tuple[int, Tuple[int, ...]], ...]:
         if req_bins.device.type != "cpu":
@@ -1663,6 +1910,8 @@ def load_lora_adapter(*args, **kwargs):
 
 
 __all__ = [
+    "SpecJobHandle",
+    "SpecJobKey",
     "Qwen3VLMoELoRADispatcher",
     "create_vl_moe_lora_dispatcher",
     "load_lora_adapter",

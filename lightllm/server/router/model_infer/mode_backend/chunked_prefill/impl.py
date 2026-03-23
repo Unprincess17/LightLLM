@@ -234,7 +234,8 @@ class ChunkedPrefillBackend(ModeBackend):
         event_pack: OverlapEventPack,
         decode_reqs: List[InferReq],
     ):
-        model_input, run_reqs = prepare_decode_inputs(decode_reqs)
+        decode_step_id = self._alloc_decode_step_id()
+        model_input, run_reqs = prepare_decode_inputs(decode_reqs, decode_step_id=decode_step_id)
         with torch.cuda.stream(g_infer_context.get_overlap_stream()):
             model_output = self.model.forward(model_input)
             _, next_token_ids_cpu, next_token_logprobs_cpu = self._sample_and_scatter_token(
@@ -322,7 +323,8 @@ class ChunkedPrefillBackend(ModeBackend):
         """
         MTP解码的通用流程，整合eagle和vanilla的共同逻辑
         """
-        model_input, run_reqs = prepare_decode_inputs(decode_reqs)
+        decode_step_id = self._alloc_decode_step_id()
+        model_input, run_reqs = prepare_decode_inputs(decode_reqs, decode_step_id=decode_step_id)
 
         with torch.cuda.stream(g_infer_context.get_overlap_stream()):
             b_mtp_index_cpu = model_input.b_mtp_index

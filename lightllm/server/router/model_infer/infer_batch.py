@@ -23,6 +23,22 @@ from lightllm.server.embed_cache.embed_cache_client import CpuEmbedCacheClient
 logger = init_logger(__name__)
 
 
+def normalize_req_adapter_id(raw_adapter_id: Any) -> int:
+    try:
+        adapter_id = int(raw_adapter_id)
+    except (TypeError, ValueError):
+        adapter_id = 0
+    return adapter_id
+
+
+def req_adapter_id_to_bin(adapter_id: int) -> int:
+    return adapter_id - 1 if adapter_id > 0 else -1
+
+
+def get_req_adapter_bin(req: "InferReq") -> int:
+    return req_adapter_id_to_bin(normalize_req_adapter_id(getattr(req, "adapter_id", 0)))
+
+
 @dataclass
 class InferenceContext:
     req_manager: ReqManager = None  # gpu 请求管理

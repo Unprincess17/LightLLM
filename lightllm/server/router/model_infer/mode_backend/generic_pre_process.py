@@ -1,7 +1,7 @@
 import torch
 import numpy as np
-from typing import List, Tuple
-from lightllm.server.router.model_infer.infer_batch import InferReq, g_infer_context
+from typing import List, Optional, Tuple
+from lightllm.server.router.model_infer.infer_batch import InferReq, g_infer_context, get_req_adapter_bin
 from lightllm.common.basemodel.infer_lock import g_infer_state_lock
 from lightllm.common.basemodel.batch_objs import ModelInput
 from lightllm.utils.envs_utils import (
@@ -99,19 +99,24 @@ def prepare_prefill_inputs(
     return model_input, run_reqs
 
 
-def prepare_decode_inputs(req_objs: List[InferReq]) -> Tuple[ModelInput, List[InferReq]]:
+def prepare_decode_inputs(
+    req_objs: List[InferReq], decode_step_id: Optional[int] = None
+) -> Tuple[ModelInput, List[InferReq]]:
     run_reqs: List[InferReq] = []
     total_token_num = 0
     max_len_in_batch = 0
     b_req_idx = []
+    b_adapter_bin = []
     b_trace_req_id = []
     b_mtp_index = []
     b_seq_len = []
     b_q_seq_len = []
     multimodal_params = []
     for req in req_objs:
+        adapter_bin = get_req_adapter_bin(req)
         run_reqs.append(req)
         b_req_idx.append(req.req_idx)
+        b_adapter_bin.append(adapter_bin)
         b_trace_req_id.append(req.req_id)
         seq_len = req.get_cur_total_len()
         assert req.cur_kv_len == seq_len - 1, f"{req.cur_kv_len} {seq_len}"
@@ -124,6 +129,7 @@ def prepare_decode_inputs(req_objs: List[InferReq]) -> Tuple[ModelInput, List[In
         for step in range(req.mtp_step):
             run_reqs.append(req)
             b_req_idx.append(req.req_idx)
+            b_adapter_bin.append(adapter_bin)
             b_trace_req_id.append(req.req_id)
             seq_len += 1
             b_seq_len.append(seq_len)
@@ -137,6 +143,7 @@ def prepare_decode_inputs(req_objs: List[InferReq]) -> Tuple[ModelInput, List[In
     max_q_seq_len = max(b_q_seq_len)
 
     b_req_idx = torch.tensor(b_req_idx, dtype=torch.int32, device="cpu")
+    b_adapter_bin = torch.tensor(b_adapter_bin, dtype=torch.int32, device="cpu")
     b_trace_req_id = torch.tensor(b_trace_req_id, dtype=torch.int64, device="cpu")
     b_seq_len = torch.tensor(b_seq_len, dtype=torch.int32, device="cpu")
     b_mtp_index = torch.tensor(b_mtp_index, dtype=torch.int32, device="cpu")
@@ -163,12 +170,14 @@ def prepare_decode_inputs(req_objs: List[InferReq]) -> Tuple[ModelInput, List[In
         input_ids=None,
         mem_indexes_cpu=mem_indexes,
         b_req_idx=b_req_idx,
+        b_adapter_bin=b_adapter_bin,
         b_trace_req_id=b_trace_req_id,
         b_mtp_index=b_mtp_index,
         b_seq_len=b_seq_len,
         b_shared_seq_len=b_shared_seq_len,
         b_mark_shared_group=b_mark_shared_group,
         is_prefill=False,
+        decode_step_id=decode_step_id,
     )
     model_input.multimodal_params = multimodal_params
     return model_input, run_reqs

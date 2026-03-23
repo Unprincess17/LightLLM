@@ -21,9 +21,11 @@ class ModelInput:
     prefix_total_token_num: int = None
     input_ids: torch.Tensor = None
     b_req_idx: torch.Tensor = None
+    b_adapter_bin: torch.Tensor = None
     b_trace_req_id: torch.Tensor = None
     b_mtp_index: torch.Tensor = None
     b_seq_len: torch.Tensor = None
+    decode_step_id: Optional[int] = None
     # 只会在 diverse_mode 下的 decode 阶段真正被使用的参数, 用于记录共享的radix cache中的长度
     b_shared_seq_len: torch.Tensor = None
     # 只会在 diverse_mode 下的 decode 阶段真正被使用的参数, 用于记录请求间的共享关系。
@@ -58,6 +60,8 @@ class ModelInput:
         if self.mem_indexes is None:
             self.mem_indexes = self.mem_indexes_cpu.cuda(non_blocking=True)
         self.b_req_idx = self.b_req_idx.cuda(non_blocking=True)
+        if self.b_adapter_bin is not None:
+            self.b_adapter_bin = self.b_adapter_bin.cuda(non_blocking=True)
         self.b_seq_len = self.b_seq_len.cuda(non_blocking=True)
         self.b_mtp_index = self.b_mtp_index.cuda(non_blocking=True)
         if self.b_ready_cache_len is not None:

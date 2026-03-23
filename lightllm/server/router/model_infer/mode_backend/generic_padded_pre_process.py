@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 import triton
 from typing import List, Optional, Tuple
-from lightllm.server.router.model_infer.infer_batch import g_infer_context, InferReq
+from lightllm.server.router.model_infer.infer_batch import g_infer_context, InferReq, get_req_adapter_bin
 from lightllm.utils.infer_utils import calculate_time
 from lightllm.utils.envs_utils import get_env_start_args
 from lightllm.common.basemodel.infer_lock import g_infer_state_lock
@@ -129,7 +129,7 @@ def padded_prepare_prefill_inputs(
 
 
 def padded_prepare_decode_inputs(
-    req_objs: List[InferReq], dest_batch_size: Optional[int] = None
+    req_objs: List[InferReq], dest_batch_size: Optional[int] = None, decode_step_id: Optional[int] = None
 ) -> Tuple[ModelInput, List[InferReq], int]:
 
     if dest_batch_size is None:
@@ -145,6 +145,7 @@ def padded_prepare_decode_inputs(
     run_reqs = []
     total_token_num = 0
     b_req_idx = []
+    b_adapter_bin = []
     b_trace_req_id = []
     b_mtp_index = []
     b_seq_len = []
@@ -152,8 +153,10 @@ def padded_prepare_decode_inputs(
     args_mtp_step = get_env_start_args().mtp_step
     batch_multimodal_params = []
     for req in req_objs:
+        adapter_bin = get_req_adapter_bin(req)
         run_reqs.append(req)
         b_req_idx.append(req.req_idx)
+        b_adapter_bin.append(adapter_bin)
         b_trace_req_id.append(req.req_id)
         seq_len = req.get_cur_total_len()
         assert req.cur_kv_len == seq_len - 1
@@ -167,6 +170,7 @@ def padded_prepare_decode_inputs(
             seq_len += 1
             total_token_num += seq_len
             b_req_idx.append(req.req_idx)
+            b_adapter_bin.append(adapter_bin)
             b_trace_req_id.append(req.req_id)
             b_seq_len.append(seq_len)
             b_mtp_index.append(step + 1)
@@ -179,6 +183,7 @@ def padded_prepare_decode_inputs(
         seq_len = 2
         total_token_num += seq_len
         b_req_idx.append(g_infer_context.req_manager.HOLD_REQUEST_ID)
+        b_adapter_bin.append(-1)
         b_trace_req_id.append(g_infer_context.req_manager.HOLD_REQUEST_ID)
         b_seq_len.append(seq_len)
         b_mtp_index.append(0)
@@ -188,6 +193,7 @@ def padded_prepare_decode_inputs(
             total_token_num += seq_len
             b_seq_len.append(seq_len)
             b_req_idx.append(g_infer_context.req_manager.HOLD_REQUEST_ID)
+            b_adapter_bin.append(-1)
             b_trace_req_id.append(g_infer_context.req_manager.HOLD_REQUEST_ID)
             b_mtp_index.append(step + 1)
             batch_multimodal_params.append({"images": [], "audios": []})
@@ -199,6 +205,7 @@ def padded_prepare_decode_inputs(
     max_len_in_batch = max(b_seq_len)
 
     b_req_idx = torch.tensor(b_req_idx, dtype=torch.int32, device="cpu")
+    b_adapter_bin = torch.tensor(b_adapter_bin, dtype=torch.int32, device="cpu")
     b_trace_req_id = torch.tensor(b_trace_req_id, dtype=torch.int64, device="cpu")
     b_seq_len = torch.tensor(b_seq_len, dtype=torch.int32, device="cpu")
     b_mtp_index = torch.tensor(b_mtp_index, dtype=torch.int32, device="cpu")
@@ -228,10 +235,12 @@ def padded_prepare_decode_inputs(
         input_ids=None,
         mem_indexes_cpu=mem_indexes,
         b_req_idx=b_req_idx,
+        b_adapter_bin=b_adapter_bin,
         b_trace_req_id=b_trace_req_id,
         b_mtp_index=b_mtp_index,
         b_seq_len=b_seq_len,
         is_prefill=False,
+        decode_step_id=decode_step_id,
     )
     model_input.multimodal_params = batch_multimodal_params
     return model_input, run_reqs, padded_req_num
@@ -239,6 +248,7 @@ def padded_prepare_decode_inputs(
 
 def padded_overlap_prepare_decode_inputs(
     req_objs: List[InferReq],
+    decode_step_id: Optional[int] = None,
 ) -> Tuple[ModelInput, List[InferReq], int, ModelInput, List[InferReq], int]:
     split_req_bound = triton.cdiv(len(req_objs), 2)
     req_objs_0 = req_objs[0:split_req_bound]
@@ -247,9 +257,11 @@ def padded_overlap_prepare_decode_inputs(
     micro_batch_size = triton.cdiv(len(req_objs), 2)
     micro_batch_size = max(1, micro_batch_size)
 
-    micro_input, run_reqs, padded_req_num = padded_prepare_decode_inputs(req_objs_0, dest_batch_size=micro_batch_size)
+    micro_input, run_reqs, padded_req_num = padded_prepare_decode_inputs(
+        req_objs_0, dest_batch_size=micro_batch_size, decode_step_id=decode_step_id
+    )
     micro_input1, run_reqs1, padded_req_num1 = padded_prepare_decode_inputs(
-        req_objs_1, dest_batch_size=micro_batch_size
+        req_objs_1, dest_batch_size=micro_batch_size, decode_step_id=decode_step_id
     )
     return micro_input, run_reqs, padded_req_num, micro_input1, run_reqs1, padded_req_num1
 

@@ -50,6 +50,10 @@ def _router_trace_phase_enabled(is_prefill: bool) -> bool:
     return "all" in allowed or phase in allowed
 
 
+def _colora_phase1_metadata_validation_enabled() -> bool:
+    return os.environ.get("COLORA_DEBUG_VALIDATE_METADATA", "0") == "1"
+
+
 def _alloc_router_trace_arrival_indices(count: int) -> range:
     global _ROUTER_TRACE_NEXT_ARRIVAL
 
@@ -102,6 +106,31 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
             req_bins: Tensor of shape [batch_size] containing per-request adapter indices
         """
         self.req_bins_ = req_bins
+
+    def _validate_decode_colora_metadata(self, infer_state: LlamaInferStateInfo, num_tokens: int) -> None:
+        if not _colora_phase1_metadata_validation_enabled():
+            return
+        if getattr(infer_state, "is_prefill", True):
+            return
+
+        assert infer_state.decode_step_id is not None, "decode_step_id must be set on decode infer_state"
+        assert infer_state.b_req_idx is not None, "b_req_idx must be set on decode infer_state"
+        assert infer_state.b_req_idx.shape[0] == num_tokens, (
+            f"decode b_req_idx row count mismatch: {infer_state.b_req_idx.shape[0]} vs {num_tokens}"
+        )
+        assert infer_state.b_adapter_bin is not None, "b_adapter_bin must be set on decode infer_state"
+        assert infer_state.b_adapter_bin.shape[0] == num_tokens, (
+            f"decode b_adapter_bin row count mismatch: {infer_state.b_adapter_bin.shape[0]} vs {num_tokens}"
+        )
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[COLoRA][Phase1] layer=%s decode_step_id=%s rows=%s adapter_rows=%s",
+                self.layer_num_,
+                infer_state.decode_step_id,
+                num_tokens,
+                infer_state.b_adapter_bin.shape[0],
+            )
 
     def _coalesce_lora_activations(
         self,
@@ -750,6 +779,8 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
         # 确保 dispatcher 存在且开启了 detached lora 模式
         force_slow = getattr(self, 'force_slow_lora_path', False)
         use_per_expert_lora = (self.use_detached_lora_ and self.lora_dispatcher_ is not None) or force_slow
+        if use_per_expert_lora:
+            self._validate_decode_colora_metadata(infer_state, num_tokens)
         colora_stats = self._new_colora_stats()
 
         # ----------------------------------------------------------------

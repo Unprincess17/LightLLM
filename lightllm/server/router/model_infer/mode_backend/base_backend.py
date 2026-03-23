@@ -11,7 +11,12 @@ from lightllm.utils.infer_utils import set_random_seed
 from lightllm.utils.log_utils import init_logger
 from lightllm.models import get_model
 from lightllm.server.router.dynamic_prompt.radix_cache import RadixCache
-from lightllm.server.router.model_infer.infer_batch import InferReq, InferReqUpdatePack
+from lightllm.server.router.model_infer.infer_batch import (
+    InferReq,
+    InferReqUpdatePack,
+    get_req_adapter_bin,
+    normalize_req_adapter_id,
+)
 from lightllm.server.router.token_load import TokenLoad
 from lightllm.common.basemodel.infer_lock import g_infer_state_lock, InferStateLock
 from lightllm.common.basemodel.basemodel import TpPartBaseModel
@@ -74,7 +79,13 @@ class ModeBackend:
         self._radix_tree_merge_counter: int = 0
         self._enable_radix_tree_timer_merge: bool = enable_radix_tree_timer_merge()
         self._radix_tree_merge_update_delta: int = get_radix_tree_merge_update_delta()
+        self._decode_step_id: int = 0
         pass
+
+    def _alloc_decode_step_id(self) -> int:
+        decode_step_id = self._decode_step_id
+        self._decode_step_id += 1
+        return decode_step_id
 
     @staticmethod
     def _split_lora_dirs(lora_dir_arg: Optional[str]) -> List[str]:
@@ -1217,17 +1228,11 @@ class ModeBackend:
         req_bins_list: List[int] = []
         active_adapter_ids = set()
         for req in batch.reqs:
-            raw_adapter_id = getattr(req, "adapter_id", 0)
-            try:
-                adapter_id = int(raw_adapter_id)
-            except (TypeError, ValueError):
-                adapter_id = 0
-
+            adapter_id = normalize_req_adapter_id(getattr(req, "adapter_id", 0))
+            adapter_bin = get_req_adapter_bin(req)
+            req_bins_list.append(adapter_bin)
             if adapter_id > 0:
-                req_bins_list.append(adapter_id - 1)
                 active_adapter_ids.add(adapter_id)
-            else:
-                req_bins_list.append(-1)
 
         self.logger.info(
             f"[LoRA Backend] Preparing batch: batch_size={len(batch.reqs)}, active_adapters={sorted(active_adapter_ids)}"
