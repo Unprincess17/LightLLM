@@ -287,6 +287,11 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
             "promotion_drop_cooldown": 0,
             "moe_kernel_calls": 0,
             "moe_kernel_tokens": 0,
+            "attempted_bind": 0,
+            "successful_bind": 0,
+            "stale": 0,
+            "not_ready": 0,
+            "fallback": 0,
         }
 
     def _merge_colora_stats(self, agg_stats: Dict[str, float]) -> None:
@@ -1005,32 +1010,50 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
                         up_out = torch.mm(expert_input, w3.T)
 
                 # 4.4.4 Apply Per-Expert LoRA (Gate/Up)
-                with NvtxAnnotate("MoE_GateLoRA"):
-                    gate_lora = self._dispatch_lora_with_optional_coalescing(
-                        dispatch_fn=self.lora_dispatcher_.batch_apply_gate_lora,
-                        input_tensor=expert_input,
-                        layer_id=layer_weight.layer_num_,
-                        req_bins=expert_req_bins,
+                gate_up_bind_fn = getattr(self, "_maybe_bind_fused_gate_up_exact", None)
+                bound_gate_up = None
+                if callable(gate_up_bind_fn):
+                    # Exact bind only: same layer/step/op/joint-key and identical row-group signature.
+                    bound_gate_up = gate_up_bind_fn(
+                        expert_input=expert_input,
+                        infer_state=infer_state,
+                        layer_weight=layer_weight,
                         expert_id=local_expert_idx,
+                        batch_indices=batch_indices,
+                        expert_req_bins=expert_req_bins,
                         pack_meta=pack_meta,
-                        reuse_packed_input=True,
-                        phase_name="Gate",
-                        study2_prefix=study2_prefix,
+                        colora_stats=colora_stats,
                     )
-                    self._merge_colora_stats(colora_stats)
-                with NvtxAnnotate("MoE_UpLoRA"):
-                    up_lora = self._dispatch_lora_with_optional_coalescing(
-                        dispatch_fn=self.lora_dispatcher_.batch_apply_up_lora,
-                        input_tensor=expert_input,
-                        layer_id=layer_weight.layer_num_,
-                        req_bins=expert_req_bins,
-                        expert_id=local_expert_idx,
-                        pack_meta=pack_meta,
-                        reuse_packed_input=True,
-                        phase_name="Up",
-                        study2_prefix=study2_prefix,
-                    )
-                    self._merge_colora_stats(colora_stats)
+
+                if bound_gate_up is None:
+                    with NvtxAnnotate("MoE_GateLoRA"):
+                        gate_lora = self._dispatch_lora_with_optional_coalescing(
+                            dispatch_fn=self.lora_dispatcher_.batch_apply_gate_lora,
+                            input_tensor=expert_input,
+                            layer_id=layer_weight.layer_num_,
+                            req_bins=expert_req_bins,
+                            expert_id=local_expert_idx,
+                            pack_meta=pack_meta,
+                            reuse_packed_input=True,
+                            phase_name="Gate",
+                            study2_prefix=study2_prefix,
+                        )
+                        self._merge_colora_stats(colora_stats)
+                    with NvtxAnnotate("MoE_UpLoRA"):
+                        up_lora = self._dispatch_lora_with_optional_coalescing(
+                            dispatch_fn=self.lora_dispatcher_.batch_apply_up_lora,
+                            input_tensor=expert_input,
+                            layer_id=layer_weight.layer_num_,
+                            req_bins=expert_req_bins,
+                            expert_id=local_expert_idx,
+                            pack_meta=pack_meta,
+                            reuse_packed_input=True,
+                            phase_name="Up",
+                            study2_prefix=study2_prefix,
+                        )
+                        self._merge_colora_stats(colora_stats)
+                else:
+                    gate_lora, up_lora = bound_gate_up
 
                 gate_out += gate_lora
                 up_out += up_lora
@@ -1072,7 +1095,10 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
                 with NvtxAnnotate("MoE_Cleanup"):
                     del current_weights, w1, w3, w2
 
-        if (colora_stats["colora_hit_tokens"] + colora_stats["colora_miss_tokens"]) > 0:
+        if (
+            (colora_stats["colora_hit_tokens"] + colora_stats["colora_miss_tokens"]) > 0
+            or colora_stats["attempted_bind"] > 0
+        ):
             overlap_ratio_avg = 0.0
             if colora_stats["overlap_ratio_count"] > 0:
                 overlap_ratio_avg = colora_stats["overlap_ratio_sum"] / float(colora_stats["overlap_ratio_count"])
@@ -1081,7 +1107,8 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
                 "cpu_compute_time=%.6f gpu_compute_time=%.6f cpu_queue_wait=%.6f "
                 "d2h_bytes=%.0f h2d_bytes=%.0f overlap_ratio=%.4f fallback_degrade_count=%s cpu_queue_depth=%s "
                 "promotion_drop_total=%s promotion_drop_queue=%s promotion_drop_cooldown=%s "
-                "moe_kernel_calls=%s moe_kernel_tokens=%s",
+                "moe_kernel_calls=%s moe_kernel_tokens=%s attempted_bind=%s successful_bind=%s "
+                "stale=%s not_ready=%s fallback=%s",
                 self.layer_num_,
                 colora_stats["colora_hit_tokens"],
                 colora_stats["colora_miss_tokens"],
@@ -1100,6 +1127,11 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
                 colora_stats["promotion_drop_cooldown"],
                 colora_stats["moe_kernel_calls"],
                 colora_stats["moe_kernel_tokens"],
+                colora_stats["attempted_bind"],
+                colora_stats["successful_bind"],
+                colora_stats["stale"],
+                colora_stats["not_ready"],
+                colora_stats["fallback"],
             )
 
         return final_output.view(num_tokens, hidden_dim)

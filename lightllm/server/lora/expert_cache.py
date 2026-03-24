@@ -187,6 +187,28 @@ class MoEExpertCacheManager:
 
         return ready
 
+    def peek_ready_slots(self, keys: List[ExpertCacheKey]) -> Dict[ExpertCacheKey, int]:
+        """Return READY slot IDs without mutating cache accounting or utility."""
+        ready: Dict[ExpertCacheKey, int] = {}
+
+        with self._lock:
+            for key in keys:
+                state = self._states.get(key.projection)
+                if state is None:
+                    continue
+
+                entry = state.entries.get(key)
+                if entry is None:
+                    continue
+                if entry.state != ExpertCacheSlotState.READY:
+                    continue
+                if entry.slot_id < 0:
+                    continue
+
+                ready[key] = entry.slot_id
+
+        return ready
+
     def record_access(self, keys: List[ExpertCacheKey]) -> None:
         now_ts = time.time()
         with self._lock:
