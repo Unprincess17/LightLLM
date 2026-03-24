@@ -230,28 +230,30 @@ The key contributions of this work are:
 \end{itemize}
 
 
-\section{Background and Motivation}
+\section{Background, Motivation, and Challenges}
 \label{sec:background}
 
-\subsection{Background on Multi-LoRA MoE Serving}
-\label{subsec:background-setting}
+\subsection{Background: Expert--LoRA Computation in Multi-LoRA MoE Decode}
+\label{subsec:background}
 
-We target decode-time serving where a shared sparse MoE base model is combined with multiple LoRA specializations. In this setting, different requests may invoke different LoRA adapters, while each generated token still triggers dynamic expert routing in the base model. We focus on attention LoRA, where low-rank updates are attached to attention projections rather than realized as full-model replicas. Although each individual adapter is compact, the serving system must still identify, access, and apply request-specific adaptation state on the latency-critical decode path.
+We study decode-time serving where a shared sparse MoE base model is combined with multiple LoRA specializations. In this setting, each generated token still triggers dynamic expert routing in the base model, while different requests may invoke different LoRA adapters. As a result, the serving system must repeatedly determine not only which experts are activated, but also which adapter-specific LoRA states are needed on the latency-critical decode path.
 
-This interaction is particularly important in decode. Decode operates at small effective batch sizes, repeats routing and parameter-access decisions once per token, and offers little opportunity to amortize miss-handling overheads across long computations. In this work, we focus on the resulting intra-worker execution and memory-management problem, rather than cluster-level request routing or global placement.
+This interaction changes the natural unit at which the system should reason about locality and misses. In dense multi-LoRA serving, adapter-level reasoning is often sufficient because accesses concentrate on a single adapter's weights. In MoE decode, however, each token activates only a small routed subset of experts, and LoRA computation is needed only for the routed experts of the current request. The relevant access unit is therefore not an expert or an adapter in isolation, but their joint occurrence in the decode path, which we refer to as an \emph{expert--LoRA joint object}.
+
+This distinction matters particularly in decode. Decode operates at small effective batch sizes, repeats routing and parameter-access decisions once per token, and exposes miss-handling overheads directly on the latency-critical path. Consequently, when expert--LoRA joint objects do not fit cleanly within practical GPU cache budgets, the key systems question is not only how to manage residency, but also how to recover cold misses without inflating per-token latency.
 
 
 \subsection{Motivation}
 \label{subsec:motivation}
 
-\subsubsection{Joint Expert--Adapter Objects as a Natural Management View}
+\subsubsection{Expert--LoRA Joint Objects as the Natural Access Unit}
 \label{subsec:joint-object}
 
 A central question is what abstraction the system should use to reason about locality, residency, and misses.
 
-In dense models with a single adapter, adapter-level management is often sufficient because most tokens share the same adapted weights. In sparse MoE models, however, each token activates only a small routed subset of experts. Once multiple adapters coexist, accesses no longer concentrate on entire adapters or on experts alone, but on adapter states attached to specific routed experts.
+In dense models with a single adapter, adapter-level management is often sufficient because most tokens share the same adapted weights. In sparse MoE models, however, each token activates only a small routed subset of experts. Once multiple LoRA adapters coexist, accesses no longer concentrate on entire adapters or on experts alone, but on LoRA states attached to specific routed experts.
 
-This makes joint expert--adapter objects a natural management view for decode-time serving. Adapter-level management is too coarse, because it retains many unused expert slices together with the few that are actually needed. Expert-level management is incomplete, because it ignores adapter diversity and therefore overestimates reuse across requests. To understand locality under multi-LoRA MoE serving, the relevant unit is thus not an expert or an adapter in isolation, but their joint occurrence in the decode path.
+This makes expert--LoRA joint objects the natural access unit for decode-time serving. Adapter-level management is too coarse because it retains many unused expert slices together with the few that are actually needed. Expert-level management is incomplete because it ignores adapter diversity and therefore overestimates reuse across requests. To understand locality under multi-LoRA MoE serving, the relevant unit is thus not an expert or an adapter in isolation, but their joint occurrence on the decode path.
 
 \subsubsection{Joint Objects Fragment Decode Locality}
 \label{subsec:case-study}
@@ -297,36 +299,33 @@ As shown in Fig.~\ref{fig:system}(a), miss rates rise significantly under the sa
 
 Taken together, these results suggest that the difficulty in multi-LoRA MoE decode serving is not merely insufficient cache capacity, but a deeper fragmentation of locality once expert access and adapter identity are considered jointly.
 
-\section{Challenges}
-\label{sec:challenges}
+\subsection{Challenges}
+\label{subsec:challenges}
 
-The above observations reveal a fundamental shift in the role of caching. 
-Under joint-object modeling, locality degradation makes cache misses both frequent and concentrated in the tail, implying that misses are no longer rare events to be hidden, but a dominant factor that must be explicitly managed.
+The above observations reveal a fundamental shift in the role of caching. Under expert--LoRA joint-object modeling, locality degradation makes cold misses difficult to eliminate within practical GPU cache budgets. As a result, misses are no longer rare events that can be hidden behind a sufficiently large hot set; they become a dominant factor that must be explicitly managed on the latency-critical decode path.
 
-This reframes the problem: instead of minimizing misses, the system must decide how to handle unavoidable misses in a latency-critical decode path. Turning this insight into a practical runtime requires addressing three challenges.
+This reframes the systems problem. The key question is no longer only how to reduce misses, but how to recover unavoidable misses without inflating per-token latency. Turning this insight into a practical runtime requires addressing three challenges.
 
-\subsection{Challenge 1: Fine-Grained Residency Without Runaway Churn}
+\paragraph{Challenge 1: Organizing expert--LoRA objects under expanded and fragmented working sets.}
 \label{subsec:challenge-residency}
 
-Joint-object modeling flattens the popularity distribution, weakening the dominance of any small hot set. This makes coarse-grained residency ineffective, but fine-grained management introduces a new problem: a rapidly expanding key space with unstable reuse.
+Under joint-object modeling, the effective key space expands substantially, while reuse becomes weaker and more fragmented across requests. This makes coarse-grained management ineffective: adapter-level residency retains many expert slices that are never touched, whereas expert-only reasoning overestimates reuse by ignoring adapter diversity. At the same time, naively treating every expert--LoRA joint object as an independent cache unit can lead to unstable residency, repeated admissions of low-reuse objects, and excessive churn.
 
-Naively caching at joint-object granularity leads to frequent insertions of low-reuse objects, repeated evictions, and wasted bandwidth on objects that never become hot again. The system must therefore preserve fine-grained precision while suppressing low-value promotions and avoiding repeated re-admission of cold objects. Otherwise, the cache degenerates into churn rather than improving locality.
+The system must therefore preserve the precision of joint-object reasoning without turning fine-grained residency into a self-defeating management problem. In other words, it must organize expert--LoRA objects at the granularity demanded by actual computation, while preventing limited GPU cache capacity from being consumed by transient cold objects.
 
-\subsection{Challenge 2: Handling Misses Without Blocking the Critical Path}
+\paragraph{Challenge 2: Recovering cold misses without forcing promotion-first stalls on decode.}
 \label{subsec:challenge-miss}
 
-In this regime, many misses correspond to low-reuse objects whose cost cannot be amortized. Temporal locality weakens in the tail, causing reuse distances to grow and cold accesses to increase. As a result, many misses correspond to objects that are unlikely to be reused in the near future.
+In this regime, many misses correspond to cold objects whose reuse is too limited to amortize the cost of immediate promotion. If the system continues to apply a conventional load-then-run policy, each such miss becomes a blocking recovery event: the current token must wait for weight migration before expert--LoRA computation can proceed. Under decode-time latency sensitivity, this directly amplifies tail latency.
 
-In this regime, the traditional load-then-run strategy becomes inefficient: blocking on weight transfer for low-reuse objects directly translates into tail latency. The system must therefore provide an alternative miss-handling path that can serve cold objects without stalling the decode pipeline, while keeping the fixed cost of this path low enough to remain competitive at small, irregular batch sizes.
+The system therefore needs a different default recovery strategy for cold misses. Instead of forcing all misses through immediate GPU promotion, it must provide a way to complete the current expert--LoRA computation without making promotion the only recovery path, while still preserving the option to promote objects later when future reuse justifies it.
 
-\subsection{Challenge 3: Overlapping Heterogeneous Execution Without Creating a New Tail}
+\paragraph{Challenge 3: Making cold-path recovery practical and overlap-friendly under decode constraints.}
 \label{subsec:challenge-overlap}
 
-Locality loss not only increases miss frequency, but also concentrates misses in tail requests, making miss handling itself a latency-critical component.
+Changing the miss-recovery abstraction is not sufficient by itself. If cold-path execution is too slow, the system merely replaces GPU promotion stall with CPU-side stall. If it is poorly integrated with the decode pipeline, heterogeneous execution introduces a new source of queueing and tail behavior rather than alleviating the original one.
 
-A dual-path design introduces new interactions between GPU execution, CPU execution, and host--device transfers. If GPU execution stalls on every miss, the system collapses back into a serialized pipeline. Conversely, if fallback processing becomes overloaded, it becomes a new tail bottleneck.
-
-The system must therefore overlap GPU hits with miss handling whenever dependencies allow, while controlling queueing and resource contention so that the tail remains predictable rather than shifting across execution paths.
+The system must therefore make cold-path recovery efficient enough to operate at small, irregular decode batch sizes, and organize execution so that cold-miss handling can overlap with GPU hot-path and base-model computation whenever dependencies allow. The challenge is not only to provide an alternative path, but to ensure that this path reduces exposed miss latency instead of becoming a new bottleneck.
 
 \section{Design}
 \label{sec:design-overview}
