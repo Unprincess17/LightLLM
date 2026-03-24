@@ -1003,3 +1003,205 @@ def test_qwen3_vl_moe_exact_bind_counts_stale_group_as_fallback():
             os.environ.pop("MOE_MODE", None)
         else:
             os.environ["MOE_MODE"] = prev_mode
+
+
+class _SpecSubmitSpyDispatcher:
+    def __init__(self, hybrid: bool = True, with_cache: bool = True):
+        self._hybrid = bool(hybrid)
+        self.expert_cache_manager = object() if with_cache else None
+        self.begin_calls = []
+        self.submit_calls = []
+
+    def _should_use_hybrid_moe_compute(self):
+        return self._hybrid
+
+    def begin_spec_step(self, decode_step_id):
+        self.begin_calls.append(int(decode_step_id))
+        return {"retired_active": 0, "reaped_retired": 0, "pending_retired": 0}
+
+    def maybe_submit_fused_gate_up_spec_job(self, **kwargs):
+        self.submit_calls.append(kwargs)
+        return dispatch_mod.SpecSubmitOutcome(status="submitted", reason="admitted", handle=object())
+
+
+def _make_spec_submit_guard_layer(dispatcher, spec_layer_enabled: bool = True):
+    layer = object.__new__(layer_infer_mod.Qwen3VLMOETransformerLayerInfer)
+    layer.layer_num_ = 7
+    layer.n_routed_experts = 16
+    layer._spec_submit_layer_enabled = bool(spec_layer_enabled)
+    layer._spec_submit_totals = {"submitted": 0, "skipped": 0, "rejected": 0}
+    layer._spec_bind_totals = {
+        "attempted_bind": 0,
+        "successful_bind": 0,
+        "stale": 0,
+        "not_ready": 0,
+        "fallback": 0,
+    }
+    layer._spec_bound_job_keys_current_call = set()
+    layer._spec_prev_decode_step_id = None
+    layer._spec_prev_top1_by_req = {}
+    layer.use_detached_lora_ = True
+    layer.lora_dispatcher_ = dispatcher
+    return layer
+
+
+def test_qwen3_vl_moe_should_enable_spec_submit_returns_false_when_feature_disabled():
+    prev_mode = os.environ.get("MOE_MODE")
+    os.environ["MOE_MODE"] = "TP"
+    try:
+        dispatcher = _SpecSubmitSpyDispatcher(hybrid=True, with_cache=True)
+        layer = _make_spec_submit_guard_layer(dispatcher, spec_layer_enabled=False)
+        infer_state = type("InferState", (), {"is_prefill": False, "decode_step_id": 41})()
+
+        enabled = layer_infer_mod.Qwen3VLMOETransformerLayerInfer._should_enable_spec_submit(layer, infer_state)
+
+        assert enabled is False
+    finally:
+        if prev_mode is None:
+            os.environ.pop("MOE_MODE", None)
+        else:
+            os.environ["MOE_MODE"] = prev_mode
+
+
+def test_qwen3_vl_moe_should_enable_spec_submit_is_decode_only():
+    prev_mode = os.environ.get("MOE_MODE")
+    os.environ["MOE_MODE"] = "TP"
+    try:
+        dispatcher = _SpecSubmitSpyDispatcher(hybrid=True, with_cache=True)
+        layer = _make_spec_submit_guard_layer(dispatcher, spec_layer_enabled=True)
+
+        decode_state = type("InferState", (), {"is_prefill": False, "decode_step_id": 42})()
+        prefill_state = type("InferState", (), {"is_prefill": True, "decode_step_id": 42})()
+        missing_step_state = type("InferState", (), {"is_prefill": False, "decode_step_id": None})()
+
+        assert layer_infer_mod.Qwen3VLMOETransformerLayerInfer._should_enable_spec_submit(layer, decode_state) is True
+        assert layer_infer_mod.Qwen3VLMOETransformerLayerInfer._should_enable_spec_submit(layer, prefill_state) is False
+        assert layer_infer_mod.Qwen3VLMOETransformerLayerInfer._should_enable_spec_submit(layer, missing_step_state) is False
+    finally:
+        if prev_mode is None:
+            os.environ.pop("MOE_MODE", None)
+        else:
+            os.environ["MOE_MODE"] = prev_mode
+
+
+def test_qwen3_vl_moe_whitelist_miss_skips_submit_path_entirely():
+    prev_mode = os.environ.get("MOE_MODE")
+    os.environ["MOE_MODE"] = "TP"
+    try:
+        dispatcher = _SpecSubmitSpyDispatcher(hybrid=True, with_cache=True)
+        layer = _make_spec_submit_guard_layer(dispatcher, spec_layer_enabled=False)
+        layer._spec_prev_decode_step_id = 42
+        layer._spec_prev_top1_by_req = {1000: (3, 11)}
+
+        infer_state = type(
+            "InferState",
+            (),
+            {
+                "is_prefill": False,
+                "decode_step_id": 43,
+                "b_req_idx": torch.tensor([1000], dtype=torch.long),
+                "b_adapter_bin": torch.tensor([3], dtype=torch.int32),
+            },
+        )()
+
+        layer_infer_mod.Qwen3VLMOETransformerLayerInfer._maybe_submit_decode_spec_gate_up(
+            layer,
+            torch.zeros(1, 4),
+            infer_state,
+        )
+
+        assert dispatcher.begin_calls == []
+        assert dispatcher.submit_calls == []
+        assert layer._spec_submit_totals == {"submitted": 0, "skipped": 0, "rejected": 0}
+    finally:
+        if prev_mode is None:
+            os.environ.pop("MOE_MODE", None)
+        else:
+            os.environ["MOE_MODE"] = prev_mode
+
+
+def test_qwen3_vl_moe_failed_future_retires_and_returns_none_for_caller_fallback():
+    prev_mode = os.environ.get("MOE_MODE")
+    os.environ["MOE_MODE"] = "TP"
+    try:
+        dispatcher = _make_dispatcher(queue_depth=2)
+        dispatcher.begin_spec_step(44)
+        dispatcher._should_use_hybrid_moe_compute = lambda: True
+        dispatcher.expert_cache_manager = object()
+
+        future = _ManualFuture(allow_cancel=False)
+        key = _make_key(44, row_group_sig=((0, 1000), (1, 1001)))
+        assert dispatcher.try_admit_spec_job(key, lambda: future) is not None
+
+        future.set_exception(RuntimeError("boom"))
+
+        expert_input = torch.zeros(2, 2, dtype=torch.float32)
+        expert_req_bins = torch.tensor([3, 3], dtype=torch.int32)
+        batch_indices = torch.tensor([0, 1], dtype=torch.long)
+        infer_state = type(
+            "InferState",
+            (),
+            {"is_prefill": False, "decode_step_id": 44, "b_req_idx": torch.tensor([1000, 1001], dtype=torch.long)},
+        )()
+        layer = _make_spec_bind_layer(dispatcher)
+        pack_meta = layer_infer_mod.Qwen3VLMOETransformerLayerInfer._coalesce_lora_activations(
+            layer,
+            expert_input,
+            expert_req_bins,
+        )
+        colora_stats = layer_infer_mod.Qwen3MOETransformerLayerInfer._new_colora_stats(layer)
+
+        result = layer_infer_mod.Qwen3VLMOETransformerLayerInfer._maybe_bind_fused_gate_up_exact(
+            layer,
+            expert_input,
+            infer_state,
+            type("LayerWeight", (), {"layer_num_": 7})(),
+            11,
+            batch_indices,
+            expert_req_bins,
+            pack_meta,
+            colora_stats,
+        )
+
+        assert result is None
+        assert key not in dispatcher._spec_active_jobs
+        assert len(dispatcher._spec_retired_jobs) == 1
+        assert dispatcher._spec_retired_jobs[0].retire_reason == "bind_failed"
+        assert dispatcher._get_cpu_queue_depth() == 0
+        assert colora_stats["attempted_bind"] == 1
+        assert colora_stats["successful_bind"] == 0
+        assert colora_stats["stale"] == 0
+        assert colora_stats["not_ready"] == 0
+        assert colora_stats["fallback"] == 1
+    finally:
+        if prev_mode is None:
+            os.environ.pop("MOE_MODE", None)
+        else:
+            os.environ["MOE_MODE"] = prev_mode
+
+
+def test_begin_spec_step_retires_previous_step_jobs_and_reaps_late_completion():
+    dispatcher = _make_dispatcher(queue_depth=2)
+    dispatcher.begin_spec_step(45)
+
+    slow_future = _ManualFuture(allow_cancel=False)
+    key = _make_key(45)
+    assert dispatcher.try_admit_spec_job(key, lambda: slow_future) is not None
+    assert dispatcher._get_cpu_queue_depth() == 1
+
+    stats = dispatcher.begin_spec_step(46)
+
+    assert stats["retired_active"] == 1
+    assert stats["reaped_retired"] == 0
+    assert stats["pending_retired"] == 1
+    assert dispatcher._spec_current_step_id == 46
+    assert len(dispatcher._spec_active_jobs) == 0
+    assert len(dispatcher._spec_retired_jobs) == 1
+    assert dispatcher._spec_retired_jobs[0].retire_reason == "step_advanced"
+
+    slow_future.set_result(("late_gate", "late_up"))
+    assert dispatcher._get_cpu_queue_depth() == 0
+
+    reap_stats = dispatcher.reap_retired()
+    assert reap_stats["reaped_retired"] == 1
+    assert reap_stats["pending_retired"] == 0

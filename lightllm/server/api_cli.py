@@ -200,6 +200,17 @@ def make_argument_parser() -> argparse.ArgumentParser:
         help="Queue wait budget in microseconds before degrading async fallback submission.",
     )
     parser.add_argument(
+        "--colora_speculative_dispatch",
+        action="store_true",
+        help="Enable decode-stage COLoRA speculative dispatch MVP. Disabled by default.",
+    )
+    parser.add_argument(
+        "--colora_spec_layer_whitelist",
+        type=str,
+        default="",
+        help="Comma-separated layer IDs eligible for COLoRA speculative dispatch. Empty keeps speculation inactive.",
+    )
+    parser.add_argument(
         "--force_slow_lora_path",
         action="store_true",
         help="""Force use of slow path for LoRA (per-expert computation).

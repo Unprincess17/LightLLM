@@ -146,6 +146,8 @@ class StartArgs:
     colora_cpu_workers: int = field(default=4)
     colora_cpu_queue_depth: int = field(default=256)
     colora_cpu_batch_timeout_us: int = field(default=50)
+    colora_speculative_dispatch: bool = field(default=False)
+    colora_spec_layer_whitelist: str = field(default="")
     # Force slow path for LoRA (per-expert baseline)
     force_slow_lora_path: bool = field(default=False)
     # multi_modal

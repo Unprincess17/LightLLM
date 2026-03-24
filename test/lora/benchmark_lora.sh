@@ -41,6 +41,9 @@ Server pass-through options:
   --colora_cpu_workers N
   --colora_cpu_queue_depth N
   --colora_cpu_batch_timeout_us N
+  --colora_speculative_dispatch | --no_colora_speculative_dispatch
+  --colora_spec_layer_whitelist CSV
+  --server_log_path PATH
 USAGE
 }
 
@@ -84,6 +87,9 @@ COLORA_ASYNC_FALLBACK=""
 COLORA_CPU_WORKERS="8"
 COLORA_CPU_QUEUE_DEPTH="512"
 COLORA_CPU_BATCH_TIMEOUT_US="200"
+COLORA_SPECULATIVE_DISPATCH="0"
+COLORA_SPEC_LAYER_WHITELIST=""
+SERVER_LOG_PATH=""
 SERVER_PID=""
 
 terminate_server_tree() {
@@ -157,6 +163,10 @@ while [[ $# -gt 0 ]]; do
         --colora_cpu_workers) COLORA_CPU_WORKERS="$2"; shift 2 ;;
         --colora_cpu_queue_depth) COLORA_CPU_QUEUE_DEPTH="$2"; shift 2 ;;
         --colora_cpu_batch_timeout_us) COLORA_CPU_BATCH_TIMEOUT_US="$2"; shift 2 ;;
+        --colora_speculative_dispatch) COLORA_SPECULATIVE_DISPATCH="1"; shift ;;
+        --no_colora_speculative_dispatch) COLORA_SPECULATIVE_DISPATCH="0"; shift ;;
+        --colora_spec_layer_whitelist) COLORA_SPEC_LAYER_WHITELIST="$2"; shift 2 ;;
+        --server_log_path) SERVER_LOG_PATH="$2"; shift 2 ;;
         --print_per_request) PRINT_PER_REQUEST=1; shift ;;
         --no_print_per_request) PRINT_PER_REQUEST=0; shift ;;
         --top_k_slowest) TOP_K_SLOWEST="$2"; shift 2 ;;
@@ -166,6 +176,12 @@ while [[ $# -gt 0 ]]; do
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
+
+if [[ -z "$SERVER_LOG_PATH" ]]; then
+    SERVER_LOG_PATH="/tmp/${OUTPUT_PREFIX}_server.log"
+fi
+mkdir -p "$(dirname "$SERVER_LOG_PATH")"
+COLORA_SPEC_LAYER_WHITELIST="${COLORA_SPEC_LAYER_WHITELIST//[[:space:]]/}"
 
 # Cleanup function
 cleanup() {
@@ -229,6 +245,9 @@ echo "Print per-request lines: $PRINT_PER_REQUEST"
 [[ -n "$COLORA_CPU_WORKERS" ]] && echo "COLoRA CPU workers override: $COLORA_CPU_WORKERS"
 [[ -n "$COLORA_CPU_QUEUE_DEPTH" ]] && echo "COLoRA CPU queue depth override: $COLORA_CPU_QUEUE_DEPTH"
 [[ -n "$COLORA_CPU_BATCH_TIMEOUT_US" ]] && echo "COLoRA CPU batch timeout (us) override: $COLORA_CPU_BATCH_TIMEOUT_US"
+echo "COLoRA speculative dispatch override: $COLORA_SPECULATIVE_DISPATCH"
+[[ -n "$COLORA_SPEC_LAYER_WHITELIST" ]] && echo "COLoRA speculative layer whitelist: $COLORA_SPEC_LAYER_WHITELIST"
+echo "Server log path: $SERVER_LOG_PATH"
 if [[ -n "$PER_REQUEST_LOG_PATH" ]]; then
     echo "Per-request metrics log: $PER_REQUEST_LOG_PATH"
 else
@@ -319,7 +338,13 @@ fi
 if [[ -n "$COLORA_CPU_BATCH_TIMEOUT_US" ]]; then
     SERVER_ARGS+=(--colora_cpu_batch_timeout_us "$COLORA_CPU_BATCH_TIMEOUT_US")
 fi
-bash "$SERVER_SCRIPT" "${SERVER_ARGS[@]}" &
+if [[ "$COLORA_SPECULATIVE_DISPATCH" == "1" ]]; then
+    SERVER_ARGS+=(--colora_speculative_dispatch)
+fi
+if [[ -n "$COLORA_SPEC_LAYER_WHITELIST" ]]; then
+    SERVER_ARGS+=(--colora_spec_layer_whitelist "$COLORA_SPEC_LAYER_WHITELIST")
+fi
+bash "$SERVER_SCRIPT" "${SERVER_ARGS[@]}" >"$SERVER_LOG_PATH" 2>&1 &
 SERVER_PID=$!
 echo "Server PID: $SERVER_PID"
 
@@ -368,6 +393,7 @@ if [[ -n "$SERVER_PID" ]]; then
     wait "$SERVER_PID" 2>/dev/null || true
 fi
 SERVER_PID=""
+echo "[5/5] Server log saved to: $SERVER_LOG_PATH"
 
 # Extra thorough cleanup to ensure all processes are dead
 echo "[Cleanup] Killing all remaining lightllm and worker processes..."

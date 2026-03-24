@@ -103,6 +103,18 @@ class ModeBackend:
             adapter_dirs[adapter_id] = abs_dir
         return adapter_dirs
 
+    def _apply_colora_speculation_env(self) -> None:
+        spec_enabled = bool(getattr(self.args, "colora_speculative_dispatch", False))
+        raw_whitelist = getattr(self.args, "colora_spec_layer_whitelist", "")
+        whitelist_tokens = []
+        for token in str(raw_whitelist or "").split(","):
+            token = token.strip()
+            if token:
+                whitelist_tokens.append(token)
+        whitelist = ",".join(whitelist_tokens)
+        os.environ["COLORA_SPEC_SUBMIT_ENABLE"] = "1" if spec_enabled else "0"
+        os.environ["COLORA_SPEC_SUBMIT_LAYER_WHITELIST"] = whitelist
+
     def init_model(self, kvargs):
         self.args: StartArgs = kvargs.get("args", None)
         assert self.args is not None
@@ -172,6 +184,7 @@ class ModeBackend:
             g_infer_context.init_cpu_embed_cache_client()
 
         model_cfg, _ = PretrainedConfig.get_config_dict(self.weight_dir)
+        self._apply_colora_speculation_env()
 
         model_kvargs = {
             "weight_dir": self.weight_dir,

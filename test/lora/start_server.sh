@@ -35,6 +35,9 @@
 #   --colora_cpu_workers N             Async CPU fallback worker threads
 #   --colora_cpu_queue_depth N         Async CPU fallback queue depth
 #   --colora_cpu_batch_timeout_us N    Queue wait budget before sync degrade
+#   --colora_speculative_dispatch      Enable COLoRA speculative dispatch MVP
+#   --no_colora_speculative_dispatch   Disable COLoRA speculative dispatch MVP
+#   --colora_spec_layer_whitelist CSV  Comma-separated speculative layer whitelist
 #   --adapter_expert_profile Enable adapter x expert routing profiling log
 #   --adapter_expert_log_path PATH Log path for adapter x expert routing profiling
 #   --router_trace Enable ordered per-token router trace logging
@@ -76,6 +79,9 @@ Options:
   --colora_cpu_workers N
   --colora_cpu_queue_depth N
   --colora_cpu_batch_timeout_us N
+  --colora_speculative_dispatch
+  --no_colora_speculative_dispatch
+  --colora_spec_layer_whitelist CSV
   --adapter_expert_profile
   --adapter_expert_log_path PATH
   --router_trace
@@ -140,6 +146,8 @@ COLORA_ASYNC_FALLBACK=1
 COLORA_CPU_WORKERS=4
 COLORA_CPU_QUEUE_DEPTH=256
 COLORA_CPU_BATCH_TIMEOUT_US=50
+COLORA_SPECULATIVE_DISPATCH=0
+COLORA_SPEC_LAYER_WHITELIST=""
 
 # Environment variables
 LOADWORKER=8
@@ -257,6 +265,18 @@ while [[ $# -gt 0 ]]; do
             ;;
         --colora_cpu_batch_timeout_us)
             COLORA_CPU_BATCH_TIMEOUT_US="$2"
+            shift 2
+            ;;
+        --colora_speculative_dispatch)
+            COLORA_SPECULATIVE_DISPATCH=1
+            shift
+            ;;
+        --no_colora_speculative_dispatch)
+            COLORA_SPECULATIVE_DISPATCH=0
+            shift
+            ;;
+        --colora_spec_layer_whitelist)
+            COLORA_SPEC_LAYER_WHITELIST="$2"
             shift 2
             ;;
         --adapter_expert_profile)
@@ -388,6 +408,15 @@ CMD="$CMD --colora_cache_budget_mb $COLORA_CACHE_BUDGET_MB \
     --colora_cpu_queue_depth $COLORA_CPU_QUEUE_DEPTH \
     --colora_cpu_batch_timeout_us $COLORA_CPU_BATCH_TIMEOUT_US"
 
+COLORA_SPEC_LAYER_WHITELIST="${COLORA_SPEC_LAYER_WHITELIST//[[:space:]]/}"
+if [[ "$COLORA_SPECULATIVE_DISPATCH" == "1" ]]; then
+    CMD="$CMD --colora_speculative_dispatch"
+fi
+
+if [[ -n "$COLORA_SPEC_LAYER_WHITELIST" ]]; then
+    CMD="$CMD --colora_spec_layer_whitelist $COLORA_SPEC_LAYER_WHITELIST"
+fi
+
 # Export environment variables
 export LOADWORKER=$LOADWORKER
 export LIGHTLLM_LOGGING=$LIGHTLLM_LOGGING
@@ -426,6 +455,8 @@ echo "  COLORA_ASYNC_FALLBACK=$COLORA_ASYNC_FALLBACK"
 echo "  COLORA_CPU_WORKERS=$COLORA_CPU_WORKERS"
 echo "  COLORA_CPU_QUEUE_DEPTH=$COLORA_CPU_QUEUE_DEPTH"
 echo "  COLORA_CPU_BATCH_TIMEOUT_US=$COLORA_CPU_BATCH_TIMEOUT_US"
+echo "  COLORA_SPECULATIVE_DISPATCH=$COLORA_SPECULATIVE_DISPATCH"
+echo "  COLORA_SPEC_LAYER_WHITELIST=$COLORA_SPEC_LAYER_WHITELIST"
 echo ""
 
 

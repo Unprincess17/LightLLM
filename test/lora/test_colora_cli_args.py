@@ -9,6 +9,8 @@ def test_colora_cli_defaults():
     assert args.colora_cpu_workers == 4
     assert args.colora_cpu_queue_depth == 256
     assert args.colora_cpu_batch_timeout_us == 50
+    assert args.colora_speculative_dispatch is False
+    assert args.colora_spec_layer_whitelist == ""
 
 
 def test_colora_cli_overrides():
@@ -25,6 +27,9 @@ def test_colora_cli_overrides():
             "64",
             "--colora_cpu_batch_timeout_us",
             "120",
+            "--colora_speculative_dispatch",
+            "--colora_spec_layer_whitelist",
+            "3,7,11",
         ]
     )
     assert args.colora_miss_policy == "load_then_run"
@@ -32,3 +37,5 @@ def test_colora_cli_overrides():
     assert args.colora_cpu_workers == 8
     assert args.colora_cpu_queue_depth == 64
     assert args.colora_cpu_batch_timeout_us == 120
+    assert args.colora_speculative_dispatch is True
+    assert args.colora_spec_layer_whitelist == "3,7,11"
