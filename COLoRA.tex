@@ -216,15 +216,20 @@ This fragmentation translates directly into system-level degradation under reali
 
 Once misses become structural, the conventional load-then-run paradigm becomes suboptimal. Existing GPU-centric systems treat a cache miss as a weight-migration problem, resolving it by transferring parameters from host to device before execution~\cite{todo:gpu-offload}. This paradigm works well for hot objects with predictable reuse, but breaks down for long-tail decode misses, where batches are small, reuse is uncertain, and host--device transfer latency is directly exposed on the critical path. The core bottleneck thus shifts from miss avoidance alone to \emph{miss handling}, requiring systems to decide how a miss should be served rather than simply how it should be avoided.
 
-This paper presents \textbf{COLoRA}, a decode-worker runtime built around a \emph{dual-path execution paradigm} for handling cache misses. Instead of treating a miss as a mandatory weight-migration event, COLoRA treats it as a runtime execution choice between heterogeneous paths. 
-COLoRA maintains (1) a bounded GPU hot cache for reusable joint objects and (2) a CPU-resident full replica. On a cache hit, execution follows the fast GPU path. On a miss, COLoRA selectively executes the LoRA residual via a CPU fallback path, primarily targeting cold, long-tail objects where GPU promotion is unlikely to amortize its cost, while optionally promoting the object asynchronously when reuse is likely. Importantly, this fallback path is overlapped with GPU execution to minimize exposed latency and is invoked only when beneficial, preventing it from becoming a dominant cost on the critical path.
-To further reduce exposed latency, COLoRA incorporates a \emph{temporal-locality-guided speculative dispatch} mechanism that overlaps GPU execution with CPU fallback and data movement, minimizing idle bubbles in the decode pipeline. Together, these components transform miss handling from a blocking data-movement pipeline into a flexible execution-scheduling problem.
+This paper presents \textbf{COLoRA}, a decode-time serving runtime for multi-LoRA MoE models built around a \emph{hot/cold dual-path design} for expert--LoRA computation. In this regime, expert--LoRA joint objects expand and fragment the effective working set, making cold misses difficult to eliminate within practical GPU cache budgets. 
+Rather than treating every miss as an immediate blocking \emph{promotion-first} recovery event, COLoRA adopts an \emph{execution-first} default: cache-hit objects continue on the GPU hot path, while cold misses are served through a CPU cold path to complete the current LoRA computation, and GPU promotion is deferred to future reuse. 
+To make this design practical, COLoRA implements an optimized CPU cold path with AVX kernels and activation coalescing, enabling cold-miss handling to overlap with the GPU hot/base path in mixed hit/miss batches. 
+COLoRA further includes a selective speculative dispatch extension for a subset of decode-time gate/up computation to expose additional overlap opportunities.
 
 The key contributions of this work are:
 \begin{itemize}
-\item \textbf{Problem characterization.} We identify the joint-object fragmentation regime in MoE multi-LoRA decode serving and show that the dominant failure mode is tail amplification from structural misses rather than uniform slowdown.
-\item \textbf{Execution paradigm.} We introduce a dual-path execution model that treats cache misses as runtime execution choices rather than mandatory weight-migration events.
-\item \textbf{System realization.} We design COLoRA, a heterogeneous runtime that integrates CPU fallback execution, temporal-locality-guided speculative dispatch, and selective asynchronous promotion to efficiently realize this paradigm.
+\item \textbf{Problem characterization.} We identify the expert--LoRA joint-object regime in multi-LoRA MoE decode serving and show that working-set expansion and fragmentation make cold misses difficult to eliminate within realistic GPU cache budgets, turning miss handling---rather than cache capacity alone---into a first-order systems problem.
+
+\item \textbf{Miss-recovery abstraction.} We introduce a hot/cold dual-path serving design for expert--LoRA computation in decode. Its key abstraction change is to replace conventional \emph{promotion-first} load-then-run recovery with \emph{execution-first} recovery: hot objects remain on the GPU hot path, while cold misses are completed on a CPU cold path, and promotion is retained only for future reuse.
+
+\item \textbf{System realization.} We implement an efficient CPU cold path with AVX kernels and activation coalescing, making execution-first recovery practical under decode-time latency constraints and enabling overlap with the GPU hot/base path in mixed hit/miss batches.
+
+\item \textbf{Extension for additional overlap.} We prototype a selective speculative dispatch mechanism for decode-time gate/up computation, using temporal locality and exact late binding to further expose overlap opportunities beyond the main miss-recovery design.
 \end{itemize}
 
 
