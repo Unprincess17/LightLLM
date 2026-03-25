@@ -217,7 +217,7 @@ These structural changes translate directly into system-level degradation under 
 
 Once misses become a persistent feature of this regime, the conventional load-then-run paradigm becomes suboptimal. Existing GPU-centric systems treat a cache miss as a weight-migration problem, resolving it by transferring parameters from host to device before execution~\cite{todo:gpu-offload}. This approach works well for hot objects with predictable reuse, but breaks down for long-tail decode misses, where batches are small, reuse is uncertain, and host--device transfer latency is directly exposed on the critical path. As a result, the core systems bottleneck shifts from miss avoidance alone to \emph{miss handling}: the key question is no longer only how to keep more objects resident, but how unavoidable cold misses should be served.
 
-This paper presents \textbf{COLoRA}, a decode-time serving runtime for multi-LoRA MoE models built around a \emph{hot/cold dual-path design} for expert--LoRA computation. Under expert--LoRA joint-object caching, working-set expansion and fragmentation make cold misses difficult to eliminate within practical GPU cache budgets. Rather than treating every miss as an immediate blocking \emph{promotion-first} recovery event, COLoRA adopts an \emph{execution-first} default: cache-hit objects continue on the GPU hot path, while cold misses are served through a CPU cold path to complete the current LoRA computation, and GPU promotion is deferred to future reuse. To make this design practical, COLoRA implements an optimized CPU cold path with AVX kernels and activation coalescing, enabling cold-miss handling to overlap with the GPU hot/base path in mixed hit/miss batches. COLoRA further includes a selective speculative dispatch extension for a subset of decode-time gate/up computation to expose additional overlap opportunities.
+This paper presents \textbf{COLoRA}, a decode-time serving runtime for multi-LoRA MoE models built around a \emph{hot/cold dual-path design} for expert--LoRA computation. Under expert--LoRA joint-object caching, working-set expansion and fragmentation make cold misses difficult to eliminate within practical GPU cache budgets. Rather than treating every miss as an immediate blocking \emph{promotion-first} recovery event, COLoRA adopts an \emph{execution-first} default: cache-hit objects continue on the GPU hot path, while cold misses are served through a CPU cold path to complete the current LoRA computation, and GPU promotion is deferred to future reuse. To make this design practical, COLoRA implements an optimized CPU cold path with AVX kernels and activation coalescing, enabling cold-miss handling to overlap with the GPU hot/base path in mixed hit/miss batches. COLoRA further exploits short-range routing locality across adjacent decode tokens to prefetch a small set of likely expert weights ahead of use, exposing additional overlap opportunities while preserving exact execution semantics.
 
 The key contributions of this work are:
 \begin{itemize}
@@ -227,7 +227,7 @@ The key contributions of this work are:
 
 \item \textbf{System realization.} We implement an efficient CPU cold path with AVX kernels and activation coalescing, making execution-first handling practical under decode-time latency constraints and enabling overlap with the GPU hot/base path in mixed hit/miss batches.
 
-\item \textbf{Extension for additional overlap.} We prototype a selective speculative dispatch mechanism for decode-time gate/up computation, using temporal locality and exact late binding to further expose overlap opportunities beyond the main miss-handling design.
+\item \textbf{Overlap-oriented prefetch optimization.} We further exploit short-range routing locality across adjacent decode tokens to prefetch a small set of likely expert weights ahead of use. This conservative mechanism preserves exact execution semantics while exposing additional overlap opportunities beyond the main hot/cold miss-handling design.
 \end{itemize}
 
 \begin{figure*}[!t]
@@ -320,12 +320,12 @@ The above observations reveal a fundamental shift in the role of caching. Under 
 
 This reframes the systems problem. The key question is no longer only how to reduce misses, but how to recover unavoidable misses without inflating per-token latency. Turning this insight into a practical runtime requires addressing three challenges.
 
-\paragraph{Challenge 1: Organizing expert--LoRA objects under expanded and fragmented working sets.}
+\paragraph{Challenge 1: Reasoning at expert--LoRA granularity under expanded and fragmented working sets.}
 \label{subsec:challenge-residency}
 
-Under joint-object modeling, the effective key space expands substantially, while reuse becomes weaker and more fragmented across requests. This makes coarse-grained management ineffective: adapter-level residency retains many expert slices that are never touched, whereas expert-only reasoning overestimates reuse by ignoring adapter diversity. At the same time, naively treating every expert--LoRA joint object as an independent cache unit can lead to unstable residency, repeated admissions of low-reuse objects, and excessive churn.
+Under joint-object modeling, the effective key space expands substantially, while reuse becomes weaker and more fragmented across requests. This makes coarse-grained management ineffective: adapter-level residency retains many expert slices that are never touched, whereas expert-only reasoning overestimates reuse by ignoring adapter diversity. At the same time, naive fine-grained residency increases fragmentation pressure on the effective hot set and makes limited GPU capacity more vulnerable to transient cold objects.
 
-The system must therefore preserve the precision of joint-object reasoning without turning fine-grained residency into a self-defeating management problem. In other words, it must organize expert--LoRA objects at the granularity demanded by actual computation, while preventing limited GPU cache capacity from being consumed by transient cold objects.
+The system must therefore reason at expert--LoRA granularity, which matches actual computation, without assuming that caching alone can absorb the resulting working-set expansion.
 
 \paragraph{Challenge 2: Recovering cold misses without forcing promotion-first stalls on decode.}
 \label{subsec:challenge-miss}
@@ -334,148 +334,90 @@ In this regime, many misses correspond to cold objects whose reuse is too limite
 
 The system therefore needs a different default recovery strategy for cold misses. Instead of forcing all misses through immediate GPU promotion, it must provide a way to complete the current expert--LoRA computation without making promotion the only recovery path, while still preserving the option to promote objects later when future reuse justifies it.
 
-\paragraph{Challenge 3: Making cold-path recovery practical and overlap-friendly under decode constraints.}
+\paragraph{Challenge 3: Making cold-path recovery practical under decode constraints.}
 \label{subsec:challenge-overlap}
 
 Changing the miss-recovery abstraction is not sufficient by itself. If cold-path execution is too slow, the system merely replaces GPU promotion stall with CPU-side stall. If it is poorly integrated with the decode pipeline, heterogeneous execution introduces a new source of queueing and tail behavior rather than alleviating the original one.
 
-The system must therefore make cold-path recovery efficient enough to operate at small, irregular decode batch sizes, and organize execution so that cold-miss handling can overlap with GPU hot-path and base-model computation whenever dependencies allow. The challenge is not only to provide an alternative path, but to ensure that this path reduces exposed miss latency instead of becoming a new bottleneck.
+The system must therefore make cold-path recovery efficient enough to operate at small, irregular decode batch sizes, and organize execution so that cold-miss handling can overlap with GPU hot-path and base-model computation whenever dependencies allow. The challenge is not only to provide an alternative recovery path, but to ensure that this path reduces exposed miss latency instead of becoming a new bottleneck.
 
 \section{Design}
-\label{sec:design-overview}
+\label{sec:design}
 
-\subsection{Core Idea}
-\label{subsec:core-idea}
+\subsection{Design Overview}
+\label{subsec:design-overview}
 
-Under joint-object modeling, cache misses become unavoidable and latency-critical, requiring explicit miss handling rather than relying on caching to hide them.
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=\textwidth]{figures/fig6.pdf}
+  \caption{
+  Overview of COLoRA's hot/cold dual-path serving design for expert--LoRA computation in decode.
+  Routed expert--LoRA accesses first check GPU residency.
+  Cache-hit objects are served on the GPU hot path together with the base-model path, preserving the fast path for the frequent working set.
+  Cold misses are redirected to a CPU cold path, which completes the current LoRA computation without making immediate GPU promotion the default recovery action.
+  Promotion is deferred to future reuse, allowing repeatedly accessed cold objects to re-enter the GPU hot set.
+  On top of this main miss-handling design, COLoRA further exploits short-range routing locality across adjacent decode tokens to prefetch a small set of likely expert weights ahead of use, exposing additional overlap opportunities while preserving exact execution semantics.
+  }
+  \label{fig:colora_overview}
+\end{figure*}
 
-These observations shift the problem from data placement to execution-path selection: instead of always blocking on promotion, the system must decide whether to serve a miss immediately from the cold layer or to invest in future reuse through promotion.
+Under expert--LoRA joint-object modeling, the central systems problem is no longer cache placement alone, but miss recovery on the decode critical path. As shown in Section~\ref{subsec:challenges}, working-set expansion and fragmentation make cold misses difficult to eliminate within realistic GPU cache budgets. As a result, a practical serving runtime cannot rely on caching alone to hide miss costs; it must instead determine how unavoidable misses are recovered without inflating per-token latency.
 
-This shift imposes three constraints: (1) maintaining a precise hot set without inducing churn, (2) handling misses without blocking the critical decode path, and (3) overlapping heterogeneous execution so that miss handling does not become the new tail bottleneck.
+Based on this insight, COLoRA adopts a \emph{hot/cold dual-path serving design} for expert--LoRA computation in decode. The design is illustrated in Figure~\ref{fig:colora_overview}. When a routed expert--LoRA object is already resident in the GPU hot set, execution proceeds on the GPU hot path. When the object is a cold miss, however, COLoRA does not treat immediate GPU promotion as the mandatory first recovery step. Instead, the current expert--LoRA computation is redirected to a CPU cold path, while promotion is deferred and used only when later accesses indicate sufficient reuse potential. In this sense, the key abstraction change in COLoRA is not merely the addition of a fallback path, but the replacement of conventional \emph{promotion-first} recovery with an \emph{execution-first} default for cold misses.
 
-COLoRA satisfies these constraints through three mechanisms: selective joint-object residency, non-blocking miss handling with a cold-layer execution path, and overlap-aware heterogeneous execution.
+This design separates three roles that are coupled in conventional load-then-run recovery. The GPU hot path serves the frequent expert--LoRA working set and remains the primary path for maintaining average performance and throughput. The CPU cold path absorbs the latency impact of unavoidable cold misses, preventing every miss from becoming an immediate promotion stall on the current token. Promotion, in turn, is retained only as a \emph{future-reuse optimization}: rather than recovering the current token, it gradually moves repeatedly accessed cold objects back into the GPU hot set.
 
-\subsection{Selective Joint-Object Residency}
-\label{subsec:memory-hierarchy}
+Making this execution-first design practical requires more than simply moving LoRA computation from GPU to CPU. If the cold path is too slow, the system merely replaces GPU-side stall with CPU-side stall. COLoRA therefore combines the dual-path miss-handling design with an optimized CPU cold path, including AVX-based kernels and activation coalescing, so that cold-miss handling can operate efficiently in the small, irregular batch regime of decode. In mixed hit/miss batches, this organization also creates opportunities for overlap between CPU cold-path work and GPU hot-path/base-model execution, reducing the exposed latency of cold misses.
 
-COLoRA maintains a stable hot set by selectively promoting joint objects while suppressing low-value cache churn.
+Beyond the main miss-handling path, COLoRA further exploits short-range temporal locality in MoE routing to prefetch likely expert weights ahead of use. This conservative mechanism does not alter the realized routing result or replace exact expert--LoRA computation with approximate outputs. Instead, it moves part of the data-movement work earlier in time when routing behavior is predictable, thereby exposing additional overlap opportunities while preserving exact execution semantics.
 
-To address Challenge~\ref{subsec:challenge-residency}, COLoRA uses an asymmetric memory hierarchy: GPU memory serves as a bounded hot cache for reusable joint objects, while CPU memory maintains a full read-only replica that acts as both the cold layer and the execution source for misses.
+The remainder of this section elaborates these components in turn. Section~\ref{subsec:dual-path-handling} presents the hot/cold dual-path miss-handling design. Section~\ref{subsec:cpu-cold-path} describes the optimized CPU cold path that makes execution-first handling practical. Section~\ref{subsec:deferred-promotion} explains how deferred promotion supports future reuse. Finally, Section~\ref{subsec:early-prefetch} presents the temporal-locality-guided early prefetch mechanism.
 
-Flattened popularity under joint-object modeling weakens hot-set dominance, making naive fine-grained caching unstable. Without filtering, frequent insertions of low-reuse objects lead to repeated eviction and re-admission, degenerating into churn.
+\subsection{Hot/Cold Dual-Path Miss Handling}
+\label{subsec:dual-path-handling}
 
-COLoRA therefore performs selective promotion. Each joint object maintains lightweight utility signals derived from recent accesses, and promotion is gated by minimum-hit thresholds, bounded queues, and cooldown windows. This preserves fine-grained precision while preventing promotion traffic from overwhelming the system.
+The central mechanism in COLoRA is a hot/cold dual-path design for expert--LoRA miss handling in decode. Its purpose is not simply to distinguish cache hits from cache misses, but to change what the system does by default when a cold miss occurs. In conventional load-then-run execution, a miss is implicitly bound to a single recovery action: the missing object must first be promoted to GPU memory, and the current token waits until this migration completes before expert--LoRA computation can proceed. Under the expert--LoRA joint-object regime, however, such misses are no longer rare enough to be treated as exceptional events. Since many of them correspond to cold objects with weak short-term reuse, forcing every miss through immediate promotion-first recovery turns miss cost directly into decode stall and amplifies tail latency.
 
-\subsection{Non-Blocking Miss Handling}
-\label{subsec:cpu-first}
+COLoRA breaks this binding by separating expert--LoRA computation into a GPU hot path and a CPU cold path, as illustrated in Figure~\ref{fig:colora_overview}. When a routed expert--LoRA object is already resident in the GPU hot set, the request follows the GPU hot path and executes normally on the device. This path serves the frequent working set and preserves the fast path for average-case decode performance. When the object is a cold miss, COLoRA does not require the current token to wait for immediate GPU promotion. Instead, it redirects the missing expert--LoRA computation to a CPU cold path, which completes the current LoRA contribution while allowing promotion to be handled separately.
 
-COLoRA serves misses without blocking the decode path by executing directly from the cold layer.
+The key abstraction change is therefore not the mere existence of a backup path, but the replacement of conventional \emph{promotion-first} miss recovery with an \emph{execution-first} default for cold misses. In COLoRA, promotion is no longer the mandatory first step in recovering the current token from a miss. Rather, the system first completes the missing expert--LoRA computation through the cold path, and only then treats promotion as a secondary decision driven by future reuse. This change is particularly important in decode, where current-token latency matters more than whether every cold object is immediately made resident on GPU.
 
-To address Challenge~\ref{subsec:challenge-miss}, COLoRA avoids blocking on promotion for low-reuse objects. Under degraded temporal locality, many misses correspond to objects whose reuse is too distant to amortize promotion cost. In this regime, blocking load-then-run exposes promotion latency directly on the critical path.
+This dual-path organization also clarifies the roles of the three participating components. The GPU hot path is responsible for serving frequently reused expert--LoRA objects and therefore primarily determines average latency and throughput. The CPU cold path is responsible for absorbing the latency impact of unavoidable cold misses and preventing each such miss from becoming an immediate promotion stall. Promotion, in turn, is retained only as a future-reuse optimization: objects that prove to be repeatedly accessed can later re-enter the GPU hot set, but promotion no longer defines the default recovery path for the current token.
 
-COLoRA instead serves misses immediately. When a joint object misses in the GPU cache, the request is routed to a cold-layer execution path rather than waiting for promotion. Promotion is treated as an asynchronous optimization for future requests rather than a prerequisite for serving the current one.
+Algorithmically, the handling logic is simple. For each routed expert--LoRA access, COLoRA first checks whether the corresponding joint object is resident in the GPU hot set. If the lookup hits, the object is executed on the GPU hot path. If the lookup misses, the current expert--LoRA computation is issued to the CPU cold path, while any GPU promotion is deferred and considered separately according to reuse-driven policy. In this way, COLoRA does not eliminate misses altogether; instead, it prevents unavoidable cold misses from always appearing as synchronous promotion stalls on the decode critical path.
 
-The dense expert backbone remains on GPU, while only the sparse LoRA residual uses the heterogeneous path. This confines miss handling to the component responsible for fragmentation, minimizing disruption to the main execution flow.
+\subsection{Realizing the CPU Cold Path}
+\label{subsec:cpu-cold-path}
 
-\subsection{Analytical Regime for Non-Blocking Miss Handling}
-\label{subsec:analytical-model}
+Changing the miss-recovery abstraction is not sufficient by itself. If the cold path is too slow, the system merely replaces GPU-side promotion stall with CPU-side stall. COLoRA therefore makes the CPU cold path efficient enough to operate in the decode regime, where misses are small, irregular, and latency-sensitive.
 
-We use a lightweight latency model to characterize the regime in which non-blocking fallback reduces the exposed critical-path latency of a miss relative to blocking GPU promotion.
+Generic framework execution is poorly matched to this setting because its fixed dispatch overhead is large relative to the amount of work performed for a cold miss. COLoRA instead implements a specialized cold-path execution flow tailored to expert--LoRA fallback. Miss work is organized compactly, activations are coalesced before host-side execution, and lightweight CPU kernels are used whenever available. In particular, COLoRA exposes AVX-512 BF16 kernels for the gate, up, and down projections, reducing per-miss dispatch overhead and improving efficiency for the small tensor shapes characteristic of decode-time cold accesses.
 
-Consider a miss on joint object $j$, where $W_j$ denotes the missed weight size and $A_j, O_j$ denote the activation and output sizes of the fallback path. In decode, batch sizes are small and sequence length is typically one, so $A_j$ and $O_j$ scale with per-token activations, whereas $W_j$ scales with the missed object weights.
+The goal of these optimizations is not to outperform GPU execution in general. Rather, the goal is to make execution-first recovery practical in the regime where cold objects have weak near-term reuse and are poor candidates for immediate promotion. In this setting, the relevant comparison is exposed miss latency on the critical path, not raw standalone compute speed.
 
-The exposed latency of the blocking promotion path is
-\begin{equation}
-T_{\mathrm{block}}(j)
-=
-T_{\mathrm{xfer}}^{w}(j)
-+
-T_{\mathrm{gpu}}(j)
-+
-T_{\mathrm{stall}}(j),
-\label{eq:blocking-path}
-\end{equation}
-where $T_{\mathrm{xfer}}^{w}(j)$ is the host-to-device weight transfer cost, $T_{\mathrm{gpu}}(j)$ is the GPU execution cost after promotion, and $T_{\mathrm{stall}}(j)$ is the blocking-side delay exposed on the critical path, including queueing, synchronization, and promotion-side cache-management overheads when they lie on the critical path.
+These optimizations also create opportunities for overlap in mixed hit/miss batches. While the GPU continues to execute the base-model path and the hot-path expert--LoRA computation for cache-hit objects, the CPU cold path can process missing expert--LoRA work concurrently. As a result, the exposed latency of a cold miss is no longer determined solely by synchronous promotion delay. Instead, part of the cold-path cost can be absorbed alongside ongoing GPU work, making execution-first recovery beneficial even when CPU fallback is not intrinsically faster than GPU execution in isolation.
 
-\begin{equation}
-T_{\mathrm{fb}}(j)
-=
-T_{\mathrm{xfer}}^{a}(j)
-+
-T_{\mathrm{cpu}}(j)
-+
-T_{\mathrm{merge}}(j)
--
-T_{\mathrm{overlap}}(j),
-\label{eq:fallback-path}
-\end{equation}
-where $T_{\mathrm{xfer}}^{a}(j)$ is the activation-side transfer cost, including activation transfer and result return, $T_{\mathrm{cpu}}(j)$ is the CPU execution cost including dispatch and kernel wake-up overheads, $T_{\mathrm{merge}}(j)$ is the rejoin overhead, and $T_{\mathrm{overlap}}(j)$ is the portion hidden under independent GPU work.
+\subsection{Promotion for Future Reuse}
+\label{subsec:deferred-promotion}
 
-COLoRA prefers fallback when
-\begin{equation}
-T_{\mathrm{fb}}(j) < T_{\mathrm{block}}(j).
-\label{eq:fallback-better}
-\end{equation}
+COLoRA does not eliminate GPU promotion; it changes its role. In conventional load-then-run execution, promotion is the default recovery action for the current token. In COLoRA, by contrast, promotion is deferred and used only as a future-reuse optimization.
 
-We approximate the transfer terms as
-\begin{align}
-T_{\mathrm{xfer}}^{w}(j)
-&\approx
-\alpha + \frac{W_j}{B_{\mathrm{pcie}}}, \\
-T_{\mathrm{xfer}}^{a}(j)
-&\approx
-2\alpha + \frac{A_j + O_j}{B_{\mathrm{pcie}}},
-\label{eq:transfer-model}
-\end{align}
-where $\alpha$ is the fixed host-device transfer overhead and $B_{\mathrm{pcie}}$ is the effective transfer bandwidth.
+Once a cold miss has been served through the CPU cold path, the system may still decide to promote the corresponding expert--LoRA object into the GPU hot set if subsequent accesses indicate that the object is becoming hot. In this way, repeatedly accessed cold objects can gradually re-enter the GPU fast path, while transient long-tail objects are handled without forcing immediate migration on the current token.
 
-Raw transfer cost alone does not necessarily favor fallback, since activation-side service incurs a round-trip transfer whereas promotion transfers weights only once. COLoRA instead targets the regime in which blocking-side delay and overlap effects dominate the exposed latency of a cold miss.
+This separation is important for hybrid serving. The GPU hot path remains focused on serving the frequent working set that determines average latency and throughput, whereas the CPU cold path absorbs the tail impact of unavoidable misses. Promotion connects the two paths over time: it does not recover the current miss, but it allows objects whose reuse later proves worthwhile to transition back into GPU residency.
 
-Substituting the transfer terms, fallback is favored when
-\begin{equation}
-\begin{split}
-\bigl(T_{\mathrm{xfer}}^{a}(j) - T_{\mathrm{xfer}}^{w}(j)\bigr)
-+ \bigl(T_{\mathrm{cpu}}(j) - T_{\mathrm{gpu}}(j)\bigr) \\
-+ T_{\mathrm{merge}}(j)
-- T_{\mathrm{overlap}}(j)
-- T_{\mathrm{stall}}(j)
-< 0 .
-\end{split}
-\label{eq:decode-regime}
-\end{equation}
+\subsection{Temporal-Locality-Guided Early Prefetch}
+\label{subsec:early-prefetch}
 
-Equation~\ref{eq:decode-regime} characterizes the regime targeted by COLoRA: cold misses with weak near-term reuse, where blocking promotion exposes cost immediately while deferring benefit to future requests, whereas fallback serves the current miss directly and may additionally hide part of its cost through overlap. COLoRA therefore requires only lower \emph{exposed} latency than blocking promotion, not lower raw compute latency than GPU execution.
+Even with execution-first miss handling, part of the cold-path cost may still remain exposed on the decode critical path. COLoRA therefore further exploits temporal locality in MoE routing to prefetch likely expert weights ahead of use. The purpose of this mechanism is not to change the miss-handling semantics of the system, but to reduce exposed cold-miss latency by moving part of the weight-movement work earlier when routing behavior is predictable.
 
-\subsection{Low-Overhead Miss Execution Path}
-\label{subsec:cpu-fallback}
+The key observation is that expert routing in decode often exhibits short-range temporal locality across adjacent tokens. COLoRA uses the routed experts from the previous token at the same layer as a lightweight predictor for the current token, and proactively prefetches the top-$2$ expert weights that are most likely to be needed next. Since this mechanism only fetches candidate weights early and does not commit approximate computation results, it preserves exact execution semantics. If the prefetched experts are indeed reused, the subsequent access observes lower miss latency. If the prediction is incorrect, execution simply falls back to the normal hot/cold miss-handling path, and the only cost is unnecessary prefetch traffic.
 
-COLoRA ensures that the fallback path is efficient enough to make non-blocking miss handling viable in the decode regime.
+This design is conservative by construction. It does not alter the routed expert set used for the current token, nor does it replace exact expert--LoRA computation with approximate results. Instead, it uses routing locality only to move a small amount of miss-related preparation earlier in time. In this sense, the mechanism is best viewed as an overlap-oriented prefetch optimization layered on top of the main hot/cold dual-path design, rather than as an alternative recovery path.
 
-Decode misses are small, irregular, and latency-sensitive, making generic framework execution inefficient due to high fixed overhead. COLoRA therefore implements a specialized execution path tailored to this regime.
+Operationally, after completing layer-$\ell$ routing for token $t$, COLoRA records the selected experts for that layer and issues a small prefetch request for token $t{+}1$ at the same layer. The prefetch is intentionally conservative: only the top-$2$ predicted experts are considered, limiting wasted movement when routing changes. When the next token reaches layer-$\ell$, any prefetched expert weights that match the realized routing can be consumed immediately, while unmatched prefetched weights are ignored. Because correctness depends solely on the realized route and exact execution path, this mechanism never changes model outputs; it only changes whether some of the required expert data has already been moved closer to use time.
 
-Miss work is grouped by adapter, lightweight kernels are used when available, and the control path is kept compact. The implementation exposes AVX-512 BF16 kernels for the gate, up, and down projections, reducing dispatch overhead and improving efficiency for small tensor shapes.
-
-The goal is not to outperform GPU execution in general, but to ensure that for cold, low-reuse objects, fallback incurs lower exposed miss latency than blocking promotion.
-
-\subsection{Overlap-Aware Heterogeneous Execution}
-\label{subsec:overlap}
-
-COLoRA overlaps GPU execution with miss handling to reduce the exposed cost of heterogeneous execution and prevent fallback from becoming a new tail bottleneck.
-
-To address Challenge~\ref{subsec:challenge-overlap}, COLoRA exploits mixed batches containing both GPU-cache hits and misses. Without overlap, non-blocking miss handling degenerates into a serialized pipeline, where the fallback path becomes the new critical path.
-
-COLoRA launches miss execution asynchronously when independent GPU work is available and synchronizes only when the residual output is required. This allows CPU computation, GPU computation, and data movement to proceed concurrently.
-
-The runtime also tracks signals such as promotion queue depth, CPU queue depth, queueing delay, and overlap ratio, enabling the system to remain explainable and to identify when contention or insufficient overlap limits performance.
-
-\subsection{Behavior Under Different Locality Regimes}
-\label{subsec:graceful-degradation}
-
-COLoRA adapts to workload locality rather than enforcing heterogeneity.
-
-When locality is strong and the working set fits in GPU memory, most requests hit in the hot cache and execution behaves similarly to a GPU-only system. As locality degrades and misses become frequent, the system transitions to heterogeneous execution, using non-blocking miss handling and overlap to stabilize tail latency.
-
-This adaptive behavior ensures that COLoRA improves performance in fragmented regimes while remaining efficient in well-behaved workloads.
+This optimization is most useful when routing locality is strong enough that a small predicted set frequently overlaps with the realized expert set. Under such conditions, prefetching reduces the amount of cold-miss latency that remains exposed after the main execution-first design has already removed immediate promotion-first stalls. When locality weakens, the mechanism degrades gracefully to a small amount of ineffective prefetch traffic, while the main hot/cold dual-path miss-handling design continues to provide correct execution and the primary latency benefit.
 
 % \section{Implementation}
 % \label{sec:implementation}
