@@ -90,6 +90,9 @@ REUSE_QUANTILE_LABELS = ("P90", "P95", "P99")
 FIG4_PREFERRED_BUDGETS = (8192, 16384, 32768, 65536, 4096, 1024, 256)
 FIG4_PLATEAU_START_LORAS = 4
 FIGURE_SAVE_METADATA = {"Creator": str(PLOT_SCRIPT_PATH)}
+PAPER_TWO_UP_FIGSIZE = (5.6, 3.6)
+PAPER_TWO_UP_MULTI_PANEL_FIGSIZE = (6.1, 3.6)
+PAPER_TWO_UP_COMPACT_FIGSIZE = (5.3, 3.5)
 
 
 @dataclass(frozen=True)
@@ -153,11 +156,11 @@ def apply_matplotlib_style() -> None:
             "axes.axisbelow": True,
             "grid.alpha": 0.22,
             "grid.linewidth": 0.7,
-            "axes.labelsize": 11,
-            "axes.titlesize": 12,
-            "legend.fontsize": 9,
-            "xtick.labelsize": 10,
-            "ytick.labelsize": 10,
+            "axes.labelsize": 15,
+            "axes.titlesize": 16,
+            "legend.fontsize": 13,
+            "xtick.labelsize": 14,
+            "ytick.labelsize": 14,
         }
     )
 
@@ -322,7 +325,7 @@ def resolve_b13_paths(
 
 def plot_fig1_popularity_rank(popularity_path: Path, output_path: Path) -> tuple[plt.Figure, FigureRecord]:
     rows = read_csv_rows(popularity_path)
-    fig, ax = plt.subplots(figsize=(7.0, 4.2))
+    fig, ax = plt.subplots(figsize=PAPER_TWO_UP_FIGSIZE, constrained_layout=True)
 
     topk_lines = []
     for condition in CACHE_CONDITION_ORDER:
@@ -352,7 +355,7 @@ def plot_fig1_popularity_rank(popularity_path: Path, output_path: Path) -> tuple
         0.72,
         "\n".join(topk_lines),
         transform=ax.transAxes,
-        fontsize=9,
+        fontsize=13,
         bbox={"facecolor": "white", "edgecolor": "#D7DCE0", "boxstyle": "round,pad=0.3"},
     )
 
@@ -395,8 +398,9 @@ def plot_fig2_reuse_distance(reuse_path: Path, output_path: Path) -> tuple[plt.F
     fig, axes = plt.subplots(
         1,
         2,
-        figsize=(8.0, 4.2),
-        gridspec_kw={"width_ratios": [3.3, 1.5]},
+        figsize=PAPER_TWO_UP_MULTI_PANEL_FIGSIZE,
+        constrained_layout=True,
+        gridspec_kw={"width_ratios": [3.15, 1.35]},
     )
     ax_left, ax_right = axes
 
@@ -455,7 +459,7 @@ def build_fig2_reuse_distance(reuse_path: Path, output_path: Path) -> FigureReco
 
 def plot_fig3_cache_curve(cache_curve_path: Path, output_path: Path) -> tuple[plt.Figure, FigureRecord]:
     rows = read_csv_rows(cache_curve_path)
-    fig, ax = plt.subplots(figsize=(7.0, 4.2))
+    fig, ax = plt.subplots(figsize=PAPER_TWO_UP_FIGSIZE, constrained_layout=True)
 
     for condition in CACHE_CONDITION_ORDER:
         subset = sorted(
@@ -495,12 +499,8 @@ def plot_fig3_cache_curve(cache_curve_path: Path, output_path: Path) -> tuple[pl
     row_b0_2048 = single_row(rows, condition="expert_only", cache_budget="2048")
     row_b1_2048 = single_row(rows, condition="joint_indep", cache_budget="2048")
     row_b2_2048 = single_row(rows, condition="joint_corr", cache_budget="2048")
-    row_b0_8192 = single_row(rows, condition="expert_only", cache_budget="8192")
-    row_b2_8192 = single_row(rows, condition="joint_corr", cache_budget="8192")
     ratio_b1_2048 = float(row_b1_2048["miss_rate"]) / float(row_b0_2048["miss_rate"])
     ratio_b2_2048 = float(row_b2_2048["miss_rate"]) / float(row_b0_2048["miss_rate"])
-    ratio_b2_8192 = float(row_b2_8192["miss_rate"]) / float(row_b0_8192["miss_rate"])
-
     caption = (
         "Cache replay under a shared LRU budget shows that joint modeling amplifies misses after the expert-only "
         f"condition reaches its locality scale. At 2048 objects, miss rate is {float(row_b0_2048['miss_rate']):.5f} "
@@ -615,7 +615,7 @@ def plot_fig4_num_loras_vs_p99(num_loras_path: Path, output_path: Path) -> tuple
         transform=ax.transAxes,
         ha="right",
         va="bottom",
-        fontsize=9,
+        fontsize=13,
         bbox={"facecolor": "white", "edgecolor": "#D7DCE0", "boxstyle": "round,pad=0.3"},
     )
 
@@ -708,7 +708,7 @@ def plot_fig5_tail_breakdown(
         x_labels.append(CONDITION_SHORT_LABELS[latency_condition])
         tail_bar_colors.append(CONDITION_COLORS[latency_condition])
 
-    fig, ax = plt.subplots(figsize=(6.6, 4.1))
+    fig, ax = plt.subplots(figsize=PAPER_TWO_UP_COMPACT_FIGSIZE, constrained_layout=True)
     x = np.arange(len(JOINT_CACHE_CONDITIONS))
     width = 0.32
     ax.bar(
@@ -732,7 +732,7 @@ def plot_fig5_tail_breakdown(
             ratio,
             ha="center",
             va="bottom",
-            fontsize=9,
+            fontsize=13,
         )
     ax.set_xticks(x, x_labels)
     ax.set_ylabel("Cold joint-object touches per request")
