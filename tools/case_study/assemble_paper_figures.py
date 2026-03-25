@@ -17,6 +17,7 @@ if "ipykernel" not in sys.modules:
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.patches import Patch
 from matplotlib.ticker import FuncFormatter, PercentFormatter
 
 if __package__ in (None, ""):
@@ -54,21 +55,27 @@ CACHE_CONDITION_ORDER = ("expert_only", "joint_indep", "joint_corr")
 JOINT_CACHE_CONDITIONS = ("joint_indep", "joint_corr")
 
 CONDITION_LABELS = {
-    "expert_only": "B0 Expert-only",
-    "joint_indep": "B1 Joint-indep",
-    "joint_corr": "B2 Joint-corr",
-    "B0": "B0 Expert-only",
-    "B1": "B1 Joint-indep",
-    "B2": "B2 Joint-corr",
+    "expert_only": "C0 Expert-only",
+    "joint_indep": "C1 Joint-indep",
+    "joint_corr": "C2 Joint-corr",
+    "B0": "C0 Expert-only",
+    "B1": "C1 Joint-indep",
+    "B2": "C2 Joint-corr",
+    "C0": "C0 Expert-only",
+    "C1": "C1 Joint-indep",
+    "C2": "C2 Joint-corr",
 }
 
 CONDITION_SHORT_LABELS = {
-    "expert_only": "B0",
-    "joint_indep": "B1",
-    "joint_corr": "B2",
-    "B0": "B0",
-    "B1": "B1",
-    "B2": "B2",
+    "expert_only": "C0",
+    "joint_indep": "C1",
+    "joint_corr": "C2",
+    "B0": "C0",
+    "B1": "C1",
+    "B2": "C2",
+    "C0": "C0",
+    "C1": "C1",
+    "C2": "C2",
 }
 
 CONDITION_COLORS = {
@@ -78,6 +85,9 @@ CONDITION_COLORS = {
     "B0": "#355070",
     "B1": "#C8553D",
     "B2": "#2A9D8F",
+    "C0": "#355070",
+    "C1": "#C8553D",
+    "C2": "#2A9D8F",
 }
 
 TAIL_CONDITION_PAIRS = {
@@ -325,13 +335,15 @@ def resolve_b13_paths(
 
 def plot_fig1_popularity_rank(popularity_path: Path, output_path: Path) -> tuple[plt.Figure, FigureRecord]:
     rows = read_csv_rows(popularity_path)
-    fig, ax = plt.subplots(figsize=PAPER_TWO_UP_FIGSIZE, constrained_layout=True)
+    fig, ax = plt.subplots(figsize=(PAPER_TWO_UP_FIGSIZE))
 
     topk_lines = []
     for condition in CACHE_CONDITION_ORDER:
         subset = condition_rows(rows, condition)
         ranks = [int(row["rank"]) for row in subset]
         coverage = [float(row["cumulative_fraction"]) for row in subset]
+        topk = popularity_rank_coverage(rows, condition, rank=1000)
+        topk_lines.append(f"{CONDITION_SHORT_LABELS[condition]} top-1000: {format_pct(topk)}")
         ax.plot(
             ranks,
             coverage,
@@ -339,20 +351,34 @@ def plot_fig1_popularity_rank(popularity_path: Path, output_path: Path) -> tuple
             linewidth=2.2,
             label=CONDITION_LABELS[condition],
         )
-        topk = popularity_rank_coverage(rows, condition, rank=1000)
-        topk_lines.append(f"{CONDITION_SHORT_LABELS[condition]} top-1000: {format_pct(topk)}")
 
     ax.set_xscale("log")
     ax.set_xlim(left=1)
     ax.set_ylim(0.0, 1.02)
-    ax.set_xlabel("Object popularity rank")
-    ax.set_ylabel("Cumulative access share")
+    ax.set_ylabel("Cumulative access share", y=0.35, labelpad=10)
     ax.yaxis.set_major_formatter(PercentFormatter(xmax=1.0))
     ax.set_title("Access Coverage by Popularity Rank")
-    ax.legend(loc="lower right", frameon=False)
+    fig.subplots_adjust(left=0.17, bottom=0.37, top=0.88)
+    handles, labels = ax.get_legend_handles_labels()
+    fig.supxlabel("Object popularity rank", y=0.12, fontsize=plt.rcParams["axes.labelsize"])
+    fig.legend(
+        handles,
+        labels,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.19),
+        borderaxespad=0.0,
+        ncol=3,
+        columnspacing=0.5,
+        frameon=True,
+        framealpha=1.0,
+        facecolor="white",
+        edgecolor="#D7DCE0",
+        handlelength=2.0,
+        fontsize=12,
+    )
     ax.text(
         0.03,
-        0.72,
+        0.69,
         "\n".join(topk_lines),
         transform=ax.transAxes,
         fontsize=13,
@@ -365,7 +391,7 @@ def plot_fig1_popularity_rank(popularity_path: Path, output_path: Path) -> tuple
     caption = (
         "Cumulative access share versus object popularity rank. The expert-only stream concentrates "
         f"{format_pct(coverage_b0)} of accesses in the top 1000 objects, while the joint stream falls to "
-        f"{format_pct(coverage_b1)} in B1 and {format_pct(coverage_b2)} in B2, indicating a much flatter and "
+        f"{format_pct(coverage_b1)} in C1 and {format_pct(coverage_b2)} in C2, indicating a much flatter and "
         "more fragmented popularity profile once adapters enter the access key."
     )
     return fig, FigureRecord(
@@ -418,7 +444,7 @@ def plot_fig2_reuse_distance(reuse_path: Path, output_path: Path) -> tuple[plt.F
         )
     ax_left.set_xticks(x, REUSE_QUANTILE_LABELS)
     ax_left.set_ylabel("Finite reuse distance (events)")
-    ax_left.set_title("Finite Reuse-Distance Quantiles")
+    ax_left.set_title("Finite Reuse-Distance Quantiles", x=0.42)
     ax_left.legend(loc="upper left", frameon=False)
 
     cold_x = np.arange(len(CACHE_CONDITION_ORDER))
@@ -430,14 +456,14 @@ def plot_fig2_reuse_distance(reuse_path: Path, output_path: Path) -> tuple[plt.F
     )
     ax_right.set_xticks(cold_x, [CONDITION_SHORT_LABELS[condition] for condition in CACHE_CONDITION_ORDER])
     ax_right.set_ylabel("Cold first touches per 10k events")
-    ax_right.set_title("Cold-Start Rate")
+    ax_right.set_title("Cold-Start Rate", x=0.37)
 
     q99_b0 = quantile_map["expert_only"][0.99]
     q99_b1 = quantile_map["joint_indep"][0.99]
     q99_b2 = quantile_map["joint_corr"][0.99]
     caption = (
         "Joint keys worsen temporal locality in both tail reuse distance and cold-start rate. The finite P99 reuse "
-        f"distance rises from {q99_b0:,} events in B0 to {q99_b1:,} in B1 and {q99_b2:,} in B2, while cold first "
+        f"distance rises from {q99_b0:,} events in C0 to {q99_b1:,} in C1 and {q99_b2:,} in C2, while cold first "
         f"touches rise from {cold_per_10k['expert_only']:.1f} to {cold_per_10k['joint_indep']:.1f} and "
         f"{cold_per_10k['joint_corr']:.1f} per 10k events."
     )
@@ -504,8 +530,8 @@ def plot_fig3_cache_curve(cache_curve_path: Path, output_path: Path) -> tuple[pl
     caption = (
         "Cache replay under a shared LRU budget shows that joint modeling amplifies misses after the expert-only "
         f"condition reaches its locality scale. At 2048 objects, miss rate is {float(row_b0_2048['miss_rate']):.5f} "
-        f"in B0 versus {float(row_b1_2048['miss_rate']):.5f} in B1 and {float(row_b2_2048['miss_rate']):.5f} in B2 "
-        f"({ratio_b1_2048:.1f}x and {ratio_b2_2048:.1f}x worse than B0)."
+        f"in C0 versus {float(row_b1_2048['miss_rate']):.5f} in C1 and {float(row_b2_2048['miss_rate']):.5f} in C2 "
+        f"({ratio_b1_2048:.1f}x and {ratio_b2_2048:.1f}x worse than C0)."
     )
     return fig, FigureRecord(
         output_path=output_path,
@@ -591,10 +617,15 @@ def plot_fig4_num_loras_vs_p99(num_loras_path: Path, output_path: Path) -> tuple
         ax.set_xscale("log", base=2)
     ax.set_xticks(num_loras, [str(value) for value in num_loras])
     ax.set_xlabel("Number of modeled LoRAs")
-    ax.set_ylabel("P99 latency gap vs. B0 (ms)")
-    ax.set_title(f"Tail Penalty Onset and Plateau ({selected_budget} objects)")
+    ax.set_ylabel("P99 latency gap vs. C0 (ms)")
+    ax.set_title("Tail Penalty Onset and Plateau")
     ax.legend(
-        loc="upper left",
+        loc="lower right",
+        bbox_to_anchor=(0.985, 0.01),
+        borderaxespad=0.0,
+        labelspacing=0.3,
+        borderpad=0.3,
+        handlelength=2.0,
         frameon=True,
         framealpha=0.95,
         facecolor="white",
@@ -610,7 +641,7 @@ def plot_fig4_num_loras_vs_p99(num_loras_path: Path, output_path: Path) -> tuple
         plateau_text += f"\n1 -> {plateau_start} LoRAs: +{format_ms(onset_gain)}"
     ax.text(
         0.98,
-        0.04,
+        0.35,
         plateau_text,
         transform=ax.transAxes,
         ha="right",
@@ -626,7 +657,7 @@ def plot_fig4_num_loras_vs_p99(num_loras_path: Path, output_path: Path) -> tuple
             f"At the {selected_budget}-object slice, the joint P99 penalty rises from "
             f"{format_ms(mean_gap[single_index])} at 1 LoRA to {format_ms(mean_gap[plateau_entry_index])} at "
             f"{plateau_start} LoRAs, then stays on a broad plateau around {format_ms(plateau_mean_joint_gap)} for "
-            f">= {plateau_start} LoRAs. B1 and B2 plateau near {format_ms(plateau_mean_by_condition['joint_indep'])} "
+            f">= {plateau_start} LoRAs. C1 and C2 plateau near {format_ms(plateau_mean_by_condition['joint_indep'])} "
             f"and {format_ms(plateau_mean_by_condition['joint_corr'])}, respectively."
         )
         figure_slice = (
@@ -711,6 +742,8 @@ def plot_fig5_tail_breakdown(
     fig, ax = plt.subplots(figsize=PAPER_TWO_UP_COMPACT_FIGSIZE, constrained_layout=True)
     x = np.arange(len(JOINT_CACHE_CONDITIONS))
     width = 0.32
+    max_tail_cold_misses = max(average_tail_cold_misses)
+    label_offset = max_tail_cold_misses * 0.012
     ax.bar(
         x - width / 2.0,
         average_request_misses,
@@ -728,20 +761,34 @@ def plot_fig5_tail_breakdown(
     for index, ratio in enumerate(ratio_strings):
         ax.text(
             x[index] + width / 2.0,
-            average_tail_cold_misses[index] + max(average_tail_cold_misses) * 0.025,
+            average_tail_cold_misses[index] + label_offset,
             ratio,
             ha="center",
             va="bottom",
             fontsize=13,
         )
     ax.set_xticks(x, x_labels)
-    ax.set_ylabel("Cold joint-object touches per request")
-    ax.set_title(f"Tail Requests Touch More Cold Objects ({selected_budget} objects)")
-    ax.legend(loc="upper left", frameon=False)
+    ax.set_ylim(0.0, max_tail_cold_misses * 1.12)
+    ax.set_ylabel("Cold joint-object touches\nper request")
+    ax.set_title("Tail Requests Touch More Cold Objects", pad=10)
+    ax.legend(
+        handles=[
+            Patch(facecolor="#C9CED6", label="Average"),
+            Patch(facecolor=CONDITION_COLORS["B1"], label="C1 tail"),
+            Patch(facecolor=CONDITION_COLORS["B2"], label="C2 tail"),
+        ],
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.08),
+        borderaxespad=0.0,
+        ncol=3,
+        columnspacing=1.0,
+        handlelength=1.5,
+        frameon=False,
+    )
 
     caption = (
         f"At the {selected_budget}-object cold-miss floor, an average request touches "
-        f"{average_request_misses[0]:.1f} cold joint objects in B1 and {average_request_misses[1]:.1f} in B2, "
+        f"{average_request_misses[0]:.1f} cold joint objects in C1 and {average_request_misses[1]:.1f} in C2, "
         f"but a P95+ tail request touches {average_tail_cold_misses[0]:.1f} and {average_tail_cold_misses[1]:.1f}, "
         f"roughly {ratio_strings[0]} and {ratio_strings[1]} more than average."
     )
@@ -815,9 +862,9 @@ def write_storyline(path: Path, run_id: str, figure_records: Sequence[FigureReco
         "",
         "## Setup",
         "",
-        "We replay one aligned trace-driven request stream under three object definitions: B0 uses expert-only objects "
-        "`(layer_id, expert_id)`, B1 uses joint objects `(layer_id, expert_id, adapter_id)` under the independent "
-        "mapping, and B2 uses the same joint key under the correlated mapping. Figures 1-3 are direct measurements "
+        "We replay one aligned trace-driven request stream under three object definitions: C0 uses expert-only objects "
+        "`(layer_id, expert_id)`, C1 uses joint objects `(layer_id, expert_id, adapter_id)` under the independent "
+        "mapping, and C2 uses the same joint key under the correlated mapping. Figures 1-3 are direct measurements "
         "from the real joined trace in B7-B9, while Figure 4 uses a richer B10 synthetic num_loras sweep to show "
         "how the tail turns on once the system leaves the single-LoRA regime and then saturates.",
         "",
