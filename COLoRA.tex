@@ -45,6 +45,7 @@
 %%
 %%
 \documentclass[sigplan,anonymous,review,nonacm]{acmart}
+\usepackage{subcaption}
 %%
 %% \BibTeX command to typeset BibTeX logo in the docs
 \AtBeginDocument{%
@@ -229,6 +230,41 @@ The key contributions of this work are:
 \item \textbf{Extension for additional overlap.} We prototype a selective speculative dispatch mechanism for decode-time gate/up computation, using temporal locality and exact late binding to further expose overlap opportunities beyond the main miss-handling design.
 \end{itemize}
 
+\begin{figure*}[!t]
+  \centering
+  \begin{minipage}[b]{0.49\textwidth}
+    \centering
+    \includegraphics[width=\linewidth]{figures/fig1_popularity_rank.pdf}
+    \subcaption{}
+  \end{minipage}
+  \hfill
+  \begin{minipage}[b]{0.49\textwidth}
+    \centering
+    \includegraphics[width=\linewidth]{figures/fig2_reuse_distance.pdf}
+    \subcaption{}
+  \end{minipage}
+  \\[8pt]
+  \begin{minipage}[b]{0.49\textwidth}
+    \centering
+    \includegraphics[width=\linewidth]{figures/fig3_cache_curve.pdf}
+    \subcaption{}
+  \end{minipage}
+  \hfill
+  \begin{minipage}[b]{0.49\textwidth}
+    \centering
+    \includegraphics[width=\linewidth]{figures/fig5_tail_breakdown.pdf}
+    \subcaption{}
+  \end{minipage}
+  \caption{
+  Trace-driven case study of expert--LoRA joint-object modeling.
+  (a) Popularity becomes significantly less concentrated: under adapter-only modeling (\texttt{C0}), the top-1000 objects account for 89.1\% of accesses, but only 40.7\% and 32.6\% under joint modeling (\texttt{C1}/\texttt{C2}).
+  (b) Temporal locality weakens: reuse distance increases substantially (P99: 1{,}393 $\rightarrow$ 2{,}041 $\rightarrow$ 4{,}521), and cold-start frequency rises sharply.
+  (c) Under the same cache budget, miss rates increase significantly with joint-object modeling, showing that degraded locality cannot be compensated by fixed-capacity caching.
+  (d) Tail requests access up to an order of magnitude more cold objects than average requests, concentrating misses in the tail.
+  Together, these results show that joint-object modeling first fragments decode locality and then translates that locality loss into higher miss rates and more severe tail behavior.
+  }
+  \label{fig:case-study}
+\end{figure*}
 
 \section{Background, Motivation, and Challenges}
 \label{sec:background}
@@ -238,66 +274,44 @@ The key contributions of this work are:
 
 We study decode-time serving where a shared sparse MoE base model is combined with multiple LoRA specializations. In this setting, each generated token still triggers dynamic expert routing in the base model, while different requests may invoke different LoRA adapters. As a result, the serving system must repeatedly determine not only which experts are activated, but also which adapter-specific LoRA states are needed on the latency-critical decode path.
 
-This interaction changes the natural unit at which the system should reason about locality and misses. In dense multi-LoRA serving, adapter-level reasoning is often sufficient because accesses concentrate on a single adapter's weights. In MoE decode, however, each token activates only a small routed subset of experts, and LoRA computation is needed only for the routed experts of the current request. The relevant access unit is therefore not an expert or an adapter in isolation, but their joint occurrence in the decode path, which we refer to as an \emph{expert--LoRA joint object}.
+This interaction changes the natural unit at which the system should reason about locality and misses. In dense multi-LoRA serving, accesses often concentrate on a single adapter's weights, making adapter-level reasoning sufficient in many cases. In MoE decode, however, each token activates only a small routed subset of experts, and LoRA computation is needed only for the routed experts of the current request. The relevant access unit is therefore not an expert or an adapter in isolation, but their joint occurrence in the decode path, which we refer to as an \emph{expert--LoRA joint object}.
 
 This distinction matters particularly in decode. Decode operates at small effective batch sizes, repeats routing and parameter-access decisions once per token, and exposes miss-handling overheads directly on the latency-critical path. Consequently, when expert--LoRA joint objects do not fit cleanly within practical GPU cache budgets, the key systems question is not only how to manage residency, but also how to recover cold misses without inflating per-token latency.
 
 
-\subsection{Motivation}
+\subsection{Motivation: Joint-Object Modeling Fragments Decode Locality}
 \label{subsec:motivation}
 
-\subsubsection{Expert--LoRA Joint Objects as the Natural Access Unit}
+\subsubsection{Expert--LoRA Joint Objects as the Relevant Access Unit}
 \label{subsec:joint-object}
 
 A central question is what abstraction the system should use to reason about locality, residency, and misses.
 
-In dense models with a single adapter, adapter-level management is often sufficient because most tokens share the same adapted weights. In sparse MoE models, however, each token activates only a small routed subset of experts. Once multiple LoRA adapters coexist, accesses no longer concentrate on entire adapters or on experts alone, but on LoRA states attached to specific routed experts.
+In sparse MoE decode, each token activates only a small subset of routed experts. Once multiple LoRA adapters coexist, accesses no longer concentrate on entire adapters or on experts alone, but on LoRA states attached to specific routed experts. This makes expert--LoRA joint objects the relevant access unit for decode-time serving.
 
-This makes expert--LoRA joint objects the natural access unit for decode-time serving. Adapter-level management is too coarse because it retains many unused expert slices together with the few that are actually needed. Expert-level management is incomplete because it ignores adapter diversity and therefore overestimates reuse across requests. To understand locality under multi-LoRA MoE serving, the relevant unit is thus not an expert or an adapter in isolation, but their joint occurrence on the decode path.
+Reasoning at coarser granularity obscures the true access pattern. Adapter-level management is too coarse because it retains many expert slices together with the few that are actually needed for the current token. Expert-level management is incomplete in multi-tenant serving because it ignores adapter identity: while the expert set is fixed, LoRA adapters vary across requests, so collapsing accesses by expert alone systematically overestimates reuse across tenants. To understand the consequences of this change in access granularity, we next compare decode locality and system behavior under adapter-only and expert--LoRA joint-object conditions.
+
 
 \subsubsection{Joint Objects Fragment Decode Locality}
 \label{subsec:case-study}
 
-\begin{figure*}[t]
-  \centering
-  \includegraphics[width=0.49\textwidth]{figures/fig1_popularity_rank.pdf}
-  \includegraphics[width=0.49\textwidth]{figures/fig2_reuse_distance.pdf}
-  \caption{
-  Joint expert--adapter modeling fundamentally degrades locality.\\
-  (a) Popularity becomes significantly less concentrated: the top-1000 objects account for 89.1\% of accesses under expert-only modeling, but only 40.7\% and 32.6\% under joint modeling.\\
-  (b) Temporal locality weakens: reuse distance increases substantially (P99: 1,393 $\rightarrow$ 2,041 $\rightarrow$ 4,521), and cold-start frequency rises sharply.\\
-  Together, these results show that introducing the adapter dimension fragments both spatial and temporal locality, reducing the effectiveness of any bounded cache.
-  }
-  \label{fig:locality}
-\end{figure*}
+To examine whether this finer-grained access view matters in practice, we conduct a trace-driven case study under three workload conditions.
+\texttt{C0} uses adapter-only keys.
+\texttt{C1} uses expert--LoRA joint keys under independent assignment, where adapter identity is sampled independently of expert routing.
+\texttt{C2} uses the same expert--LoRA joint keys under correlated assignment, where certain adapters are more likely to co-occur with specific experts.
+This setup separates the effect of finer-grained keying itself from the extent to which structured adapter--expert affinity can partially preserve locality.
+We use Azure trace~\cite{zhang2021faster} to model LLM request arrivals and Poisson arrivals to model LoRA invocations, and replay the resulting decode access streams under these conditions.
 
-\begin{figure*}[t]
-  \centering
-  \includegraphics[width=0.49\textwidth]{figures/fig3_cache_curve.pdf}
-  \includegraphics[width=0.49\textwidth]{figures/fig5_tail_breakdown.pdf}
-  \caption{
-  Locality degradation directly translates into system-level inefficiency.\\
-  (a) Under the same cache budget, miss rates increase significantly with joint modeling, showing that degraded locality cannot be compensated by fixed-capacity caching.\\
-  (b) Tail requests access up to an order of magnitude more cold objects than average requests, concentrating misses in the tail.\\
-  These results demonstrate that locality collapse not only increases average miss rate, but also amplifies tail latency.
-  }
-  \label{fig:system}
-\end{figure*}
+Figure~\ref{fig:case-study} reveals a consistent two-stage effect. Moving from adapter-only to expert--LoRA joint-object modeling first fragments decode locality by flattening popularity and lengthening reuse distance [Fig.~\ref{fig:case-study}(a)--(b)]; this locality loss then manifests at the system level as higher miss rates and more severe tail behavior [Fig.~\ref{fig:case-study}(c)--(d)].
 
-To examine whether this finer-grained view matters in practice, we perform a trace-driven replay study on a fixed MoE routing trace under three object definitions. \texttt{B0} uses expert-only keys $(\mathit{layer}, \mathit{expert})$. \texttt{B1} uses joint keys $(\mathit{layer}, \mathit{expert}, \mathit{adapter})$ with adapter identity sampled independently of expert routing. \texttt{B2} uses the same joint keys under correlated assignment, where certain adapters are more likely to co-occur with specific experts.
+\paragraph{Locality becomes weaker and less concentrated.}
+As shown in Fig.~\ref{fig:case-study}(a), joint-object modeling significantly flattens the popularity distribution. Under adapter-only modeling (\texttt{C0}), the top-1000 objects account for 89.1\% of accesses. Under joint modeling, this drops to 40.7\% in \texttt{C1} and 32.6\% in \texttt{C2}. The effective hot set therefore becomes much less dominant, making it harder for any bounded GPU cache to capture a large fraction of accesses.
+Fig.~\ref{fig:case-study}(b) shows that temporal locality weakens as well: the P99 reuse distance grows from 1{,}393 events in \texttt{C0} to 2{,}041 and 4{,}521 events in \texttt{C1} and \texttt{C2}, respectively, while cold-start frequency also rises sharply. These longer reuse gaps are especially harmful in decode, where delayed reuse is less likely to be hidden or amortized.
 
-Figures~\ref{fig:locality} and~\ref{fig:system} reveal a consistent two-stage effect. Joint modeling first fragments decode locality; this locality loss then translates into higher miss rates and more severe tail behavior.
+\paragraph{Locality loss translates into system-level inefficiency.}
+The locality degradation above directly increases miss pressure. As shown in Fig.~\ref{fig:case-study}(c), miss rates under joint-object modeling fall much more slowly with increasing cache size, indicating that degraded locality cannot be compensated by simply enlarging a fixed-capacity cache. More importantly, Fig.~\ref{fig:case-study}(d) shows that tail requests access up to an order of magnitude more cold objects than average requests. The degradation is therefore not limited to average miss rate: it is concentrated in the tail, where it directly amplifies request latency.
 
-\paragraph{Popularity becomes less concentrated.}
-As shown in Fig.~\ref{fig:locality}(a), introducing the adapter dimension significantly flattens the popularity distribution. Under expert-only modeling, the top 1000 objects account for 89.1\% of accesses. Under joint modeling, this drops to 40.7\% and 32.6\%. The hot set therefore becomes much less dominant, reducing the effectiveness of any bounded GPU cache.
-
-\paragraph{Temporal locality weakens, especially in the tail.}
-Fig.~\ref{fig:locality}(b) shows that joint modeling substantially increases reuse distance and cold-start frequency. The P99 reuse distance grows from 1{,}393 to 2{,}041 and 4{,}521 events. These longer gaps are especially harmful in decode, where delayed reuse is less likely to be hidden or amortized, and where tail requests are more exposed to long-latency misses.
-
-\paragraph{Locality loss amplifies misses and tail latency.}
-As shown in Fig.~\ref{fig:system}(a), miss rates rise significantly under the same cache budget once accesses are modeled jointly. More importantly, Fig.~\ref{fig:system}(b) shows that tail requests access up to an order of magnitude more cold objects than average requests. The degradation is therefore not limited to average miss rate: it is concentrated in the tail, where it directly amplifies request latency.
-
-Taken together, these results suggest that the difficulty in multi-LoRA MoE decode serving is not merely insufficient cache capacity, but a deeper fragmentation of locality once expert access and adapter identity are considered jointly.
+Taken together, these results show that the difficulty in multi-LoRA MoE decode serving is not merely insufficient cache capacity, but a deeper fragmentation of locality once expert routing and adapter identity are modeled jointly. Under realistic GPU cache budgets, cold misses therefore become difficult to eliminate and increasingly concentrated in tail requests, making miss handling---rather than cache capacity alone---a first-order systems problem.
 
 \subsection{Challenges}
 \label{subsec:challenges}
@@ -475,7 +489,7 @@ This adaptive behavior ensures that COLoRA improves performance in fragmented re
 
 % \begin{itemize}
 % \item \textbf{RQ1: End-to-end latency.} Does COLoRA reduce end-to-end decode latency under multi-LoRA workloads?
-% \item \textbf{RQ2: Tail latency.} How much does COLoRA improve P95/P99 latency under long-tail expert--adapter access patterns?
+% \item \textbf{RQ2: Tail latency.} How much does COLoRA improve P95/P99 latency under long-tail expert--lora access patterns?
 % \item \textbf{RQ3: Miss handling.} How effective is COLoRA's non-blocking miss path, which combines a GPU hot cache with CPU fallback, relative to conventional load-then-run execution?
 % \item \textbf{RQ4: Component contribution.} What performance gain is attributable to each major component, including CPU fallback and speculative dispatch?
 % \item \textbf{RQ5: System behavior.} How does COLoRA affect cache hit rate, miss cost, overlap efficiency, and overall resource utilization?
@@ -497,11 +511,11 @@ This adaptive behavior ensures that COLoRA improves performance in fragmented re
 
 % \subsection{Models and Workloads}
 % \label{subsec:workloads}
-% We instantiate COLoRA on the public \textbf{Qwen3-VL-30B-A3B-Instruct} checkpoint. Although Qwen3-VL is a multimodal model, our evaluation targets its MoE text decoder because COLoRA operates on decode-time expert--adapter management. The evaluated decoder has 48 layers, hidden size 2048, 128 routed experts per layer, and top-8 routing for each token at every sparse layer. For adapter experiments, we use rank-16 LoRA modules applied to the attention and MLP projections, including the MoE gate, up, and down projections.
+% We instantiate COLoRA on the public \textbf{Qwen3-VL-30B-A3B-Instruct} checkpoint. Although Qwen3-VL is a multimodal model, our evaluation targets its MoE text decoder because COLoRA operates on decode-time expert--lora management. The evaluated decoder has 48 layers, hidden size 2048, 128 routed experts per layer, and top-8 routing for each token at every sparse layer. For adapter experiments, we use rank-16 LoRA modules applied to the attention and MLP projections, including the MoE gate, up, and down projections.
 
 % All workloads target the decode worker in a PD-separated serving pipeline. We collect real decode-phase routing traces by replaying a fixed corpus of 512 ShareGPT V3 requests through the model and recording the router-selected experts at each token. We then pair this routing stream with semi-realistic adapter-invocation traces derived from the Azure Functions workload trace, which preserves realistic tenant-arrival skew while allowing controlled variation in adapter-side multiplexing.
 
-% Unless otherwise specified, we evaluate both independent and correlated tenant-to-adapter mappings and sweep the active adapter cardinality over $\{8, 32, 128\}$. We further vary the decode batch size (typically 1--4) and the request concurrency at the decode worker to test how COLoRA behaves as joint expert--adapter fragmentation and system contention increase together.
+% Unless otherwise specified, we evaluate both independent and correlated tenant-to-adapter mappings and sweep the active adapter cardinality over $\{8, 32, 128\}$. We further vary the decode batch size (typically 1--4) and the request concurrency at the decode worker to test how COLoRA behaves as joint expert--lora fragmentation and system contention increase together.
 
 % \subsection{Baselines}
 % \label{subsec:baselines}
