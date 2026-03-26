@@ -364,13 +364,15 @@ COLoRA is motivated by a simple observation: under multi-tenant expert--LoRA ser
 
 The design objective is therefore not to eliminate every miss, but to prevent a cold miss from becoming a global synchronization event. COLoRA does so by changing the default recovery action. Instead of synchronously restoring the missing weights to the GPU and only then resuming execution, it adopts an execution-first policy: the system prioritizes completing the missing expert--LoRA computation using whatever resources are immediately available, while treating weight promotion as a separate optimization for future reuse.
 
+More broadly, COLoRA is built around a uniform design philosophy: the mechanism that guarantees progress for the current token should be separated from the mechanisms that improve locality for future tokens. This separation allows miss handling to remain latency-oriented and correctness-critical, while promotion and prefetching remain opportunistic optimizations rather than mandatory recovery steps.
+
 This leads to a hot/cold dual-path design for expert--LoRA computation in decode. When the required expert--LoRA object is resident, execution proceeds on the GPU hot path with no change to the normal fast path. When the object is absent, the request is diverted to a CPU cold path that completes the current LoRA computation using host-resident parameters. The key point is that the miss no longer forces the entire execution group to wait for immediate promotion.
 
 The runtime realizes this behavior through a skip-and-reinsert discipline. If request $i$ encounters a miss at layer $L$, it is temporarily removed from the current GPU execution group, and its activation state is staged for host-side execution. The GPU then continues processing other ready requests at the same layer without waiting. Once the CPU cold path finishes the missing expert--LoRA computation, the result is returned to the device and request $i$ resumes from the next execution point. In effect, a cold miss delays only the affected request, rather than serializing all requests that happened to be grouped with it.
 
-This design preserves three invariants that are central to correctness. First, each request still advances strictly in layer order. Second, different requests are allowed to be temporarily out of phase, which creates room for overlap rather than forcing lockstep execution. Third, a miss in one request does not block the progress of other ready requests. These invariants are what allow COLoRA to convert unavoidable misses from global stalls into localized delay.
+This design preserves three invariants that are central to correctness. First, each request still advances strictly in layer order. Second, different requests are allowed to be temporarily out of phase, which creates room for overlap rather than forcing lockstep execution. Third, a miss in one request does not block the progress of other ready requests. Together, these invariants allow COLoRA to convert unavoidable misses from global stalls into localized delay.
 
-The design is particularly well matched to decode-time serving, where per-adapter batch sizes are small, routing decisions are heterogeneous across requests, and misses are not perfectly synchronized. In this regime, even modest overlap between hot-path GPU execution and cold-path CPU execution can substantially reduce the visible impact of cold misses.
+The design is particularly well matched to decode-time serving, where per-adapter batch sizes are small, routing decisions are heterogeneous across requests, and misses are not perfectly synchronized. In this regime, even modest overlap between hot-path GPU execution and cold-path CPU execution can substantially reduce the visible impact of cold misses. The next subsection therefore examines the cost structure of this execution-first recovery path and clarifies why its critical-path placement is more favorable than promotion-first recovery.
 
 \subsection{Cost Structure of Cold-Path Execution}
 \label{subsec:analytical-formulation}
@@ -381,7 +383,7 @@ T_{\text{cold}} = T_{\text{pack}} + T_{\text{D2H}} + T_{\text{cpu}} + T_{\text{H
 \end{equation}
 where $T_{\text{pack}}$ denotes activation packing and layout preparation, $T_{\text{D2H}}$ and $T_{\text{H2D}}$ are device-to-host and host-to-device transfers, $T_{\text{cpu}}$ is host-side computation, and $T_{\text{merge}}$ is the cost of reintegrating the result into the device-side execution stream.
 
-This decomposition matters because, in decode, the transferred activation payload is typically much smaller than the missing expert--LoRA weights themselves. As a result, execution-first avoids placing full weight movement on the current token's critical path. The dominant concern is not whether the CPU path is universally faster in absolute time, but whether enough of its latency can be overlapped with ongoing GPU work on other requests.
+This decomposition matters because, in decode, the transferred activation payload is typically much smaller than the missing expert--LoRA weights themselves. As a result, execution-first avoids placing full weight movement on the current token's critical path. The dominant concern is therefore not whether the CPU path is universally faster in absolute time, but whether enough of its latency can be overlapped with ongoing GPU work on other requests.
 
 For comparison, a promotion-first recovery path incurs
 \begin{equation}
@@ -389,9 +391,9 @@ T_{\text{promote}} = T_{\text{admit}} + T_{\text{H2D-weights}} + T_{\text{gpu}},
 \end{equation}
 where $T_{\text{admit}}$ captures admission and scheduling overheads for the restored object, $T_{\text{H2D-weights}}$ is the host-to-device transfer of weights, and $T_{\text{gpu}}$ is the subsequent GPU execution. In expert--LoRA serving, the transfer and preparation of weights are often the dominant terms. More importantly, promotion-first keeps those costs on the synchronous recovery path of the current token.
 
-The central distinction, then, is not merely one of total latency but of critical-path placement. Promotion-first makes recovery latency visible immediately because execution must wait for residency restoration. Execution-first instead turns recovery into a parallel side path whose visible cost is reduced whenever the hot path still has useful work to perform. This view directly guides the system design: COLoRA minimizes fixed per-miss overheads in packing and merging, engineers the CPU path for bounded and predictable execution time, and structures runtime scheduling so that cold-path work overlaps with GPU progress whenever possible.
+The central distinction, then, is not merely one of total latency but of critical-path placement. Promotion-first makes recovery latency visible immediately because execution must wait for residency restoration. Execution-first instead turns recovery into a parallel side path whose visible cost is reduced whenever the hot path still has useful work to perform. This observation directly informs the runtime design: COLoRA must minimize fixed per-miss overheads, keep cold-path execution bounded and predictable, and preserve overlap whenever ready GPU work remains. We next describe the scheduler that realizes this decoupling in the runtime.
 
-\subsection{Non-Blocking Runtime Scheduler}
+\subsection{Decoupled Miss-Recovery Scheduler}
 \label{subsec:scheduler}
 
 The execution-first design depends on a runtime scheduler that explicitly decouples cold-miss handling from the main GPU execution stream. Conceptually, each request alternates among three states: it is either ready to execute on the GPU hot path, being processed on the CPU cold path after a miss, or waiting to be reinserted once a cold-path result has returned. The scheduler maintains corresponding queues for GPU-ready work, CPU cold-path jobs, and completed results awaiting reintegration.
@@ -402,18 +404,22 @@ This organization gives the system \emph{decoupled miss recovery}: GPU progress 
 
 To keep the cold path from turning into an uncontrolled source of backlog, COLoRA uses an explicit bound on cold-path concurrency. Only a limited number of cold jobs may be in flight at once, and excess misses are queued rather than launched immediately. This keeps host-side resource usage predictable and avoids replacing one form of global instability with another. Within this bounded regime, the scheduler preserves per-request layer ordering, allows cross-request phase decoupling, and maintains forward progress on the GPU whenever ready work exists.
 
+This scheduler is the runtime embodiment of COLoRA's core philosophy: demand execution is serviced immediately through the hot path or the cold path, while all other optimizations remain secondary to forward progress. Realizing that philosophy in practice, however, requires a cold path whose overheads are low and predictable enough to overlap with useful GPU work.
+
 \subsection{CPU Cold Path Realization}
 \label{subsec:cpu-cold-path}
 
 The CPU cold path is designed not as a throughput replacement for the GPU, but as a predictable execution engine for unavoidable misses. Its job is to make execution-first recovery viable in decode by keeping miss handling bounded, overlap-friendly, and implementation-efficient.
 
-The first step is activation packing. Before a cold-path transfer is issued, the relevant activations are reorganized on the GPU into contiguous staging buffers. This activation coalescing reduces fragmentation in DMA traffic and amortizes transfer overheads when multiple cold-path requests can be handled together. Because decode activations are relatively small, careful packing is important not for bandwidth alone, but for avoiding excessive fixed overheads.
+The first step is activation packing. Before a cold-path transfer is issued, the relevant activations are reorganized on the GPU into contiguous staging buffers. This activation coalescing reduces fragmentation in DMA traffic and amortizes transfer overheads when multiple cold-path requests can be handled together. Because decode activations are relatively small, careful packing matters not only for bandwidth efficiency, but also for reducing fixed per-miss overheads.
 
 Transfers between device and host use pinned memory and are issued asynchronously on separate CUDA streams. This allows device-to-host activation movement and host-to-device result return to overlap opportunistically with foreground GPU work, subject to available copy-engine capacity and scheduler state. The goal is not to assume perfect overlap, but to preserve it whenever the hardware and workload permit.
 
 On the host side, missing expert--LoRA computations are executed by vectorized CPU kernels. COLoRA uses AVX-optimized implementations for the dense linear operations involved in LoRA execution, binds worker threads to dedicated cores to reduce scheduling jitter, and NUMA-aligns those workers with the GPU's PCIe root complex when applicable. These choices are intended to keep $T_{\text{cpu}}$ stable and predictable under repeated decode-time invocations. The system does not rely on the claim that CPU execution is generally faster than GPU execution. Instead, it relies on the more realistic and more important claim that the cold path can be made sufficiently efficient and sufficiently stable to overlap with useful GPU work in mixed hit/miss batches.
 
 Once the host computation completes, the result is copied back and merged into the device-side execution state. This reintegration step is deliberately lightweight and avoids introducing a global barrier. In combination, activation coalescing, asynchronous staging, and vectorized host execution turn the CPU into a practical cold-path engine rather than a fallback of last resort.
+
+With this execution substrate in place, COLoRA can cleanly separate the mechanism that serves a miss now from the mechanisms that improve how likely similar accesses are to be served more efficiently later. We therefore turn to the locality-driven optimizations layered on top of the execution-first core.
 
 \subsection{Locality-Driven Background Optimizations}
 \label{subsec:locality-background}
@@ -429,11 +435,12 @@ To prevent promotion from degenerating into indiscriminate background traffic, C
 In the current design, $\delta$ is implemented as a static hyperparameter. A more adaptive policy that tunes $\delta$ online based on runtime signals, such as observed reuse behavior, PCIe queue depth, or device-memory pressure, is left to future work. Importantly, admission errors affect only future cache efficiency: they do not delay the current request and do not alter COLoRA's execution-first miss-handling semantics.
 
 The second optimization exploits short-horizon temporal locality in decode to reduce effective cold-path service time. This design is motivated by an empirical observation from our traces: for a given layer, adjacent decode steps share the same top-1 routed expert in more than 95\% of cases. Although long-horizon reuse of expert--LoRA objects can be weak under multi-tenant serving, this strong step-to-step routing continuity makes near-future accesses substantially more predictable than global cache behavior might suggest.
-% TODO: motivation 中加入这一观察
+% TODO: motivation 中加入相应观察
 
-COLoRA leverages this regularity using a lightweight temporal predictor that identifies expert candidates likely to be accessed in the next few decode steps and opportunistically prefetches the corresponding host-resident weights. The purpose of this mechanism is not to guarantee stable residency in any particular CPU cache level, nor to assume that large expert weights remain fully resident in LLC. Rather, it aims to improve effective access locality and reduce the service time of the next cold-path invocation when the prediction is correct.
+COLoRA leverages this regularity using a lightweight temporal predictor that identifies expert candidates likely to be accessed in the next few decode steps and opportunistically prefetches the corresponding host-resident weights. Importantly, prefetching does not participate in demand execution: a request never waits for a prefetched object, and cold-path execution remains the default fallback when the required object is not yet available. The purpose of this mechanism is therefore not to guarantee stable residency in any particular CPU cache level, nor to assume that large expert weights remain fully resident in LLC. Rather, it improves effective access locality and reduces the service time of subsequent cold-path invocations when the prediction is correct.
+% TODO: 是否需要说明 prefetch 的对象很小 ~几百KB level，所以足以放在 LLC 上而不影响别的计算？
 
-Because temporal prefetching is auxiliary to the main execution-first design, incorrect predictions consume only bounded background bandwidth and do not affect correctness or foreground progress. Taken together, deferred promotion and temporal prefetching improve future access efficiency while preserving the central design principle of COLoRA: misses are handled immediately through execution-first recovery, while locality-driven background mechanisms optimize how similar accesses are served later.
+Because temporal prefetching is auxiliary to the main execution-first design, incorrect predictions consume only bounded background bandwidth and do not affect correctness or foreground progress. Taken together, deferred promotion and temporal prefetching preserve COLoRA's uniform design philosophy: misses are served immediately through execution-first recovery, while locality-driven background mechanisms optimize how similar accesses are handled later.
 
 % \section{Implementation}
 % \label{sec:implementation}
