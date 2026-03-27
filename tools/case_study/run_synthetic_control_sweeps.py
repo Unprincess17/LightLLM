@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Run B10 synthetic control sweeps on top of the case-study replay core."""
+"""Run synthetic control sweeps with calibrated token-level TPOT."""
 
 from __future__ import annotations
 
 import argparse
+import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,14 +17,6 @@ if __package__ in (None, ""):
 
     sys.path.append(str(Path(__file__).resolve().parent))
 
-from analyze_latency_proxy import (
-    CONDITION_LABELS,
-    DEFAULT_PREFILL_MISS_RATIO,
-    DEFAULT_TAIL_QUANTILE,
-    compute_latency_proxy_rows,
-    fit_base_compute_model,
-    load_request_latencies,
-)
 from analyze_locality import (
     ADAPTER_SLOT_STRIDE,
     CONDITION_EXPERT_ONLY,
@@ -32,22 +25,20 @@ from analyze_locality import (
     iter_jsonl_bytes,
     pack_expert_object,
 )
-from common import (
-    artifact_root,
-    ensure_dir,
-    load_global_config,
-    load_seed_config,
-    stable_hash_int,
-    write_csv,
-    write_json,
+from common import artifact_root, ensure_dir, load_global_config, load_seed_config, stable_hash_int, write_csv, write_json
+from replay_core import ConditionAccessBuffer, simulate_phase_replay_with_bitmaps
+from system_tpot_core import (
+    CONDITION_LABELS,
+    TRANSFER_MODE_ORDER,
+    TRANSFER_MODE_STAGED_PAGEABLE_PACKED,
+    DecodeLayerStep,
+    DecodeToken,
+    TokenStructuredStream,
+    compute_component_sizes,
+    dtype_name_to_torch_dtype,
+    load_model_text_config,
 )
-from replay_core import (
-    ConditionAccessBuffer,
-    PHASE_DECODE,
-    PHASE_PREFILL,
-    PHASE_UNKNOWN,
-    simulate_phase_replay,
-)
+from system_tpot_sim import compute_stage1_token_tpot
 
 
 DEFAULT_TEMPLATE_REQUEST_COUNT = 128
@@ -62,6 +53,7 @@ DEFAULT_PRIMARY_NUM_LORAS = 32
 DEFAULT_PRIMARY_SKEW = 0.8
 DEFAULT_PRIMARY_BURSTINESS = 2.5
 DEFAULT_PRIMARY_CORR = 0.5
+DEFAULT_SYSTEM_BATCH = 1
 RESULT_FIELDS = [
     "run_id",
     "condition",
@@ -71,6 +63,7 @@ RESULT_FIELDS = [
     "corr_strength",
     "cache_budget",
     "miss_rate",
+    "mean_tpot_ms",
     "p95",
     "p99",
 ]
@@ -83,23 +76,22 @@ class RequestTemplate:
     phase_ids: np.ndarray
     prefill_events: int
     decode_events: int
+    decode_start_event_offset: int
+    decode_layer_step_layer_ids: Tuple[int, ...]
+    decode_layer_step_event_counts: Tuple[int, ...]
+    decode_token_step_counts: Tuple[int, ...]
     request_class: int
 
 
 @dataclass(frozen=True)
 class SyntheticBaseStream:
-    request_ids: List[int]
-    request_template_ids: np.ndarray
+    stream: TokenStructuredStream
     request_classes: np.ndarray
     request_offsets: np.ndarray
     request_lengths: np.ndarray
     expert_access_ids: np.ndarray
     expert_access_ids_shifted: np.ndarray
-    phase_ids: np.ndarray
-    per_request_prefill_events: np.ndarray
-    per_request_decode_events: np.ndarray
     total_events: int
-    max_expert_object_id: int
 
 
 @dataclass(frozen=True)
@@ -116,82 +108,29 @@ class SweepPoint:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run B10 synthetic-control replay sweeps")
+    parser = argparse.ArgumentParser(description="Run calibrated TPOT synthetic-control sweeps")
     parser.add_argument("--config", type=str, default=None, help="Path to configs/global.yaml")
     parser.add_argument("--seeds", type=str, default=None, help="Path to configs/seeds.yaml")
     parser.add_argument("--run_id", type=str, default=None, help="Base case-study run id used for source artifacts")
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default=None,
-        help="Override output directory for sweep artifacts (default: artifacts/case_study/<run_id>/sweeps)",
-    )
-    parser.add_argument(
-        "--joined_indep_path",
-        type=str,
-        default=None,
-        help="Override joined_trace_indep.jsonl used to build request templates",
-    )
-    parser.add_argument(
-        "--router_request_log_path",
-        type=str,
-        default=None,
-        help="Override router_request_log.jsonl used to fit latency-proxy coefficients",
-    )
-    parser.add_argument(
-        "--template_request_count",
-        type=int,
-        default=DEFAULT_TEMPLATE_REQUEST_COUNT,
-        help="How many canonical joined requests to load as replay templates",
-    )
-    parser.add_argument(
-        "--synthetic_request_count",
-        type=int,
-        default=DEFAULT_SYNTHETIC_REQUEST_COUNT,
-        help="How many synthetic requests to replay per sweep point",
-    )
-    parser.add_argument(
-        "--num_classes",
-        type=int,
-        default=DEFAULT_NUM_CLASSES,
-        help="Class buckets used for correlation-aware adapter assignment",
-    )
-    parser.add_argument(
-        "--num_loras",
-        type=str,
-        default=",".join(str(value) for value in DEFAULT_NUM_LORAS),
-        help="Comma-separated LoRA-count sweep",
-    )
-    parser.add_argument(
-        "--skew_levels",
-        type=str,
-        default=",".join(str(value) for value in DEFAULT_SKEW_LEVELS),
-        help="Comma-separated adapter-skew levels (Zipf exponent; 0 means uniform)",
-    )
-    parser.add_argument(
-        "--burstiness_levels",
-        type=str,
-        default=",".join(str(value) for value in DEFAULT_BURSTINESS_LEVELS),
-        help="Comma-separated mean adapter run lengths",
-    )
-    parser.add_argument(
-        "--corr_strength_levels",
-        type=str,
-        default=",".join(str(value) for value in DEFAULT_CORR_LEVELS),
-        help="Comma-separated correlation strengths in [0, 1]",
-    )
-    parser.add_argument(
-        "--cache_budgets",
-        type=str,
-        default=",".join(str(value) for value in DEFAULT_CACHE_BUDGETS),
-        help="Comma-separated cache budgets in object slots",
-    )
-    parser.add_argument(
-        "--tail_quantile",
-        type=float,
-        default=DEFAULT_TAIL_QUANTILE,
-        help="Tail threshold quantile used to compute per-point p95/p99 summaries",
-    )
+    parser.add_argument("--output_dir", type=str, default=None, help="Override output directory for sweep artifacts")
+    parser.add_argument("--joined_indep_path", type=str, default=None, help="Override joined_trace_indep.jsonl used to build request templates")
+    parser.add_argument("--calibration_path", type=str, required=True, help="Calibration JSON emitted by calibrate_system_baseline.py")
+    parser.add_argument("--model_dir", type=str, default=None, help="Override HF model directory used for dimension lookup")
+    parser.add_argument("--template_request_count", type=int, default=DEFAULT_TEMPLATE_REQUEST_COUNT, help="How many canonical joined requests to load as replay templates")
+    parser.add_argument("--synthetic_request_count", type=int, default=DEFAULT_SYNTHETIC_REQUEST_COUNT, help="How many synthetic requests to replay per sweep point")
+    parser.add_argument("--num_classes", type=int, default=DEFAULT_NUM_CLASSES, help="Class buckets used for correlation-aware adapter assignment")
+    parser.add_argument("--num_loras", type=str, default=",".join(str(value) for value in DEFAULT_NUM_LORAS), help="Comma-separated LoRA-count sweep")
+    parser.add_argument("--skew_levels", type=str, default=",".join(str(value) for value in DEFAULT_SKEW_LEVELS), help="Comma-separated adapter-skew levels")
+    parser.add_argument("--burstiness_levels", type=str, default=",".join(str(value) for value in DEFAULT_BURSTINESS_LEVELS), help="Comma-separated mean adapter run lengths")
+    parser.add_argument("--corr_strength_levels", type=str, default=",".join(str(value) for value in DEFAULT_CORR_LEVELS), help="Comma-separated correlation strengths in [0, 1]")
+    parser.add_argument("--cache_budgets", type=str, default=",".join(str(value) for value in DEFAULT_CACHE_BUDGETS), help="Comma-separated cache budgets in object slots")
+    parser.add_argument("--transfer_mode", type=str, default=TRANSFER_MODE_STAGED_PAGEABLE_PACKED, choices=list(TRANSFER_MODE_ORDER), help="Transfer mode from the calibration manifest")
+    parser.add_argument("--load_profile", type=str, default="stressed", help="Load profile from the calibration manifest")
+    parser.add_argument("--calibration_stat", type=str, default="p50_ms", choices=["mean_ms", "p50_ms", "p90_ms"], help="Statistic to pull from the calibration curves")
+    parser.add_argument("--system_batch", type=int, default=DEFAULT_SYSTEM_BATCH, help="Effective decode batch used for per-token TPOT")
+    parser.add_argument("--dtype", type=str, default="bf16", help="LoRA dtype used for byte accounting")
+    parser.add_argument("--lora_rank", type=int, default=16, help="LoRA rank used for byte accounting")
+    parser.add_argument("--slice_bytes", type=int, default=256 * 1024, help="Audit slice size in bytes")
     return parser.parse_args()
 
 
@@ -206,10 +145,10 @@ def parse_int_grid(raw: str) -> List[int]:
 def phase_name_to_id(phase: object) -> int:
     phase_name = str(phase or "").strip().lower()
     if phase_name == "prefill":
-        return PHASE_PREFILL
+        return 0
     if phase_name == "decode":
-        return PHASE_DECODE
-    return PHASE_UNKNOWN
+        return 1
+    return 2
 
 
 def float_token(value: float) -> str:
@@ -221,11 +160,7 @@ def bounded_seed(prefix: str, token: str, base_seed: int) -> int:
     return int(stable_hash_int(f"{prefix}|{token}", base_seed) % (2**31 - 1))
 
 
-def load_request_templates(
-    joined_indep_path: Path,
-    request_limit: int,
-    num_classes: int,
-) -> List[RequestTemplate]:
+def load_request_templates(joined_indep_path: Path, request_limit: int, num_classes: int) -> List[RequestTemplate]:
     if request_limit <= 0:
         raise ValueError("template_request_count must be positive")
     if num_classes <= 0:
@@ -238,10 +173,41 @@ def load_request_templates(
     current_histogram: Dict[int, int] = {}
     current_prefill_events = 0
     current_decode_events = 0
+    current_decode_start_offset: Optional[int] = None
+    current_step_layer_ids: List[int] = []
+    current_step_event_counts: List[int] = []
+    current_token_step_counts: List[int] = []
+    active_step_key: Optional[Tuple[int, int, int]] = None
+    active_step_layer_id: Optional[int] = None
+    active_step_event_count = 0
+    active_token_pos: Optional[int] = None
+    active_token_step_count = 0
 
-    def flush_current() -> None:
-        nonlocal current_req_idx, current_experts, current_phases
-        nonlocal current_histogram, current_prefill_events, current_decode_events
+    def flush_active_step() -> None:
+        nonlocal active_step_key, active_step_layer_id, active_step_event_count, active_token_step_count
+        if active_step_key is None:
+            return
+        current_step_layer_ids.append(int(active_step_layer_id))
+        current_step_event_counts.append(int(active_step_event_count))
+        active_token_step_count += 1
+        active_step_key = None
+        active_step_layer_id = None
+        active_step_event_count = 0
+
+    def flush_active_token() -> None:
+        nonlocal active_token_pos, active_token_step_count
+        if active_token_pos is None:
+            return
+        current_token_step_counts.append(int(active_token_step_count))
+        active_token_pos = None
+        active_token_step_count = 0
+
+    def flush_request() -> None:
+        nonlocal current_req_idx, current_experts, current_phases, current_histogram
+        nonlocal current_prefill_events, current_decode_events, current_decode_start_offset
+        nonlocal current_step_layer_ids, current_step_event_counts, current_token_step_counts
+        flush_active_step()
+        flush_active_token()
         if current_req_idx is None:
             return
         if not current_experts:
@@ -254,6 +220,10 @@ def load_request_templates(
                 phase_ids=np.asarray(current_phases, dtype=np.uint8),
                 prefill_events=int(current_prefill_events),
                 decode_events=int(current_decode_events),
+                decode_start_event_offset=int(current_decode_start_offset if current_decode_start_offset is not None else len(current_experts)),
+                decode_layer_step_layer_ids=tuple(int(value) for value in current_step_layer_ids),
+                decode_layer_step_event_counts=tuple(int(value) for value in current_step_event_counts),
+                decode_token_step_counts=tuple(int(value) for value in current_token_step_counts),
                 request_class=int(dominant_expert % num_classes),
             )
         )
@@ -263,31 +233,55 @@ def load_request_templates(
         current_histogram = {}
         current_prefill_events = 0
         current_decode_events = 0
+        current_decode_start_offset = None
+        current_step_layer_ids = []
+        current_step_event_counts = []
+        current_token_step_counts = []
 
     for row in iter_jsonl_bytes(joined_indep_path):
         req_idx = int(row["req_idx"])
-        if req_idx >= request_limit:
-            break
         if current_req_idx is None:
             current_req_idx = req_idx
         elif req_idx != current_req_idx:
-            flush_current()
+            flush_request()
             current_req_idx = req_idx
+        if len(templates) >= request_limit:
+            break
 
         expert_object_id = pack_expert_object(int(row["layer_id"]), int(row["expert_id"]))
         phase_id = phase_name_to_id(row.get("phase"))
         current_experts.append(expert_object_id)
         current_phases.append(phase_id)
         current_histogram[expert_object_id] = current_histogram.get(expert_object_id, 0) + 1
-        if phase_id == PHASE_PREFILL:
+        if phase_id == 0:
             current_prefill_events += 1
-        elif phase_id == PHASE_DECODE:
+        elif phase_id == 1:
             current_decode_events += 1
+            if current_decode_start_offset is None:
+                current_decode_start_offset = len(current_experts) - 1
+            token_pos = int(row.get("token_pos", row.get("chunk_idx", -1)))
+            step_key = (token_pos, int(row["layer_id"]), int(row["event_idx"]))
+            if active_step_key is None:
+                active_token_pos = token_pos
+                active_step_key = step_key
+                active_step_layer_id = int(row["layer_id"])
+                active_step_event_count = 1
+            elif step_key == active_step_key:
+                active_step_event_count += 1
+            else:
+                flush_active_step()
+                if token_pos != active_token_pos:
+                    flush_active_token()
+                    active_token_pos = token_pos
+                active_step_key = step_key
+                active_step_layer_id = int(row["layer_id"])
+                active_step_event_count = 1
 
-    flush_current()
+    if len(templates) < request_limit:
+        flush_request()
     if not templates:
         raise ValueError(f"failed to load any request templates from {joined_indep_path}")
-    return templates
+    return templates[:request_limit]
 
 
 def build_synthetic_schedule(template_count: int, synthetic_request_count: int, seed: int) -> np.ndarray:
@@ -305,12 +299,8 @@ def build_synthetic_schedule(template_count: int, synthetic_request_count: int, 
 def build_base_stream(templates: Sequence[RequestTemplate], schedule: np.ndarray) -> SyntheticBaseStream:
     request_count = int(schedule.shape[0])
     request_ids = [int(req_idx) for req_idx in range(request_count)]
-    request_template_ids = np.asarray(schedule, dtype=np.int32)
     request_classes = np.asarray([templates[int(template_idx)].request_class for template_idx in schedule], dtype=np.int16)
-    request_lengths = np.asarray(
-        [int(templates[int(template_idx)].expert_access_ids.shape[0]) for template_idx in schedule],
-        dtype=np.int64,
-    )
+    request_lengths = np.asarray([int(templates[int(template_idx)].expert_access_ids.shape[0]) for template_idx in schedule], dtype=np.int64)
     request_offsets = np.zeros(request_count + 1, dtype=np.int64)
     request_offsets[1:] = np.cumsum(request_lengths, dtype=np.int64)
     total_events = int(request_offsets[-1])
@@ -321,6 +311,8 @@ def build_base_stream(templates: Sequence[RequestTemplate], schedule: np.ndarray
     phase_ids = np.empty(total_events, dtype=np.uint8)
     per_request_prefill_events = np.empty(request_count, dtype=np.int64)
     per_request_decode_events = np.empty(request_count, dtype=np.int64)
+    decode_layer_steps: List[DecodeLayerStep] = []
+    decode_tokens: List[DecodeToken] = []
 
     cursor = 0
     max_expert_object_id = 0
@@ -334,21 +326,73 @@ def build_base_stream(templates: Sequence[RequestTemplate], schedule: np.ndarray
         per_request_decode_events[request_ordinal] = int(template.decode_events)
         if event_count > 0:
             max_expert_object_id = max(max_expert_object_id, int(np.max(template.expert_access_ids)))
+
+        decode_cursor = cursor + int(template.decode_start_event_offset)
+        step_ordinal = 0
+        event_idx_counter = 0
+        for token_ordinal, token_step_count in enumerate(template.decode_token_step_counts):
+            token_step_start = len(decode_layer_steps)
+            for _ in range(int(token_step_count)):
+                layer_id = int(template.decode_layer_step_layer_ids[step_ordinal])
+                step_event_count = int(template.decode_layer_step_event_counts[step_ordinal])
+                decode_layer_steps.append(
+                    DecodeLayerStep(
+                        request_ordinal=int(request_ordinal),
+                        req_idx=int(request_ids[request_ordinal]),
+                        token_ordinal=int(token_ordinal),
+                        token_pos=int(token_ordinal),
+                        layer_id=int(layer_id),
+                        event_idx=int(event_idx_counter),
+                        start_index=int(decode_cursor),
+                        end_index=int(decode_cursor + step_event_count),
+                    )
+                )
+                decode_cursor += step_event_count
+                step_ordinal += 1
+                event_idx_counter += 1
+            decode_tokens.append(
+                DecodeToken(
+                    request_ordinal=int(request_ordinal),
+                    req_idx=int(request_ids[request_ordinal]),
+                    token_ordinal=int(token_ordinal),
+                    token_pos=int(token_ordinal),
+                    step_start=int(token_step_start),
+                    step_end=len(decode_layer_steps),
+                )
+            )
         cursor = next_cursor
 
-    return SyntheticBaseStream(
+    stream = TokenStructuredStream(
         request_ids=request_ids,
-        request_template_ids=request_template_ids,
+        request_offsets=request_offsets,
+        condition_buffers={
+            CONDITION_EXPERT_ONLY: ConditionAccessBuffer(
+                condition=CONDITION_EXPERT_ONLY,
+                access_ids=expert_access_ids,
+                total_events=int(total_events),
+                max_object_id=int(max_expert_object_id),
+            )
+        },
+        phase_ids=phase_ids,
+        per_request_prefill_events=per_request_prefill_events,
+        per_request_decode_events=per_request_decode_events,
+        decode_layer_steps=decode_layer_steps,
+        decode_tokens=decode_tokens,
+        request_arrival_idx=np.arange(request_count, dtype=np.int64),
+        request_start_ts=np.arange(request_count, dtype=np.int64),
+        total_events=int(total_events),
+        phase_available=True,
+        position_field_counts={"token_pos": int(sum(len(template.decode_layer_step_event_counts) for template in templates))},
+        invariant_checked_fields=["synthetic_template_stream"],
+    )
+    return SyntheticBaseStream(
+        stream=stream,
         request_classes=request_classes,
         request_offsets=request_offsets,
         request_lengths=request_lengths,
         expert_access_ids=expert_access_ids,
         expert_access_ids_shifted=(expert_access_ids.astype(np.uint64) * ADAPTER_SLOT_STRIDE).astype(np.uint32),
-        phase_ids=phase_ids,
-        per_request_prefill_events=per_request_prefill_events,
-        per_request_decode_events=per_request_decode_events,
-        total_events=total_events,
-        max_expert_object_id=int(max_expert_object_id),
+        total_events=int(total_events),
     )
 
 
@@ -387,9 +431,7 @@ def generate_adapter_slots(
     correlated: bool,
 ) -> np.ndarray:
     if num_loras <= 0 or num_loras >= ADAPTER_SLOT_STRIDE:
-        raise ValueError(
-            f"num_loras must be in [1, {ADAPTER_SLOT_STRIDE - 1}] so object-key packing stays valid, got {num_loras}"
-        )
+        raise ValueError(f"num_loras must be in [1, {ADAPTER_SLOT_STRIDE - 1}], got {num_loras}")
     rng = np.random.default_rng(seed)
     run_lengths = sample_run_lengths(int(request_classes.shape[0]), burstiness, rng)
     global_weights = make_rank_weights(num_loras, skew)
@@ -425,46 +467,17 @@ def build_joint_access_ids(base_stream: SyntheticBaseStream, slots: np.ndarray) 
     return (base_stream.expert_access_ids_shifted + slot_vector).astype(np.uint32)
 
 
-def fit_model_parameters(
-    templates: Sequence[RequestTemplate],
-    request_latencies_ms: Mapping[int, float],
-    tail_quantile: float,
-    prefill_miss_ratio: float,
-) -> dict:
-    request_ids = [int(template.template_req_idx) for template in templates]
-    fitted = fit_base_compute_model(
-        request_ids=request_ids,
-        per_request_prefill_events=np.asarray([template.prefill_events for template in templates], dtype=np.int64),
-        per_request_decode_events=np.asarray([template.decode_events for template in templates], dtype=np.int64),
-        request_latencies_ms=request_latencies_ms,
-        base_request_ms_override=None,
-        prefill_event_cost_ms_override=None,
-        decode_event_cost_ms_override=None,
-    )
-    prefill_event_cost_ms = float(fitted["prefill_event_cost_ms"])
-    decode_event_cost_ms = float(fitted["decode_event_cost_ms"])
-    return {
-        "phase_aware": True,
-        "tail_quantile": float(tail_quantile),
-        "base_request_ms": float(fitted["base_request_ms"]),
-        "prefill_event_cost_ms": prefill_event_cost_ms,
-        "decode_event_cost_ms": decode_event_cost_ms,
-        "event_cost_ms": float((prefill_event_cost_ms + decode_event_cost_ms) / 2.0),
-        "hit_cost_ms": 0.0,
-        "miss_penalty_ms": float(decode_event_cost_ms),
-        "miss_penalty_prefill_ms": float(max(prefill_event_cost_ms, prefill_miss_ratio * decode_event_cost_ms)),
-        "miss_penalty_decode_ms": float(decode_event_cost_ms),
-        "prefill_miss_ratio": float(prefill_miss_ratio),
-        "base_compute_fit": fitted,
-    }
-
-
 def evaluate_condition(
     condition: str,
     access_ids: np.ndarray,
     base_stream: SyntheticBaseStream,
     cache_budgets: Sequence[int],
-    model_parameters: Mapping[str, object],
+    calibration: Mapping[str, object],
+    object_sizes,
+    transfer_mode: str,
+    load_profile: str,
+    stat_key: str,
+    system_batch: int,
 ) -> Dict[int, dict]:
     access_buffer = ConditionAccessBuffer(
         condition=condition,
@@ -474,26 +487,30 @@ def evaluate_condition(
     )
     metrics_by_budget: Dict[int, dict] = {}
     for cache_budget in cache_budgets:
-        summary = simulate_phase_replay(
+        replay_summary = simulate_phase_replay_with_bitmaps(
             condition_buffer=access_buffer,
-            phase_ids=base_stream.phase_ids,
+            phase_ids=base_stream.stream.phase_ids,
             request_offsets=base_stream.request_offsets,
             cache_budget=int(cache_budget),
         )
-        _per_request_rows, quantiles, _tail_rows, _phase_rows = compute_latency_proxy_rows(
+        stage1 = compute_stage1_token_tpot(
             condition=condition,
             cache_budget=int(cache_budget),
-            request_ids=base_stream.request_ids,
-            summary=summary,
-            per_request_prefill_events=base_stream.per_request_prefill_events,
-            per_request_decode_events=base_stream.per_request_decode_events,
-            model_parameters=model_parameters,
-            phase_available=True,
+            stream=base_stream.stream,
+            replay_summary=replay_summary,
+            calibration=calibration,
+            object_sizes=object_sizes,
+            transfer_mode=transfer_mode,
+            load_profile=load_profile,
+            stat_key=stat_key,
+            system_batch=int(system_batch),
+            tail_quantile=0.95,
         )
         metrics_by_budget[int(cache_budget)] = {
-            "miss_rate": float(summary.misses / summary.total_events) if summary.total_events else 0.0,
-            "p95": float(quantiles["p95"]),
-            "p99": float(quantiles["p99"]),
+            "miss_rate": float(replay_summary.misses / replay_summary.total_events) if replay_summary.total_events else 0.0,
+            "mean_tpot_ms": float(stage1.quantiles["mean"]),
+            "p95": float(stage1.quantiles["p95"]),
+            "p99": float(stage1.quantiles["p99"]),
         }
     return metrics_by_budget
 
@@ -539,35 +556,18 @@ def build_sweep_points(
 
     for num_loras_value in num_loras:
         for cache_budget in cache_budgets:
-            append_point(
-                family="num_loras",
-                num_loras_value=int(num_loras_value),
-                skew_value=DEFAULT_PRIMARY_SKEW,
-                burstiness_value=DEFAULT_PRIMARY_BURSTINESS,
-                corr_value=DEFAULT_PRIMARY_CORR,
-                cache_budget=int(cache_budget),
-            )
+            append_point("num_loras", int(num_loras_value), DEFAULT_PRIMARY_SKEW, DEFAULT_PRIMARY_BURSTINESS, DEFAULT_PRIMARY_CORR, int(cache_budget))
 
     for skew_value in skew_levels:
         for burstiness_value in burstiness_levels:
             for corr_value in corr_levels:
                 for cache_budget in cache_budgets:
-                    append_point(
-                        family="grid",
-                        num_loras_value=DEFAULT_PRIMARY_NUM_LORAS,
-                        skew_value=float(skew_value),
-                        burstiness_value=float(burstiness_value),
-                        corr_value=float(corr_value),
-                        cache_budget=int(cache_budget),
-                    )
+                    append_point("grid", DEFAULT_PRIMARY_NUM_LORAS, float(skew_value), float(burstiness_value), float(corr_value), int(cache_budget))
 
     return points
 
 
-def summarize_p99_drivers(
-    result_rows: Sequence[Mapping[str, object]],
-    cache_budgets: Sequence[int],
-) -> List[dict]:
+def summarize_p99_drivers(result_rows: Sequence[Mapping[str, object]], cache_budgets: Sequence[int]) -> List[dict]:
     rows = [dict(row) for row in result_rows]
     primary_budget = int(cache_budgets[min(1, len(cache_budgets) - 1)])
     joint_conditions = (CONDITION_JOINT_INDEP, CONDITION_JOINT_CORR)
@@ -663,9 +663,16 @@ def summarize_p99_drivers(
     return summaries
 
 
+def load_json(path: Path) -> dict:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"expected JSON object in {path}")
+    return payload
+
+
 def run_synthetic_control_sweeps(
     joined_indep_path: Path,
-    router_request_log_path: Path,
+    calibration_path: Path,
     output_dir: Path,
     template_request_count: int,
     synthetic_request_count: int,
@@ -675,8 +682,11 @@ def run_synthetic_control_sweeps(
     burstiness_levels: Sequence[float],
     corr_levels: Sequence[float],
     cache_budgets: Sequence[int],
-    tail_quantile: float,
-    config: Mapping[str, object],
+    transfer_mode: str,
+    load_profile: str,
+    calibration_stat: str,
+    system_batch: int,
+    object_sizes,
     seeds: Mapping[str, object],
     source_run_id: str,
 ) -> dict:
@@ -685,21 +695,10 @@ def run_synthetic_control_sweeps(
     template_seed = int(seeds.get("synthetic_trace_seed", seeds.get("global_seed", 7)))
     points_seed = int(seeds.get("replay_seed", seeds.get("global_seed", 7)))
 
-    templates = load_request_templates(
-        joined_indep_path=joined_indep_path,
-        request_limit=template_request_count,
-        num_classes=num_classes,
-    )
+    templates = load_request_templates(joined_indep_path=joined_indep_path, request_limit=template_request_count, num_classes=num_classes)
     schedule = build_synthetic_schedule(len(templates), synthetic_request_count, template_seed)
     base_stream = build_base_stream(templates, schedule)
-
-    request_latencies_ms = load_request_latencies(router_request_log_path)
-    model_parameters = fit_model_parameters(
-        templates=templates,
-        request_latencies_ms=request_latencies_ms,
-        tail_quantile=tail_quantile,
-        prefill_miss_ratio=DEFAULT_PREFILL_MISS_RATIO,
-    )
+    calibration = load_json(calibration_path)
 
     points = build_sweep_points(
         num_loras=num_loras,
@@ -716,12 +715,16 @@ def run_synthetic_control_sweeps(
         access_ids=base_stream.expert_access_ids,
         base_stream=base_stream,
         cache_budgets=unique_budgets,
-        model_parameters=model_parameters,
+        calibration=calibration,
+        object_sizes=object_sizes,
+        transfer_mode=transfer_mode,
+        load_profile=load_profile,
+        stat_key=calibration_stat,
+        system_batch=system_batch,
     )
 
     indep_metric_cache: Dict[Tuple[int, float, float], Dict[int, dict]] = {}
     corr_metric_cache: Dict[Tuple[int, float, float, float], Dict[int, dict]] = {}
-
     result_rows: List[dict] = []
     run_manifest_rows: List[dict] = []
 
@@ -743,7 +746,12 @@ def run_synthetic_control_sweeps(
                 access_ids=build_joint_access_ids(base_stream, indep_slots),
                 base_stream=base_stream,
                 cache_budgets=unique_budgets,
-                model_parameters=model_parameters,
+                calibration=calibration,
+                object_sizes=object_sizes,
+                transfer_mode=transfer_mode,
+                load_profile=load_profile,
+                stat_key=calibration_stat,
+                system_batch=system_batch,
             )
 
         corr_key = (int(point.num_loras), float(point.skew), float(point.burstiness), float(point.corr_strength))
@@ -763,7 +771,12 @@ def run_synthetic_control_sweeps(
                 access_ids=build_joint_access_ids(base_stream, corr_slots),
                 base_stream=base_stream,
                 cache_budgets=unique_budgets,
-                model_parameters=model_parameters,
+                calibration=calibration,
+                object_sizes=object_sizes,
+                transfer_mode=transfer_mode,
+                load_profile=load_profile,
+                stat_key=calibration_stat,
+                system_batch=system_batch,
             )
 
         run_manifest_rows.append(
@@ -796,17 +809,15 @@ def run_synthetic_control_sweeps(
                     "corr_strength": float(point.corr_strength),
                     "cache_budget": int(point.cache_budget),
                     "miss_rate": float(metrics["miss_rate"]),
+                    "mean_tpot_ms": float(metrics["mean_tpot_ms"]),
                     "p95": float(metrics["p95"]),
                     "p99": float(metrics["p99"]),
                 }
             )
 
-    result_rows.sort(
-        key=lambda row: (
-            str(row["run_id"]),
-            str(row["condition"]),
-        )
-    )
+    result_rows.sort(key=lambda row: (str(row["run_id"]), str(row["condition"])))
+    num_loras_run_ids = {row["run_id"] for row in run_manifest_rows if row["family"] == "num_loras"}
+    grid_run_ids = {row["run_id"] for row in run_manifest_rows if row["family"] == "grid"}
     num_loras_rows = [
         {
             "condition": row["condition"],
@@ -815,7 +826,7 @@ def run_synthetic_control_sweeps(
             "p99": row["p99"],
         }
         for row in result_rows
-        if any(point["run_id"] == row["run_id"] and point["family"] == "num_loras" for point in run_manifest_rows)
+        if row["run_id"] in num_loras_run_ids
     ]
     grid_rows = [
         {
@@ -828,17 +839,17 @@ def run_synthetic_control_sweeps(
             "p99": row["p99"],
         }
         for row in result_rows
-        if any(point["run_id"] == row["run_id"] and point["family"] == "grid" for point in run_manifest_rows)
+        if row["run_id"] in grid_run_ids
     ]
 
     strongest_p99_drivers = summarize_p99_drivers(result_rows, cache_budgets)
     manifest = {
-        "model_name": "case_study_synthetic_control_sweeps_v1",
-        "goal": "B10 robustness sweeps over synthetic LoRA workloads while reusing the B8/B9 replay core.",
+        "model_name": "case_study_synthetic_control_tpot_v1",
+        "goal": "Synthetic robustness sweeps over calibrated token TPOT using the same miss-bitmaps and transfer model as the real-trace system baseline.",
         "source_run_id": source_run_id,
         "inputs": {
             "joined_indep_path": str(joined_indep_path),
-            "router_request_log_path": str(router_request_log_path),
+            "calibration_path": str(calibration_path),
         },
         "template_config": {
             "template_request_count": int(template_request_count),
@@ -866,6 +877,19 @@ def run_synthetic_control_sweeps(
                 "corr_strength": DEFAULT_PRIMARY_CORR,
             },
         },
+        "system_model": {
+            "transfer_mode": transfer_mode,
+            "load_profile": load_profile,
+            "calibration_stat": calibration_stat,
+            "system_batch": int(system_batch),
+            "object_sizes": {
+                "early_object_bytes": int(object_sizes.early_object_bytes),
+                "late_object_bytes": int(object_sizes.late_object_bytes),
+                "total_object_bytes": int(object_sizes.total_object_bytes),
+                "slice_bytes": int(object_sizes.slice_bytes),
+                "gate_lora_excluded": bool(object_sizes.gate_lora_excluded),
+            },
+        },
         "reproducibility": {
             "seed_config": dict(seeds),
             "run_points": run_manifest_rows,
@@ -874,7 +898,6 @@ def run_synthetic_control_sweeps(
                 "joint_corr": "At session boundaries, sample from a class-local adapter pool with probability corr_strength; otherwise use the global pool.",
             },
         },
-        "latency_model_parameters": model_parameters,
         "condition_labels": dict(CONDITION_LABELS),
         "strongest_p99_drivers": strongest_p99_drivers,
         "outputs": {
@@ -888,11 +911,7 @@ def run_synthetic_control_sweeps(
     write_json(output_dir / "sweep_manifest.json", manifest)
     write_csv(output_dir / "sweep_results.csv", RESULT_FIELDS, result_rows)
     write_csv(output_dir / "num_loras_vs_p99.csv", ["condition", "num_loras", "cache_budget", "p99"], num_loras_rows)
-    write_csv(
-        output_dir / "skew_burst_corr_grid.csv",
-        ["condition", "skew", "burstiness", "corr_strength", "cache_budget", "miss_rate", "p99"],
-        grid_rows,
-    )
+    write_csv(output_dir / "skew_burst_corr_grid.csv", ["condition", "skew", "burstiness", "corr_strength", "cache_budget", "miss_rate", "p99"], grid_rows)
     return manifest
 
 
@@ -907,20 +926,22 @@ def main() -> None:
         if args.joined_indep_path
         else artifact_root(config) / "case_study" / source_run_id / "joined_trace" / "joined_trace_indep.jsonl"
     )
-    router_request_log_path = (
-        Path(args.router_request_log_path)
-        if args.router_request_log_path
-        else artifact_root(config) / "case_study" / source_run_id / "router_trace" / "router_request_log.jsonl"
-    )
-    output_dir = (
-        ensure_dir(Path(args.output_dir))
-        if args.output_dir
-        else ensure_dir(artifact_root(config) / "case_study" / source_run_id / "sweeps")
+    output_dir = ensure_dir(Path(args.output_dir)) if args.output_dir else ensure_dir(artifact_root(config) / "case_study" / source_run_id / "sweeps")
+    calibration_path = Path(args.calibration_path)
+    model_dir = Path(args.model_dir) if args.model_dir else Path(config.get("paths", {}).get("model_dir"))
+
+    text_config = load_model_text_config(model_dir)
+    object_sizes = compute_component_sizes(
+        hidden_size=int(text_config["hidden_size"]),
+        moe_intermediate_size=int(text_config["moe_intermediate_size"]),
+        lora_rank=int(args.lora_rank),
+        dtype=dtype_name_to_torch_dtype(args.dtype),
+        slice_bytes=int(args.slice_bytes),
     )
 
     manifest = run_synthetic_control_sweeps(
         joined_indep_path=joined_indep_path,
-        router_request_log_path=router_request_log_path,
+        calibration_path=calibration_path,
         output_dir=output_dir,
         template_request_count=int(args.template_request_count),
         synthetic_request_count=int(args.synthetic_request_count),
@@ -930,8 +951,11 @@ def main() -> None:
         burstiness_levels=parse_float_grid(args.burstiness_levels),
         corr_levels=parse_float_grid(args.corr_strength_levels),
         cache_budgets=parse_int_grid(args.cache_budgets),
-        tail_quantile=float(args.tail_quantile),
-        config=config,
+        transfer_mode=args.transfer_mode,
+        load_profile=args.load_profile,
+        calibration_stat=args.calibration_stat,
+        system_batch=int(args.system_batch),
+        object_sizes=object_sizes,
         seeds=seeds,
         source_run_id=source_run_id,
     )

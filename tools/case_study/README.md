@@ -13,8 +13,8 @@ The current implementation covers:
 - `B6` trace join and quality checks
 - `B7` offline replay locality analysis
 - `B8` offline replay cache analysis
-- `B9` offline replay latency proxy analysis
-- `B10` synthetic control sweeps
+- `B9` micro-benchmark calibrated system TPOT analysis
+- `B10` synthetic control sweeps on calibrated TPOT
 - `B11` small live validation
 - `B13` figure and story assembly
 
@@ -327,71 +327,70 @@ High-level findings for `router_lora_case_v1`:
 - At `8192` objects, `B0` has already fallen to its cold-miss floor of `0.000104`, while `B1` remains at `0.00636` and `B2` at `0.00810`. That is `61x` and `78x` higher miss rate than `B0`, and `B2` is still about `27%` worse than `B1`.
 - The per-request miss counts show the same amplification. At `2048` objects, median request misses rise from `80` in `B0` to `1,188` in `B1` and `1,577` in `B2`. At `8192` objects, the median request is already at `0` misses in `B0`, but still at `151` misses in `B1` and `254` in `B2`.
 
-### B9. Offline Replay Study, Latency Proxy Layer
+### B8.5. Calibrate System Baseline
 
-Attach a deterministic request-latency proxy to the B8 replay outputs.
+Measure the transfer, launch, compute, and overlap terms that the TPOT simulator uses.
 
 Command:
 
 ```bash
-python tools/case_study/analyze_latency_proxy.py --run_id router_lora_case_v1
+python tools/case_study/calibrate_system_baseline.py \
+  --run_id router_lora_case_v1 \
+  --base_tpot_ms 1:1.20,2:1.45,4:1.90
 ```
 
 Outputs:
 
-- `artifacts/case_study/<run_id>/replay/latency/latency_proxy.json`
-- `artifacts/case_study/<run_id>/replay/latency/latency_quantiles.csv`
-- `artifacts/case_study/<run_id>/replay/latency/tail_request_breakdown.csv`
-- `artifacts/case_study/<run_id>/replay/latency/prefill_decode_breakdown.csv` when `phase` labels are available in the joined trace
+- `artifacts/case_study/<run_id>/calibration/system_baseline_calibration.json`
 
-Replay and audit rules:
+Calibration notes:
 
-- `B9` reads the exact B8 budget grid from `replay/cache/cache_curve.csv`.
-- It rebuilds the aligned LRU replay stream from `joined_trace_indep.jsonl` and `joined_trace_corr.jsonl`.
-- It validates every `(condition, cache_budget, req_idx)` miss count against `replay/cache/per_request_miss_count.csv` before writing latency artifacts, so the latency layer is explicitly attached to the existing B8 outputs rather than using a different replay contract.
-- `tail_request_breakdown.csv` contains the `P95+` tail for each `(condition, cache_budget)` pair, with `miss_count`, `cold_miss_count`, and phase-specific miss counts for each tail request.
+- The calibration manifest stores packed pinned H2D curves, staged pageable-to-pinned gather plus H2D curves, and fragmented direct pageable H2D curves.
+- Both `idle` and `stressed` host profiles are benchmarked so the simulator can model realistic pageable-pool staging overheads instead of assuming an infinite pinned host pool.
+- `gate_lora` is excluded from the fixed object-byte accounting because its footprint is negligible relative to the MLP LoRA matrices.
+- `base_tpot_ms` is treated as an externally measured hot-cache constant and is serialized into the same JSON alongside the micro-benchmark curves.
 
-Latency model used for `router_lora_case_v1`:
+### B9. Offline Replay Study, Calibrated System TPOT
 
-- Because the joined trace includes `prefill` and `decode`, the default phase-aware model is:
-
-```text
-latency_proxy =
-  base_request_ms
-  + prefill_event_cost_ms * num_prefill_events
-  + decode_event_cost_ms * num_decode_events
-  + hit_cost_ms * num_hits
-  + miss_penalty_prefill_ms * num_prefill_misses
-  + miss_penalty_decode_ms * num_decode_misses
-```
-
-- `base_request_ms`, `prefill_event_cost_ms`, and `decode_event_cost_ms` are fit by least squares against `router_trace/router_request_log.jsonl` using the replay-aligned per-request phase event counts.
-- `hit_cost_ms` defaults to `0.0` because the base compute term already covers hit-side request work.
-- For this run the fitted and derived parameters are:
-  - `base_request_ms = 72.2563`
-  - `prefill_event_cost_ms = 0.0001311`
-  - `decode_event_cost_ms = 0.252325`
-  - `hit_cost_ms = 0.0`
-  - `miss_penalty_prefill_ms = 0.0630812`
-  - `miss_penalty_decode_ms = 0.252325`
-- The base fit is intentionally simple but stable: `MAE = 106.1 ms`, `RMSE = 144.8 ms`, and `R^2 = 0.9995`.
-- If phase labels are unavailable, the tool falls back to an aggregate-event model and emits `miss_penalty_ms` instead of the phase split.
-
-High-level findings for `router_lora_case_v1`:
-
-- Tail latency amplification is stronger than mean amplification once `B0` is near its cold-miss floor. At `8192` objects, `B1` mean latency proxy is only `+135.7 ms` over `B0` and `B2` is `+173.3 ms`, but the `P99` gaps are `+488.4 ms` and `+504.3 ms`.
-- The effect is even clearer at `65536` objects: mean latency proxy is almost converged (`+18.8 ms` for `B1`, `+27.2 ms` for `B2` over `B0`), while `P99` still carries `+403.9 ms` and `+432.1 ms` gaps because a small decode-heavy tail keeps seeing residual misses.
-- The tail breakdown shows that the tail is overwhelmingly decode-driven in the joint conditions. At `2048`, `8192`, and `65536` objects, `B1` and `B2` `P95+` tails are about `99%` decode misses, so the mean gap can shrink while the serialized decode tail remains visibly amplified.
-
-### B10. Synthetic Control Sweeps
-
-Run robustness sweeps over synthetic adapter-assignment knobs while reusing the same object keys,
-LRU replay kernels, and latency-proxy path as `B8` and `B9`.
+Convert B8 miss bitmaps into calibrated token-level TPOT under a causal per-layer system baseline.
 
 Command:
 
 ```bash
-python tools/case_study/run_synthetic_control_sweeps.py --run_id router_lora_case_v1
+python tools/case_study/analyze_system_tpot.py \
+  --run_id router_lora_case_v1 \
+  --calibration_path artifacts/case_study/router_lora_case_v1/calibration/system_baseline_calibration.json
+```
+
+Outputs:
+
+- `artifacts/case_study/<run_id>/replay/system_tpot/token_tpot.csv`
+- `artifacts/case_study/<run_id>/replay/system_tpot/tpot_quantiles.csv`
+- `artifacts/case_study/<run_id>/replay/system_tpot/tail_token_breakdown.csv`
+- `artifacts/case_study/<run_id>/replay/system_tpot/layer_barrier_breakdown.csv`
+- `artifacts/case_study/<run_id>/replay/system_tpot/request_decode_summary.csv`
+- `artifacts/case_study/<run_id>/replay/system_tpot/scheduler_sensitivity.csv`
+- `artifacts/case_study/<run_id>/replay/system_tpot/system_tpot_manifest.json`
+
+Replay and audit rules:
+
+- `B9` reads the exact B8 budget grid from `replay/cache/cache_curve.csv` unless `--cache_budgets` overrides it.
+- It rebuilds the aligned LRU replay stream from `joined_trace_indep.jsonl` and `joined_trace_corr.jsonl`.
+- It validates every `(condition, cache_budget, req_idx)` miss count against `replay/cache/per_request_miss_count.csv` before writing TPOT artifacts.
+- The miss-to-latency model is causal: packing is legal only within one layer step, never across future layers of the same token.
+- The default physical baseline is `pageable host pool -> pinned staging buffer -> PCIe H2D -> GPU compute`, and the transfer mode and load profile are recorded in the manifest.
+- `scheduler_sensitivity.csv` is a second-stage sweep over shared-batch service with one PCIe service queue; its `service_tpot` columns match stage-1 TPOT when `system_batch=1`, and its scheduler wait columns isolate queueing effects separately.
+
+### B10. Synthetic Control Sweeps
+
+Run robustness sweeps over synthetic adapter-assignment knobs while reusing the same object keys, LRU replay kernels, and calibrated token-TPOT path as `B8` and `B9`.
+
+Command:
+
+```bash
+python tools/case_study/run_synthetic_control_sweeps.py \
+  --run_id router_lora_case_v1 \
+  --calibration_path artifacts/case_study/router_lora_case_v1/calibration/system_baseline_calibration.json
 ```
 
 The default run:
@@ -409,10 +408,10 @@ The default run:
 Useful overrides:
 
 - `--joined_indep_path <path>`: source a different joined replay stream for request templates
-- `--router_request_log_path <path>`: fit the latency proxy from another request log
 - `--template_request_count <N>`: change how many real requests seed the template bank
 - `--synthetic_request_count <N>`: change how many synthetic requests are replayed per point
 - `--num_loras`, `--skew_levels`, `--burstiness_levels`, `--corr_strength_levels`, `--cache_budgets`: override the sweep grid
+- `--transfer_mode`, `--load_profile`, `--calibration_stat`, `--system_batch`: change which calibrated TPOT baseline the sweep uses
 
 Outputs:
 
@@ -424,28 +423,18 @@ Outputs:
 Output contracts:
 
 - `sweep_results.csv` has one row per `(run_id, condition)` sweep point with:
-  `run_id, condition, num_loras, skew, burstiness, corr_strength, cache_budget, miss_rate, p95, p99`
+  `run_id, condition, num_loras, skew, burstiness, corr_strength, cache_budget, miss_rate, mean_tpot_ms, p95, p99`
 - `num_loras_vs_p99.csv` is the plotting projection:
   `condition, num_loras, cache_budget, p99`
 - `skew_burst_corr_grid.csv` is the grid projection:
   `condition, skew, burstiness, corr_strength, cache_budget, miss_rate, p99`
-- `sweep_manifest.json` serializes the full sweep grid, seeds, latency-model parameters, template configuration, source run id, output paths, and a ranked summary of the strongest `P99` drivers
+- The `p95` and `p99` columns are token-level TPOT in milliseconds, not the retired request-level latency proxy.
 
 Replay and reproducibility rules:
 
-- `B10` keeps the `B0` / `B1` / `B2` condition definitions unchanged:
-  - `B0`: `(layer_id, expert_id)`
-  - `B1`: `(layer_id, expert_id, adapter_id)` on the synthetic independent assignment
-  - `B2`: `(layer_id, expert_id, adapter_id)` on the synthetic correlated assignment
-- The sweep path reuses the shared `replay_core.py` LRU kernels plus `analyze_latency_proxy.py` request-latency logic instead of implementing a second replay model.
+- `B10` keeps the `B0` / `B1` / `B2` condition definitions unchanged.
+- The sweep path reuses the shared `replay_core.py` LRU kernels plus the same calibrated per-token TPOT logic that powers `analyze_system_tpot.py`.
 - Every sweep point is deterministic because the point id, adapter schedules, and template resampling order are all derived from serialized seeds and written into `sweep_manifest.json`.
-
-High-level findings for the current `router_lora_case_v1` sweep:
-
-- `cache_budget` is the dominant `P99` driver by a wide margin. The manifest reports mean joint-condition `P99` movement of about `24.3 s`, and at budget `256` every condition is saturated at `100%` miss rate.
-- Among the workload knobs at the primary slice (`num_loras=32`, `skew=0.8`, `burstiness=2.5`, `corr_strength=0.5`, `cache_budget=1024`), the strongest movers are `skew` and `num_loras`, both at about `54.3 ms` mean joint `P99` delta.
-- `burstiness` and `corr_strength` are weaker overall, at about `27.5 ms` and `26.8 ms` mean joint `P99` delta. In this run, `corr_strength` does not move `B1` at all and only perturbs `B2`, which is the expected behavior for a correlation-only knob.
-- Even with favorable joint settings, the joint conditions still trail `B0` at budget `4096`. The best observed `B1` `P99` is `25377.16 ms` versus `24961.89 ms` for `B0`, and the best observed `B2` `P99` is `25320.56 ms`, so the joint fragmentation penalty remains visible after the cache is no longer saturated.
 
 ### B11. Small Live Validation
 

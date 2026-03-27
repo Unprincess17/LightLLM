@@ -76,6 +76,27 @@ class PhaseReplaySummary:
     per_request_decode_misses: np.ndarray
 
 
+@dataclass
+class PhaseReplayBitmapSummary:
+    condition: str
+    cache_budget: int
+    total_events: int
+    hits: int
+    misses: int
+    cold_misses: int
+    capacity_misses: int
+    total_evictions: int
+    unique_evicted_objects: int
+    mean_residency_if_available: Optional[float]
+    per_request_hits: np.ndarray
+    per_request_misses: np.ndarray
+    per_request_cold_misses: np.ndarray
+    per_request_prefill_misses: np.ndarray
+    per_request_decode_misses: np.ndarray
+    miss_flags: np.ndarray
+    cold_miss_flags: np.ndarray
+
+
 @njit(cache=False)
 def lru_detach(prev_link: np.ndarray, next_link: np.ndarray, object_id: int, head: int, tail: int) -> Tuple[int, int]:
     previous_id = int(prev_link[object_id])
@@ -352,6 +373,164 @@ def simulate_lru_accesses_with_phase(
     )
 
 
+@njit(cache=False)
+def simulate_lru_accesses_with_phase_and_bitmaps(
+    access_ids: np.ndarray,
+    phase_ids: np.ndarray,
+    request_offsets: np.ndarray,
+    max_object_id: int,
+    capacity: int,
+) -> Tuple[
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    float,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
+    seen_before = np.zeros(max_object_id + 1, dtype=np.uint8)
+    request_count = request_offsets.shape[0] - 1
+    per_request_hits = np.zeros(request_count, dtype=np.int64)
+    per_request_misses = np.zeros(request_count, dtype=np.int64)
+    per_request_cold_misses = np.zeros(request_count, dtype=np.int64)
+    per_request_prefill_misses = np.zeros(request_count, dtype=np.int64)
+    per_request_decode_misses = np.zeros(request_count, dtype=np.int64)
+    miss_flags = np.zeros(access_ids.shape[0], dtype=np.uint8)
+    cold_miss_flags = np.zeros(access_ids.shape[0], dtype=np.uint8)
+
+    hits = 0
+    misses = 0
+    cold_misses = 0
+    capacity_misses = 0
+    total_evictions = 0
+    unique_evicted_objects = 0
+    residency_sum = 0.0
+    residency_count = 0
+
+    if capacity <= 0:
+        request_ordinal = 0
+        for event_index in range(access_ids.shape[0]):
+            while request_ordinal + 1 < request_offsets.shape[0] and event_index >= request_offsets[request_ordinal + 1]:
+                request_ordinal += 1
+
+            object_id = int(access_ids[event_index])
+            phase_id = int(phase_ids[event_index])
+            misses += 1
+            miss_flags[event_index] = 1
+            per_request_misses[request_ordinal] += 1
+            if phase_id == PHASE_PREFILL:
+                per_request_prefill_misses[request_ordinal] += 1
+            elif phase_id == PHASE_DECODE:
+                per_request_decode_misses[request_ordinal] += 1
+            if seen_before[object_id] != 0:
+                capacity_misses += 1
+            else:
+                seen_before[object_id] = 1
+                cold_misses += 1
+                cold_miss_flags[event_index] = 1
+                per_request_cold_misses[request_ordinal] += 1
+
+        return (
+            hits,
+            misses,
+            cold_misses,
+            capacity_misses,
+            total_evictions,
+            unique_evicted_objects,
+            0.0,
+            per_request_hits,
+            per_request_misses,
+            per_request_cold_misses,
+            per_request_prefill_misses,
+            per_request_decode_misses,
+            miss_flags,
+            cold_miss_flags,
+        )
+
+    in_cache = np.zeros(max_object_id + 1, dtype=np.uint8)
+    prev_link = np.zeros(max_object_id + 1, dtype=np.int32)
+    next_link = np.zeros(max_object_id + 1, dtype=np.int32)
+    inserted_at = np.zeros(max_object_id + 1, dtype=np.int64)
+    ever_evicted = np.zeros(max_object_id + 1, dtype=np.uint8)
+
+    cache_size = 0
+    head = 0
+    tail = 0
+    request_ordinal = 0
+
+    for event_index in range(access_ids.shape[0]):
+        while request_ordinal + 1 < request_offsets.shape[0] and event_index >= request_offsets[request_ordinal + 1]:
+            request_ordinal += 1
+
+        object_id = int(access_ids[event_index])
+        phase_id = int(phase_ids[event_index])
+        if in_cache[object_id] != 0:
+            hits += 1
+            per_request_hits[request_ordinal] += 1
+            if tail != object_id:
+                head, tail = lru_detach(prev_link, next_link, object_id, head, tail)
+                head, tail = lru_append(prev_link, next_link, object_id, head, tail)
+            continue
+
+        misses += 1
+        miss_flags[event_index] = 1
+        per_request_misses[request_ordinal] += 1
+        if phase_id == PHASE_PREFILL:
+            per_request_prefill_misses[request_ordinal] += 1
+        elif phase_id == PHASE_DECODE:
+            per_request_decode_misses[request_ordinal] += 1
+        if seen_before[object_id] != 0:
+            capacity_misses += 1
+        else:
+            seen_before[object_id] = 1
+            cold_misses += 1
+            cold_miss_flags[event_index] = 1
+            per_request_cold_misses[request_ordinal] += 1
+
+        if cache_size >= capacity:
+            evicted_object_id = head
+            head, tail = lru_detach(prev_link, next_link, evicted_object_id, head, tail)
+            in_cache[evicted_object_id] = 0
+            total_evictions += 1
+            if ever_evicted[evicted_object_id] == 0:
+                ever_evicted[evicted_object_id] = 1
+                unique_evicted_objects += 1
+            residency_sum += float((event_index + 1) - inserted_at[evicted_object_id])
+            residency_count += 1
+        else:
+            cache_size += 1
+
+        head, tail = lru_append(prev_link, next_link, object_id, head, tail)
+        in_cache[object_id] = 1
+        inserted_at[object_id] = event_index + 1
+
+    mean_residency = residency_sum / residency_count if residency_count > 0 else 0.0
+    return (
+        hits,
+        misses,
+        cold_misses,
+        capacity_misses,
+        total_evictions,
+        unique_evicted_objects,
+        mean_residency,
+        per_request_hits,
+        per_request_misses,
+        per_request_cold_misses,
+        per_request_prefill_misses,
+        per_request_decode_misses,
+        miss_flags,
+        cold_miss_flags,
+    )
+
+
 def simulate_cache_policy(
     policy: str,
     access_buffer: ConditionAccessBuffer,
@@ -485,4 +664,80 @@ def simulate_phase_replay(
         per_request_cold_misses=per_request_cold_misses,
         per_request_prefill_misses=per_request_prefill_misses,
         per_request_decode_misses=per_request_decode_misses,
+    )
+
+
+def simulate_phase_replay_with_bitmaps(
+    condition_buffer: ConditionAccessBuffer,
+    phase_ids: np.ndarray,
+    request_offsets: np.ndarray,
+    cache_budget: int,
+) -> PhaseReplayBitmapSummary:
+    (
+        hits,
+        misses,
+        cold_misses,
+        capacity_misses,
+        total_evictions,
+        unique_evicted_objects,
+        mean_residency,
+        per_request_hits,
+        per_request_misses,
+        per_request_cold_misses,
+        per_request_prefill_misses,
+        per_request_decode_misses,
+        miss_flags,
+        cold_miss_flags,
+    ) = simulate_lru_accesses_with_phase_and_bitmaps(
+        access_ids=condition_buffer.access_ids,
+        phase_ids=phase_ids,
+        request_offsets=request_offsets,
+        max_object_id=condition_buffer.max_object_id,
+        capacity=cache_budget,
+    )
+
+    total_events = int(condition_buffer.total_events)
+    if hits + misses != total_events:
+        raise ValueError(
+            "cache replay accounting mismatch: "
+            f"condition={condition_buffer.condition}, budget={cache_budget}, "
+            f"hits={hits}, misses={misses}, total_events={total_events}"
+        )
+    if cold_misses + capacity_misses != misses:
+        raise ValueError(
+            "cache miss accounting mismatch: "
+            f"condition={condition_buffer.condition}, budget={cache_budget}, "
+            f"cold={cold_misses}, capacity={capacity_misses}, misses={misses}"
+        )
+    if int(np.sum(miss_flags)) != misses:
+        raise ValueError(
+            "event-level miss bitmap mismatch: "
+            f"condition={condition_buffer.condition}, budget={cache_budget}, "
+            f"miss_bitmap_sum={int(np.sum(miss_flags))}, misses={misses}"
+        )
+    if int(np.sum(cold_miss_flags)) != cold_misses:
+        raise ValueError(
+            "event-level cold-miss bitmap mismatch: "
+            f"condition={condition_buffer.condition}, budget={cache_budget}, "
+            f"cold_bitmap_sum={int(np.sum(cold_miss_flags))}, cold_misses={cold_misses}"
+        )
+
+    return PhaseReplayBitmapSummary(
+        condition=condition_buffer.condition,
+        cache_budget=int(cache_budget),
+        total_events=total_events,
+        hits=int(hits),
+        misses=int(misses),
+        cold_misses=int(cold_misses),
+        capacity_misses=int(capacity_misses),
+        total_evictions=int(total_evictions),
+        unique_evicted_objects=int(unique_evicted_objects),
+        mean_residency_if_available=(float(mean_residency) if total_evictions > 0 else None),
+        per_request_hits=per_request_hits,
+        per_request_misses=per_request_misses,
+        per_request_cold_misses=per_request_cold_misses,
+        per_request_prefill_misses=per_request_prefill_misses,
+        per_request_decode_misses=per_request_decode_misses,
+        miss_flags=miss_flags,
+        cold_miss_flags=cold_miss_flags,
     )
