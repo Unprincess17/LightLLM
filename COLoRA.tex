@@ -257,7 +257,7 @@ The key contributions of this work are:
   \end{minipage}
   \caption{
   Trace-driven case study of expert--LoRA joint-object modeling.
-  (a) Popularity becomes significantly less concentrated: under adapter-only modeling (\texttt{C0}), the top-1000 objects account for 89.1\% of accesses, but only 40.7\% and 32.6\% under joint modeling (\texttt{C1}/\texttt{C2}).
+  (a) Popularity becomes significantly less concentrated: under expert-only modeling (\texttt{C0}), the top-1000 objects account for 89.1\% of accesses, but only 40.7\% and 32.6\% under joint modeling (\texttt{C1}/\texttt{C2}).
   (b) Temporal locality weakens: reuse distance increases substantially (P99: 1{,}393 $\rightarrow$ 2{,}041 $\rightarrow$ 4{,}521), and cold-start frequency rises sharply.
   (c) Under the same cache budget, miss rates increase significantly with joint-object modeling, showing that degraded locality cannot be compensated by fixed-capacity caching.
   (d) Tail requests access up to an order of magnitude more cold objects than average requests, concentrating misses in the tail.
@@ -289,23 +289,23 @@ A central question is what abstraction the system should use to reason about loc
 
 In sparse MoE decode, each token activates only a small subset of routed experts. Once multiple LoRA adapters coexist, accesses no longer concentrate on entire adapters or on experts alone, but on LoRA states attached to specific routed experts. This makes expert--LoRA joint objects the relevant access unit for decode-time serving.
 
-Reasoning at coarser granularity obscures the true access pattern. Adapter-level management is too coarse because it retains many expert slices together with the few that are actually needed for the current token. Expert-level management is incomplete in multi-tenant serving because it ignores adapter identity: while the expert set is fixed, LoRA adapters vary across requests, so collapsing accesses by expert alone systematically overestimates reuse across tenants. To understand the consequences of this change in access granularity, we next compare decode locality and system behavior under adapter-only and expert--LoRA joint-object conditions.
+Reasoning at coarser granularity obscures the true access pattern. Adapter-level management is too coarse because it retains many expert slices together with the few that are actually needed for the current token. Expert-level management is incomplete in multi-tenant serving because it ignores adapter identity: while the expert set is fixed, LoRA adapters vary across requests, so collapsing accesses by expert alone systematically overestimates reuse across tenants. To understand the consequences of this change in access granularity, we next compare decode locality and system behavior under expert-only and expert--LoRA joint-object conditions.
 
 
 \subsubsection{Joint Objects Fragment Decode Locality}
 \label{subsec:case-study}
 
 To examine whether this finer-grained access view matters in practice, we conduct a trace-driven case study under three workload conditions.
-\texttt{C0} uses adapter-only keys.
+\texttt{C0} uses expert-only keys.
 \texttt{C1} uses expert--LoRA joint keys under independent assignment, where adapter identity is sampled independently of expert routing.
 \texttt{C2} uses the same expert--LoRA joint keys under correlated assignment, where certain adapters are more likely to co-occur with specific experts.
 This setup separates the effect of finer-grained keying itself from the extent to which structured adapter--expert affinity can partially preserve locality.
 We use Azure trace~\cite{zhang2021faster} to model LLM request arrivals and Poisson arrivals to model LoRA invocations, and replay the resulting decode access streams under these conditions.
 
-Figure~\ref{fig:case-study} reveals a consistent two-stage effect. Moving from adapter-only to expert--LoRA joint-object modeling first fragments decode locality by flattening popularity and lengthening reuse distance [Fig.~\ref{fig:case-study}(a)--(b)]; this locality loss then manifests at the system level as higher miss rates and more severe tail behavior [Fig.~\ref{fig:case-study}(c)--(d)].
+Figure~\ref{fig:case-study} reveals a consistent two-stage effect. Moving from expert-only to expert--LoRA joint-object modeling first fragments decode locality by flattening popularity and lengthening reuse distance [Fig.~\ref{fig:case-study}(a)--(b)]; this locality loss then manifests at the system level as higher miss rates and more severe tail behavior [Fig.~\ref{fig:case-study}(c)--(d)].
 
 \paragraph{Locality becomes weaker and less concentrated.}
-As shown in Fig.~\ref{fig:case-study}(a), joint-object modeling significantly flattens the popularity distribution. Under adapter-only modeling (\texttt{C0}), the top-1000 objects account for 89.1\% of accesses. Under joint modeling, this drops to 40.7\% in \texttt{C1} and 32.6\% in \texttt{C2}. The effective hot set therefore becomes much less dominant, making it harder for any bounded GPU cache to capture a large fraction of accesses.
+As shown in Fig.~\ref{fig:case-study}(a), joint-object modeling significantly flattens the popularity distribution. Under expert-only modeling (\texttt{C0}), the top-1000 objects account for 89.1\% of accesses. Under joint modeling, this drops to 40.7\% in \texttt{C1} and 32.6\% in \texttt{C2}. The effective hot set therefore becomes much less dominant, making it harder for any bounded GPU cache to capture a large fraction of accesses.
 Fig.~\ref{fig:case-study}(b) shows that temporal locality weakens as well: the P99 reuse distance grows from 1{,}393 events in \texttt{C0} to 2{,}041 and 4{,}521 events in \texttt{C1} and \texttt{C2}, respectively, while cold-start frequency also rises sharply. These longer reuse gaps are especially harmful in decode, where delayed reuse is less likely to be hidden or amortized.
 
 \paragraph{Locality loss translates into system-level inefficiency.}
