@@ -230,40 +230,33 @@ The key contributions of this work are:
 \item \textbf{Overlap-oriented prefetch optimization.} We further exploit short-range routing locality across adjacent decode tokens to prefetch a small set of likely expert weights for the CPU cold path ahead of use. This conservative mechanism preserves exact execution semantics while exposing additional overlap opportunities beyond the main hot/cold miss-handling design.
 \end{itemize}
 
-\begin{figure*}[!t]
-  \centering
-  \begin{minipage}[b]{0.49\textwidth}
+\begin{figure*}[t]
     \centering
-    \includegraphics[width=\linewidth]{figures/fig1_popularity_rank.pdf}
-    \subcaption{}
-  \end{minipage}
-  \hfill
-  \begin{minipage}[b]{0.49\textwidth}
-    \centering
-    \includegraphics[width=\linewidth]{figures/fig2_reuse_distance.pdf}
-    \subcaption{}
-  \end{minipage}
-  \\[8pt]
-  \begin{minipage}[b]{0.49\textwidth}
-    \centering
-    \includegraphics[width=\linewidth]{figures/fig3_cache_curve.pdf}
-    \subcaption{}
-  \end{minipage}
-  \hfill
-  \begin{minipage}[b]{0.49\textwidth}
-    \centering
-    \includegraphics[width=\linewidth]{figures/fig5_tail_breakdown.pdf}
-    \subcaption{}
-  \end{minipage}
-  \caption{
-  Trace-driven case study of expert--LoRA joint-object modeling.
-  (a) Popularity becomes significantly less concentrated: under expert-only modeling (\texttt{C0}), the top-1000 objects account for 89.1\% of accesses, but only 40.7\% and 32.6\% under joint modeling (\texttt{C1}/\texttt{C2}).
-  (b) Temporal locality weakens: reuse distance increases substantially (P99: 1{,}393 $\rightarrow$ 2{,}041 $\rightarrow$ 4{,}521), and cold-start frequency rises sharply.
-  (c) Under the same cache budget, miss rates increase significantly with joint-object modeling, showing that degraded locality cannot be compensated by fixed-capacity caching.
-  (d) Tail requests access up to an order of magnitude more cold objects than average requests, concentrating misses in the tail.
-  Together, these results show that joint-object modeling first fragments decode locality and then translates that locality loss into higher miss rates and more severe tail behavior.
-  }
-  \label{fig:case-study}
+
+    \begin{minipage}{0.33\textwidth}
+        \centering
+        \small\textbf{(a) Locality breaks under joint objects}
+        \includegraphics[width=\linewidth]{figures/motivation/motivation_panel_a_root_cause.pdf}
+    \end{minipage}\hfill
+    \begin{minipage}{0.33\textwidth}
+        \centering
+        \small\textbf{(b) Cache scaling loses effectiveness}
+        \includegraphics[width=\linewidth]{figures/motivation/motivation_panel_b_capacity_illusion.pdf}
+    \end{minipage}\hfill
+    \begin{minipage}{0.33\textwidth}
+        \centering
+        \small\textbf{(c) Tail latency explodes under misses}
+        \includegraphics[width=\linewidth]{figures/motivation/motivation_panel_c_tail_blowout_budget_4096.pdf}
+    \end{minipage}
+
+    \vspace{-0.05in}
+    \caption{
+    \textbf{Why caching alone is insufficient for multi-LoRA MoE decode serving.}
+    (a) When the access unit becomes joint expert--LoRA objects, the access distribution flattens substantially, indicating severe locality fragmentation.
+    (b) As a result, increasing GPU cache capacity yields diminishing returns: up to 16$\times$ more objects are required to match the P99 latency achieved by an expert-only oracle.
+    (c) Under a practical cache budget, degradation concentrates in the tail: median TPOT remains near-optimal (1.2\,ms), while P99.9 latency increases by $\sim$6$\times$ due to cold misses. These results show that the key challenge is not cache capacity, but how cold misses are handled on the decode critical path.
+    }
+    \label{fig:motivation-breakdown}
 \end{figure*}
 
 \section{Background, Motivation, and Challenges}
