@@ -141,11 +141,16 @@ COLORA_PROMOTE_MIN_HITS=2
 COLORA_PROMOTE_WINDOW=128
 COLORA_MAX_PROMOTE_PER_STEP=8
 COLORA_DECAY=0.9
+COLORA_DEFERRED_PROMOTION_DELTA_STEPS=4
+COLORA_PROMOTION_EMA_ALPHA=0.5
 COLORA_MISS_POLICY="cpu_first"
 COLORA_ASYNC_FALLBACK=1
 COLORA_CPU_WORKERS=4
 COLORA_CPU_QUEUE_DEPTH=256
 COLORA_CPU_BATCH_TIMEOUT_US=50
+COLORA_TEMPORAL_PREFETCH=0
+COLORA_TEMPORAL_PREFETCH_LAYER_WHITELIST=""
+COLORA_TEMPORAL_HOT_CACHE_SLOTS=64
 COLORA_SPECULATIVE_DISPATCH=0
 COLORA_SPEC_LAYER_WHITELIST=""
 
@@ -247,6 +252,14 @@ while [[ $# -gt 0 ]]; do
             COLORA_DECAY="$2"
             shift 2
             ;;
+        --colora_deferred_promotion_delta_steps)
+            COLORA_DEFERRED_PROMOTION_DELTA_STEPS="$2"
+            shift 2
+            ;;
+        --colora_promotion_ema_alpha)
+            COLORA_PROMOTION_EMA_ALPHA="$2"
+            shift 2
+            ;;
         --colora_miss_policy)
             COLORA_MISS_POLICY="$2"
             shift 2
@@ -265,6 +278,18 @@ while [[ $# -gt 0 ]]; do
             ;;
         --colora_cpu_batch_timeout_us)
             COLORA_CPU_BATCH_TIMEOUT_US="$2"
+            shift 2
+            ;;
+        --colora_temporal_prefetch)
+            COLORA_TEMPORAL_PREFETCH=1
+            shift
+            ;;
+        --colora_temporal_prefetch_layer_whitelist)
+            COLORA_TEMPORAL_PREFETCH_LAYER_WHITELIST="$2"
+            shift 2
+            ;;
+        --colora_temporal_hot_cache_slots)
+            COLORA_TEMPORAL_HOT_CACHE_SLOTS="$2"
             shift 2
             ;;
         --colora_speculative_dispatch)
@@ -402,6 +427,8 @@ CMD="$CMD --colora_cache_budget_mb $COLORA_CACHE_BUDGET_MB \
     --colora_promote_window $COLORA_PROMOTE_WINDOW \
     --colora_max_promote_per_step $COLORA_MAX_PROMOTE_PER_STEP \
     --colora_decay $COLORA_DECAY \
+    --colora_deferred_promotion_delta_steps $COLORA_DEFERRED_PROMOTION_DELTA_STEPS \
+    --colora_promotion_ema_alpha $COLORA_PROMOTION_EMA_ALPHA \
     --colora_miss_policy $COLORA_MISS_POLICY \
     --colora_async_fallback $COLORA_ASYNC_FALLBACK \
     --colora_cpu_workers $COLORA_CPU_WORKERS \
@@ -409,6 +436,16 @@ CMD="$CMD --colora_cache_budget_mb $COLORA_CACHE_BUDGET_MB \
     --colora_cpu_batch_timeout_us $COLORA_CPU_BATCH_TIMEOUT_US"
 
 COLORA_SPEC_LAYER_WHITELIST="${COLORA_SPEC_LAYER_WHITELIST//[[:space:]]/}"
+COLORA_TEMPORAL_PREFETCH_LAYER_WHITELIST="${COLORA_TEMPORAL_PREFETCH_LAYER_WHITELIST//[[:space:]]/}"
+if [[ "$COLORA_TEMPORAL_PREFETCH" == "1" ]]; then
+    CMD="$CMD --colora_temporal_prefetch"
+fi
+if [[ -n "$COLORA_TEMPORAL_PREFETCH_LAYER_WHITELIST" ]]; then
+    CMD="$CMD --colora_temporal_prefetch_layer_whitelist $COLORA_TEMPORAL_PREFETCH_LAYER_WHITELIST"
+fi
+if [[ -n "$COLORA_TEMPORAL_HOT_CACHE_SLOTS" ]]; then
+    CMD="$CMD --colora_temporal_hot_cache_slots $COLORA_TEMPORAL_HOT_CACHE_SLOTS"
+fi
 if [[ "$COLORA_SPECULATIVE_DISPATCH" == "1" ]]; then
     CMD="$CMD --colora_speculative_dispatch"
 fi
@@ -450,11 +487,16 @@ echo "  COLORA_PROMOTE_MIN_HITS=$COLORA_PROMOTE_MIN_HITS"
 echo "  COLORA_PROMOTE_WINDOW=$COLORA_PROMOTE_WINDOW"
 echo "  COLORA_MAX_PROMOTE_PER_STEP=$COLORA_MAX_PROMOTE_PER_STEP"
 echo "  COLORA_DECAY=$COLORA_DECAY"
+echo "  COLORA_DEFERRED_PROMOTION_DELTA_STEPS=$COLORA_DEFERRED_PROMOTION_DELTA_STEPS"
+echo "  COLORA_PROMOTION_EMA_ALPHA=$COLORA_PROMOTION_EMA_ALPHA"
 echo "  COLORA_MISS_POLICY=$COLORA_MISS_POLICY"
 echo "  COLORA_ASYNC_FALLBACK=$COLORA_ASYNC_FALLBACK"
 echo "  COLORA_CPU_WORKERS=$COLORA_CPU_WORKERS"
 echo "  COLORA_CPU_QUEUE_DEPTH=$COLORA_CPU_QUEUE_DEPTH"
 echo "  COLORA_CPU_BATCH_TIMEOUT_US=$COLORA_CPU_BATCH_TIMEOUT_US"
+echo "  COLORA_TEMPORAL_PREFETCH=$COLORA_TEMPORAL_PREFETCH"
+echo "  COLORA_TEMPORAL_PREFETCH_LAYER_WHITELIST=$COLORA_TEMPORAL_PREFETCH_LAYER_WHITELIST"
+echo "  COLORA_TEMPORAL_HOT_CACHE_SLOTS=$COLORA_TEMPORAL_HOT_CACHE_SLOTS"
 echo "  COLORA_SPECULATIVE_DISPATCH=$COLORA_SPECULATIVE_DISPATCH"
 echo "  COLORA_SPEC_LAYER_WHITELIST=$COLORA_SPEC_LAYER_WHITELIST"
 echo ""

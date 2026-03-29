@@ -114,6 +114,16 @@ class ModeBackend:
         whitelist = ",".join(whitelist_tokens)
         os.environ["COLORA_SPEC_SUBMIT_ENABLE"] = "1" if spec_enabled else "0"
         os.environ["COLORA_SPEC_SUBMIT_LAYER_WHITELIST"] = whitelist
+        temporal_enabled = bool(getattr(self.args, "colora_temporal_prefetch", False))
+        raw_temporal_whitelist = getattr(self.args, "colora_temporal_prefetch_layer_whitelist", "")
+        temporal_whitelist_tokens = []
+        for token in str(raw_temporal_whitelist or "").split(","):
+            token = token.strip()
+            if token:
+                temporal_whitelist_tokens.append(token)
+        temporal_whitelist = ",".join(temporal_whitelist_tokens)
+        os.environ["COLORA_TEMPORAL_PREFETCH_ENABLE"] = "1" if temporal_enabled else "0"
+        os.environ["COLORA_TEMPORAL_PREFETCH_LAYER_WHITELIST"] = temporal_whitelist
 
     def init_model(self, kvargs):
         self.args: StartArgs = kvargs.get("args", None)
@@ -1100,6 +1110,7 @@ class ModeBackend:
                     promote_window=getattr(self.args, "colora_promote_window", 128),
                     max_promote_per_step=getattr(self.args, "colora_max_promote_per_step", 8),
                     decay=getattr(self.args, "colora_decay", 0.9),
+                    deferred_promotion_delta_steps=getattr(self.args, "colora_deferred_promotion_delta_steps", 4),
                     miss_policy=getattr(self.args, "colora_miss_policy", "cpu_first"),
                     queue_high_watermark=getattr(self.args, "colora_promote_window", 128),
                     promote_cooldown_steps=4,
@@ -1110,12 +1121,13 @@ class ModeBackend:
                 self.moe_expert_cache_manager.register_projection_pool("down", self.lora_mem_pool.moe_down_pool)
                 self.logger.info(
                     "[COLoRA] Expert cache initialized: budget_mb=%s, promote_min_hits=%s, "
-                    "window=%s, max_promote_per_step=%s, decay=%.4f, miss_policy=%s, queue_hwm=%s",
+                    "window=%s, max_promote_per_step=%s, decay=%.4f, deferred_delta=%s, miss_policy=%s, queue_hwm=%s",
                     cache_cfg.cache_budget_mb,
                     cache_cfg.promote_min_hits,
                     cache_cfg.promote_window,
                     cache_cfg.max_promote_per_step,
                     cache_cfg.decay,
+                    cache_cfg.deferred_promotion_delta_steps,
                     cache_cfg.miss_policy,
                     cache_cfg.queue_high_watermark,
                 )
@@ -1197,6 +1209,12 @@ class ModeBackend:
                 colora_cpu_workers=int(getattr(self.args, "colora_cpu_workers", 4)),
                 colora_cpu_queue_depth=int(getattr(self.args, "colora_cpu_queue_depth", 256)),
                 colora_cpu_batch_timeout_us=int(getattr(self.args, "colora_cpu_batch_timeout_us", 50)),
+                colora_deferred_promotion_delta_steps=int(
+                    getattr(self.args, "colora_deferred_promotion_delta_steps", 4)
+                ),
+                colora_promotion_ema_alpha=float(getattr(self.args, "colora_promotion_ema_alpha", 0.5)),
+                colora_temporal_prefetch=bool(getattr(self.args, "colora_temporal_prefetch", False)),
+                colora_temporal_hot_cache_slots=int(getattr(self.args, "colora_temporal_hot_cache_slots", 64)),
             )
             try:
                 dispatcher = self._create_lora_dispatcher_fn(**dispatcher_kwargs)

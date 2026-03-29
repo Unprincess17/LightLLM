@@ -285,8 +285,18 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
             "promotion_drop_total": 0,
             "promotion_drop_queue_high_watermark": 0,
             "promotion_drop_cooldown": 0,
+            "promotion_admitted": 0,
+            "promotion_reject_delta": 0,
+            "promotion_reject_no_ema": 0,
+            "tracker_queue_drop": 0,
             "moe_kernel_calls": 0,
             "moe_kernel_tokens": 0,
+            "prefetch_submitted": 0,
+            "prefetch_ready_hits": 0,
+            "prefetch_not_ready": 0,
+            "prefetch_stale": 0,
+            "prefetch_false_positives": 0,
+            "prefetch_slot_overwrite": 0,
             "attempted_bind": 0,
             "successful_bind": 0,
             "stale": 0,
@@ -323,8 +333,20 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
         agg_stats["promotion_drop_cooldown"] = int(
             stats.get("promotion_drop_cooldown", agg_stats["promotion_drop_cooldown"])
         )
+        agg_stats["promotion_admitted"] += int(stats.get("promotion_admitted", 0))
+        agg_stats["promotion_reject_delta"] += int(stats.get("promotion_reject_delta", 0))
+        agg_stats["promotion_reject_no_ema"] += int(stats.get("promotion_reject_no_ema", 0))
+        agg_stats["tracker_queue_drop"] += int(stats.get("tracker_queue_drop", 0))
         agg_stats["moe_kernel_calls"] += int(stats.get("moe_kernel_calls", 0))
         agg_stats["moe_kernel_tokens"] += int(stats.get("moe_kernel_tokens", 0))
+        agg_stats["prefetch_submitted"] += int(stats.get("prefetch_submitted", 0))
+        agg_stats["prefetch_ready_hits"] += int(stats.get("prefetch_ready_hits", 0))
+        agg_stats["prefetch_not_ready"] += int(stats.get("prefetch_not_ready", 0))
+        agg_stats["prefetch_stale"] += int(stats.get("prefetch_stale", 0))
+        agg_stats["prefetch_false_positives"] += int(stats.get("prefetch_false_positives", 0))
+        agg_stats["prefetch_slot_overwrite"] = int(
+            stats.get("prefetch_slot_overwrite", agg_stats["prefetch_slot_overwrite"])
+        )
         overlap_ratio = float(stats.get("overlap_ratio", 0.0))
         if overlap_ratio > 0.0:
             agg_stats["overlap_ratio_sum"] += overlap_ratio
@@ -970,130 +992,155 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
             with NvtxAnnotate(f"MoE_Expert_{local_expert_idx}"):
                 expert_input = hidden_states[batch_indices]
                 expert_req_bins = self.req_bins_[batch_indices] if self.req_bins_ is not None else None
-
-                study2_prefix = self._get_study2_profile_prefix(
-                    expert_id=local_expert_idx,
-                    step_idx=i,
-                    token_count=int(expert_input.shape[0]),
-                )
-                gpu_stream_label = f"{study2_prefix}/GPU_Stream" if study2_prefix is not None else None
-
-                enable_coalescing = os.environ.get("MOE_COALESCING_PACKER", "1") == "1"
-                pack_meta = None
-                if enable_coalescing:
-                    pack_label = f"{study2_prefix}/Gather" if study2_prefix is not None else "MoE_COLoRA_CoalescePack"
-                    with NvtxAnnotate(pack_label):
-                        pack_meta = self._coalesce_lora_activations(
-                            activations=expert_input,
-                            req_bins=expert_req_bins,
+                decode_step_id = getattr(infer_state, "decode_step_id", None)
+                dispatcher = self.lora_dispatcher_ if self.use_detached_lora_ else None
+                if dispatcher is not None and expert_req_bins is not None and decode_step_id is not None:
+                    adapter_bins_cpu = expert_req_bins.detach().to(device="cpu", dtype=torch.int64).view(-1).tolist()
+                    note_access_fn = getattr(dispatcher, "note_decode_joint_access", None)
+                    if callable(note_access_fn):
+                        note_access_fn(
+                            decode_step_id=int(decode_step_id),
+                            layer_id=int(layer_weight.layer_num_),
+                            expert_id=int(local_expert_idx),
+                            adapter_bins=adapter_bins_cpu,
+                        )
+                    begin_joint_context_fn = getattr(dispatcher, "begin_decode_joint_context", None)
+                    if callable(begin_joint_context_fn):
+                        begin_joint_context_fn(
+                            int(decode_step_id),
+                            int(layer_weight.layer_num_),
+                            int(local_expert_idx),
                         )
 
-                # 4.4.1 Synchronize: ensure current expert's weights have arrived
-                with NvtxAnnotate("MoE_WaitTransfer"):
-                    compute_stream.wait_stream(transfer_stream)
-                current_weights = next_weights
-
-                # 4.4.2 Prefetch next expert's weights concurrently
-                if i + 1 < len(active_experts_data):
-                    with NvtxAnnotate("MoE_PrefetchNext"):
-                        next_expert_idx, _, _ = active_experts_data[i + 1]
-                        with torch.cuda.stream(transfer_stream):
-                            next_weights = prefetch_weights(next_expert_idx)
-
-                w1, w3, w2 = current_weights
-
-                # 4.4.3 Compute Base GEMM
-                with (NvtxAnnotate(gpu_stream_label) if gpu_stream_label is not None else nullcontext()):
-                    with NvtxAnnotate("MoE_GateGEMM"):
-                        gate_out = torch.mm(expert_input, w1.T)
-                    with NvtxAnnotate("MoE_UpGEMM"):
-                        up_out = torch.mm(expert_input, w3.T)
-
-                # 4.4.4 Apply Per-Expert LoRA (Gate/Up)
-                gate_up_bind_fn = getattr(self, "_maybe_bind_fused_gate_up_exact", None)
-                bound_gate_up = None
-                if callable(gate_up_bind_fn):
-                    # Exact bind only: same layer/step/op/joint-key and identical row-group signature.
-                    bound_gate_up = gate_up_bind_fn(
-                        expert_input=expert_input,
-                        infer_state=infer_state,
-                        layer_weight=layer_weight,
+                try:
+                    study2_prefix = self._get_study2_profile_prefix(
                         expert_id=local_expert_idx,
-                        batch_indices=batch_indices,
-                        expert_req_bins=expert_req_bins,
-                        pack_meta=pack_meta,
-                        colora_stats=colora_stats,
+                        step_idx=i,
+                        token_count=int(expert_input.shape[0]),
                     )
+                    gpu_stream_label = f"{study2_prefix}/GPU_Stream" if study2_prefix is not None else None
 
-                if bound_gate_up is None:
-                    with NvtxAnnotate("MoE_GateLoRA"):
-                        gate_lora = self._dispatch_lora_with_optional_coalescing(
-                            dispatch_fn=self.lora_dispatcher_.batch_apply_gate_lora,
-                            input_tensor=expert_input,
+                    enable_coalescing = os.environ.get("MOE_COALESCING_PACKER", "1") == "1"
+                    pack_meta = None
+                    if enable_coalescing:
+                        pack_label = f"{study2_prefix}/Gather" if study2_prefix is not None else "MoE_COLoRA_CoalescePack"
+                        with NvtxAnnotate(pack_label):
+                            pack_meta = self._coalesce_lora_activations(
+                                activations=expert_input,
+                                req_bins=expert_req_bins,
+                            )
+
+                    # 4.4.1 Synchronize: ensure current expert's weights have arrived
+                    with NvtxAnnotate("MoE_WaitTransfer"):
+                        compute_stream.wait_stream(transfer_stream)
+                    current_weights = next_weights
+
+                    # 4.4.2 Prefetch next expert's weights concurrently
+                    if i + 1 < len(active_experts_data):
+                        with NvtxAnnotate("MoE_PrefetchNext"):
+                            next_expert_idx, _, _ = active_experts_data[i + 1]
+                            with torch.cuda.stream(transfer_stream):
+                                next_weights = prefetch_weights(next_expert_idx)
+
+                    w1, w3, w2 = current_weights
+
+                    # 4.4.3 Compute Base GEMM
+                    with (NvtxAnnotate(gpu_stream_label) if gpu_stream_label is not None else nullcontext()):
+                        with NvtxAnnotate("MoE_GateGEMM"):
+                            gate_out = torch.mm(expert_input, w1.T)
+                        with NvtxAnnotate("MoE_UpGEMM"):
+                            up_out = torch.mm(expert_input, w3.T)
+
+                    # 4.4.4 Apply Per-Expert LoRA (Gate/Up)
+                    gate_up_bind_fn = getattr(self, "_maybe_bind_fused_gate_up_exact", None)
+                    bound_gate_up = None
+                    if callable(gate_up_bind_fn):
+                        # Exact bind only: same layer/step/op/joint-key and identical row-group signature.
+                        bound_gate_up = gate_up_bind_fn(
+                            expert_input=expert_input,
+                            infer_state=infer_state,
+                            layer_weight=layer_weight,
+                            expert_id=local_expert_idx,
+                            batch_indices=batch_indices,
+                            expert_req_bins=expert_req_bins,
+                            pack_meta=pack_meta,
+                            colora_stats=colora_stats,
+                        )
+
+                    if bound_gate_up is None:
+                        with NvtxAnnotate("MoE_GateLoRA"):
+                            gate_lora = self._dispatch_lora_with_optional_coalescing(
+                                dispatch_fn=self.lora_dispatcher_.batch_apply_gate_lora,
+                                input_tensor=expert_input,
+                                layer_id=layer_weight.layer_num_,
+                                req_bins=expert_req_bins,
+                                expert_id=local_expert_idx,
+                                pack_meta=pack_meta,
+                                reuse_packed_input=True,
+                                phase_name="Gate",
+                                study2_prefix=study2_prefix,
+                            )
+                            self._merge_colora_stats(colora_stats)
+                        with NvtxAnnotate("MoE_UpLoRA"):
+                            up_lora = self._dispatch_lora_with_optional_coalescing(
+                                dispatch_fn=self.lora_dispatcher_.batch_apply_up_lora,
+                                input_tensor=expert_input,
+                                layer_id=layer_weight.layer_num_,
+                                req_bins=expert_req_bins,
+                                expert_id=local_expert_idx,
+                                pack_meta=pack_meta,
+                                reuse_packed_input=True,
+                                phase_name="Up",
+                                study2_prefix=study2_prefix,
+                            )
+                            self._merge_colora_stats(colora_stats)
+                    else:
+                        gate_lora, up_lora = bound_gate_up
+
+                    gate_out += gate_lora
+                    up_out += up_lora
+
+                    # 4.4.5 Activation
+                    with (NvtxAnnotate(gpu_stream_label) if gpu_stream_label is not None else nullcontext()):
+                        with NvtxAnnotate("MoE_Activation"):
+                            current_hidden = torch.nn.functional.silu(gate_out) * up_out
+
+                        # 4.4.6 Down Projection Base
+                        with NvtxAnnotate("MoE_DownGEMM"):
+                            down_out = torch.mm(current_hidden, w2.T)
+
+                    # 4.4.7 Apply Per-Expert LoRA (Down)
+                    with NvtxAnnotate("MoE_DownLoRA"):
+                        down_lora = self._dispatch_lora_with_optional_coalescing(
+                            dispatch_fn=self.lora_dispatcher_.batch_apply_down_lora,
+                            input_tensor=current_hidden,
                             layer_id=layer_weight.layer_num_,
                             req_bins=expert_req_bins,
                             expert_id=local_expert_idx,
                             pack_meta=pack_meta,
-                            reuse_packed_input=True,
-                            phase_name="Gate",
+                            phase_name="Down",
                             study2_prefix=study2_prefix,
                         )
                         self._merge_colora_stats(colora_stats)
-                    with NvtxAnnotate("MoE_UpLoRA"):
-                        up_lora = self._dispatch_lora_with_optional_coalescing(
-                            dispatch_fn=self.lora_dispatcher_.batch_apply_up_lora,
-                            input_tensor=expert_input,
-                            layer_id=layer_weight.layer_num_,
-                            req_bins=expert_req_bins,
-                            expert_id=local_expert_idx,
-                            pack_meta=pack_meta,
-                            reuse_packed_input=True,
-                            phase_name="Up",
-                            study2_prefix=study2_prefix,
-                        )
-                        self._merge_colora_stats(colora_stats)
-                else:
-                    gate_lora, up_lora = bound_gate_up
+                    down_out += down_lora
 
-                gate_out += gate_lora
-                up_out += up_lora
+                    # 4.4.8 Weighted Aggregation (Corrected)
+                    with NvtxAnnotate("MoE_Aggregation"):
+                        # routing_weights: [num_selected, 1]
+                        routing_weights = topk_weights[batch_indices, k_indices].view(-1, 1)
+                        weighted_output = (down_out * routing_weights).to(hidden_states.dtype)
 
-                # 4.4.5 Activation
-                with (NvtxAnnotate(gpu_stream_label) if gpu_stream_label is not None else nullcontext()):
-                    with NvtxAnnotate("MoE_Activation"):
-                        current_hidden = torch.nn.functional.silu(gate_out) * up_out
+                        # 使用 index_add_ 在 final_output 上原地累加
+                        final_output.index_add_(0, batch_indices, weighted_output)
 
-                    # 4.4.6 Down Projection Base
-                    with NvtxAnnotate("MoE_DownGEMM"):
-                        down_out = torch.mm(current_hidden, w2.T)
-
-                # 4.4.7 Apply Per-Expert LoRA (Down)
-                with NvtxAnnotate("MoE_DownLoRA"):
-                    down_lora = self._dispatch_lora_with_optional_coalescing(
-                        dispatch_fn=self.lora_dispatcher_.batch_apply_down_lora,
-                        input_tensor=current_hidden,
-                        layer_id=layer_weight.layer_num_,
-                        req_bins=expert_req_bins,
-                        expert_id=local_expert_idx,
-                        pack_meta=pack_meta,
-                        phase_name="Down",
-                        study2_prefix=study2_prefix,
-                    )
-                    self._merge_colora_stats(colora_stats)
-                down_out += down_lora
-
-                # 4.4.8 Weighted Aggregation (Corrected)
-                with NvtxAnnotate("MoE_Aggregation"):
-                    # routing_weights: [num_selected, 1]
-                    routing_weights = topk_weights[batch_indices, k_indices].view(-1, 1)
-                    weighted_output = (down_out * routing_weights).to(hidden_states.dtype)
-
-                    # 使用 index_add_ 在 final_output 上原地累加
-                    final_output.index_add_(0, batch_indices, weighted_output)
-
-                # 4.4.9 Cleanup - eagerly free GPU tensor references
-                with NvtxAnnotate("MoE_Cleanup"):
-                    del current_weights, w1, w3, w2
+                    # 4.4.9 Cleanup - eagerly free GPU tensor references
+                    with NvtxAnnotate("MoE_Cleanup"):
+                        del current_weights, w1, w3, w2
+                finally:
+                    if dispatcher is not None:
+                        end_joint_context_fn = getattr(dispatcher, "end_decode_joint_context", None)
+                        if callable(end_joint_context_fn):
+                            end_joint_context_fn()
 
         if (
             (colora_stats["colora_hit_tokens"] + colora_stats["colora_miss_tokens"]) > 0
@@ -1107,6 +1154,9 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
                 "cpu_compute_time=%.6f gpu_compute_time=%.6f cpu_queue_wait=%.6f "
                 "d2h_bytes=%.0f h2d_bytes=%.0f overlap_ratio=%.4f fallback_degrade_count=%s cpu_queue_depth=%s "
                 "promotion_drop_total=%s promotion_drop_queue=%s promotion_drop_cooldown=%s "
+                "promotion_admitted=%s promotion_reject_delta=%s promotion_reject_no_ema=%s tracker_queue_drop=%s "
+                "prefetch_submitted=%s prefetch_ready_hits=%s prefetch_not_ready=%s prefetch_stale=%s "
+                "prefetch_false_positives=%s prefetch_slot_overwrite=%s "
                 "moe_kernel_calls=%s moe_kernel_tokens=%s attempted_bind=%s successful_bind=%s "
                 "stale=%s not_ready=%s fallback=%s",
                 self.layer_num_,
@@ -1125,6 +1175,16 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
                 colora_stats["promotion_drop_total"],
                 colora_stats["promotion_drop_queue_high_watermark"],
                 colora_stats["promotion_drop_cooldown"],
+                colora_stats["promotion_admitted"],
+                colora_stats["promotion_reject_delta"],
+                colora_stats["promotion_reject_no_ema"],
+                colora_stats["tracker_queue_drop"],
+                colora_stats["prefetch_submitted"],
+                colora_stats["prefetch_ready_hits"],
+                colora_stats["prefetch_not_ready"],
+                colora_stats["prefetch_stale"],
+                colora_stats["prefetch_false_positives"],
+                colora_stats["prefetch_slot_overwrite"],
                 colora_stats["moe_kernel_calls"],
                 colora_stats["moe_kernel_tokens"],
                 colora_stats["attempted_bind"],

@@ -82,11 +82,16 @@ COLORA_PROMOTE_MIN_HITS="1"
 COLORA_PROMOTE_WINDOW="512"
 COLORA_MAX_PROMOTE_PER_STEP="32"
 COLORA_DECAY=""
+COLORA_DEFERRED_PROMOTION_DELTA_STEPS=""
+COLORA_PROMOTION_EMA_ALPHA=""
 COLORA_MISS_POLICY=""
 COLORA_ASYNC_FALLBACK=""
 COLORA_CPU_WORKERS="8"
 COLORA_CPU_QUEUE_DEPTH="512"
 COLORA_CPU_BATCH_TIMEOUT_US="200"
+COLORA_TEMPORAL_PREFETCH="0"
+COLORA_TEMPORAL_PREFETCH_LAYER_WHITELIST=""
+COLORA_TEMPORAL_HOT_CACHE_SLOTS=""
 COLORA_SPECULATIVE_DISPATCH="0"
 COLORA_SPEC_LAYER_WHITELIST=""
 SERVER_LOG_PATH=""
@@ -158,11 +163,16 @@ while [[ $# -gt 0 ]]; do
         --colora_promote_window) COLORA_PROMOTE_WINDOW="$2"; shift 2 ;;
         --colora_max_promote_per_step) COLORA_MAX_PROMOTE_PER_STEP="$2"; shift 2 ;;
         --colora_decay) COLORA_DECAY="$2"; shift 2 ;;
+        --colora_deferred_promotion_delta_steps) COLORA_DEFERRED_PROMOTION_DELTA_STEPS="$2"; shift 2 ;;
+        --colora_promotion_ema_alpha) COLORA_PROMOTION_EMA_ALPHA="$2"; shift 2 ;;
         --colora_miss_policy) COLORA_MISS_POLICY="$2"; shift 2 ;;
         --colora_async_fallback) COLORA_ASYNC_FALLBACK="$2"; shift 2 ;;
         --colora_cpu_workers) COLORA_CPU_WORKERS="$2"; shift 2 ;;
         --colora_cpu_queue_depth) COLORA_CPU_QUEUE_DEPTH="$2"; shift 2 ;;
         --colora_cpu_batch_timeout_us) COLORA_CPU_BATCH_TIMEOUT_US="$2"; shift 2 ;;
+        --colora_temporal_prefetch) COLORA_TEMPORAL_PREFETCH="1"; shift ;;
+        --colora_temporal_prefetch_layer_whitelist) COLORA_TEMPORAL_PREFETCH_LAYER_WHITELIST="$2"; shift 2 ;;
+        --colora_temporal_hot_cache_slots) COLORA_TEMPORAL_HOT_CACHE_SLOTS="$2"; shift 2 ;;
         --colora_speculative_dispatch) COLORA_SPECULATIVE_DISPATCH="1"; shift ;;
         --no_colora_speculative_dispatch) COLORA_SPECULATIVE_DISPATCH="0"; shift ;;
         --colora_spec_layer_whitelist) COLORA_SPEC_LAYER_WHITELIST="$2"; shift 2 ;;
@@ -182,6 +192,7 @@ if [[ -z "$SERVER_LOG_PATH" ]]; then
 fi
 mkdir -p "$(dirname "$SERVER_LOG_PATH")"
 COLORA_SPEC_LAYER_WHITELIST="${COLORA_SPEC_LAYER_WHITELIST//[[:space:]]/}"
+COLORA_TEMPORAL_PREFETCH_LAYER_WHITELIST="${COLORA_TEMPORAL_PREFETCH_LAYER_WHITELIST//[[:space:]]/}"
 
 # Cleanup function
 cleanup() {
@@ -245,6 +256,11 @@ echo "Print per-request lines: $PRINT_PER_REQUEST"
 [[ -n "$COLORA_CPU_WORKERS" ]] && echo "COLoRA CPU workers override: $COLORA_CPU_WORKERS"
 [[ -n "$COLORA_CPU_QUEUE_DEPTH" ]] && echo "COLoRA CPU queue depth override: $COLORA_CPU_QUEUE_DEPTH"
 [[ -n "$COLORA_CPU_BATCH_TIMEOUT_US" ]] && echo "COLoRA CPU batch timeout (us) override: $COLORA_CPU_BATCH_TIMEOUT_US"
+[[ -n "$COLORA_DEFERRED_PROMOTION_DELTA_STEPS" ]] && echo "COLoRA deferred promotion delta override: $COLORA_DEFERRED_PROMOTION_DELTA_STEPS"
+[[ -n "$COLORA_PROMOTION_EMA_ALPHA" ]] && echo "COLoRA promotion EMA alpha override: $COLORA_PROMOTION_EMA_ALPHA"
+echo "COLoRA temporal prefetch override: $COLORA_TEMPORAL_PREFETCH"
+[[ -n "$COLORA_TEMPORAL_PREFETCH_LAYER_WHITELIST" ]] && echo "COLoRA temporal prefetch layer whitelist: $COLORA_TEMPORAL_PREFETCH_LAYER_WHITELIST"
+[[ -n "$COLORA_TEMPORAL_HOT_CACHE_SLOTS" ]] && echo "COLoRA temporal hot cache slots: $COLORA_TEMPORAL_HOT_CACHE_SLOTS"
 echo "COLoRA speculative dispatch override: $COLORA_SPECULATIVE_DISPATCH"
 [[ -n "$COLORA_SPEC_LAYER_WHITELIST" ]] && echo "COLoRA speculative layer whitelist: $COLORA_SPEC_LAYER_WHITELIST"
 echo "Server log path: $SERVER_LOG_PATH"
@@ -323,6 +339,12 @@ fi
 if [[ -n "$COLORA_DECAY" ]]; then
     SERVER_ARGS+=(--colora_decay "$COLORA_DECAY")
 fi
+if [[ -n "$COLORA_DEFERRED_PROMOTION_DELTA_STEPS" ]]; then
+    SERVER_ARGS+=(--colora_deferred_promotion_delta_steps "$COLORA_DEFERRED_PROMOTION_DELTA_STEPS")
+fi
+if [[ -n "$COLORA_PROMOTION_EMA_ALPHA" ]]; then
+    SERVER_ARGS+=(--colora_promotion_ema_alpha "$COLORA_PROMOTION_EMA_ALPHA")
+fi
 if [[ -n "$COLORA_MISS_POLICY" ]]; then
     SERVER_ARGS+=(--colora_miss_policy "$COLORA_MISS_POLICY")
 fi
@@ -337,6 +359,15 @@ if [[ -n "$COLORA_CPU_QUEUE_DEPTH" ]]; then
 fi
 if [[ -n "$COLORA_CPU_BATCH_TIMEOUT_US" ]]; then
     SERVER_ARGS+=(--colora_cpu_batch_timeout_us "$COLORA_CPU_BATCH_TIMEOUT_US")
+fi
+if [[ "$COLORA_TEMPORAL_PREFETCH" == "1" ]]; then
+    SERVER_ARGS+=(--colora_temporal_prefetch)
+fi
+if [[ -n "$COLORA_TEMPORAL_PREFETCH_LAYER_WHITELIST" ]]; then
+    SERVER_ARGS+=(--colora_temporal_prefetch_layer_whitelist "$COLORA_TEMPORAL_PREFETCH_LAYER_WHITELIST")
+fi
+if [[ -n "$COLORA_TEMPORAL_HOT_CACHE_SLOTS" ]]; then
+    SERVER_ARGS+=(--colora_temporal_hot_cache_slots "$COLORA_TEMPORAL_HOT_CACHE_SLOTS")
 fi
 if [[ "$COLORA_SPECULATIVE_DISPATCH" == "1" ]]; then
     SERVER_ARGS+=(--colora_speculative_dispatch)

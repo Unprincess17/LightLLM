@@ -38,6 +38,7 @@ def _build_pool(num_adapters: int = 4):
 
 def test_colora_cache_config_defaults_cover_new_controls():
     cfg = MoEExpertCacheConfig()
+    assert cfg.deferred_promotion_delta_steps == 4
     assert cfg.miss_policy == "cpu_first"
     assert cfg.queue_high_watermark is None
     assert cfg.promote_cooldown_steps == 4

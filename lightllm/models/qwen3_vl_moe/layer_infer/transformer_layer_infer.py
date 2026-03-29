@@ -27,7 +27,7 @@ logger = logging.getLogger("lightllm.lora.infer")
 logger.setLevel(_LOG_LEVEL)
 
 
-def _parse_spec_submit_layer_whitelist(raw: str):
+def _parse_layer_whitelist(raw: str, label: str):
     whitelist = set()
     for token in raw.split(","):
         token = token.strip()
@@ -36,7 +36,7 @@ def _parse_spec_submit_layer_whitelist(raw: str):
         try:
             whitelist.add(int(token))
         except ValueError:
-            logger.warning("[COLoRA][SpecSubmit] Ignore invalid whitelist token '%s'", token)
+            logger.warning("[COLoRA][%s] Ignore invalid whitelist token '%s'", label, token)
     return frozenset(whitelist)
 
 
@@ -51,11 +51,20 @@ class Qwen3VLMOETransformerLayerInfer(Qwen3MOETransformerLayerInfer):
         # S-LoRA batched mode support
         self.req_bins_ = None  # Per-request adapter indices for batched LoRA
         self._spec_submit_enabled = os.environ.get("COLORA_SPEC_SUBMIT_ENABLE", "0") == "1"
-        self._spec_submit_layer_whitelist = _parse_spec_submit_layer_whitelist(
-            os.environ.get("COLORA_SPEC_SUBMIT_LAYER_WHITELIST", "")
+        self._spec_submit_layer_whitelist = _parse_layer_whitelist(
+            os.environ.get("COLORA_SPEC_SUBMIT_LAYER_WHITELIST", ""),
+            "SpecSubmit",
         )
         self._spec_submit_layer_enabled = (
             self._spec_submit_enabled and self.layer_num_ in self._spec_submit_layer_whitelist
+        )
+        self._temporal_prefetch_enabled = os.environ.get("COLORA_TEMPORAL_PREFETCH_ENABLE", "0") == "1"
+        self._temporal_prefetch_layer_whitelist = _parse_layer_whitelist(
+            os.environ.get("COLORA_TEMPORAL_PREFETCH_LAYER_WHITELIST", ""),
+            "TemporalPrefetch",
+        )
+        self._temporal_prefetch_layer_enabled = (
+            self._temporal_prefetch_enabled and self.layer_num_ in self._temporal_prefetch_layer_whitelist
         )
         self._spec_submit_totals = {"submitted": 0, "skipped": 0, "rejected": 0}
         self._spec_bind_totals = {
@@ -68,10 +77,19 @@ class Qwen3VLMOETransformerLayerInfer(Qwen3MOETransformerLayerInfer):
         self._spec_bound_job_keys_current_call = set()
         self._spec_prev_decode_step_id: Optional[int] = None
         self._spec_prev_top1_by_req: Dict[int, Tuple[int, int]] = {}
+        self._temporal_prev_decode_step_id: Optional[int] = None
+        self._temporal_prev_top1_by_req: Dict[int, Tuple[int, int]] = {}
 
     def _bind_ffn(self):
         super()._bind_ffn()
-        if self.is_moe and os.environ.get("MOE_MODE", "TP") != "EP" and self._spec_submit_layer_enabled:
+        if (
+            self.is_moe
+            and os.environ.get("MOE_MODE", "TP") != "EP"
+            and (
+                bool(getattr(self, "_spec_submit_layer_enabled", False))
+                or bool(getattr(self, "_temporal_prefetch_layer_enabled", False))
+            )
+        ):
             self._ffn = partial(Qwen3VLMOETransformerLayerInfer._moe_ffn, self)
 
     def set_lora_dispatcher(self, dispatcher: Any, use_detached_lora: bool = True):
@@ -96,6 +114,8 @@ class Qwen3VLMOETransformerLayerInfer(Qwen3MOETransformerLayerInfer):
         self._spec_bound_job_keys_current_call = set()
         self._spec_prev_decode_step_id = None
         self._spec_prev_top1_by_req = {}
+        self._temporal_prev_decode_step_id = None
+        self._temporal_prev_top1_by_req = {}
 
     def _should_enable_spec_submit(self, infer_state: Optional[Qwen3VLInferStateInfo]) -> bool:
         if not self._spec_submit_layer_enabled:
@@ -128,6 +148,78 @@ class Qwen3VLMOETransformerLayerInfer(Qwen3MOETransformerLayerInfer):
         if not self._should_enable_spec_submit(infer_state):
             return False
         return callable(getattr(self.lora_dispatcher_, "try_bind_gate_up_job_with_status", None))
+
+    def _should_enable_temporal_prefetch(self, infer_state: Optional[Qwen3VLInferStateInfo]) -> bool:
+        if not bool(getattr(self, "_temporal_prefetch_layer_enabled", False)):
+            return False
+        if infer_state is None or getattr(infer_state, "is_prefill", True):
+            return False
+        if getattr(infer_state, "decode_step_id", None) is None:
+            return False
+        if not (self.use_detached_lora_ and self.lora_dispatcher_ is not None):
+            return False
+        if os.environ.get("MOE_MODE", "TP") != "TP":
+            return False
+        should_hybrid = getattr(self.lora_dispatcher_, "_should_use_hybrid_moe_compute", None)
+        if not callable(should_hybrid) or not bool(should_hybrid()):
+            return False
+        return callable(getattr(self.lora_dispatcher_, "maybe_submit_temporal_prefetch_job", None))
+
+    def _maybe_submit_decode_temporal_prefetch(self, infer_state: Qwen3VLInferStateInfo) -> None:
+        if not self._should_enable_temporal_prefetch(infer_state):
+            return
+
+        step_id = int(infer_state.decode_step_id)
+        begin_step = getattr(self.lora_dispatcher_, "begin_temporal_prefetch_step", None)
+        if callable(begin_step):
+            begin_step(step_id)
+
+        req_idx_tensor = getattr(infer_state, "b_req_idx", None)
+        adapter_bin_tensor = getattr(infer_state, "b_adapter_bin", None)
+        if req_idx_tensor is None or adapter_bin_tensor is None:
+            return
+
+        num_tokens = min(int(req_idx_tensor.shape[0]), int(adapter_bin_tensor.shape[0]))
+        if num_tokens <= 0:
+            return
+        if self._temporal_prev_decode_step_id is None or int(self._temporal_prev_decode_step_id) + 1 != step_id:
+            return
+
+        req_idx_cpu = req_idx_tensor[:num_tokens].detach().to(device="cpu", dtype=torch.int64).view(-1).tolist()
+        adapter_bins_cpu = (
+            adapter_bin_tensor[:num_tokens].detach().to(device="cpu", dtype=torch.int64).view(-1).tolist()
+        )
+
+        predicted_joint_keys = set()
+        for req_idx, adapter_bin in zip(req_idx_cpu, adapter_bins_cpu):
+            if int(adapter_bin) < 0:
+                continue
+            prev_joint = self._temporal_prev_top1_by_req.get(int(req_idx))
+            if prev_joint is None:
+                continue
+            prev_adapter_bin, prev_expert_id = prev_joint
+            if int(prev_adapter_bin) != int(adapter_bin) or int(prev_expert_id) < 0:
+                continue
+            predicted_joint_keys.add((int(adapter_bin), int(prev_expert_id)))
+
+        submit_fn = getattr(self.lora_dispatcher_, "maybe_submit_temporal_prefetch_job", None)
+        if not callable(submit_fn):
+            return
+        for adapter_bin, expert_id in sorted(predicted_joint_keys):
+            submit_fn(
+                decode_step_id=step_id,
+                layer_id=int(self.layer_num_),
+                adapter_bin=int(adapter_bin),
+                expert_id=int(expert_id),
+            )
+
+    def _finalize_decode_temporal_prefetch_step_nonblocking(self, infer_state: Optional[Qwen3VLInferStateInfo]) -> None:
+        if not self._should_enable_temporal_prefetch(infer_state):
+            return
+        finalize_fn = getattr(self.lora_dispatcher_, "finalize_temporal_prefetch_step_nonblocking", None)
+        if not callable(finalize_fn):
+            return
+        finalize_fn(int(infer_state.decode_step_id))
 
     def _maybe_submit_decode_spec_gate_up(
         self,
@@ -498,6 +590,48 @@ class Qwen3VLMOETransformerLayerInfer(Qwen3MOETransformerLayerInfer):
         self._spec_prev_decode_step_id = int(step_id)
         self._spec_prev_top1_by_req = next_predictor
 
+    def _update_decode_temporal_predictor(
+        self,
+        topk_ids: torch.Tensor,
+        infer_state: Qwen3VLInferStateInfo,
+        num_tokens: int,
+    ) -> None:
+        if not self._temporal_prefetch_layer_enabled:
+            return
+        if infer_state is None or getattr(infer_state, "is_prefill", True):
+            self._temporal_prev_decode_step_id = None
+            self._temporal_prev_top1_by_req = {}
+            return
+        if os.environ.get("MOE_MODE", "TP") != "TP":
+            return
+
+        step_id = getattr(infer_state, "decode_step_id", None)
+        req_idx_tensor = getattr(infer_state, "b_req_idx", None)
+        adapter_bin_tensor = getattr(infer_state, "b_adapter_bin", None)
+        if step_id is None or req_idx_tensor is None or adapter_bin_tensor is None:
+            self._temporal_prev_decode_step_id = None
+            self._temporal_prev_top1_by_req = {}
+            return
+
+        num_tokens = min(int(num_tokens), int(req_idx_tensor.shape[0]), int(adapter_bin_tensor.shape[0]))
+        if topk_ids is None or topk_ids.numel() == 0 or num_tokens <= 0:
+            self._temporal_prev_decode_step_id = int(step_id)
+            self._temporal_prev_top1_by_req = {}
+            return
+
+        top1_experts = topk_ids[:num_tokens, 0].detach().to(device="cpu", dtype=torch.int64).view(-1).tolist()
+        req_idx_cpu = req_idx_tensor[:num_tokens].detach().to(device="cpu", dtype=torch.int64).view(-1).tolist()
+        adapter_bins_cpu = adapter_bin_tensor[:num_tokens].detach().to(device="cpu", dtype=torch.int64).view(-1).tolist()
+
+        next_predictor: Dict[int, Tuple[int, int]] = {}
+        for req_idx, adapter_bin, expert_id in zip(req_idx_cpu, adapter_bins_cpu, top1_experts):
+            if int(adapter_bin) < 0 or int(expert_id) < 0 or int(expert_id) >= int(self.n_routed_experts):
+                continue
+            next_predictor[int(req_idx)] = (int(adapter_bin), int(expert_id))
+
+        self._temporal_prev_decode_step_id = int(step_id)
+        self._temporal_prev_top1_by_req = next_predictor
+
     def _log_router_trace(
         self,
         topk_ids: torch.Tensor,
@@ -507,6 +641,7 @@ class Qwen3VLMOETransformerLayerInfer(Qwen3MOETransformerLayerInfer):
     ) -> None:
         super()._log_router_trace(topk_ids, topk_weights, num_tokens, infer_state)
         self._update_decode_spec_predictor(topk_ids, infer_state, num_tokens)
+        self._update_decode_temporal_predictor(topk_ids, infer_state, num_tokens)
 
     def _moe_ffn(
         self,
@@ -520,12 +655,14 @@ class Qwen3VLMOETransformerLayerInfer(Qwen3MOETransformerLayerInfer):
         self._spec_bound_job_keys_current_call = set()
         try:
             hidden_states = input.view(-1, self.embed_dim_)
+            self._maybe_submit_decode_temporal_prefetch(infer_state)
             self._maybe_submit_decode_spec_gate_up(hidden_states, infer_state)
             output = super()._moe_ffn(input, infer_state, layer_weight)
             self._eager_retire_remaining_decode_spec_jobs(infer_state)
             return output
         finally:
             self._spec_bound_job_keys_current_call = set()
+            self._finalize_decode_temporal_prefetch_step_nonblocking(infer_state)
             self._finalize_decode_spec_step_nonblocking(infer_state)
 
     @NvtxAnnotate("Qwen3VL_QKV")

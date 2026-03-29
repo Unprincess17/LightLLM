@@ -28,6 +28,7 @@ class MoEExpertCacheConfig:
     promote_window: int = 128
     max_promote_per_step: int = 8
     decay: float = 0.9
+    deferred_promotion_delta_steps: int = 4
     # Default COLoRA miss policy: do not block request on promotion.
     miss_policy: str = "cpu_first"
     # Promotion queue soft cap. If None, derive from promote_window.

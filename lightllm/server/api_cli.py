@@ -168,6 +168,18 @@ def make_argument_parser() -> argparse.ArgumentParser:
         help="Decay factor for COLoRA utility score updates.",
     )
     parser.add_argument(
+        "--colora_deferred_promotion_delta_steps",
+        type=int,
+        default=4,
+        help="Static decode-step reuse threshold delta for COLoRA deferred promotion admission.",
+    )
+    parser.add_argument(
+        "--colora_promotion_ema_alpha",
+        type=float,
+        default=0.5,
+        help="EMA alpha used to estimate decode-step access intervals for COLoRA deferred promotion.",
+    )
+    parser.add_argument(
         "--colora_miss_policy",
         type=str,
         default="cpu_first",
@@ -198,6 +210,23 @@ def make_argument_parser() -> argparse.ArgumentParser:
         type=int,
         default=50,
         help="Queue wait budget in microseconds before degrading async fallback submission.",
+    )
+    parser.add_argument(
+        "--colora_temporal_prefetch",
+        action="store_true",
+        help="Enable paper-faithful COLoRA temporal weight prefetch into the CPU hot cache.",
+    )
+    parser.add_argument(
+        "--colora_temporal_prefetch_layer_whitelist",
+        type=str,
+        default="",
+        help="Comma-separated layer IDs eligible for COLoRA temporal weight prefetch.",
+    )
+    parser.add_argument(
+        "--colora_temporal_hot_cache_slots",
+        type=int,
+        default=64,
+        help="Number of static CPU hot-cache ring slots reserved for COLoRA temporal weight prefetch.",
     )
     parser.add_argument(
         "--colora_speculative_dispatch",

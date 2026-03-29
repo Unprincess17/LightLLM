@@ -18,10 +18,12 @@ Debugging:
 import torch
 import os
 import logging
+import queue
 import time
 import threading
 from collections import OrderedDict, deque
 from concurrent.futures import CancelledError, ThreadPoolExecutor
+from dataclasses import dataclass, field
 from typing import Callable, Deque, Dict, Optional, Any, List, NamedTuple, Set, Tuple
 
 from lightllm.server.core.objs.lora_compute_config import LoRAComputeConfig
@@ -124,6 +126,379 @@ class SpecBindOutcome(NamedTuple):
     result: Optional[Any]
 
 
+class JointObjectKey(NamedTuple):
+    layer_id: int
+    adapter_bin: int
+    expert_id: int
+
+
+class TemporalPrefetchJobKey(NamedTuple):
+    layer_id: int
+    decode_step_id: int
+    adapter_bin: int
+    expert_id: int
+
+
+@dataclass(frozen=True)
+class _JointAccessEvent:
+    key: JointObjectKey
+    decode_step_id: int
+
+
+@dataclass
+class _JointAccessState:
+    last_decode_step_id: int = -1
+    ema_interval_steps: Optional[float] = None
+    interval_sample_count: int = 0
+
+
+@dataclass
+class PrefetchedProjectionWeights:
+    a_buffer: torch.Tensor
+    b_buffer: torch.Tensor
+    rank: int
+    scaling: float
+
+
+@dataclass
+class _TemporalProjectionBuffers:
+    a_buffer: torch.Tensor
+    b_buffer: torch.Tensor
+    max_rank: int
+
+
+@dataclass
+class _TemporalHotCacheSlot:
+    generation: int = 0
+    key: Optional[TemporalPrefetchJobKey] = None
+    state: str = "invalid"
+    refcount: int = 0
+    ranks: Dict[str, int] = field(default_factory=dict)
+    scalings: Dict[str, float] = field(default_factory=dict)
+    used: bool = False
+
+
+@dataclass
+class TemporalPrefetchJobHandle:
+    key: TemporalPrefetchJobKey
+    future: Any
+    slot_id: int
+    generation: int
+    submitted_at: float = field(default_factory=time.perf_counter)
+    stale: bool = False
+    used: bool = False
+
+
+class JointAccessIntervalTracker:
+    def __init__(self, ema_alpha: float, max_queue_size: int = 4096):
+        alpha = float(ema_alpha)
+        if alpha <= 0.0 or alpha > 1.0:
+            alpha = 0.5
+        self.ema_alpha = alpha
+        self._events: "queue.Queue[_JointAccessEvent]" = queue.Queue(maxsize=max(int(max_queue_size), 1))
+        self._lock = threading.Lock()
+        self._states: Dict[JointObjectKey, _JointAccessState] = {}
+        self._dropped_events = 0
+        self._stop_event = threading.Event()
+        self._worker = threading.Thread(
+            target=self._run,
+            name="colora_interval_tracker",
+            daemon=True,
+        )
+        self._worker.start()
+
+    def submit_access(self, key: JointObjectKey, decode_step_id: int) -> bool:
+        try:
+            self._events.put_nowait(_JointAccessEvent(key=key, decode_step_id=int(decode_step_id)))
+            return True
+        except queue.Full:
+            with self._lock:
+                self._dropped_events += 1
+            return False
+
+    def get_ema_interval_steps(self, key: JointObjectKey) -> Optional[float]:
+        with self._lock:
+            state = self._states.get(key)
+            if state is None or state.interval_sample_count <= 0 or state.ema_interval_steps is None:
+                return None
+            return float(state.ema_interval_steps)
+
+    def get_dropped_events(self) -> int:
+        with self._lock:
+            return int(self._dropped_events)
+
+    def close(self) -> None:
+        self._stop_event.set()
+        if self._worker.is_alive():
+            self._worker.join(timeout=1.0)
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set() or not self._events.empty():
+            try:
+                event = self._events.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            self._apply_event(event)
+
+    def _apply_event(self, event: _JointAccessEvent) -> None:
+        with self._lock:
+            state = self._states.get(event.key)
+            if state is None:
+                self._states[event.key] = _JointAccessState(last_decode_step_id=int(event.decode_step_id))
+                return
+
+            if state.last_decode_step_id < 0:
+                state.last_decode_step_id = int(event.decode_step_id)
+                return
+            if int(event.decode_step_id) < int(state.last_decode_step_id):
+                return
+
+            gap = int(event.decode_step_id) - int(state.last_decode_step_id)
+            if state.ema_interval_steps is None or state.interval_sample_count <= 0:
+                state.ema_interval_steps = float(gap)
+            else:
+                state.ema_interval_steps = (
+                    self.ema_alpha * float(gap)
+                    + (1.0 - self.ema_alpha) * float(state.ema_interval_steps)
+                )
+            state.interval_sample_count += 1
+            state.last_decode_step_id = int(event.decode_step_id)
+
+
+class TemporalHotCacheHandle:
+    def __init__(self, cache: "TemporalPrefetchHotCache", slot_id: int, generation: int):
+        self._cache = cache
+        self.slot_id = int(slot_id)
+        self.generation = int(generation)
+        self._released = False
+
+    def get_projection(self, projection: str) -> Optional[PrefetchedProjectionWeights]:
+        return self._cache.get_projection_weights(self.slot_id, self.generation, projection)
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        self._cache.release(self.slot_id, self.generation)
+
+
+class TemporalPrefetchHotCache:
+    def __init__(self, slots: int, lora_mem_pool: Optional[Any]):
+        self.slot_count = max(int(slots), 0)
+        self.enabled = bool(self.slot_count > 0 and lora_mem_pool is not None)
+        self._lock = threading.Lock()
+        self._next_slot = 0
+        self._slot_overwrite_count = 0
+        self._slots: List[_TemporalHotCacheSlot] = [_TemporalHotCacheSlot() for _ in range(self.slot_count)]
+        self._key_to_slot: Dict[TemporalPrefetchJobKey, Tuple[int, int]] = {}
+        self._buffers: Dict[str, _TemporalProjectionBuffers] = {}
+
+        if not self.enabled:
+            return
+
+        projection_pools = {
+            "gate": getattr(lora_mem_pool, "moe_gate_pool", None),
+            "up": getattr(lora_mem_pool, "moe_up_pool", None),
+            "down": getattr(lora_mem_pool, "moe_down_pool", None),
+        }
+        if any(pool is None for pool in projection_pools.values()):
+            self.enabled = False
+            return
+
+        for projection, pool in projection_pools.items():
+            dtype = pool.key_buffer.dtype
+            self._buffers[projection] = _TemporalProjectionBuffers(
+                a_buffer=torch.empty(
+                    (self.slot_count, int(pool.max_rank), int(pool.key_buffer.shape[2])),
+                    dtype=dtype,
+                    device="cpu",
+                ),
+                b_buffer=torch.empty(
+                    (self.slot_count, int(pool.max_rank), int(pool.value_buffer.shape[2])),
+                    dtype=dtype,
+                    device="cpu",
+                ),
+                max_rank=int(pool.max_rank),
+            )
+
+    def reserve_slot(self, key: TemporalPrefetchJobKey) -> Optional[Tuple[int, int]]:
+        if not self.enabled:
+            return None
+
+        with self._lock:
+            for slot_offset in range(self.slot_count):
+                slot_id = (self._next_slot + slot_offset) % self.slot_count
+                slot = self._slots[slot_id]
+                if slot.refcount > 0:
+                    continue
+                if slot.key is not None and slot.state in ("ready", "filling"):
+                    self._slot_overwrite_count += 1
+                self._invalidate_slot_locked(slot_id)
+                slot.generation += 1
+                slot.key = key
+                slot.state = "filling"
+                slot.refcount = 0
+                slot.ranks = {}
+                slot.scalings = {}
+                slot.used = False
+                self._key_to_slot[key] = (slot_id, slot.generation)
+                self._next_slot = (slot_id + 1) % max(self.slot_count, 1)
+                return int(slot_id), int(slot.generation)
+        return None
+
+    def publish_ready(
+        self,
+        slot_id: int,
+        generation: int,
+        key: TemporalPrefetchJobKey,
+        ranks: Dict[str, int],
+        scalings: Dict[str, float],
+    ) -> bool:
+        if not self.enabled:
+            return False
+        with self._lock:
+            if slot_id < 0 or slot_id >= self.slot_count:
+                return False
+            slot = self._slots[slot_id]
+            if slot.generation != int(generation) or slot.key != key:
+                return False
+            slot.ranks = dict(ranks)
+            slot.scalings = dict(scalings)
+            slot.state = "ready"
+            return True
+
+    def invalidate_slot(self, slot_id: int, generation: int) -> None:
+        if not self.enabled:
+            return
+        with self._lock:
+            if slot_id < 0 or slot_id >= self.slot_count:
+                return
+            slot = self._slots[slot_id]
+            if slot.generation != int(generation) or slot.refcount > 0:
+                return
+            self._invalidate_slot_locked(slot_id)
+
+    def invalidate_older_than(self, min_decode_step_id: int) -> int:
+        if not self.enabled:
+            return 0
+        invalidated = 0
+        with self._lock:
+            for slot_id, slot in enumerate(self._slots):
+                if slot.key is None or slot.refcount > 0:
+                    continue
+                if int(slot.key.decode_step_id) >= int(min_decode_step_id):
+                    continue
+                self._invalidate_slot_locked(slot_id)
+                invalidated += 1
+        return invalidated
+
+    def has_key(self, key: TemporalPrefetchJobKey) -> bool:
+        if not self.enabled:
+            return False
+        with self._lock:
+            slot_ref = self._key_to_slot.get(key)
+            if slot_ref is None:
+                return False
+            slot_id, generation = slot_ref
+            slot = self._slots[slot_id]
+            return slot.generation == int(generation) and slot.key == key and slot.state in ("filling", "ready")
+
+    def get_status(self, key: TemporalPrefetchJobKey) -> str:
+        if not self.enabled:
+            return "missing"
+        with self._lock:
+            slot_ref = self._key_to_slot.get(key)
+            if slot_ref is None:
+                return "missing"
+            slot_id, generation = slot_ref
+            slot = self._slots[slot_id]
+            if slot.generation != int(generation) or slot.key != key:
+                return "missing"
+            return str(slot.state)
+
+    def acquire(self, key: TemporalPrefetchJobKey) -> Optional[TemporalHotCacheHandle]:
+        if not self.enabled:
+            return None
+        with self._lock:
+            slot_ref = self._key_to_slot.get(key)
+            if slot_ref is None:
+                return None
+            slot_id, generation = slot_ref
+            slot = self._slots[slot_id]
+            if slot.generation != int(generation) or slot.key != key or slot.state != "ready":
+                return None
+            slot.refcount += 1
+            slot.used = True
+            return TemporalHotCacheHandle(self, slot_id, generation)
+
+    def get_projection_weights(
+        self,
+        slot_id: int,
+        generation: int,
+        projection: str,
+    ) -> Optional[PrefetchedProjectionWeights]:
+        with self._lock:
+            if slot_id < 0 or slot_id >= self.slot_count:
+                return None
+            slot = self._slots[slot_id]
+            if slot.generation != int(generation) or slot.state != "ready":
+                return None
+            rank = int(slot.ranks.get(projection, 0))
+            if rank <= 0:
+                return None
+            scaling = float(slot.scalings.get(projection, 1.0))
+            buffers = self._buffers.get(projection)
+            if buffers is None:
+                return None
+            return PrefetchedProjectionWeights(
+                a_buffer=buffers.a_buffer[slot_id],
+                b_buffer=buffers.b_buffer[slot_id],
+                rank=rank,
+                scaling=scaling,
+            )
+
+    def release(self, slot_id: int, generation: int) -> None:
+        if not self.enabled:
+            return
+        with self._lock:
+            if slot_id < 0 or slot_id >= self.slot_count:
+                return
+            slot = self._slots[slot_id]
+            if slot.generation != int(generation):
+                return
+            slot.refcount = max(int(slot.refcount) - 1, 0)
+
+    def get_slot_overwrite_count(self) -> int:
+        with self._lock:
+            return int(self._slot_overwrite_count)
+
+    def count_unused_ready_for_step(self, decode_step_id: int) -> int:
+        if not self.enabled:
+            return 0
+        with self._lock:
+            count = 0
+            for slot in self._slots:
+                if (
+                    slot.key is not None
+                    and slot.state == "ready"
+                    and int(slot.key.decode_step_id) == int(decode_step_id)
+                    and not slot.used
+                ):
+                    count += 1
+            return count
+
+    def _invalidate_slot_locked(self, slot_id: int) -> None:
+        slot = self._slots[slot_id]
+        if slot.key is not None:
+            self._key_to_slot.pop(slot.key, None)
+        slot.key = None
+        slot.state = "invalid"
+        slot.ranks = {}
+        slot.scalings = {}
+        slot.used = False
+
+
+
 class Qwen3VLMoELoRADispatcher:
     """
     S-LoRA Batched LoRA Dispatcher for Qwen3-VL-MoE.
@@ -166,6 +541,10 @@ class Qwen3VLMoELoRADispatcher:
         colora_cpu_workers: int = 4,
         colora_cpu_queue_depth: int = 256,
         colora_cpu_batch_timeout_us: int = 50,
+        colora_deferred_promotion_delta_steps: int = 4,
+        colora_promotion_ema_alpha: float = 0.5,
+        colora_temporal_prefetch: bool = False,
+        colora_temporal_hot_cache_slots: int = 64,
     ):
         self.num_layers = num_layers
         self.lora_compute_config = lora_compute_config or LoRAComputeConfig()
@@ -211,16 +590,39 @@ class Qwen3VLMoELoRADispatcher:
         self.colora_cpu_queue_depth = max(int(colora_cpu_queue_depth), 1)
         self.colora_cpu_batch_timeout_us = max(int(colora_cpu_batch_timeout_us), 0)
         self._cpu_executor: Optional[ThreadPoolExecutor] = None
+        self._prefetch_executor: Optional[ThreadPoolExecutor] = None
         self._cpu_queue_lock = threading.Lock()
         self._cpu_inflight = 0
         self._cpu_group_plan_cache: "OrderedDict[Tuple[int, bytes], Tuple[Tuple[int, Tuple[int, ...]], ...]]" = OrderedDict()
         self._cpu_group_plan_cache_cap = 256
+        self._thread_local = threading.local()
+        self._deferred_promotion_delta_steps = max(int(colora_deferred_promotion_delta_steps), 0)
+        self._promotion_interval_tracker = JointAccessIntervalTracker(
+            ema_alpha=float(colora_promotion_ema_alpha),
+            max_queue_size=max(self.colora_cpu_queue_depth * 4, 1024),
+        )
+        self._temporal_prefetch_enabled = bool(colora_temporal_prefetch)
+        self._temporal_hot_cache_slots = max(int(colora_temporal_hot_cache_slots), 0)
+        self._temporal_hot_cache: Optional[TemporalPrefetchHotCache] = None
+        self._prefetch_lock = threading.Lock()
+        self._prefetch_current_step_id: Optional[int] = None
+        self._prefetch_active_jobs: Dict[TemporalPrefetchJobKey, TemporalPrefetchJobHandle] = {}
+        self._prefetch_active_job_keys_by_step: Dict[int, Set[TemporalPrefetchJobKey]] = {}
         self._spec_lock = threading.Lock()
         self._spec_current_step_id: Optional[int] = None
         self._spec_active_jobs: Dict[SpecJobKey, SpecJobHandle] = {}
         self._spec_active_job_keys_by_step: Dict[int, Set[SpecJobKey]] = {}
         self._spec_retired_jobs: Deque[SpecJobHandle] = deque()
         self._spec_reserved_job_keys: Set[SpecJobKey] = set()
+        self._pending_background_stats = {
+            "promotion_admitted": 0,
+            "promotion_reject_delta": 0,
+            "promotion_reject_no_ema": 0,
+            "tracker_queue_drop": 0,
+            "prefetch_submitted": 0,
+            "prefetch_stale": 0,
+            "prefetch_false_positives": 0,
+        }
 
         # Last-call COLoRA stats for decode observability.
         self._last_colora_stats = {
@@ -239,8 +641,18 @@ class Qwen3VLMoELoRADispatcher:
             "promotion_drop_total": 0,
             "promotion_drop_queue_high_watermark": 0,
             "promotion_drop_cooldown": 0,
+            "promotion_admitted": 0,
+            "promotion_reject_delta": 0,
+            "promotion_reject_no_ema": 0,
+            "tracker_queue_drop": 0,
             "moe_kernel_calls": 0,
             "moe_kernel_tokens": 0,
+            "prefetch_submitted": 0,
+            "prefetch_ready_hits": 0,
+            "prefetch_not_ready": 0,
+            "prefetch_stale": 0,
+            "prefetch_false_positives": 0,
+            "prefetch_slot_overwrite": 0,
         }
 
         # Check if any LoRA is enabled
@@ -276,6 +688,14 @@ class Qwen3VLMoELoRADispatcher:
         self.use_batched_mode = True
         self.expert_cache_manager = expert_cache_manager
         self._reset_colora_stats()
+        self._reset_pending_background_stats()
+        if self._temporal_prefetch_enabled and self._should_use_hybrid_moe_compute():
+            self._temporal_hot_cache = TemporalPrefetchHotCache(
+                slots=self._temporal_hot_cache_slots,
+                lora_mem_pool=lora_mem_pool,
+            )
+        else:
+            self._temporal_hot_cache = None
 
         # batch_size = req_bins.shape[0] if req_bins is not None else 0
         # unique_adapters = len(torch.unique(req_bins)) if req_bins is not None else 0
@@ -284,11 +704,14 @@ class Qwen3VLMoELoRADispatcher:
         """Switch back to single adapter mode (original behavior)."""
         logger.debug(f"[LoRA Dispatch] Switching to single adapter mode")
         self.cleanup_speculation_state()
+        self.cleanup_temporal_prefetch_state()
         self.use_batched_mode = False
         self.lora_mem_pool = None
         self.req_bins = None
         self.expert_cache_manager = None
+        self._temporal_hot_cache = None
         self._reset_colora_stats()
+        self._reset_pending_background_stats()
 
     # =====================================================================
     # S-LoRA Batched Methods (FIXED)
@@ -337,6 +760,338 @@ class Qwen3VLMoELoRADispatcher:
             return moe_batch_lora_down_avx
         raise ValueError(f"Unsupported MoE projection '{projection}', expected gate|up|down")
 
+    def _reset_pending_background_stats(self) -> None:
+        self._pending_background_stats = {
+            "promotion_admitted": 0,
+            "promotion_reject_delta": 0,
+            "promotion_reject_no_ema": 0,
+            "tracker_queue_drop": 0,
+            "prefetch_submitted": 0,
+            "prefetch_stale": 0,
+            "prefetch_false_positives": 0,
+        }
+
+    def _record_background_stat(self, key: str, value: int = 1) -> None:
+        if key not in self._pending_background_stats:
+            return
+        self._pending_background_stats[key] += int(value)
+
+    def _flush_pending_background_stats(self) -> None:
+        for key, value in self._pending_background_stats.items():
+            if key in self._last_colora_stats:
+                self._last_colora_stats[key] += int(value)
+        self._reset_pending_background_stats()
+
+    def _get_or_create_prefetch_executor(self) -> ThreadPoolExecutor:
+        if self._prefetch_executor is None:
+            self._prefetch_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="colora_prefetch",
+            )
+        return self._prefetch_executor
+
+    def begin_decode_joint_context(self, decode_step_id: int, layer_id: int, expert_id: int) -> None:
+        self._thread_local.decode_joint_context = (
+            int(decode_step_id),
+            int(layer_id),
+            int(expert_id),
+        )
+
+    def end_decode_joint_context(self) -> None:
+        if hasattr(self._thread_local, "decode_joint_context"):
+            del self._thread_local.decode_joint_context
+
+    def _get_current_decode_joint_context(self) -> Optional[Tuple[int, int, int]]:
+        return getattr(self._thread_local, "decode_joint_context", None)
+
+    def _build_temporal_prefetch_job_key(
+        self,
+        decode_step_id: int,
+        layer_id: int,
+        adapter_bin: int,
+        expert_id: int,
+    ) -> TemporalPrefetchJobKey:
+        return TemporalPrefetchJobKey(
+            layer_id=int(layer_id),
+            decode_step_id=int(decode_step_id),
+            adapter_bin=int(adapter_bin),
+            expert_id=int(expert_id),
+        )
+
+    def _build_joint_object_key(self, layer_id: int, adapter_bin: int, expert_id: int) -> JointObjectKey:
+        return JointObjectKey(
+            layer_id=int(layer_id),
+            adapter_bin=int(adapter_bin),
+            expert_id=int(expert_id),
+        )
+
+    def _get_pool_rank_and_scaling(self, pool, adapter_idx: int) -> Tuple[int, float]:
+        if hasattr(pool, "a_rank") and len(pool.a_rank) > adapter_idx:
+            rank = int(pool.a_rank[adapter_idx].item())
+        else:
+            rank = int(pool.max_rank)
+        scaling = float(pool.a_scaling[adapter_idx].item())
+        return rank, scaling
+
+    def _get_pool_source_slot(self, pool, layer_id: int, expert_id: int, adapter_idx: int) -> Optional[int]:
+        if adapter_idx < 0 or adapter_idx >= len(pool.a_start):
+            return None
+
+        layer_offset = int(layer_id)
+        if getattr(pool, "num_experts", 1) > 1:
+            layer_offset = int(layer_id) * int(pool.num_experts) + int(expert_id)
+
+        src_slot = int(pool.a_start[adapter_idx].item()) + int(layer_offset)
+        if src_slot < 0 or src_slot >= int(pool.key_buffer.shape[0]):
+            return None
+        return src_slot
+
+    def _is_joint_projection_ready(self, projection: str, layer_id: int, adapter_bin: int, expert_id: int) -> bool:
+        manager = self.expert_cache_manager
+        if manager is None:
+            return False
+        key = ExpertCacheKey(
+            projection=str(projection),
+            adapter_idx=int(adapter_bin),
+            layer_id=int(layer_id),
+            expert_id=int(expert_id),
+        )
+        ready_slots = manager.peek_ready_slots([key])
+        return key in ready_slots
+
+    def _is_joint_ready(self, layer_id: int, adapter_bin: int, expert_id: int) -> bool:
+        return (
+            self._is_joint_projection_ready("gate", layer_id, adapter_bin, expert_id)
+            and self._is_joint_projection_ready("up", layer_id, adapter_bin, expert_id)
+            and self._is_joint_projection_ready("down", layer_id, adapter_bin, expert_id)
+        )
+
+    def note_decode_joint_access(
+        self,
+        decode_step_id: int,
+        layer_id: int,
+        expert_id: int,
+        adapter_bins: List[int],
+    ) -> None:
+        manager = self.expert_cache_manager
+        if manager is None or not self._should_use_hybrid_moe_compute():
+            return
+
+        unique_adapter_bins = sorted({int(adapter_bin) for adapter_bin in adapter_bins if int(adapter_bin) >= 0})
+        for adapter_bin in unique_adapter_bins:
+            joint_key = self._build_joint_object_key(layer_id, adapter_bin, expert_id)
+            if not self._promotion_interval_tracker.submit_access(joint_key, int(decode_step_id)):
+                self._record_background_stat("tracker_queue_drop", 1)
+            promotion_keys = [
+                ExpertCacheKey("gate", adapter_bin, int(layer_id), int(expert_id)),
+                ExpertCacheKey("up", adapter_bin, int(layer_id), int(expert_id)),
+                ExpertCacheKey("down", adapter_bin, int(layer_id), int(expert_id)),
+            ]
+            manager.record_access(promotion_keys)
+            if self._deferred_promotion_delta_steps <= 0:
+                continue
+            if self._is_joint_ready(layer_id, adapter_bin, expert_id):
+                continue
+            ema_interval = self._promotion_interval_tracker.get_ema_interval_steps(joint_key)
+            if ema_interval is None:
+                self._record_background_stat("promotion_reject_no_ema", 1)
+                continue
+            if float(ema_interval) > float(self._deferred_promotion_delta_steps):
+                self._record_background_stat("promotion_reject_delta", 1)
+                continue
+            queued = manager.schedule_promotion(promotion_keys)
+            if queued > 0:
+                self._record_background_stat("promotion_admitted", 1)
+
+    def begin_temporal_prefetch_step(self, decode_step_id: int) -> Dict[str, int]:
+        step_id = int(decode_step_id)
+        retired = 0
+        with self._prefetch_lock:
+            stale_steps = [active_step for active_step in self._prefetch_active_job_keys_by_step.keys() if active_step != step_id]
+            for active_step in stale_steps:
+                retired += self._retire_prefetch_step_locked(active_step, mark_stale=True)
+            self._prefetch_current_step_id = step_id
+            self._prefetch_active_job_keys_by_step.setdefault(step_id, set())
+        stale_from_cache = 0
+        if self._temporal_hot_cache is not None:
+            stale_from_cache = self._temporal_hot_cache.invalidate_older_than(step_id)
+        if stale_from_cache > 0:
+            self._record_background_stat("prefetch_stale", stale_from_cache)
+        return {"retired_active": int(retired), "retired_ready": int(stale_from_cache)}
+
+    def finalize_temporal_prefetch_step_nonblocking(self, decode_step_id: int) -> Dict[str, int]:
+        step_id = int(decode_step_id)
+        retired = 0
+        false_positives = 0
+        with self._prefetch_lock:
+            retired = self._retire_prefetch_step_locked(step_id, mark_stale=True)
+            if self._prefetch_current_step_id == step_id:
+                self._prefetch_current_step_id = None
+        if self._temporal_hot_cache is not None:
+            false_positives = self._temporal_hot_cache.count_unused_ready_for_step(step_id)
+        if retired > 0:
+            self._record_background_stat("prefetch_stale", retired)
+        if false_positives > 0:
+            self._record_background_stat("prefetch_false_positives", false_positives)
+        return {"retired_active": int(retired), "unused_ready": int(false_positives)}
+
+    def cleanup_temporal_prefetch_state(self) -> Dict[str, int]:
+        retired = 0
+        with self._prefetch_lock:
+            active_steps = tuple(self._prefetch_active_job_keys_by_step.keys())
+            for step_id in active_steps:
+                retired += self._retire_prefetch_step_locked(step_id, mark_stale=True)
+            self._prefetch_current_step_id = None
+            self._prefetch_active_jobs.clear()
+            self._prefetch_active_job_keys_by_step.clear()
+        if self._prefetch_executor is not None:
+            self._prefetch_executor.shutdown(wait=False, cancel_futures=False)
+            self._prefetch_executor = None
+        if self._temporal_hot_cache is not None:
+            retired += self._temporal_hot_cache.invalidate_older_than(1 << 30)
+        return {"retired": int(retired)}
+
+    def maybe_submit_temporal_prefetch_job(
+        self,
+        decode_step_id: int,
+        layer_id: int,
+        adapter_bin: int,
+        expert_id: int,
+    ) -> bool:
+        if (
+            not self._temporal_prefetch_enabled
+            or not self._should_use_hybrid_moe_compute()
+            or self._temporal_hot_cache is None
+            or self.lora_mem_pool is None
+        ):
+            return False
+        if int(adapter_bin) < 0 or int(expert_id) < 0:
+            return False
+        if self._is_joint_ready(layer_id, adapter_bin, expert_id):
+            return False
+
+        key = self._build_temporal_prefetch_job_key(decode_step_id, layer_id, adapter_bin, expert_id)
+        with self._prefetch_lock:
+            if self._prefetch_current_step_id is None or int(self._prefetch_current_step_id) != int(decode_step_id):
+                return False
+            if key in self._prefetch_active_jobs or self._temporal_hot_cache.has_key(key):
+                return False
+
+        slot_ref = self._temporal_hot_cache.reserve_slot(key)
+        if slot_ref is None:
+            return False
+        slot_id, generation = slot_ref
+
+        def _worker() -> Tuple[Dict[str, int], Dict[str, float]]:
+            pools = {
+                "gate": self.lora_mem_pool.moe_gate_pool,
+                "up": self.lora_mem_pool.moe_up_pool,
+                "down": self.lora_mem_pool.moe_down_pool,
+            }
+            ranks: Dict[str, int] = {}
+            scalings: Dict[str, float] = {}
+            for projection, pool in pools.items():
+                src_slot = self._get_pool_source_slot(pool, layer_id, expert_id, adapter_bin)
+                if src_slot is None:
+                    raise ValueError(f"missing source slot for {projection} layer={layer_id} expert={expert_id} adapter={adapter_bin}")
+                rank, scaling = self._get_pool_rank_and_scaling(pool, adapter_bin)
+                ranks[projection] = int(rank)
+                scalings[projection] = float(scaling)
+                buffers = self._temporal_hot_cache._buffers[projection]
+                if rank > 0:
+                    buffers.a_buffer[slot_id, :rank].copy_(pool.key_buffer[src_slot, :rank], non_blocking=False)
+                    buffers.b_buffer[slot_id, :rank].copy_(pool.value_buffer[src_slot, :rank], non_blocking=False)
+                if rank < buffers.max_rank:
+                    buffers.a_buffer[slot_id, rank:].zero_()
+                    buffers.b_buffer[slot_id, rank:].zero_()
+            return ranks, scalings
+
+        future = self._get_or_create_prefetch_executor().submit(_worker)
+        handle = TemporalPrefetchJobHandle(
+            key=key,
+            future=future,
+            slot_id=int(slot_id),
+            generation=int(generation),
+        )
+
+        def _on_complete(done_future) -> None:
+            try:
+                ranks, scalings = done_future.result()
+            except Exception:
+                self._temporal_hot_cache.invalidate_slot(handle.slot_id, handle.generation)
+                with self._prefetch_lock:
+                    active = self._prefetch_active_jobs.pop(key, None)
+                    if active is not None:
+                        step_keys = self._prefetch_active_job_keys_by_step.get(int(key.decode_step_id))
+                        if step_keys is not None:
+                            step_keys.discard(key)
+                            if not step_keys:
+                                self._prefetch_active_job_keys_by_step.pop(int(key.decode_step_id), None)
+                return
+
+            publish = False
+            with self._prefetch_lock:
+                active = self._prefetch_active_jobs.get(key)
+                publish = active is not None and not active.stale
+                if active is not None:
+                    self._prefetch_active_jobs.pop(key, None)
+                    step_keys = self._prefetch_active_job_keys_by_step.get(int(key.decode_step_id))
+                    if step_keys is not None:
+                        step_keys.discard(key)
+                        if not step_keys:
+                            self._prefetch_active_job_keys_by_step.pop(int(key.decode_step_id), None)
+            if publish:
+                self._temporal_hot_cache.publish_ready(handle.slot_id, handle.generation, key, ranks, scalings)
+            else:
+                self._temporal_hot_cache.invalidate_slot(handle.slot_id, handle.generation)
+
+        with self._prefetch_lock:
+            self._prefetch_active_jobs[key] = handle
+            self._prefetch_active_job_keys_by_step.setdefault(int(key.decode_step_id), set()).add(key)
+        future.add_done_callback(_on_complete)
+        self._record_background_stat("prefetch_submitted", 1)
+        return True
+
+    def _retire_prefetch_step_locked(self, decode_step_id: int, mark_stale: bool) -> int:
+        retired = 0
+        keys = tuple(self._prefetch_active_job_keys_by_step.get(int(decode_step_id), ()))
+        for key in keys:
+            handle = self._prefetch_active_jobs.get(key)
+            if handle is None:
+                continue
+            if mark_stale:
+                handle.stale = True
+            self._prefetch_active_jobs.pop(key, None)
+            retired += 1
+        if int(decode_step_id) in self._prefetch_active_job_keys_by_step:
+            self._prefetch_active_job_keys_by_step.pop(int(decode_step_id), None)
+        return retired
+
+    def _maybe_acquire_prefetched_projection(
+        self,
+        projection: str,
+        adapter_idx: int,
+        temporal_prefetch_context: Optional[Tuple[int, int, int]],
+    ) -> Tuple[Optional[PrefetchedProjectionWeights], Optional[TemporalHotCacheHandle], str]:
+        if self._temporal_hot_cache is None or temporal_prefetch_context is None:
+            return None, None, "disabled"
+        decode_step_id, layer_id, expert_id = temporal_prefetch_context
+        key = self._build_temporal_prefetch_job_key(
+            decode_step_id=decode_step_id,
+            layer_id=layer_id,
+            adapter_bin=adapter_idx,
+            expert_id=expert_id,
+        )
+        handle = self._temporal_hot_cache.acquire(key)
+        if handle is not None:
+            weights = handle.get_projection(projection)
+            if weights is not None:
+                return weights, handle, "ready"
+            handle.release()
+            return None, None, "missing"
+        status = self._temporal_hot_cache.get_status(key)
+        return None, None, status
+
     def _strict_moe_cpu_batch_lora(
         self,
         input_tensor: torch.Tensor,
@@ -346,6 +1101,7 @@ class Qwen3VLMoELoRADispatcher:
         projection: str,
         adapter_group_plan: Optional[Tuple[Tuple[int, Tuple[int, ...]], ...]] = None,
         return_to_original_device: bool = True,
+        temporal_prefetch_context: Optional[Tuple[int, int, int]] = None,
     ) -> Tuple[torch.Tensor, int, int]:
         """Strict MoE CPU fallback: force MoE-specific AVX kernel path."""
         self._require_moe_cpu_kernel(mode=projection)
@@ -391,41 +1147,64 @@ class Qwen3VLMoELoRADispatcher:
             if len(req_indices) == 0:
                 continue
 
-            a_start = int(pool.a_start[adapter_idx].item())
-            a_len = int(pool.a_len[adapter_idx].item())
-            a_scaling = float(pool.a_scaling[adapter_idx].item())
-            if hasattr(pool, "a_rank") and len(pool.a_rank) > adapter_idx:
-                a_rank = int(pool.a_rank[adapter_idx].item())
-            else:
-                a_rank = int(a_len)
+            hot_weights = None
+            hot_handle = None
+            hot_status = "disabled"
+            if temporal_prefetch_context is not None:
+                hot_weights, hot_handle, hot_status = self._maybe_acquire_prefetched_projection(
+                    projection=projection,
+                    adapter_idx=int(adapter_idx),
+                    temporal_prefetch_context=temporal_prefetch_context,
+                )
 
-            loc = a_start + layer_id
-            if loc >= a_start + a_len:
-                continue
+            try:
+                if hot_weights is not None:
+                    A = hot_weights.a_buffer[: hot_weights.rank]
+                    B = hot_weights.b_buffer[: hot_weights.rank]
+                    a_scaling = float(hot_weights.scaling)
+                    self._last_colora_stats["prefetch_ready_hits"] += 1
+                else:
+                    if hot_status == "filling":
+                        self._last_colora_stats["prefetch_not_ready"] += 1
+                    a_start = int(pool.a_start[adapter_idx].item())
+                    a_len = int(pool.a_len[adapter_idx].item())
+                    a_scaling = float(pool.a_scaling[adapter_idx].item())
+                    if hasattr(pool, "a_rank") and len(pool.a_rank) > adapter_idx:
+                        a_rank = int(pool.a_rank[adapter_idx].item())
+                    else:
+                        a_rank = int(a_len)
 
-            A = pool.key_buffer[loc, :a_rank]
-            B = pool.value_buffer[loc, :a_rank]
-            if A.device.type != "cpu" or A.dtype != torch.bfloat16:
-                A = A.to(device="cpu", dtype=torch.bfloat16)
-            if B.device.type != "cpu" or B.dtype != torch.bfloat16:
-                B = B.to(device="cpu", dtype=torch.bfloat16)
-            if not A.is_contiguous():
-                A = A.contiguous()
-            if not B.is_contiguous():
-                B = B.contiguous()
+                    loc = a_start + layer_id
+                    if loc >= a_start + a_len:
+                        continue
 
-            batch_input = compute_input[req_indices]
-            if not batch_input.is_contiguous():
-                batch_input = batch_input.contiguous()
+                    A = pool.key_buffer[loc, :a_rank]
+                    B = pool.value_buffer[loc, :a_rank]
 
-            # Stage-1: x @ A^T
-            intermediate = moe_batch_lora_gate_avx(batch_input, A, scaling=1.0)
-            # Stage-2: intermediate @ B, projection-specific kernel.
-            batch_output = stage2_kernel(intermediate, B, scaling=a_scaling)
-            output[req_indices] = batch_output
+                if A.device.type != "cpu" or A.dtype != torch.bfloat16:
+                    A = A.to(device="cpu", dtype=torch.bfloat16)
+                if B.device.type != "cpu" or B.dtype != torch.bfloat16:
+                    B = B.to(device="cpu", dtype=torch.bfloat16)
+                if not A.is_contiguous():
+                    A = A.contiguous()
+                if not B.is_contiguous():
+                    B = B.contiguous()
 
-            kernel_calls += 2
-            kernel_tokens += int(len(req_indices))
+                batch_input = compute_input[req_indices]
+                if not batch_input.is_contiguous():
+                    batch_input = batch_input.contiguous()
+
+                # Stage-1: x @ A^T
+                intermediate = moe_batch_lora_gate_avx(batch_input, A, scaling=1.0)
+                # Stage-2: intermediate @ B, projection-specific kernel.
+                batch_output = stage2_kernel(intermediate, B, scaling=a_scaling)
+                output[req_indices] = batch_output
+
+                kernel_calls += 2
+                kernel_tokens += int(len(req_indices))
+            finally:
+                if hot_handle is not None:
+                    hot_handle.release()
 
         if return_to_original_device and (original_device.type != "cpu" or original_dtype != torch.bfloat16):
             output = output.to(device=original_device, dtype=original_dtype, non_blocking=True)
@@ -449,8 +1228,18 @@ class Qwen3VLMoELoRADispatcher:
             "promotion_drop_total": 0,
             "promotion_drop_queue_high_watermark": 0,
             "promotion_drop_cooldown": 0,
+            "promotion_admitted": 0,
+            "promotion_reject_delta": 0,
+            "promotion_reject_no_ema": 0,
+            "tracker_queue_drop": 0,
             "moe_kernel_calls": 0,
             "moe_kernel_tokens": 0,
+            "prefetch_submitted": 0,
+            "prefetch_ready_hits": 0,
+            "prefetch_not_ready": 0,
+            "prefetch_stale": 0,
+            "prefetch_false_positives": 0,
+            "prefetch_slot_overwrite": 0,
         }
 
     def _should_use_async_cpu_fallback(self, has_hit: bool) -> bool:
@@ -994,6 +1783,11 @@ class Qwen3VLMoELoRADispatcher:
         return future.result()
 
     def pop_colora_stats(self) -> Dict[str, float]:
+        self._flush_pending_background_stats()
+        if self._temporal_hot_cache is not None:
+            self._last_colora_stats["prefetch_slot_overwrite"] = int(
+                self._temporal_hot_cache.get_slot_overwrite_count()
+            )
         stats = dict(self._last_colora_stats)
         self._reset_colora_stats()
         return stats
@@ -1011,6 +1805,8 @@ class Qwen3VLMoELoRADispatcher:
         """COLoRA hybrid path: GPU cache hit + CPU miss fallback + async promotion."""
         output = self._get_output_buffer(input_tensor, pool)
         self._reset_colora_stats()
+        self._flush_pending_background_stats()
+        decode_context = self._get_current_decode_joint_context()
 
         manager = self.expert_cache_manager
         if manager is None:
@@ -1023,6 +1819,7 @@ class Qwen3VLMoELoRADispatcher:
                 bins,
                 projection=projection,
                 adapter_group_plan=miss_plan,
+                temporal_prefetch_context=decode_context,
             )
             self._last_colora_stats.update(
                 {
@@ -1059,10 +1856,13 @@ class Qwen3VLMoELoRADispatcher:
             for adapter_idx in unique_adapters
         ]
 
-        manager.record_access(keys)
+        if decode_context is None:
+            manager.record_access(keys)
         ready_slots = manager.lookup_many(keys)
         miss_keys = [key for key in keys if key not in ready_slots]
-        manager.schedule_promotion(miss_keys)
+        allow_inline_promotion_schedule = decode_context is None
+        if allow_inline_promotion_schedule:
+            manager.schedule_promotion(miss_keys)
         if miss_keys and getattr(getattr(manager, "config", None), "miss_policy", "cpu_first") == "load_then_run":
             manager.apply_completed_promotions()
             promoted_now = manager.lookup_many(miss_keys)
@@ -1115,6 +1915,7 @@ class Qwen3VLMoELoRADispatcher:
                                 miss_bins,
                                 projection=projection,
                                 adapter_group_plan=miss_plan,
+                                temporal_prefetch_context=decode_context,
                             )
                             return miss_out, queue_wait, time.perf_counter() - t0, kernel_calls, kernel_tokens
                         finally:
@@ -1213,6 +2014,7 @@ class Qwen3VLMoELoRADispatcher:
                         miss_bins,
                         projection=projection,
                         adapter_group_plan=miss_plan,
+                        temporal_prefetch_context=decode_context,
                     )
                     queue_wait = 0.0
                     cpu_t = time.perf_counter() - t0
@@ -1248,6 +2050,18 @@ class Qwen3VLMoELoRADispatcher:
             "promotion_drop_cooldown": int(drop_breakdown.get("cooldown", 0)),
             "moe_kernel_calls": int(moe_kernel_calls),
             "moe_kernel_tokens": int(moe_kernel_tokens),
+            "promotion_admitted": int(self._last_colora_stats.get("promotion_admitted", 0)),
+            "promotion_reject_delta": int(self._last_colora_stats.get("promotion_reject_delta", 0)),
+            "promotion_reject_no_ema": int(self._last_colora_stats.get("promotion_reject_no_ema", 0)),
+            "tracker_queue_drop": int(self._last_colora_stats.get("tracker_queue_drop", 0)),
+            "prefetch_submitted": int(self._last_colora_stats.get("prefetch_submitted", 0)),
+            "prefetch_ready_hits": int(self._last_colora_stats.get("prefetch_ready_hits", 0)),
+            "prefetch_not_ready": int(self._last_colora_stats.get("prefetch_not_ready", 0)),
+            "prefetch_stale": int(self._last_colora_stats.get("prefetch_stale", 0)),
+            "prefetch_false_positives": int(self._last_colora_stats.get("prefetch_false_positives", 0)),
+            "prefetch_slot_overwrite": int(
+                self._temporal_hot_cache.get_slot_overwrite_count() if self._temporal_hot_cache is not None else 0
+            ),
         }
         return output
 
@@ -2108,6 +2922,10 @@ def create_vl_moe_lora_dispatcher(
     colora_cpu_workers: int = 4,
     colora_cpu_queue_depth: int = 256,
     colora_cpu_batch_timeout_us: int = 50,
+    colora_deferred_promotion_delta_steps: int = 4,
+    colora_promotion_ema_alpha: float = 0.5,
+    colora_temporal_prefetch: bool = False,
+    colora_temporal_hot_cache_slots: int = 64,
 ) -> Qwen3VLMoELoRADispatcher:
     """
     Factory function to create a VL-MoE LoRA dispatcher with S-LoRA batched mode.
@@ -2144,6 +2962,10 @@ def create_vl_moe_lora_dispatcher(
         colora_cpu_workers=colora_cpu_workers,
         colora_cpu_queue_depth=colora_cpu_queue_depth,
         colora_cpu_batch_timeout_us=colora_cpu_batch_timeout_us,
+        colora_deferred_promotion_delta_steps=colora_deferred_promotion_delta_steps,
+        colora_promotion_ema_alpha=colora_promotion_ema_alpha,
+        colora_temporal_prefetch=colora_temporal_prefetch,
+        colora_temporal_hot_cache_slots=colora_temporal_hot_cache_slots,
     )
 
 
