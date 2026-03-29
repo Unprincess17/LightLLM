@@ -211,7 +211,7 @@ Large-scale LLM serving is increasingly shaped by the convergence of two trends 
 
 This interaction is especially problematic during \emph{decode} in prefill--decode deployments~\cite{todo:pd-serving}. Prefill can often amortize weight-loading costs across many prompt tokens, but decode exposes them directly: generation proceeds one token at a time, effective batch sizes are small, and any miss on the per-token path immediately appears in token latency. In pure MoE serving, the natural unit of management is the expert. In conventional multi-LoRA serving, the unit is the adapter, and prior systems such as S-LoRA~\cite{todo:slora} and VaLoRA~\cite{mi2025empower} therefore adopt adapter-centric designs. In multi-LoRA MoE decode, however, a request only needs the LoRA residuals associated with the \emph{selected experts}. The effective unit of access and reuse is therefore neither an expert alone nor an adapter alone, but a joint expert--LoRA object. This shift matters because expert-layer LoRA is materially larger than conventional attention-layer LoRA. In transformer MoE models, LoRA attached to expert FFN blocks scales with the wide feed-forward dimensions rather than the narrower attention projections~\cite{todo:moe-ffn-architecture}. As a result, each expert--LoRA object consumes substantially more memory. Meanwhile, because the base MoE model is assumed to remain resident in GPU memory, only limited residual VRAM capacity is available for caching these objects~\cite{todo:large-moe-models}. Multi-LoRA MoE decode therefore fundamentally shifts the cache locality regime: it enlarges and fragments the effective working set, weakening the concentrated hot set that conventional sparse-serving caches rely on.
 
-Our trace-driven study, built on Azure LLM serving traces~\cite{zhang2021faster} with synthetic LoRA assignment, shows that multi-LoRA MoE decode fundamentally shifts the cache locality regime. As shown in Figure~\ref{fig:motivation-breakdown}(a), once the access unit becomes a joint expert--LoRA object, the access distribution flattens sharply: under expert-only modeling (\texttt{C0}), the top-1K objects account for 89.1\% of accesses, whereas under joint-object modeling (\texttt{C1/C2}) they account for only 41.4\% and 33.1\%, respectively. 
+Our trace-driven study, built on Alibaba LoRA serving traces~\cite{lin2025understanding} shows that multi-LoRA MoE decode fundamentally shifts the cache locality regime. As shown in Figure~\ref{fig:motivation-breakdown}(a), once the access unit becomes a joint expert--LoRA object, the access distribution flattens sharply: under expert-only modeling (\texttt{C0}), the top-1K objects account for 89.1\% of accesses, whereas under joint-object modeling (\texttt{C1/C2}) they account for only 41.4\% and 33.1\%, respectively. 
 Figure~\ref{fig:motivation-breakdown}(b) further shows that cache scaling becomes markedly less effective: while an expert-only oracle recovers near-ideal P99 TPOT with a cache budget of only 2K objects, realistic joint-object workloads require up to 16$\times$ more capacity to reach the same target. 
 Under a practical cache budget, the degradation is concentrated in the tail rather than the median: median TPOT remains near 1.2\,ms, while P99.9 TPOT rises to 7.06\,ms, a roughly 6$\times$ slowdown (Figure~\ref{fig:motivation-breakdown}(c)). These results indicate that in this regime, cold misses are not rare anomalies that can be eliminated by modest cache growth; they are persistent tail events on the decode critical path.
 
@@ -293,7 +293,7 @@ To examine whether this finer-grained access view matters in practice, we conduc
 \texttt{C1} uses expert--LoRA joint keys under independent assignment, where adapter identity is sampled independently of expert routing.
 \texttt{C2} uses the same expert--LoRA joint keys under correlated assignment, where certain adapters are more likely to co-occur with specific experts.
 This setup separates the effect of finer-grained keying itself from the extent to which structured adapter--expert affinity can partially preserve locality.
-We use Azure trace~\cite{zhang2021faster} to model LLM request arrivals and Poisson arrivals to model LoRA invocations, and replay the resulting decode access streams under these conditions.
+We use Alibaba trace~\cite{lin2025understanding} to model LoRA serving request arrivals and LoRA invocations, and replay the resulting decode access streams under these conditions.
 
 As illustrated in Figure \ref{fig:motivation-breakdown}, modeling accesses as joint objects triggers a cascade of system-level degradations, demonstrating that traditional caching strategies are insufficient for this workload.
 
@@ -306,12 +306,14 @@ Because locality is fundamentally fragmented, simply increasing GPU cache capaci
 \paragraph{Tail latency explodes under misses.}
 The most severe consequence of this locality fragmentation manifests in request latency. Figure \ref{fig:motivation-breakdown}(c) evaluates Time Per Output Token (TPOT) under a practical GPU cache budget. While the median TPOT remains near-optimal at approximately 1.2 ms, the degradation is heavily concentrated in the tail. P99.9 latency increases by roughly 6x. Because decode operations repeat routing and parameter-access decisions token by token, cold misses stall the synchronous execution path, disproportionately penalizing tail requests that happen to traverse un-cached expert–adapter intersections.
 
+Taken together, these results show that the key problem in multi-LoRA MoE decode is no longer only cache efficiency in the traditional sense. Once expert--LoRA joint objects become the effective unit of access, the remaining performance loss is increasingly determined by how unavoidable cold misses are handled on the decode critical path.
+
 \subsection{Challenges}
 \label{subsec:challenges}
 
-The empirical results reveal a fundamental shift in the role of caching for multi-LoRA MoE serving. Under expert-–LoRA joint-object modeling, locality degradation makes cold misses difficult to eliminate within practical cache capacity alone. Misses are no longer rare events that can be absorbed by a large hot set; they become a dominant factor that must be explicitly managed on the latency-critical decode path.
+The empirical results above reveal a fundamental shift in the role of caching for multi-LoRA MoE decode serving. Once expert--LoRA joint objects become the effective unit of access, locality degradation makes cold misses difficult to eliminate within practical GPU cache capacity alone. Cold misses are therefore no longer rare anomalies that can be absorbed by a sufficiently large hot set. Instead, they become persistent events on the latency-critical decode path, and the dominant systems question shifts from how to avoid every miss to how to recover unavoidable misses without inflating per-token latency.
 
-This reframes the systems problem. The key question is no longer only how to reduce misses, but how to recover unavoidable misses without inflating per-token latency. Turning this insight into a practical runtime requires addressing three challenges.
+Realizing this shift in a practical serving runtime requires addressing three challenges.
 
 \paragraph{Challenge 1: Reasoning at expert--LoRA granularity under expanded and fragmented working sets.}
 \label{subsec:challenge-residency}
@@ -323,7 +325,7 @@ The system must therefore reason at expert--LoRA granularity, which matches actu
 \paragraph{Challenge 2: Recovering cold misses without forcing promotion-first stalls on decode.}
 \label{subsec:challenge-miss}
 
-In this regime, many misses correspond to cold objects whose reuse is too limited to amortize the cost of immediate promotion. If the system continues to apply a conventional load-then-run policy, each such miss becomes a blocking recovery event: the current token must wait for weight migration before expert--LoRA computation can proceed. Under decode-time latency sensitivity, this directly amplifies tail latency.
+In this regime, many misses correspond to cold objects whose near-term reuse is too limited to amortize immediate promotion. If the system continues to apply a conventional load-then-run policy, each such miss becomes a blocking recovery event: the current token must wait for weight migration before expert--LoRA computation can proceed. Under decode-time latency sensitivity, this directly amplifies tail latency.
 
 The system therefore needs a different default recovery strategy for cold misses. Instead of forcing all misses through immediate GPU promotion, it must provide a way to complete the current expert--LoRA computation without making promotion the only recovery path, while still preserving the option to promote objects later when future reuse justifies it.
 
@@ -332,7 +334,7 @@ The system therefore needs a different default recovery strategy for cold misses
 
 Changing the miss-recovery abstraction is not sufficient by itself. If cold-path execution is too slow, the system merely replaces GPU promotion stall with CPU-side stall. If it is poorly integrated with the decode pipeline, heterogeneous execution introduces a new source of queueing and tail behavior rather than alleviating the original one.
 
-The system must therefore make cold-path recovery efficient enough to operate at small, irregular decode batch sizes, and organize execution so that cold-miss handling can overlap with GPU hot-path and base-model computation whenever dependencies allow. The challenge is not only to provide an alternative recovery path, but to ensure that this path reduces exposed miss latency instead of becoming a new bottleneck.
+The system must therefore make cold-path recovery efficient enough to operate at small, irregular decode batch sizes, and organize execution to preserve opportunities for overlap between cold-miss handling and GPU hot-path or base-model computation whenever dependencies allow. The challenge is not only to provide an alternative recovery path, but to ensure that this path reduces exposed miss latency instead of becoming a new bottleneck.
 
 \begin{figure*}[t]
   \centering
@@ -342,7 +344,7 @@ The system must therefore make cold-path recovery efficient enough to operate at
   Routed expert--LoRA accesses first check GPU residency.
   Cache-hit objects are served on the GPU hot path.
   Cold misses are redirected to a CPU cold path, which completes the current LoRA computation via host-memory streaming, decoupled from the layer-wise synchronization of other active requests.
-  Promotion is deferred to future reuse, and a temporal predictor prefetches top-2 experts to mask host-memory latency across sequential tokens.
+  Promotion is deferred to future reuse, and a temporal predictor prefetches top-1 experts to mask host-memory latency across sequential tokens.
   }
   \label{fig:colora_overview}
 \end{figure*}
@@ -353,9 +355,9 @@ The system must therefore make cold-path recovery efficient enough to operate at
 \subsection{Hot/Cold Execution-First Architecture}
 \label{subsec:dual-path-handling}
 
-COLoRA is motivated by a simple observation: under multi-tenant expert--LoRA serving, cache misses cannot be treated as rare exceptions. Once the unit of management becomes the expert--LoRA joint object, the effective working set expands and fragments, and cold misses remain common under realistic GPU memory budgets. In decode, where execution proceeds token by token and batching is limited, each such miss can directly appear as a stall on the current token's critical path.
+COLoRA is motivated by a simple observation: under multi-tenant expert--LoRA serving, cold misses cannot be treated as rare exceptions. Once the unit of management becomes the expert--LoRA joint object, the effective working set expands and fragments, and misses remain common under realistic GPU memory budgets. In decode, where execution proceeds token by token and batching opportunities are limited, each such miss can directly surface as a stall on the current token's critical path.
 
-The design objective is therefore not to eliminate every miss, but to prevent a cold miss from becoming a global synchronization event. COLoRA does so by changing the default recovery action. Instead of synchronously restoring the missing weights to the GPU and only then resuming execution, it adopts an execution-first policy: the system prioritizes completing the missing expert--LoRA computation using whatever resources are immediately available, while treating weight promotion as a separate optimization for future reuse.
+The design objective is therefore not to eliminate every miss, but to prevent a cold miss from becoming a global synchronization event. COLoRA does so by changing the default recovery action. Instead of synchronously restoring missing weights to the GPU and only then resuming execution, it adopts an execution-first policy: the system prioritizes completing the missing expert--LoRA computation using immediately available resources, while treating weight promotion as a separate optimization for future reuse.
 
 More broadly, COLoRA is built around a uniform design philosophy: the mechanism that guarantees progress for the current token should be separated from the mechanisms that improve locality for future tokens. This separation allows miss handling to remain latency-oriented and correctness-critical, while promotion and prefetching remain opportunistic optimizations rather than mandatory recovery steps.
 
@@ -427,10 +429,9 @@ To prevent promotion from degenerating into indiscriminate background traffic, C
 
 In the current design, $\delta$ is implemented as a static hyperparameter. A more adaptive policy that tunes $\delta$ online based on runtime signals, such as observed reuse behavior, PCIe queue depth, or device-memory pressure, is left to future work. Importantly, admission errors affect only future cache efficiency: they do not delay the current request and do not alter COLoRA's execution-first miss-handling semantics.
 
-The second optimization exploits short-horizon temporal locality in decode to reduce effective cold-path service time. This design is motivated by an empirical observation from our traces: for a given layer, adjacent decode steps share the same top-1 routed expert in more than 95\% of cases. Although long-horizon reuse of expert--LoRA objects can be weak under multi-tenant serving, this strong step-to-step routing continuity makes near-future accesses substantially more predictable than global cache behavior might suggest.
-% TODO: motivation 中加入相应观察
+The second optimization exploits short-horizon temporal locality in decode to reduce effective cold-path service time. Our router traces show that consecutive decode tokens exhibit strong but layer-dependent routing continuity: the mean expert-set hit rate is 72.2\% overall, with early layers exceeding 95\%, middle layers dipping to 56.8\%, and late layers recovering to 87\% (Appendix~\ref{app:temporal-locality}, Figure~\ref{fig:temporal_locality_hit_rate}). Although long-horizon reuse of expert--LoRA objects can be weak under multi-tenant serving, this U-shaped per-layer profile still indicates that near-future accesses are substantially more predictable than global cache behavior might suggest.
 
-COLoRA leverages this regularity using a lightweight temporal predictor that identifies expert candidates likely to be accessed in the next few decode steps and opportunistically prefetches the corresponding host-resident weights. Importantly, prefetching does not participate in demand execution: a request never waits for a prefetched object, and cold-path execution remains the default fallback when the required object is not yet available. The purpose of this mechanism is therefore not to guarantee stable residency in any particular CPU cache level, nor to assume that large expert weights remain fully resident in LLC. Rather, it improves effective access locality and reduces the service time of subsequent cold-path invocations when the prediction is correct.
+COLoRA leverages this regularity using a lightweight temporal predictor that identifies expert candidates likely to be accessed in the next few decode steps and opportunistically prefetches the corresponding host-resident weights. The layer dependence of the trace signal suggests that this predictor should be viewed as an opportunistic background policy rather than an always-on dependency for forward progress. Importantly, prefetching does not participate in demand execution: a request never waits for a prefetched object, and cold-path execution remains the default fallback when the required object is not yet available. The purpose of this mechanism is therefore not to guarantee stable residency in any particular CPU cache level, nor to assume that large expert weights remain fully resident in LLC. Rather, it improves effective access locality and reduces the service time of subsequent cold-path invocations when the prediction is correct.
 % TODO: 是否需要说明 prefetch 的对象很小 ~几百KB level，所以足以放在 LLC 上而不影响别的计算？
 
 Because temporal prefetching is auxiliary to the main execution-first design, incorrect predictions consume only bounded background bandwidth and do not affect correctness or foreground progress. Taken together, deferred promotion and temporal prefetching preserve COLoRA's uniform design philosophy: misses are served immediately through execution-first recovery, while locality-driven background mechanisms optimize how similar accesses are handled later.
@@ -697,6 +698,25 @@ Because temporal prefetching is auxiliary to the main execution-first design, in
 \clearpage
 \bibliographystyle{plain}
 \bibliography{COLoRA-reference}
+
+\clearpage
+\appendix
+\section{Per-Layer Temporal Routing Locality}
+\label{app:temporal-locality}
+
+Figure~\ref{fig:temporal_locality_hit_rate} reports the per-layer consecutive-token routing locality measured from the Qwen3--VL--MoE router on the ShareGPT--V3 trace. For each request and MoE layer, we compare the routed expert set at decode step $t$ against the previous decode step $t-1$ using the hit-rate metric $|E(L,t) \cap E(L,t-1)| / |E(L,t)|$. The resulting curve is distinctly U-shaped: early layers show very high temporal continuity, middle layers are weaker, and late layers recover. This observation motivates temporal prefetch as a useful but non-uniform optimization across depth.
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\columnwidth]{figures/motivation/temporal_locality_hit_rate.pdf}
+  \caption{
+  Per-layer consecutive-token routing locality during decode.
+  The plotted quantity is the mean expert-set hit rate $|E(L,t) \cap E(L,t-1)| / |E(L,t)|$.
+  The curve is U-shaped: early and late layers exhibit stronger temporal continuity, while middle layers are weaker.
+  This pattern supports an opportunistic, potentially layer-selective temporal prefetch policy rather than a uniform always-on rule.
+  }
+  \label{fig:temporal_locality_hit_rate}
+\end{figure}
 
 \end{document}
 \endinput
