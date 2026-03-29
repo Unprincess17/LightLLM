@@ -153,6 +153,9 @@ class StartArgs:
     colora_temporal_hot_cache_slots: int = field(default=64)
     colora_speculative_dispatch: bool = field(default=False)
     colora_spec_layer_whitelist: str = field(default="")
+    # COLaRA request-level skip-and-reinsert
+    colora_request_skip: bool = field(default=True)
+    colora_max_continuations: int = field(default=8)
     # Force slow path for LoRA (per-expert baseline)
     force_slow_lora_path: bool = field(default=False)
     # multi_modal

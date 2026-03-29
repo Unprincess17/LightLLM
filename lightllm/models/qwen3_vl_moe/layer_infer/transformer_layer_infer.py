@@ -5,7 +5,7 @@ import numpy as np
 import os
 import logging
 from functools import partial
-from typing import Tuple, Optional, Dict, Any
+from typing import Tuple, Optional, Dict, Any, List
 from lightllm.common.basemodel.infer_struct import InferStateInfo
 from lightllm.models.qwen2_vl.triton_kernel.mrope import mrope_triton_fused
 from lightllm.models.qwen3_moe.layer_infer.transformer_layer_infer import Qwen3MOETransformerLayerInfer
@@ -652,14 +652,378 @@ class Qwen3VLMOETransformerLayerInfer(Qwen3MOETransformerLayerInfer):
         if infer_state is None or getattr(infer_state, "is_prefill", True):
             return super()._moe_ffn(input, infer_state, layer_weight)
 
+        from lightllm.server.router.model_infer.infer_batch import g_infer_context, get_req_adapter_bin
+        from lightllm.server.lora.expert_cache import ExpertCacheKey
+
         self._spec_bound_job_keys_current_call = set()
         try:
             hidden_states = input.view(-1, self.embed_dim_)
+            num_tokens = hidden_states.shape[0]
+
+            # Check if COLoRA request-level skip is enabled
+            if not hasattr(self.lora_dispatcher_, 'colora_request_skip') or not self.lora_dispatcher_.colora_request_skip:
+                self._maybe_submit_decode_temporal_prefetch(infer_state)
+                self._maybe_submit_decode_spec_gate_up(hidden_states, infer_state)
+                output = super()._moe_ffn(input, infer_state, layer_weight)
+                self._eager_retire_remaining_decode_spec_jobs(infer_state)
+                return output
+
+            # Get required tensors from inference state
+            b_req_idx = infer_state.b_req_idx
+            b_adapter_bin = infer_state.b_adapter_bin
+
+            # First do routing to get topk_ids
+            router_logits = layer_weight.moe_gate.mm(hidden_states)
+            topk_weights, topk_ids = select_experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                correction_bias=getattr(layer_weight.experts, "e_score_correction_bias", None),
+                top_k=self.num_experts_per_tok,
+                renormalize=self.norm_topk_prob,
+                use_grouped_topk=False,
+                topk_group=None,
+                num_expert_group=None,
+                scoring_func=getattr(layer_weight.experts, "scoring_func", "softmax"),
+            )
+
+            if hasattr(layer_weight.experts, "routed_scaling_factor"):
+                topk_weights = topk_weights * layer_weight.experts.routed_scaling_factor
+
+            self._log_adapter_expert_distribution(
+                topk_ids=topk_ids,
+                req_bins=self.req_bins_,
+                num_experts=layer_weight.experts.n_routed_experts,
+                num_tokens=num_tokens,
+                infer_state=infer_state,
+            )
+            self._log_router_trace(
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+                num_tokens=num_tokens,
+                infer_state=infer_state,
+            )
+
+            # Check for requests where all selected experts are cold (not cached on GPU)
+            # In decode, num_tokens = number of requests (one token per request)
+            fully_cold_requests = []
+            expert_cache_manager = getattr(self.lora_dispatcher_, 'expert_cache_manager', None)
+
+            if expert_cache_manager is not None:
+                # Move to CPU for checking
+                req_idx_cpu = b_req_idx.detach().to(device='cpu', dtype=torch.int64).tolist()
+                adapter_bin_cpu = b_adapter_bin.detach().to(device='cpu', dtype=torch.int64).tolist()
+                topk_ids_cpu = topk_ids.detach().to(device='cpu', dtype=torch.int64).tolist()
+
+                for token_idx, (req_idx, adapter_bin, token_topk_ids) in enumerate(zip(req_idx_cpu, adapter_bin_cpu, topk_ids_cpu)):
+                    if adapter_bin < 0:
+                        # Base model, no LoRA - can't be cold
+                        continue
+
+                    # Get InferReq from our mapping
+                    req_obj = g_infer_context.req_idx_to_req.get(req_idx)
+                    if req_obj is None:
+                        logger.warning(f"[COLoRA] Could not find InferReq for req_idx={req_idx}, skipping")
+                        continue
+
+                    if getattr(req_obj, 'colora_paused', False):
+                        # Already paused, skip
+                        continue
+
+                    if getattr(req_obj, 'colora_continuation', None) is not None:
+                        # Already has continuation, skip
+                        continue
+
+                    # Check if all selected experts are cold
+                    all_cold = True
+                    for expert_id in token_topk_ids:
+                        # Check cache for all three projections (gate, up, down)
+                        keys = [
+                            ExpertCacheKey(projection="gate", adapter_idx=adapter_bin, layer_id=self.layer_num_, expert_id=expert_id),
+                            ExpertCacheKey(projection="up", adapter_idx=adapter_bin, layer_id=self.layer_num_, expert_id=expert_id),
+                            ExpertCacheKey(projection="down", adapter_idx=adapter_bin, layer_id=self.layer_num_, expert_id=expert_id),
+                        ]
+                        ready = expert_cache_manager.peek_ready_slots(keys)
+                        if len(ready) == len(keys):
+                            # All three projections cached on GPU - not cold
+                            all_cold = False
+                            break
+
+                    if all_cold:
+                        fully_cold_requests.append((token_idx, req_obj, adapter_bin, token_topk_ids))
+
+            # Process fully cold requests: pause them, submit for async CPU completion
+            if fully_cold_requests and self.lora_dispatcher_.expert_cache_manager is not None:
+                from queue import SimpleQueue
+                from lightllm.common.basemodel.infer_lock import g_infer_state_lock
+
+                # Get reference to all layers and weights for CPU completion
+                model = infer_state.req_manager.model
+                all_layers = model.layers_infer
+                all_weights = model.trans_layers_weight
+
+                for token_idx, req_obj, adapter_bin, expert_ids in fully_cold_requests:
+                    # Check if we've reached max concurrent continuations
+                    with g_infer_state_lock:
+                        # Count current paused requests
+                        current_paused = sum(1 for r in g_infer_context.req_idx_to_req.values() if getattr(r, 'colora_paused', False))
+                        if current_paused >= self.lora_dispatcher_.colora_max_continuations:
+                            logger.debug(f"[COLoRA] Max concurrent continuations reached ({current_paused}), skipping request")
+                            continue
+
+                    # Extract the hidden state for this token
+                    hidden_cpu = hidden_states[token_idx:token_idx+1].detach().to(device='cpu', copy=True)
+
+                    # Get current mem_index for KV reuse
+                    seq_len = req_obj.get_cur_total_len()
+                    mem_index = infer_state.req_manager.req_to_token_indexs[req_obj.req_idx].clone().detach().cpu()
+
+                    # Create continuation state
+                    from lightllm.server.router.model_infer.infer_batch import ColoraContinuation
+                    continuation = ColoraContinuation(
+                        resume_layer=self.layer_num_ + 1,
+                        saved_hidden=None,
+                        mem_index=mem_index,
+                        seq_len=seq_len,
+                        completed=False,
+                    )
+
+                    # Create completion task
+                    from lightllm.models.qwen3_vl_moe.lora_dispatch import ColoraCompletionTask
+                    task = ColoraCompletionTask(
+                        req_obj=req_obj,
+                        current_layer=self.layer_num_,
+                        hidden_input=hidden_cpu,
+                        expert_ids=expert_ids,
+                        adapter_bin=adapter_bin,
+                        layer_id=self.layer_num_,
+                        all_layers=all_layers,
+                        all_weights=all_weights,
+                    )
+
+                    # Reserve async queue slot
+                    if hasattr(self.lora_dispatcher_, '_reserve_async_queue_slot'):
+                        if not self.lora_dispatcher_._reserve_async_queue_slot():
+                            logger.debug(f"[COLoRA] No async queue slots available, skipping request")
+                            continue
+
+                    # Mark request as paused
+                    with g_infer_state_lock:
+                        req_obj.colora_continuation = continuation
+                        req_obj.colora_paused = True
+
+                    # Submit to CPU executor
+                    def cpu_complete_callback(future):
+                        """Callback after CPU completion completes."""
+                        from lightllm.common.basemodel.infer_lock import g_infer_state_lock
+                        with g_infer_state_lock:
+                            if future.exception() is not None:
+                                logger.error(f"[COLoRA] CPU completion failed: {future.exception()}")
+                                req_obj.colora_paused = False
+                                req_obj.colora_continuation = None
+                            else:
+                                # Result already stored in continuation by complete_layer_on_cpu
+                                pass
+                        # Put task in completion queue for the main loop to acknowledge
+                        self.lora_dispatcher_.colora_completion_queue.put(task)
+
+                    # Submit to existing CPU executor
+                    future = self.lora_dispatcher_._cpu_executor.submit(
+                        self._complete_layer_on_cpu,
+                        task=task,
+                    )
+                    future.add_done_callback(cpu_complete_callback)
+
             self._maybe_submit_decode_temporal_prefetch(infer_state)
             self._maybe_submit_decode_spec_gate_up(hidden_states, infer_state)
-            output = super()._moe_ffn(input, infer_state, layer_weight)
+
+            # We already did routing above, continue with the rest of the computation
+            # copied from parent class but reuse our routing results
+            experts = layer_weight.experts
+            is_ep, local_expert_ids, local_to_global, global_to_local = self._get_local_expert_info(layer_weight)
+            expert_iter_range = local_expert_ids if is_ep else range(experts.n_routed_experts)
+            final_output = torch.zeros_like(hidden_states)
+
+            with NvtxAnnotate("MoE_ActiveExpertExtraction_Optimized"):
+                flat_topk_ids = topk_ids.flatten()
+                expert_counts = torch.bincount(flat_topk_ids, minlength=experts.n_routed_experts).cpu().tolist()
+                sorted_token_indices = torch.argsort(flat_topk_ids)
+                global_offsets = [0] * (experts.n_routed_experts + 1)
+                for i in range(experts.n_routed_experts):
+                    global_offsets[i+1] = global_offsets[i] + expert_counts[i]
+
+                active_experts_data = []
+                for local_expert_idx in expert_iter_range:
+                    global_expert_id = local_to_global.get(local_expert_idx, local_expert_idx) if is_ep else local_expert_idx
+                    count = expert_counts[global_expert_id]
+                    if count > 0:
+                        start_idx = global_offsets[global_expert_id]
+                        end_idx = start_idx + count
+                        token_idx = sorted_token_indices[start_idx:end_idx]
+                        batch_indices = token_idx // self.num_experts_per_tok
+                        k_indices = token_idx % self.num_experts_per_tok
+                        active_experts_data.append((local_expert_idx, batch_indices, k_indices))
+
+            # Early exit if no active experts (all skipped due to being cold)
+            if not active_experts_data:
+                return final_output.view(num_tokens, self.embed_dim_)
+
+            # Continue with normal expert processing for non-cold tokens
+            with NvtxAnnotate("MoE_StreamSetup"):
+                transfer_stream = torch.cuda.Stream()
+                compute_stream = torch.cuda.current_stream()
+
+                def prefetch_weights(local_idx):
+                    with NvtxAnnotate("LoRA_PCIe_HtoD_Weight"):
+                        w1 = experts.experts_gate_projs[local_idx].cuda(non_blocking=True)
+                        w3 = experts.experts_up_projs[local_idx].cuda(non_blocking=True)
+                        w2 = experts.w2_list[local_idx].cuda(non_blocking=True)
+                    return w1, w3, w2
+
+            with NvtxAnnotate("MoE_PipelinePrime"):
+                first_expert_idx, _, _ = active_experts_data[0]
+                with torch.cuda.stream(transfer_stream):
+                    next_weights = prefetch_weights(first_expert_idx)
+
+            for i, (local_expert_idx, batch_indices, k_indices) in enumerate(active_experts_data):
+                with NvtxAnnotate(f"MoE_Expert_{local_expert_idx}"):
+                    expert_input = hidden_states[batch_indices]
+                    expert_req_bins = self.req_bins_[batch_indices] if self.req_bins_ is not None else None
+                    decode_step_id = getattr(infer_state, "decode_step_id", None)
+                    dispatcher = self.lora_dispatcher_ if self.use_detached_lora_ else None
+
+                    if dispatcher is not None and expert_req_bins is not None and decode_step_id is not None:
+                        adapter_bins_cpu = expert_req_bins.detach().to(device="cpu", dtype=torch.int64).view(-1).tolist()
+                        note_access_fn = getattr(dispatcher, "note_decode_joint_access", None)
+                        if callable(note_access_fn):
+                            note_access_fn(
+                                decode_step_id=int(decode_step_id),
+                                layer_id=int(layer_weight.layer_num_),
+                                expert_id=int(local_expert_idx),
+                                adapter_bins=adapter_bins_cpu,
+                            )
+                        begin_joint_context_fn = getattr(dispatcher, "begin_decode_joint_context", None)
+                        if callable(begin_joint_context_fn):
+                            begin_joint_context_fn(
+                                int(decode_step_id),
+                                int(layer_weight.layer_num_),
+                                int(local_expert_idx),
+                            )
+
+                    try:
+                        study2_prefix = self._get_study2_profile_prefix(
+                            expert_id=local_expert_idx,
+                            step_idx=i,
+                            token_count=int(expert_input.shape[0]),
+                        )
+                        gpu_stream_label = f"{study2_prefix}/GPU_Stream" if study2_prefix is not None else None
+
+                        enable_coalescing = os.environ.get("MOE_COALESCING_PACKER", "1") == "1"
+                        pack_meta = None
+                        if enable_coalescing:
+                            pack_label = f"{study2_prefix}/Gather" if study2_prefix is not None else "MoE_COLoRA_CoalescePack"
+                            with NvtxAnnotate(pack_label):
+                                pack_meta = self._coalesce_lora_activations(
+                                    activations=expert_input,
+                                    req_bins=expert_req_bins,
+                                )
+
+                        with NvtxAnnotate("MoE_WaitTransfer"):
+                            compute_stream.wait_stream(transfer_stream)
+                        current_weights = next_weights
+
+                        if i + 1 < len(active_experts_data):
+                            with NvtxAnnotate("MoE_PrefetchNext"):
+                                next_expert_idx, _, _ = active_experts_data[i + 1]
+                                with torch.cuda.stream(transfer_stream):
+                                    next_weights = prefetch_weights(next_expert_idx)
+
+                        w1, w3, w2 = current_weights
+
+                        with (NvtxAnnotate(gpu_stream_label) if gpu_stream_label is not None else nullcontext()):
+                            with NvtxAnnotate("MoE_GateGEMM"):
+                                gate_out = torch.mm(expert_input, w1.T)
+                            with NvtxAnnotate("MoE_UpGEMM"):
+                                up_out = torch.mm(expert_input, w3.T)
+
+                        gate_up_bind_fn = getattr(self, "_maybe_bind_fused_gate_up_exact", None)
+                        bound_gate_up = None
+                        if callable(gate_up_bind_fn):
+                            bound_gate_up = gate_up_bind_fn(
+                                expert_input=expert_input,
+                                infer_state=infer_state,
+                                layer_weight=layer_weight,
+                                expert_id=local_expert_idx,
+                                batch_indices=batch_indices,
+                                expert_req_bins=expert_req_bins,
+                                pack_meta=pack_meta,
+                                colora_stats=self._new_colora_stats(),
+                            )
+
+                        if bound_gate_up is None:
+                            with NvtxAnnotate("MoE_GateLoRA"):
+                                gate_lora = self._dispatch_lora_with_optional_coalescing(
+                                    dispatch_fn=self.lora_dispatcher_.batch_apply_gate_lora,
+                                    input_tensor=expert_input,
+                                    layer_id=layer_weight.layer_num_,
+                                    req_bins=expert_req_bins,
+                                    expert_id=local_expert_idx,
+                                    pack_meta=pack_meta,
+                                    reuse_packed_input=True,
+                                    phase_name="Gate",
+                                    study2_prefix=study2_prefix,
+                                )
+                                self._merge_colora_stats(self._new_colora_stats())
+                            with NvtxAnnotate("MoE_UpLoRA"):
+                                up_lora = self._dispatch_lora_with_optional_coalescing(
+                                    dispatch_fn=self.lora_dispatcher_.batch_apply_up_lora,
+                                    input_tensor=expert_input,
+                                    layer_id=layer_weight.layer_num_,
+                                    req_bins=expert_req_bins,
+                                    expert_id=local_expert_idx,
+                                    pack_meta=pack_meta,
+                                    reuse_packed_input=True,
+                                    phase_name="Up",
+                                    study2_prefix=study2_prefix,
+                                )
+                                self._merge_colora_stats(self._new_colora_stats())
+                        else:
+                            gate_lora, up_lora = bound_gate_up
+
+                        gate_out += gate_lora
+                        up_out += up_lora
+
+                        with (NvtxAnnotate(gpu_stream_label) if gpu_stream_label is not None else nullcontext()):
+                            with NvtxAnnotate("MoE_Activation"):
+                                current_hidden = torch.nn.functional.silu(gate_out) * up_out
+
+                            with NvtxAnnotate("MoE_DownGEMM"):
+                                down_out = torch.mm(current_hidden, w2.T)
+
+                        with NvtxAnnotate("MoE_DownLoRA"):
+                            down_lora = self._dispatch_lora_with_optional_coalescing(
+                                dispatch_fn=self.lora_dispatcher_.batch_apply_down_lora,
+                                input_tensor=current_hidden,
+                                layer_id=layer_weight.layer_num_,
+                                req_bins=expert_req_bins,
+                                expert_id=local_expert_idx,
+                                pack_meta=pack_meta,
+                                phase_name="Down",
+                                study2_prefix=study2_prefix,
+                            )
+                            self._merge_colora_stats(self._new_colora_stats())
+                        down_out += down_lora
+
+                        routing_weights = topk_weights[batch_indices, k_indices].view(-1, 1)
+                        weighted_output = (down_out * routing_weights).to(hidden_states.dtype)
+                        final_output.index_add_(0, batch_indices, weighted_output)
+                    finally:
+                        if dispatcher is not None:
+                            end_joint_context_fn = getattr(dispatcher, "end_decode_joint_context", None)
+                            if callable(end_joint_context_fn):
+                                end_joint_context_fn()
+
             self._eager_retire_remaining_decode_spec_jobs(infer_state)
-            return output
+            return final_output.view(num_tokens, self.embed_dim_)
         finally:
             self._spec_bound_job_keys_current_call = set()
             self._finalize_decode_temporal_prefetch_step_nonblocking(infer_state)
@@ -778,3 +1142,119 @@ class Qwen3VLMOETransformerLayerInfer(Qwen3MOETransformerLayerInfer):
                 layer_num=self.layer_num_,
             )
             return input_embdings
+
+    def token_forward_cpu(
+        self,
+        hidden: torch.Tensor,
+        adapter_bin: int,
+        expert_ids: List[int],
+        layer_weight: Qwen3MOETransformerLayerWeight,
+    ) -> torch.Tensor:
+        """CPU forward for one full layer when request is fully cold.
+
+        Attention already computed on GPU for previous layers, we only
+        need to compute the FFN (MoE) part on CPU with all LoRA projections.
+        """
+        # hidden shape: [1, hidden_dim]
+        input1 = self._ffn_norm_cpu(hidden, layer_weight)
+        ffn_out = self._moe_ffn_cpu(input1, adapter_bin, expert_ids, layer_weight)
+        return hidden + ffn_out
+
+    def _ffn_norm_cpu(self, hidden: torch.Tensor, layer_weight: Qwen3MOETransformerLayerWeight):
+        # RMS norm on CPU
+        rmsenergy = hidden * hidden
+        rmsenergy = rmsenergy.sum(dim=-1, keepdim=True)
+        rmsenergy = rmsenergy + layer_weight.eps_
+        rmsenergy = torch.sqrt(rmsenergy)
+        hidden = hidden / rmsenergy
+        return hidden * layer_weight.ffn_norm_weight_.weight
+
+    def _moe_ffn_cpu(
+        self,
+        input: torch.Tensor,
+        adapter_bin: int,
+        expert_ids: List[int],
+        layer_weight: Qwen3MOETransformerLayerWeight,
+    ) -> torch.Tensor:
+        """CPU version of MoE FFN for a single request with one token.
+
+        All experts are computed on CPU with LoRA projections using existing
+        COLoRA CPU kernels.
+        """
+        hidden_dim = self.embed_dim_
+        input = input.view(-1, hidden_dim)
+        num_tokens = input.shape[0]
+        assert num_tokens == 1
+
+        final_output = torch.zeros_like(input)
+
+        for expert_id in expert_ids:
+            # Get the expert input
+            expert_input = input
+
+            # Apply LoRA for gate, up, down projections using existing CPU kernels
+            if self.use_detached_lora_ and self.lora_dispatcher_ is not None:
+                gate_lora = self.lora_dispatcher_.strict_moe_cpu_batch_lora(
+                    expert_input, layer_weight.layer_num_, [adapter_bin], [expert_id], "gate"
+                )
+                up_lora = self.lora_dispatcher_.strict_moe_cpu_batch_lora(
+                    expert_input, layer_weight.layer_num_, [adapter_bin], [expert_id], "up"
+                )
+            else:
+                gate_lora = torch.zeros_like(expert_input)
+                up_lora = torch.zeros_like(expert_input)
+
+            # Base GEMM + LoRA
+            gate_out = layer_weight.experts.experts_gate_projs[expert_id].mm(expert_input) + gate_lora
+            up_gate_out = layer_weight.experts.experts_up_projs[expert_id].mm(gate_out) + up_lora
+
+            # Apply activation
+            up_gate_out = self.act_fn(up_gate_out)
+
+            # Down projection with LoRA
+            if self.use_detached_lora_ and self.lora_dispatcher_ is not None:
+                down_lora = self.lora_dispatcher_.strict_moe_cpu_batch_lora(
+                    up_gate_out, layer_weight.layer_num_, [adapter_bin], [expert_id], "down"
+                )
+            else:
+                down_lora = torch.zeros_like(up_gate_out)
+
+            expert_out = layer_weight.experts.experts_down_projs[expert_id].mm(up_gate_out) + down_lora
+            final_output += expert_out
+
+        return final_output.view(num_tokens, hidden_dim)
+
+    def _complete_layer_on_cpu(self, task):
+        """Complete the remaining layers starting from current_layer on CPU.
+
+        This is called by the CPU executor after a request was paused mid-layer
+        due to all experts being cold. The result (final hidden states after
+        all layers complete) is stored in req_obj.colora_continuation.saved_hidden
+        and marked completed.
+        """
+        from lightllm.common.basemodel.infer_lock import g_infer_state_lock
+
+        hidden = task.hidden_input
+        current_layer = task.current_layer
+
+        # Compute all remaining layers starting from current_layer
+        for layer_id in range(current_layer, len(task.all_layers)):
+            layer = task.all_layers[layer_id]
+            weight = task.all_weights[layer_id]
+            # Each layer does full CPU forward pass including attention + FFN
+            # Attention was already done on GPU before we got here
+            # We only need to compute FFN since attention is already done
+            hidden = layer.token_forward_cpu(hidden, task.adapter_bin, task.expert_ids, weight)
+
+        # Store result back to request with global lock for thread safety
+        with g_infer_state_lock:
+            if task.req_obj.colora_continuation is not None:
+                task.req_obj.colora_continuation.saved_hidden = hidden
+                task.req_obj.colora_continuation.completed = True
+                task.req_obj.colora_paused = False
+
+        # Release the async queue slot
+        if hasattr(self.lora_dispatcher_, '_release_async_queue_slot'):
+            self.lora_dispatcher_._release_async_queue_slot()
+
+        return None

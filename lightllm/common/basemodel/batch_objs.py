@@ -54,6 +54,12 @@ class ModelInput:
     # 的 draft 模型的输入
     deepseekv3_mtp_draft_input_hiddens: Optional[torch.Tensor] = None
 
+    # For COLoRA request-level continuation/resume
+    # When resuming a request that was paused mid-layer by COLoRA
+    resume_from_layer: Optional[int] = None
+    resumed_hidden: Optional[torch.Tensor] = None
+    is_continuation_batch: bool = False
+
     def to_cuda(self):
         if self.input_ids is not None:
             self.input_ids = self.input_ids.cuda(non_blocking=True)
@@ -78,6 +84,8 @@ class ModelInput:
                 self.b_shared_seq_len = torch.zeros(size=(batch_size,), dtype=torch.int32, device="cuda")
             else:
                 self.b_shared_seq_len = self.b_shared_seq_len.cuda(non_blocking=True)
+        if self.resumed_hidden is not None:
+            self.resumed_hidden = self.resumed_hidden.cuda(non_blocking=True)
 
 
 @dataclass

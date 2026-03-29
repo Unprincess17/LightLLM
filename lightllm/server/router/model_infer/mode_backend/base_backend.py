@@ -651,6 +651,10 @@ class ModeBackend:
                 paused_reqs.append(req_obj)
                 continue
 
+            if req_obj.colora_paused:
+                # Request is paused waiting for COLoRA CPU completion
+                continue
+
             if req_obj.infer_aborted or req_obj.finish_status.is_finished():
                 if support_overlap:
                     # 延迟处理
@@ -1215,6 +1219,8 @@ class ModeBackend:
                 colora_promotion_ema_alpha=float(getattr(self.args, "colora_promotion_ema_alpha", 0.5)),
                 colora_temporal_prefetch=bool(getattr(self.args, "colora_temporal_prefetch", False)),
                 colora_temporal_hot_cache_slots=int(getattr(self.args, "colora_temporal_hot_cache_slots", 64)),
+                colora_request_skip=bool(getattr(self.args, "colora_request_skip", True)),
+                colora_max_continuations=int(getattr(self.args, "colora_max_continuations", 8)),
             )
             try:
                 dispatcher = self._create_lora_dispatcher_fn(**dispatcher_kwargs)

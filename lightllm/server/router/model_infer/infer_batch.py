@@ -20,6 +20,17 @@ from lightllm.utils.envs_utils import get_env_start_args
 from lightllm.server.pd_io_struct import NIXLDecodeNodeInfo
 from lightllm.server.embed_cache.embed_cache_client import CpuEmbedCacheClient
 
+
+@dataclass
+class ColoraContinuation:
+    """Continuation state for a request paused mid-decode by COLoRA."""
+    resume_layer: int          # Which layer to resume from (L+1)
+    saved_hidden: torch.Tensor # Hidden states after completing layer L on CPU
+    mem_index: torch.Tensor    # Cached mem_index for the KV slots (reuse existing allocation)
+    seq_len: int               # Current sequence length
+    completed: bool = False    # Whether CPU completion is done
+
+
 logger = init_logger(__name__)
 
 
@@ -45,6 +56,7 @@ class InferenceContext:
     radix_cache: RadixCache = None
     shm_req_manager: ShmReqManager = None  # 共享内存请求对象管理
     requests_mapping: Dict[int, "InferReq"] = None
+    req_idx_to_req: Dict[int, "InferReq"] = None  # Map req_idx -> InferReq
     infer_req_ids = None
     vocab_size = None
     cpu_embed_cache_client: Optional[CpuEmbedCacheClient] = None
@@ -70,6 +82,7 @@ class InferenceContext:
         self.shm_req_manager = shm_req_manager
 
         self.requests_mapping = {}
+        self.req_idx_to_req = {}
         self.infer_req_ids = []
 
         self.vocab_size = vocab_size
@@ -116,6 +129,7 @@ class InferenceContext:
                 init_prefix_cache=init_prefix_cache,
             )
             self.requests_mapping[r_id] = r_obj
+            self.req_idx_to_req[r_obj.req_idx] = r_obj
             request_ids.append(r_id)
             req_objs.append(r_obj)
 
@@ -181,6 +195,7 @@ class InferenceContext:
         free_token_index = []
         for request_id in finished_request_ids:
             req: InferReq = self.requests_mapping.pop(request_id)
+            del self.req_idx_to_req[req.req_idx]
             if self.args.diverse_mode:
                 req.clear_master_slave_state()
             self.free_a_req_mem(free_token_index, req)
@@ -393,6 +408,12 @@ class InferReq:
             self.decode_need_token_num = self._mtp_decode_need_token_num
         else:
             self.decode_need_token_num = self._normal_decode_need_token_num
+
+        # COLoRA request-level miss recovery continuation state
+        # When request is paused mid-layer due to a cold miss, this stores
+        # the continuation information for resumption after CPU completion
+        self.colora_continuation: Optional[ColoraContinuation] = None
+        self.colora_paused: bool = False  # Mark request as paused waiting for CPU completion
 
         self._init_all_state()
         if init_prefix_cache:

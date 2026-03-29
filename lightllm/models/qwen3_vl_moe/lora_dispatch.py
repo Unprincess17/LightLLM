@@ -15,6 +15,7 @@ Key Features:
 Debugging:
 - Set LIGHTLLM_LOGGING=DEBUG to see detailed LoRA dispatch logs
 """
+from __future__ import annotations
 import torch
 import os
 import logging
@@ -150,6 +151,18 @@ class _JointAccessState:
     last_decode_step_id: int = -1
     ema_interval_steps: Optional[float] = None
     interval_sample_count: int = 0
+
+@dataclass
+class ColoraCompletionTask:
+    """Task for COLaRA request-level completion on CPU after pausing mid-layer."""
+    req_obj: 'InferReq'
+    current_layer: int
+    hidden_input: torch.Tensor  # CPU tensor, shape [1, hidden_dim]
+    expert_ids: List[int]
+    adapter_bin: int
+    layer_id: int
+    all_layers: List[Any]
+    all_weights: List[Any]
 
 
 @dataclass
@@ -545,6 +558,9 @@ class Qwen3VLMoELoRADispatcher:
         colora_promotion_ema_alpha: float = 0.5,
         colora_temporal_prefetch: bool = False,
         colora_temporal_hot_cache_slots: int = 64,
+        # COLaRA request-level skip-and-reinsert
+        colora_request_skip: bool = True,
+        colora_max_continuations: int = 8,
     ):
         self.num_layers = num_layers
         self.lora_compute_config = lora_compute_config or LoRAComputeConfig()
@@ -589,6 +605,9 @@ class Qwen3VLMoELoRADispatcher:
         self.colora_cpu_workers = max(int(colora_cpu_workers), 1)
         self.colora_cpu_queue_depth = max(int(colora_cpu_queue_depth), 1)
         self.colora_cpu_batch_timeout_us = max(int(colora_cpu_batch_timeout_us), 0)
+        # COLaRA request-level skip-and-reinsert
+        self.colora_request_skip = bool(colora_request_skip)
+        self.colora_max_continuations = max(int(colora_max_continuations), 1)
         self._cpu_executor: Optional[ThreadPoolExecutor] = None
         self._prefetch_executor: Optional[ThreadPoolExecutor] = None
         self._cpu_queue_lock = threading.Lock()
@@ -666,6 +685,11 @@ class Qwen3VLMoELoRADispatcher:
         moe_mode = self.lora_compute_config.get_compute_device("moe")
         if moe_mode in ("cpu", "hybrid"):
             self._require_moe_cpu_kernel(mode=f"moe_compute={moe_mode}")
+
+        # Completion queue for COLaRA request-level continuation
+        # CPU worker threads push completed tasks here, main infer loop collects
+        from queue import SimpleQueue
+        self.colora_completion_queue: SimpleQueue[ColoraCompletionTask] = SimpleQueue()
 
     def init_batched_mode(
         self,
@@ -2926,6 +2950,8 @@ def create_vl_moe_lora_dispatcher(
     colora_promotion_ema_alpha: float = 0.5,
     colora_temporal_prefetch: bool = False,
     colora_temporal_hot_cache_slots: int = 64,
+    colora_request_skip: bool = True,
+    colora_max_continuations: int = 8,
 ) -> Qwen3VLMoELoRADispatcher:
     """
     Factory function to create a VL-MoE LoRA dispatcher with S-LoRA batched mode.
@@ -2966,6 +2992,8 @@ def create_vl_moe_lora_dispatcher(
         colora_promotion_ema_alpha=colora_promotion_ema_alpha,
         colora_temporal_prefetch=colora_temporal_prefetch,
         colora_temporal_hot_cache_slots=colora_temporal_hot_cache_slots,
+        colora_request_skip=colora_request_skip,
+        colora_max_continuations=colora_max_continuations,
     )
 
 

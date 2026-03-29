@@ -240,6 +240,19 @@ def make_argument_parser() -> argparse.ArgumentParser:
         help="Comma-separated layer IDs eligible for COLoRA speculative dispatch. Empty keeps speculation inactive.",
     )
     parser.add_argument(
+        "--colora_request_skip",
+        type=int,
+        choices=[0, 1],
+        default=1,
+        help="Enable request-level skip-and-reinsert for COLoRA (1=enabled, 0=disabled). When enabled, fully cold requests are paused after the previous layer and continued asynchronously on CPU, allowing GPU to process other requests.",
+    )
+    parser.add_argument(
+        "--colora_max_continuations",
+        type=int,
+        default=8,
+        help="Maximum number of concurrent paused COLoRA CPU continuations. Controls concurrency to avoid overwhelming CPU.",
+    )
+    parser.add_argument(
         "--force_slow_lora_path",
         action="store_true",
         help="""Force use of slow path for LoRA (per-expert computation).

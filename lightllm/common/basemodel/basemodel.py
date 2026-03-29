@@ -264,7 +264,22 @@ class TpPartBaseModel:
         model_input.to_cuda()
         assert model_input.mem_indexes.is_cuda
 
-        if model_input.is_prefill:
+        if model_input.is_continuation_batch:
+            with NvtxAnnotate("decode_continuation"):
+                infer_state = self._create_inferstate(model_input)
+                copy_kv_index_to_req(
+                    self.req_manager.req_to_token_indexs,
+                    infer_state.b_req_idx,
+                    infer_state.b_seq_len,
+                    infer_state.mem_index,
+                )
+                infer_state.init_some_extra_state(self, model_input.input_ids)
+                return self.resume_decode_from_layer(
+                    model_input.resume_from_layer,
+                    model_input.resumed_hidden,
+                    infer_state,
+                )
+        elif model_input.is_prefill:
             with NvtxAnnotate("prefill"):
                 return self._prefill(model_input)
         else:
@@ -310,6 +325,11 @@ class TpPartBaseModel:
 
         # 特殊模型，特殊模式的特定变量初始化操作。
         infer_state.deepseekv3_mtp_draft_input_hiddens = model_input.deepseekv3_mtp_draft_input_hiddens
+
+        # COLoRA request-level continuation
+        infer_state.resume_from_layer = model_input.resume_from_layer
+        infer_state.resumed_hidden = model_input.resumed_hidden
+        infer_state.is_continuation = model_input.is_continuation_batch
 
         return infer_state
 
@@ -607,6 +627,39 @@ class TpPartBaseModel:
             model_output.deepseekv3_mtp_main_output_hiddens = graph_out_hiddens
 
         # 在 cuda graph 模式下，输出需要转为 no ref tensor, 加强mem pool 的复用，降低显存的使用。
+        if infer_state.is_cuda_graph:
+            model_output.to_no_ref_tensor()
+
+        return model_output
+
+    @final
+    @torch.no_grad()
+    def resume_decode_from_layer(
+        self,
+        start_layer: int,
+        input_hidden: torch.Tensor,
+        infer_state: InferStateInfo,
+    ) -> ModelOutput:
+        """Continue decode from a given layer with pre-computed hidden state.
+
+        Used for COLoRA request-level continuation where CPU completed
+        layers 0..start_layer-1 and we resume on GPU from start_layer.
+        """
+        run_mode_index = 1 if self.enable_tpsp_mix_mode else 0
+        input_embs = input_hidden
+        for i in range(start_layer, self.layers_num):
+            layer = self.layers_infer[i]
+            layer_method = (layer.token_forward, layer.tpsp_token_forward)[run_mode_index]
+            input_embs: torch.Tensor = layer_method(input_embs, infer_state, self.trans_layers_weight[i])
+
+        post_method = (self.post_infer.token_forward, self.post_infer.tpsp_token_forward)[run_mode_index]
+        predict_logits: torch.Tensor = post_method(input_embs, infer_state, self.pre_post_weight)
+
+        model_output = ModelOutput(logits=predict_logits.contiguous())
+
+        if self.is_deepseekv3_mtp_mode:
+            model_output.deepseekv3_mtp_main_output_hiddens = input_embs.contiguous()
+
         if infer_state.is_cuda_graph:
             model_output.to_no_ref_tensor()
 

@@ -79,6 +79,12 @@ class InferStateInfo:
         # 的输入会用到，其他模型和场景都不会用到
         self.deepseekv3_mtp_draft_input_hiddens: Optional[torch.Tensor] = None
 
+        # For COLoRA request-level continuation/resume
+        # When resuming a request that was paused mid-layer by COLoRA
+        self.resume_from_layer: Optional[int] = None
+        self.resumed_hidden: Optional[torch.Tensor] = None
+        self.is_continuation: bool = False
+
         # 在单节点多dp的运行模式下，在进行prefill的阶段，如果出现了dp之间数据不平衡的现象，
         # 可以将推理的数据，进行重新分配到各个dp，在做 att 之前，重新 all to all 到各自的
         # dp，计算完成后，再 all to all 回去，这样可以使，各个dp 间处理的数据比较均衡，提升
