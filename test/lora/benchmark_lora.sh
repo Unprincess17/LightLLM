@@ -44,6 +44,7 @@ Server pass-through options:
   --colora_speculative_dispatch | --no_colora_speculative_dispatch
   --colora_spec_layer_whitelist CSV
   --server_log_path PATH
+  --server_stdout_log PATH
 USAGE
 }
 
@@ -55,7 +56,7 @@ OUTPUT_PREFIX="moe_offload_profile"
 TEST_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEST_SCRIPT="$TEST_SCRIPT_DIR/test_moe_lora_api.py"
 MAX_TOKENS=1
-DECODE_TARGET_TOKENS=16
+DECODE_TARGET_TOKENS=2
 IGNORE_EOS=1
 SERVER_SCRIPT="$TEST_SCRIPT_DIR/start_server.sh"
 SERVER_HOST="localhost"
@@ -94,8 +95,11 @@ COLORA_TEMPORAL_PREFETCH_LAYER_WHITELIST=""
 COLORA_TEMPORAL_HOT_CACHE_SLOTS=""
 COLORA_SPECULATIVE_DISPATCH="0"
 COLORA_SPEC_LAYER_WHITELIST=""
+COLORA_REQUEST_SKIP=""
+COLORA_MAX_CONTINUATIONS=""
 SERVER_LOG_PATH=""
 SERVER_PID=""
+SERVER_STDOUT_LOG=""
 
 terminate_server_tree() {
     local pid="$1"
@@ -176,7 +180,10 @@ while [[ $# -gt 0 ]]; do
         --colora_speculative_dispatch) COLORA_SPECULATIVE_DISPATCH="1"; shift ;;
         --no_colora_speculative_dispatch) COLORA_SPECULATIVE_DISPATCH="0"; shift ;;
         --colora_spec_layer_whitelist) COLORA_SPEC_LAYER_WHITELIST="$2"; shift 2 ;;
+		--colora_request_skip) COLORA_REQUEST_SKIP="$2"; shift 2 ;;
+		--colora_max_continuations) COLORA_MAX_CONTINUATIONS="$2"; shift 2 ;;
         --server_log_path) SERVER_LOG_PATH="$2"; shift 2 ;;
+        --server_stdout_log) SERVER_STDOUT_LOG="$2"; shift 2 ;;
         --print_per_request) PRINT_PER_REQUEST=1; shift ;;
         --no_print_per_request) PRINT_PER_REQUEST=0; shift ;;
         --top_k_slowest) TOP_K_SLOWEST="$2"; shift 2 ;;
@@ -263,6 +270,8 @@ echo "COLoRA temporal prefetch override: $COLORA_TEMPORAL_PREFETCH"
 [[ -n "$COLORA_TEMPORAL_HOT_CACHE_SLOTS" ]] && echo "COLoRA temporal hot cache slots: $COLORA_TEMPORAL_HOT_CACHE_SLOTS"
 echo "COLoRA speculative dispatch override: $COLORA_SPECULATIVE_DISPATCH"
 [[ -n "$COLORA_SPEC_LAYER_WHITELIST" ]] && echo "COLoRA speculative layer whitelist: $COLORA_SPEC_LAYER_WHITELIST"
+[[ -n "$COLORA_REQUEST_SKIP" ]] && echo "COLoRA request-level skip override: $COLORA_REQUEST_SKIP"
+[[ -n "$COLORA_MAX_CONTINUATIONS" ]] && echo "COLoRA max continuations override: $COLORA_MAX_CONTINUATIONS"
 echo "Server log path: $SERVER_LOG_PATH"
 if [[ -n "$PER_REQUEST_LOG_PATH" ]]; then
     echo "Per-request metrics log: $PER_REQUEST_LOG_PATH"
@@ -375,7 +384,23 @@ fi
 if [[ -n "$COLORA_SPEC_LAYER_WHITELIST" ]]; then
     SERVER_ARGS+=(--colora_spec_layer_whitelist "$COLORA_SPEC_LAYER_WHITELIST")
 fi
-bash "$SERVER_SCRIPT" "${SERVER_ARGS[@]}" >"$SERVER_LOG_PATH" 2>&1 &
+if [[ -n "$COLORA_REQUEST_SKIP" ]]; then
+    SERVER_ARGS+=(--colora_request_skip "$COLORA_REQUEST_SKIP")
+fi
+if [[ -n "$COLORA_MAX_CONTINUATIONS" ]]; then
+    SERVER_ARGS+=(--colora_max_continuations "$COLORA_MAX_CONTINUATIONS")
+fi
+# Redirect server output
+if [[ -n "$SERVER_STDOUT_LOG" ]]; then
+    # User specified explicit output location for stdout/stderr
+    bash "$SERVER_SCRIPT" "${SERVER_ARGS[@]}" 2>&1 | tee -a "$SERVER_STDOUT_LOG" &
+elif [[ -z "$SERVER_LOG_PATH" || "$SERVER_LOG_PATH" == "/dev/null" ]]; then
+    # Output only to stdout/stderr
+    bash "$SERVER_SCRIPT" "${SERVER_ARGS[@]}" &
+else
+    # Default: output to both server log file AND stdout (so you see it in real time)
+    bash "$SERVER_SCRIPT" "${SERVER_ARGS[@]}" 2>&1 | tee "$SERVER_LOG_PATH" &
+fi
 SERVER_PID=$!
 echo "Server PID: $SERVER_PID"
 
@@ -408,8 +433,8 @@ sleep "$SETUP_DELAY"
 # Step 4: Send test request (nsys is now capturing)
 echo "[3/5] Sending test request..."
 echo > benchmark_lora.log
-REQUEST_COUNTS=(1 1 1 2 4 8 16 32 64 128 256 512 1024 2048)
-# REQUEST_COUNTS=(16)
+# REQUEST_COUNTS=(1 1 1 2 4 8 16 32 64 128 256 512 1024 2048)
+REQUEST_COUNTS=(16)
 for i in "${!REQUEST_COUNTS[@]}"; do
     num_requests="${REQUEST_COUNTS[$i]}"
     python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests "$num_requests" 2>&1 | tee -a benchmark_lora.log

@@ -153,6 +153,8 @@ COLORA_TEMPORAL_PREFETCH_LAYER_WHITELIST=""
 COLORA_TEMPORAL_HOT_CACHE_SLOTS=64
 COLORA_SPECULATIVE_DISPATCH=0
 COLORA_SPEC_LAYER_WHITELIST=""
+COLORA_REQUEST_SKIP=""
+COLORA_MAX_CONTINUATIONS=""
 
 # Environment variables
 LOADWORKER=8
@@ -304,6 +306,14 @@ while [[ $# -gt 0 ]]; do
             COLORA_SPEC_LAYER_WHITELIST="$2"
             shift 2
             ;;
+        --colora_request_skip)
+            COLORA_REQUEST_SKIP="$2"
+            shift 2
+            ;;
+        --colora_max_continuations)
+            COLORA_MAX_CONTINUATIONS="$2"
+            shift 2
+            ;;
         --adapter_expert_profile)
             MOE_ADAPTER_EXPERT_PROFILING=1
             shift
@@ -452,6 +462,12 @@ fi
 
 if [[ -n "$COLORA_SPEC_LAYER_WHITELIST" ]]; then
     CMD="$CMD --colora_spec_layer_whitelist $COLORA_SPEC_LAYER_WHITELIST"
+fi
+if [[ -n "$COLORA_REQUEST_SKIP" ]]; then
+    CMD="$CMD --colora_request_skip $COLORA_REQUEST_SKIP"
+fi
+if [[ -n "$COLORA_MAX_CONTINUATIONS" ]]; then
+    CMD="$CMD --colora_max_continuations $COLORA_MAX_CONTINUATIONS"
 fi
 
 # Export environment variables

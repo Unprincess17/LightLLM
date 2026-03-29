@@ -16,6 +16,9 @@ def test_colora_cli_defaults():
     assert args.colora_temporal_hot_cache_slots == 64
     assert args.colora_speculative_dispatch is False
     assert args.colora_spec_layer_whitelist == ""
+    # COLoRA request-level skip defaults
+    assert args.colora_request_skip == 1
+    assert args.colora_max_continuations == 8
 
 
 def test_colora_cli_overrides():
@@ -44,6 +47,10 @@ def test_colora_cli_overrides():
             "--colora_speculative_dispatch",
             "--colora_spec_layer_whitelist",
             "3,7,11",
+            "--colora_request_skip",
+            "0",
+            "--colora_max_continuations",
+            "16",
         ]
     )
     assert args.colora_deferred_promotion_delta_steps == 7
@@ -58,3 +65,5 @@ def test_colora_cli_overrides():
     assert args.colora_temporal_hot_cache_slots == 16
     assert args.colora_speculative_dispatch is True
     assert args.colora_spec_layer_whitelist == "3,7,11"
+    assert args.colora_request_skip == 0
+    assert args.colora_max_continuations == 16
