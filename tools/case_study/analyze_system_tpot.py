@@ -27,13 +27,19 @@ from common import ensure_dir, ensure_parent_dir, load_global_config, load_seed_
 from replay_core import simulate_phase_replay_with_bitmaps
 from system_tpot_core import (
     CONDITION_LABELS,
+    MISS_HANDLING_EXECUTION_FIRST,
+    MISS_HANDLING_LOAD_THEN_RUN,
+    MISS_HANDLING_MODE_ORDER,
     TRANSFER_MODE_ORDER,
     TRANSFER_MODE_STAGED_PAGEABLE_PACKED,
+    apply_temporal_prefetch_hits,
+    build_replay_policy_state,
     build_system_streams,
     build_token_templates,
     compute_component_sizes,
     dtype_name_to_torch_dtype,
     load_model_text_config,
+    simulate_miss_path_replay_with_bitmaps,
 )
 from system_tpot_sim import (
     compute_stage1_token_tpot,
@@ -52,6 +58,7 @@ TOKEN_TPOT_FIELDS = [
     "condition",
     "condition_label",
     "cache_budget",
+    "miss_handling_mode",
     "req_idx",
     "token_pos",
     "token_ordinal",
@@ -61,6 +68,7 @@ TOKEN_TPOT_FIELDS = [
     "miss_objects",
     "cold_miss_objects",
     "capacity_miss_objects",
+    "prefetched_miss_objects",
     "miss_bytes",
     "miss_slices",
     "layer_count",
@@ -69,6 +77,7 @@ TPOT_QUANTILE_FIELDS = [
     "condition",
     "condition_label",
     "cache_budget",
+    "miss_handling_mode",
     "mean",
     "p50",
     "p90",
@@ -83,10 +92,12 @@ LAYER_BARRIER_FIELDS = [
     "condition",
     "condition_label",
     "cache_budget",
+    "miss_handling_mode",
     "layer_id",
     "steps",
     "mean_miss_objects",
     "p95_miss_objects",
+    "mean_prefetched_miss_objects",
     "mean_miss_bytes",
     "mean_miss_slices",
     "mean_exposed_stall_ms",
@@ -104,6 +115,7 @@ REQUEST_DECODE_FIELDS = [
     "condition",
     "condition_label",
     "cache_budget",
+    "miss_handling_mode",
     "req_idx",
     "decode_tokens",
     "mean_tpot_ms",
@@ -115,11 +127,13 @@ REQUEST_DECODE_FIELDS = [
     "total_miss_objects",
     "total_cold_miss_objects",
     "total_capacity_miss_objects",
+    "total_prefetched_miss_objects",
 ]
 SCHEDULER_FIELDS = [
     "condition",
     "condition_label",
     "cache_budget",
+    "miss_handling_mode",
     "system_batch",
     "token_count",
     "batch_count",
@@ -139,6 +153,19 @@ SCHEDULER_FIELDS = [
     "p95_pcie_queue_wait_ms",
     "mean_active_batch_size",
 ]
+BACKGROUND_POLICY_FIELDS = [
+    "condition",
+    "condition_label",
+    "cache_budget",
+    "miss_handling_mode",
+    "deferred_promotion_delta_steps",
+    "promotion_admitted",
+    "promotion_hits",
+    "prefetch_predictions",
+    "prefetch_matches",
+    "prefetch_false_positives",
+    "prefetch_miss_hits",
+]
 
 
 def parse_args() -> argparse.Namespace:
@@ -157,6 +184,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--transfer_mode", type=str, default=TRANSFER_MODE_STAGED_PAGEABLE_PACKED, choices=list(TRANSFER_MODE_ORDER), help="Transfer mode from the calibration manifest")
     parser.add_argument("--load_profile", type=str, default="stressed", help="Load profile from the calibration manifest")
     parser.add_argument("--calibration_stat", type=str, default=DEFAULT_CALIBRATION_STAT, choices=["mean_ms", "p50_ms", "p90_ms"], help="Statistic to pull from the calibration curves")
+    parser.add_argument("--miss_handling_mode", type=str, default=MISS_HANDLING_LOAD_THEN_RUN, choices=list(MISS_HANDLING_MODE_ORDER), help="Miss handling model: baseline load-then-run or COLoRA execution-first")
+    parser.add_argument("--deferred_promotion_delta_steps", type=int, default=4, help="Static decode-step reuse threshold delta for execution-first deferred promotion; 0 disables promotion admission")
+    parser.add_argument("--temporal_prefetch", action="store_true", help="Enable the lightweight previous-top1 temporal prefetch model for execution-first mode")
+    parser.add_argument("--temporal_prefetch_cpu_discount", type=float, default=0.20, help="Fractional cold-path CPU-time discount applied to prefetched miss objects in execution-first mode")
     parser.add_argument("--stage1_system_batch", type=int, default=DEFAULT_STAGE1_SYSTEM_BATCH, help="Effective decode batch for stage-1 per-sequence TPOT")
     parser.add_argument("--scheduler_batch_grid", type=str, default=",".join(str(value) for value in DEFAULT_SCHEDULER_BATCH_GRID), help="Comma-separated max system-batch sweep for scheduler sensitivity")
     parser.add_argument("--skip_scheduler", action="store_true", help="Skip stage-2 scheduler sensitivity")
@@ -255,6 +286,19 @@ def main() -> None:
     )
     request_arrival_times_ms = resolve_request_arrival_times_ms(stream)
 
+    policy_states = {
+        condition: (
+            build_replay_policy_state(
+                stream=stream,
+                access_buffer=stream.condition_buffers[condition],
+                enable_temporal_prefetch=bool(args.temporal_prefetch),
+            )
+            if str(args.miss_handling_mode) == MISS_HANDLING_EXECUTION_FIRST
+            else None
+        )
+        for condition in CONDITION_ORDER
+    }
+
     token_handle, token_writer = open_csv_writer(output_dir / "token_tpot.csv", TOKEN_TPOT_FIELDS)
     try:
         quantile_rows: List[dict] = []
@@ -262,27 +306,37 @@ def main() -> None:
         layer_rows: List[dict] = []
         request_rows: List[dict] = []
         scheduler_rows: List[dict] = []
+        background_policy_rows: List[dict] = []
         per_condition_payloads: Dict[str, dict] = {}
 
         for condition in CONDITION_ORDER:
             print(f"replaying calibrated TPOT for {condition}")
             access_buffer = stream.condition_buffers[condition]
             budget_payloads: Dict[str, dict] = {}
+            policy_state = policy_states[condition]
             for cache_budget in cache_budgets:
                 print(f"  replay budget={cache_budget}")
-                replay_summary = simulate_phase_replay_with_bitmaps(
+                replay_summary = simulate_miss_path_replay_with_bitmaps(
                     condition_buffer=access_buffer,
-                    phase_ids=stream.phase_ids,
-                    request_offsets=stream.request_offsets,
+                    stream=stream,
                     cache_budget=int(cache_budget),
+                    miss_handling_mode=str(args.miss_handling_mode),
+                    deferred_promotion_delta_steps=int(args.deferred_promotion_delta_steps),
+                    policy_state=policy_state,
                 )
-                validate_against_b8_misses(
-                    condition=condition,
-                    cache_budget=int(cache_budget),
-                    request_ids=stream.request_ids,
-                    observed_per_request_misses=replay_summary.per_request_misses,
-                    expected_b8_misses=expected_b8_misses,
-                )
+                if str(args.miss_handling_mode) == MISS_HANDLING_LOAD_THEN_RUN:
+                    validate_against_b8_misses(
+                        condition=condition,
+                        cache_budget=int(cache_budget),
+                        request_ids=stream.request_ids,
+                        observed_per_request_misses=replay_summary.per_request_misses,
+                        expected_b8_misses=expected_b8_misses,
+                    )
+                else:
+                    replay_summary = apply_temporal_prefetch_hits(
+                        replay_summary=replay_summary,
+                        plan=policy_state.temporal_prefetch_plan if bool(args.temporal_prefetch) else None,
+                    )
                 stage1 = compute_stage1_token_tpot(
                     condition=condition,
                     cache_budget=int(cache_budget),
@@ -295,6 +349,8 @@ def main() -> None:
                     stat_key=args.calibration_stat,
                     system_batch=int(args.stage1_system_batch),
                     tail_quantile=float(args.tail_quantile),
+                    miss_handling_mode=str(args.miss_handling_mode),
+                    prefetch_cpu_discount=float(args.temporal_prefetch_cpu_discount),
                 )
                 for row in stage1.token_rows:
                     token_writer.writerow(row)
@@ -303,6 +359,7 @@ def main() -> None:
                         "condition": condition,
                         "condition_label": CONDITION_LABELS[condition],
                         "cache_budget": int(cache_budget),
+                        "miss_handling_mode": str(args.miss_handling_mode),
                         "mean": float(stage1.quantiles["mean"]),
                         "p50": float(stage1.quantiles["p50"]),
                         "p90": float(stage1.quantiles["p90"]),
@@ -316,6 +373,21 @@ def main() -> None:
                 tail_rows.extend(stage1.tail_rows)
                 layer_rows.extend(stage1.layer_rows)
                 request_rows.extend(stage1.request_rows)
+                background_policy_rows.append(
+                    {
+                        "condition": condition,
+                        "condition_label": CONDITION_LABELS[condition],
+                        "cache_budget": int(cache_budget),
+                        "miss_handling_mode": str(args.miss_handling_mode),
+                        "deferred_promotion_delta_steps": int(args.deferred_promotion_delta_steps),
+                        "promotion_admitted": int(replay_summary.promotion_admitted),
+                        "promotion_hits": int(replay_summary.promotion_hits),
+                        "prefetch_predictions": int(replay_summary.prefetch_predictions),
+                        "prefetch_matches": int(replay_summary.prefetch_matches),
+                        "prefetch_false_positives": int(replay_summary.prefetch_false_positives),
+                        "prefetch_miss_hits": int(replay_summary.prefetch_miss_hits),
+                    }
+                )
 
                 scheduler_payload: Dict[str, dict] = {}
                 if not args.skip_scheduler:
@@ -323,6 +395,7 @@ def main() -> None:
                         stream=stream,
                         miss_flags=replay_summary.miss_flags,
                         cold_miss_flags=replay_summary.cold_miss_flags,
+                        prefetch_hit_flags=replay_summary.prefetch_hit_flags,
                     )
                     for system_batch in scheduler_batch_grid:
                         scheduler = simulate_scheduler_sensitivity(
@@ -337,6 +410,8 @@ def main() -> None:
                             load_profile=args.load_profile,
                             stat_key=args.calibration_stat,
                             max_system_batch=int(system_batch),
+                            miss_handling_mode=str(args.miss_handling_mode),
+                            prefetch_cpu_discount=float(args.temporal_prefetch_cpu_discount),
                         )
                         scheduler_rows.append(scheduler.summary_row)
                         scheduler_payload[str(system_batch)] = dict(scheduler.summary_row)
@@ -350,6 +425,14 @@ def main() -> None:
                     "stage1_token_tpot_summary": dict(stage1.quantiles),
                     "stage1_tail_threshold_ms": float(stage1.tail_threshold_ms),
                     "decode_token_count": int(len(stage1.token_rows)),
+                    "background_policy": {
+                        "promotion_admitted": int(replay_summary.promotion_admitted),
+                        "promotion_hits": int(replay_summary.promotion_hits),
+                        "prefetch_predictions": int(replay_summary.prefetch_predictions),
+                        "prefetch_matches": int(replay_summary.prefetch_matches),
+                        "prefetch_false_positives": int(replay_summary.prefetch_false_positives),
+                        "prefetch_miss_hits": int(replay_summary.prefetch_miss_hits),
+                    },
                     "scheduler_sensitivity": scheduler_payload,
                 }
 
@@ -387,6 +470,10 @@ def main() -> None:
         writer = csv.DictWriter(handle, fieldnames=SCHEDULER_FIELDS)
         writer.writeheader()
         writer.writerows(scheduler_rows)
+    with (output_dir / "background_policy_summary.csv").open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=BACKGROUND_POLICY_FIELDS)
+        writer.writeheader()
+        writer.writerows(background_policy_rows)
 
     manifest = {
         "model_name": "case_study_system_tpot_v1",
@@ -409,6 +496,10 @@ def main() -> None:
             "load_profile": str(args.load_profile),
             "calibration_stat": str(args.calibration_stat),
             "tail_quantile": float(args.tail_quantile),
+            "miss_handling_mode": str(args.miss_handling_mode),
+            "deferred_promotion_delta_steps": int(args.deferred_promotion_delta_steps),
+            "temporal_prefetch_enabled": bool(args.temporal_prefetch),
+            "temporal_prefetch_cpu_discount": float(args.temporal_prefetch_cpu_discount),
         },
         "object_sizes": {
             "early_component_label": object_sizes.early_component_label,
@@ -416,6 +507,10 @@ def main() -> None:
             "early_object_bytes": int(object_sizes.early_object_bytes),
             "late_object_bytes": int(object_sizes.late_object_bytes),
             "total_object_bytes": int(object_sizes.total_object_bytes),
+            "early_activation_bytes": int(object_sizes.early_activation_bytes),
+            "early_result_bytes": int(object_sizes.early_result_bytes),
+            "late_activation_bytes": int(object_sizes.late_activation_bytes),
+            "late_result_bytes": int(object_sizes.late_result_bytes),
             "slice_bytes": int(object_sizes.slice_bytes),
             "gate_lora_excluded": bool(object_sizes.gate_lora_excluded),
         },
@@ -435,6 +530,7 @@ def main() -> None:
             "layer_barrier_breakdown_csv": str(output_dir / "layer_barrier_breakdown.csv"),
             "request_decode_summary_csv": str(output_dir / "request_decode_summary.csv"),
             "scheduler_sensitivity_csv": str(output_dir / "scheduler_sensitivity.csv"),
+            "background_policy_summary_csv": str(output_dir / "background_policy_summary.csv"),
             "manifest_json": str(output_dir / "system_tpot_manifest.json"),
         },
     }
@@ -445,9 +541,10 @@ def main() -> None:
         f"{output_dir / 'tpot_quantiles.csv'}, "
         f"{output_dir / 'tail_token_breakdown.csv'}, "
         f"{output_dir / 'layer_barrier_breakdown.csv'}, "
-        f"{output_dir / 'request_decode_summary.csv'}, "
-        f"{output_dir / 'scheduler_sensitivity.csv'}, "
-        f"{output_dir / 'system_tpot_manifest.json'}"
+            f"{output_dir / 'request_decode_summary.csv'}, "
+            f"{output_dir / 'scheduler_sensitivity.csv'}, "
+            f"{output_dir / 'background_policy_summary.csv'}, "
+            f"{output_dir / 'system_tpot_manifest.json'}"
     )
 
 

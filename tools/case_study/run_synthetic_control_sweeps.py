@@ -26,17 +26,22 @@ from analyze_locality import (
     pack_expert_object,
 )
 from common import artifact_root, ensure_dir, load_global_config, load_seed_config, stable_hash_int, write_csv, write_json
-from replay_core import ConditionAccessBuffer, simulate_phase_replay_with_bitmaps
+from replay_core import ConditionAccessBuffer
 from system_tpot_core import (
     CONDITION_LABELS,
+    MISS_HANDLING_LOAD_THEN_RUN,
+    MISS_HANDLING_MODE_ORDER,
     TRANSFER_MODE_ORDER,
     TRANSFER_MODE_STAGED_PAGEABLE_PACKED,
     DecodeLayerStep,
     DecodeToken,
     TokenStructuredStream,
+    apply_temporal_prefetch_hits,
+    build_replay_policy_state,
     compute_component_sizes,
     dtype_name_to_torch_dtype,
     load_model_text_config,
+    simulate_miss_path_replay_with_bitmaps,
 )
 from system_tpot_sim import compute_stage1_token_tpot
 
@@ -127,6 +132,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--transfer_mode", type=str, default=TRANSFER_MODE_STAGED_PAGEABLE_PACKED, choices=list(TRANSFER_MODE_ORDER), help="Transfer mode from the calibration manifest")
     parser.add_argument("--load_profile", type=str, default="stressed", help="Load profile from the calibration manifest")
     parser.add_argument("--calibration_stat", type=str, default="p50_ms", choices=["mean_ms", "p50_ms", "p90_ms"], help="Statistic to pull from the calibration curves")
+    parser.add_argument("--miss_handling_mode", type=str, default=MISS_HANDLING_LOAD_THEN_RUN, choices=list(MISS_HANDLING_MODE_ORDER), help="Miss handling model used for the synthetic TPOT sweep")
+    parser.add_argument("--deferred_promotion_delta_steps", type=int, default=4, help="Static decode-step reuse threshold delta for execution-first deferred promotion")
+    parser.add_argument("--temporal_prefetch", action="store_true", help="Enable lightweight previous-top1 temporal prefetch for execution-first mode")
+    parser.add_argument("--temporal_prefetch_cpu_discount", type=float, default=0.20, help="Fractional cold-path CPU-time discount applied to prefetched miss objects")
     parser.add_argument("--system_batch", type=int, default=DEFAULT_SYSTEM_BATCH, help="Effective decode batch used for per-token TPOT")
     parser.add_argument("--dtype", type=str, default="bf16", help="LoRA dtype used for byte accounting")
     parser.add_argument("--lora_rank", type=int, default=16, help="LoRA rank used for byte accounting")
@@ -309,10 +318,12 @@ def build_base_stream(templates: Sequence[RequestTemplate], schedule: np.ndarray
 
     expert_access_ids = np.empty(total_events, dtype=np.uint32)
     phase_ids = np.empty(total_events, dtype=np.uint8)
+    decode_step_ids = np.full(total_events, -1, dtype=np.int64)
     per_request_prefill_events = np.empty(request_count, dtype=np.int64)
     per_request_decode_events = np.empty(request_count, dtype=np.int64)
     decode_layer_steps: List[DecodeLayerStep] = []
     decode_tokens: List[DecodeToken] = []
+    decode_step_id = 0
 
     cursor = 0
     max_expert_object_id = 0
@@ -347,9 +358,11 @@ def build_base_stream(templates: Sequence[RequestTemplate], schedule: np.ndarray
                         end_index=int(decode_cursor + step_event_count),
                     )
                 )
+                decode_step_ids[decode_cursor:decode_cursor + step_event_count] = np.int64(decode_step_id)
                 decode_cursor += step_event_count
                 step_ordinal += 1
                 event_idx_counter += 1
+                decode_step_id += 1
             decode_tokens.append(
                 DecodeToken(
                     request_ordinal=int(request_ordinal),
@@ -374,6 +387,7 @@ def build_base_stream(templates: Sequence[RequestTemplate], schedule: np.ndarray
             )
         },
         phase_ids=phase_ids,
+        decode_step_ids=decode_step_ids,
         per_request_prefill_events=per_request_prefill_events,
         per_request_decode_events=per_request_decode_events,
         decode_layer_steps=decode_layer_steps,
@@ -478,6 +492,10 @@ def evaluate_condition(
     load_profile: str,
     stat_key: str,
     system_batch: int,
+    miss_handling_mode: str,
+    deferred_promotion_delta_steps: int,
+    temporal_prefetch: bool,
+    temporal_prefetch_cpu_discount: float,
 ) -> Dict[int, dict]:
     access_buffer = ConditionAccessBuffer(
         condition=condition,
@@ -485,14 +503,30 @@ def evaluate_condition(
         total_events=int(base_stream.total_events),
         max_object_id=int(np.max(access_ids)) if access_ids.size else 0,
     )
+    policy_state = (
+        build_replay_policy_state(
+            stream=base_stream.stream,
+            access_buffer=access_buffer,
+            enable_temporal_prefetch=bool(temporal_prefetch),
+        )
+        if str(miss_handling_mode) != MISS_HANDLING_LOAD_THEN_RUN
+        else None
+    )
     metrics_by_budget: Dict[int, dict] = {}
     for cache_budget in cache_budgets:
-        replay_summary = simulate_phase_replay_with_bitmaps(
+        replay_summary = simulate_miss_path_replay_with_bitmaps(
             condition_buffer=access_buffer,
-            phase_ids=base_stream.stream.phase_ids,
-            request_offsets=base_stream.request_offsets,
+            stream=base_stream.stream,
             cache_budget=int(cache_budget),
+            miss_handling_mode=str(miss_handling_mode),
+            deferred_promotion_delta_steps=int(deferred_promotion_delta_steps),
+            policy_state=policy_state,
         )
+        if str(miss_handling_mode) != MISS_HANDLING_LOAD_THEN_RUN:
+            replay_summary = apply_temporal_prefetch_hits(
+                replay_summary=replay_summary,
+                plan=policy_state.temporal_prefetch_plan if bool(temporal_prefetch) else None,
+            )
         stage1 = compute_stage1_token_tpot(
             condition=condition,
             cache_budget=int(cache_budget),
@@ -505,6 +539,8 @@ def evaluate_condition(
             stat_key=stat_key,
             system_batch=int(system_batch),
             tail_quantile=0.95,
+            miss_handling_mode=str(miss_handling_mode),
+            prefetch_cpu_discount=float(temporal_prefetch_cpu_discount),
         )
         metrics_by_budget[int(cache_budget)] = {
             "miss_rate": float(replay_summary.misses / replay_summary.total_events) if replay_summary.total_events else 0.0,
@@ -685,6 +721,10 @@ def run_synthetic_control_sweeps(
     transfer_mode: str,
     load_profile: str,
     calibration_stat: str,
+    miss_handling_mode: str,
+    deferred_promotion_delta_steps: int,
+    temporal_prefetch: bool,
+    temporal_prefetch_cpu_discount: float,
     system_batch: int,
     object_sizes,
     seeds: Mapping[str, object],
@@ -721,6 +761,10 @@ def run_synthetic_control_sweeps(
         load_profile=load_profile,
         stat_key=calibration_stat,
         system_batch=system_batch,
+        miss_handling_mode=miss_handling_mode,
+        deferred_promotion_delta_steps=deferred_promotion_delta_steps,
+        temporal_prefetch=temporal_prefetch,
+        temporal_prefetch_cpu_discount=temporal_prefetch_cpu_discount,
     )
 
     indep_metric_cache: Dict[Tuple[int, float, float], Dict[int, dict]] = {}
@@ -752,6 +796,10 @@ def run_synthetic_control_sweeps(
                 load_profile=load_profile,
                 stat_key=calibration_stat,
                 system_batch=system_batch,
+                miss_handling_mode=miss_handling_mode,
+                deferred_promotion_delta_steps=deferred_promotion_delta_steps,
+                temporal_prefetch=temporal_prefetch,
+                temporal_prefetch_cpu_discount=temporal_prefetch_cpu_discount,
             )
 
         corr_key = (int(point.num_loras), float(point.skew), float(point.burstiness), float(point.corr_strength))
@@ -777,6 +825,10 @@ def run_synthetic_control_sweeps(
                 load_profile=load_profile,
                 stat_key=calibration_stat,
                 system_batch=system_batch,
+                miss_handling_mode=miss_handling_mode,
+                deferred_promotion_delta_steps=deferred_promotion_delta_steps,
+                temporal_prefetch=temporal_prefetch,
+                temporal_prefetch_cpu_discount=temporal_prefetch_cpu_discount,
             )
 
         run_manifest_rows.append(
@@ -845,7 +897,7 @@ def run_synthetic_control_sweeps(
     strongest_p99_drivers = summarize_p99_drivers(result_rows, cache_budgets)
     manifest = {
         "model_name": "case_study_synthetic_control_tpot_v1",
-        "goal": "Synthetic robustness sweeps over calibrated token TPOT using the same miss-bitmaps and transfer model as the real-trace system baseline.",
+        "goal": "Synthetic robustness sweeps over calibrated token TPOT using the same cache/miss-handling model as the real-trace system analysis.",
         "source_run_id": source_run_id,
         "inputs": {
             "joined_indep_path": str(joined_indep_path),
@@ -881,11 +933,19 @@ def run_synthetic_control_sweeps(
             "transfer_mode": transfer_mode,
             "load_profile": load_profile,
             "calibration_stat": calibration_stat,
+            "miss_handling_mode": str(miss_handling_mode),
+            "deferred_promotion_delta_steps": int(deferred_promotion_delta_steps),
+            "temporal_prefetch_enabled": bool(temporal_prefetch),
+            "temporal_prefetch_cpu_discount": float(temporal_prefetch_cpu_discount),
             "system_batch": int(system_batch),
             "object_sizes": {
                 "early_object_bytes": int(object_sizes.early_object_bytes),
                 "late_object_bytes": int(object_sizes.late_object_bytes),
                 "total_object_bytes": int(object_sizes.total_object_bytes),
+                "early_activation_bytes": int(object_sizes.early_activation_bytes),
+                "early_result_bytes": int(object_sizes.early_result_bytes),
+                "late_activation_bytes": int(object_sizes.late_activation_bytes),
+                "late_result_bytes": int(object_sizes.late_result_bytes),
                 "slice_bytes": int(object_sizes.slice_bytes),
                 "gate_lora_excluded": bool(object_sizes.gate_lora_excluded),
             },
@@ -954,6 +1014,10 @@ def main() -> None:
         transfer_mode=args.transfer_mode,
         load_profile=args.load_profile,
         calibration_stat=args.calibration_stat,
+        miss_handling_mode=str(args.miss_handling_mode),
+        deferred_promotion_delta_steps=int(args.deferred_promotion_delta_steps),
+        temporal_prefetch=bool(args.temporal_prefetch),
+        temporal_prefetch_cpu_discount=float(args.temporal_prefetch_cpu_discount),
         system_batch=int(args.system_batch),
         object_sizes=object_sizes,
         seeds=seeds,

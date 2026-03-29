@@ -95,6 +95,13 @@ class PhaseReplayBitmapSummary:
     per_request_decode_misses: np.ndarray
     miss_flags: np.ndarray
     cold_miss_flags: np.ndarray
+    prefetch_hit_flags: Optional[np.ndarray] = None
+    promotion_admitted: int = 0
+    promotion_hits: int = 0
+    prefetch_predictions: int = 0
+    prefetch_matches: int = 0
+    prefetch_false_positives: int = 0
+    prefetch_miss_hits: int = 0
 
 
 @njit(cache=False)
@@ -531,6 +538,223 @@ def simulate_lru_accesses_with_phase_and_bitmaps(
     )
 
 
+@njit(cache=False)
+def compute_next_decode_reuse_distance_steps(
+    access_ids: np.ndarray,
+    phase_ids: np.ndarray,
+    decode_step_ids: np.ndarray,
+    max_object_id: int,
+) -> np.ndarray:
+    next_reuse_distance = np.full(access_ids.shape[0], -1, dtype=np.int32)
+    last_decode_step = np.full(max_object_id + 1, -1, dtype=np.int64)
+
+    for event_index in range(access_ids.shape[0] - 1, -1, -1):
+        if int(phase_ids[event_index]) != PHASE_DECODE:
+            continue
+        decode_step_id = int(decode_step_ids[event_index])
+        if decode_step_id < 0:
+            continue
+        object_id = int(access_ids[event_index])
+        next_step = int(last_decode_step[object_id])
+        if next_step >= 0:
+            distance = next_step - decode_step_id
+            if distance < 0:
+                distance = 0
+            next_reuse_distance[event_index] = np.int32(distance)
+        last_decode_step[object_id] = np.int64(decode_step_id)
+
+    return next_reuse_distance
+
+
+@njit(cache=False)
+def simulate_decode_selective_admission_with_phase_and_bitmaps(
+    access_ids: np.ndarray,
+    phase_ids: np.ndarray,
+    decode_step_ids: np.ndarray,
+    next_decode_reuse_distance: np.ndarray,
+    request_offsets: np.ndarray,
+    max_object_id: int,
+    capacity: int,
+    decode_reuse_threshold_steps: int,
+) -> Tuple[
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    float,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    int,
+    int,
+]:
+    seen_before = np.zeros(max_object_id + 1, dtype=np.uint8)
+    request_count = request_offsets.shape[0] - 1
+    per_request_hits = np.zeros(request_count, dtype=np.int64)
+    per_request_misses = np.zeros(request_count, dtype=np.int64)
+    per_request_cold_misses = np.zeros(request_count, dtype=np.int64)
+    per_request_prefill_misses = np.zeros(request_count, dtype=np.int64)
+    per_request_decode_misses = np.zeros(request_count, dtype=np.int64)
+    miss_flags = np.zeros(access_ids.shape[0], dtype=np.uint8)
+    cold_miss_flags = np.zeros(access_ids.shape[0], dtype=np.uint8)
+
+    hits = 0
+    misses = 0
+    cold_misses = 0
+    capacity_misses = 0
+    total_evictions = 0
+    unique_evicted_objects = 0
+    residency_sum = 0.0
+    residency_count = 0
+    promotion_admitted = 0
+    promotion_hits = 0
+
+    if capacity <= 0:
+        request_ordinal = 0
+        for event_index in range(access_ids.shape[0]):
+            while request_ordinal + 1 < request_offsets.shape[0] and event_index >= request_offsets[request_ordinal + 1]:
+                request_ordinal += 1
+
+            object_id = int(access_ids[event_index])
+            phase_id = int(phase_ids[event_index])
+            misses += 1
+            miss_flags[event_index] = 1
+            per_request_misses[request_ordinal] += 1
+            if phase_id == PHASE_PREFILL:
+                per_request_prefill_misses[request_ordinal] += 1
+            elif phase_id == PHASE_DECODE:
+                per_request_decode_misses[request_ordinal] += 1
+            if seen_before[object_id] != 0:
+                capacity_misses += 1
+            else:
+                seen_before[object_id] = 1
+                cold_misses += 1
+                cold_miss_flags[event_index] = 1
+                per_request_cold_misses[request_ordinal] += 1
+
+        return (
+            hits,
+            misses,
+            cold_misses,
+            capacity_misses,
+            total_evictions,
+            unique_evicted_objects,
+            0.0,
+            per_request_hits,
+            per_request_misses,
+            per_request_cold_misses,
+            per_request_prefill_misses,
+            per_request_decode_misses,
+            miss_flags,
+            cold_miss_flags,
+            promotion_admitted,
+            promotion_hits,
+        )
+
+    in_cache = np.zeros(max_object_id + 1, dtype=np.uint8)
+    prev_link = np.zeros(max_object_id + 1, dtype=np.int32)
+    next_link = np.zeros(max_object_id + 1, dtype=np.int32)
+    inserted_at = np.zeros(max_object_id + 1, dtype=np.int64)
+    ever_evicted = np.zeros(max_object_id + 1, dtype=np.uint8)
+    resident_origin = np.zeros(max_object_id + 1, dtype=np.uint8)
+
+    cache_size = 0
+    head = 0
+    tail = 0
+    request_ordinal = 0
+
+    for event_index in range(access_ids.shape[0]):
+        while request_ordinal + 1 < request_offsets.shape[0] and event_index >= request_offsets[request_ordinal + 1]:
+            request_ordinal += 1
+
+        object_id = int(access_ids[event_index])
+        phase_id = int(phase_ids[event_index])
+        if in_cache[object_id] != 0:
+            hits += 1
+            per_request_hits[request_ordinal] += 1
+            if phase_id == PHASE_DECODE and resident_origin[object_id] == 2:
+                promotion_hits += 1
+            if tail != object_id:
+                head, tail = lru_detach(prev_link, next_link, object_id, head, tail)
+                head, tail = lru_append(prev_link, next_link, object_id, head, tail)
+            continue
+
+        misses += 1
+        miss_flags[event_index] = 1
+        per_request_misses[request_ordinal] += 1
+        if phase_id == PHASE_PREFILL:
+            per_request_prefill_misses[request_ordinal] += 1
+        elif phase_id == PHASE_DECODE:
+            per_request_decode_misses[request_ordinal] += 1
+        if seen_before[object_id] != 0:
+            capacity_misses += 1
+        else:
+            seen_before[object_id] = 1
+            cold_misses += 1
+            cold_miss_flags[event_index] = 1
+            per_request_cold_misses[request_ordinal] += 1
+
+        should_admit = False
+        admission_origin = 0
+        if phase_id == PHASE_DECODE:
+            distance = int(next_decode_reuse_distance[event_index])
+            if decode_reuse_threshold_steps > 0 and distance >= 0 and distance <= decode_reuse_threshold_steps:
+                should_admit = True
+                admission_origin = 2
+                promotion_admitted += 1
+        else:
+            should_admit = True
+            admission_origin = 1
+
+        if not should_admit:
+            continue
+
+        if cache_size >= capacity:
+            evicted_object_id = head
+            head, tail = lru_detach(prev_link, next_link, evicted_object_id, head, tail)
+            in_cache[evicted_object_id] = 0
+            resident_origin[evicted_object_id] = 0
+            total_evictions += 1
+            if ever_evicted[evicted_object_id] == 0:
+                ever_evicted[evicted_object_id] = 1
+                unique_evicted_objects += 1
+            residency_sum += float((event_index + 1) - inserted_at[evicted_object_id])
+            residency_count += 1
+        else:
+            cache_size += 1
+
+        head, tail = lru_append(prev_link, next_link, object_id, head, tail)
+        in_cache[object_id] = 1
+        resident_origin[object_id] = np.uint8(admission_origin)
+        inserted_at[object_id] = event_index + 1
+
+    mean_residency = residency_sum / residency_count if residency_count > 0 else 0.0
+    return (
+        hits,
+        misses,
+        cold_misses,
+        capacity_misses,
+        total_evictions,
+        unique_evicted_objects,
+        mean_residency,
+        per_request_hits,
+        per_request_misses,
+        per_request_cold_misses,
+        per_request_prefill_misses,
+        per_request_decode_misses,
+        miss_flags,
+        cold_miss_flags,
+        promotion_admitted,
+        promotion_hits,
+    )
+
+
 def simulate_cache_policy(
     policy: str,
     access_buffer: ConditionAccessBuffer,
@@ -740,4 +964,90 @@ def simulate_phase_replay_with_bitmaps(
         per_request_decode_misses=per_request_decode_misses,
         miss_flags=miss_flags,
         cold_miss_flags=cold_miss_flags,
+    )
+
+
+def simulate_decode_selective_admission_replay_with_bitmaps(
+    condition_buffer: ConditionAccessBuffer,
+    phase_ids: np.ndarray,
+    decode_step_ids: np.ndarray,
+    next_decode_reuse_distance: np.ndarray,
+    request_offsets: np.ndarray,
+    cache_budget: int,
+    decode_reuse_threshold_steps: int,
+) -> PhaseReplayBitmapSummary:
+    (
+        hits,
+        misses,
+        cold_misses,
+        capacity_misses,
+        total_evictions,
+        unique_evicted_objects,
+        mean_residency,
+        per_request_hits,
+        per_request_misses,
+        per_request_cold_misses,
+        per_request_prefill_misses,
+        per_request_decode_misses,
+        miss_flags,
+        cold_miss_flags,
+        promotion_admitted,
+        promotion_hits,
+    ) = simulate_decode_selective_admission_with_phase_and_bitmaps(
+        access_ids=condition_buffer.access_ids,
+        phase_ids=phase_ids,
+        decode_step_ids=decode_step_ids,
+        next_decode_reuse_distance=next_decode_reuse_distance,
+        request_offsets=request_offsets,
+        max_object_id=condition_buffer.max_object_id,
+        capacity=cache_budget,
+        decode_reuse_threshold_steps=decode_reuse_threshold_steps,
+    )
+
+    total_events = int(condition_buffer.total_events)
+    if hits + misses != total_events:
+        raise ValueError(
+            "cache replay accounting mismatch: "
+            f"condition={condition_buffer.condition}, budget={cache_budget}, "
+            f"hits={hits}, misses={misses}, total_events={total_events}"
+        )
+    if cold_misses + capacity_misses != misses:
+        raise ValueError(
+            "cache miss accounting mismatch: "
+            f"condition={condition_buffer.condition}, budget={cache_budget}, "
+            f"cold={cold_misses}, capacity={capacity_misses}, misses={misses}"
+        )
+    if int(np.sum(miss_flags)) != misses:
+        raise ValueError(
+            "event-level miss bitmap mismatch: "
+            f"condition={condition_buffer.condition}, budget={cache_budget}, "
+            f"miss_bitmap_sum={int(np.sum(miss_flags))}, misses={misses}"
+        )
+    if int(np.sum(cold_miss_flags)) != cold_misses:
+        raise ValueError(
+            "event-level cold-miss bitmap mismatch: "
+            f"condition={condition_buffer.condition}, budget={cache_budget}, "
+            f"cold_bitmap_sum={int(np.sum(cold_miss_flags))}, cold_misses={cold_misses}"
+        )
+
+    return PhaseReplayBitmapSummary(
+        condition=condition_buffer.condition,
+        cache_budget=int(cache_budget),
+        total_events=total_events,
+        hits=int(hits),
+        misses=int(misses),
+        cold_misses=int(cold_misses),
+        capacity_misses=int(capacity_misses),
+        total_evictions=int(total_evictions),
+        unique_evicted_objects=int(unique_evicted_objects),
+        mean_residency_if_available=(float(mean_residency) if total_evictions > 0 else None),
+        per_request_hits=per_request_hits,
+        per_request_misses=per_request_misses,
+        per_request_cold_misses=per_request_cold_misses,
+        per_request_prefill_misses=per_request_prefill_misses,
+        per_request_decode_misses=per_request_decode_misses,
+        miss_flags=miss_flags,
+        cold_miss_flags=cold_miss_flags,
+        promotion_admitted=int(promotion_admitted),
+        promotion_hits=int(promotion_hits),
     )

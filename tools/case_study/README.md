@@ -346,6 +346,7 @@ Outputs:
 Calibration notes:
 
 - The calibration manifest stores packed pinned H2D curves, staged pageable-to-pinned gather plus H2D curves, and fragmented direct pageable H2D curves.
+- It now also stores execution-first cold-path curves for activation packing, pinned D2H/H2D, CPU LoRA compute, and lightweight GPU-side merge in both the `early` and `late` decode windows.
 - Both `idle` and `stressed` host profiles are benchmarked so the simulator can model realistic pageable-pool staging overheads instead of assuming an infinite pinned host pool.
 - `gate_lora` is excluded from the fixed object-byte accounting because its footprint is negligible relative to the MLP LoRA matrices.
 - `base_tpot_ms` is treated as an externally measured hot-cache constant and is serialized into the same JSON alongside the micro-benchmark curves.
@@ -362,6 +363,17 @@ python tools/case_study/analyze_system_tpot.py \
   --calibration_path artifacts/case_study/router_lora_case_v1/calibration/system_baseline_calibration.json
 ```
 
+Execution-first COLoRA-style replay:
+
+```bash
+python tools/case_study/analyze_system_tpot.py \
+  --run_id router_lora_case_v1 \
+  --calibration_path artifacts/case_study/router_lora_case_v1/calibration/system_baseline_calibration.json \
+  --miss_handling_mode execution_first \
+  --deferred_promotion_delta_steps 4 \
+  --temporal_prefetch
+```
+
 Outputs:
 
 - `artifacts/case_study/<run_id>/replay/system_tpot/token_tpot.csv`
@@ -370,15 +382,18 @@ Outputs:
 - `artifacts/case_study/<run_id>/replay/system_tpot/layer_barrier_breakdown.csv`
 - `artifacts/case_study/<run_id>/replay/system_tpot/request_decode_summary.csv`
 - `artifacts/case_study/<run_id>/replay/system_tpot/scheduler_sensitivity.csv`
+- `artifacts/case_study/<run_id>/replay/system_tpot/background_policy_summary.csv`
 - `artifacts/case_study/<run_id>/replay/system_tpot/system_tpot_manifest.json`
 
 Replay and audit rules:
 
 - `B9` reads the exact B8 budget grid from `replay/cache/cache_curve.csv` unless `--cache_budgets` overrides it.
 - It rebuilds the aligned LRU replay stream from `joined_trace_indep.jsonl` and `joined_trace_corr.jsonl`.
-- It validates every `(condition, cache_budget, req_idx)` miss count against `replay/cache/per_request_miss_count.csv` before writing TPOT artifacts.
+- In `load_then_run` mode it validates every `(condition, cache_budget, req_idx)` miss count against `replay/cache/per_request_miss_count.csv` before writing TPOT artifacts.
 - The miss-to-latency model is causal: packing is legal only within one layer step, never across future layers of the same token.
 - The default physical baseline is `pageable host pool -> pinned staging buffer -> PCIe H2D -> GPU compute`, and the transfer mode and load profile are recorded in the manifest.
+- `execution_first` switches the miss model to `activation pack -> pinned D2H -> CPU LoRA -> pinned H2D -> merge`, optionally with reuse-threshold deferred promotion and previous-top1 temporal prefetch.
+- `background_policy_summary.csv` records the deferred-promotion admissions/hits and temporal-prefetch prediction statistics for each `(condition, cache_budget)`.
 - `scheduler_sensitivity.csv` is a second-stage sweep over shared-batch service with one PCIe service queue; its `service_tpot` columns match stage-1 TPOT when `system_batch=1`, and its scheduler wait columns isolate queueing effects separately.
 
 ### B10. Synthetic Control Sweeps
@@ -412,6 +427,7 @@ Useful overrides:
 - `--synthetic_request_count <N>`: change how many synthetic requests are replayed per point
 - `--num_loras`, `--skew_levels`, `--burstiness_levels`, `--corr_strength_levels`, `--cache_budgets`: override the sweep grid
 - `--transfer_mode`, `--load_profile`, `--calibration_stat`, `--system_batch`: change which calibrated TPOT baseline the sweep uses
+- `--miss_handling_mode`, `--deferred_promotion_delta_steps`, `--temporal_prefetch`, `--temporal_prefetch_cpu_discount`: switch the sweep between the baseline load-then-run model and the execution-first COLoRA model
 
 Outputs:
 
@@ -433,7 +449,7 @@ Output contracts:
 Replay and reproducibility rules:
 
 - `B10` keeps the `B0` / `B1` / `B2` condition definitions unchanged.
-- The sweep path reuses the shared `replay_core.py` LRU kernels plus the same calibrated per-token TPOT logic that powers `analyze_system_tpot.py`.
+- The sweep path reuses the shared cache replay kernels plus the same calibrated per-token TPOT logic and optional execution-first background-policy model that powers `analyze_system_tpot.py`.
 - Every sweep point is deterministic because the point id, adapter schedules, and template resampling order are all derived from serialized seeds and written into `sweep_manifest.json`.
 
 ### B11. Small Live Validation

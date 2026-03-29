@@ -35,6 +35,10 @@ from replay_core import (
     PHASE_DECODE,
     PHASE_PREFILL,
     PHASE_UNKNOWN,
+    PhaseReplayBitmapSummary,
+    compute_next_decode_reuse_distance_steps,
+    simulate_decode_selective_admission_replay_with_bitmaps,
+    simulate_phase_replay_with_bitmaps,
 )
 
 
@@ -51,6 +55,12 @@ TRANSFER_MODE_ORDER = (
     TRANSFER_MODE_STAGED_PAGEABLE_PACKED,
     TRANSFER_MODE_DIRECT_PINNED_PACKED,
     TRANSFER_MODE_DIRECT_PAGEABLE_FRAGMENTED,
+)
+MISS_HANDLING_LOAD_THEN_RUN = "load_then_run"
+MISS_HANDLING_EXECUTION_FIRST = "execution_first"
+MISS_HANDLING_MODE_ORDER = (
+    MISS_HANDLING_LOAD_THEN_RUN,
+    MISS_HANDLING_EXECUTION_FIRST,
 )
 CURVE_STAT_KEYS = ("mean_ms", "p50_ms", "p90_ms")
 
@@ -83,6 +93,7 @@ class TokenStructuredStream:
     request_offsets: np.ndarray
     condition_buffers: Dict[str, ConditionAccessBuffer]
     phase_ids: np.ndarray
+    decode_step_ids: np.ndarray
     per_request_prefill_events: np.ndarray
     per_request_decode_events: np.ndarray
     decode_layer_steps: List[DecodeLayerStep]
@@ -107,6 +118,10 @@ class ComponentSizeBytes:
     total_object_slices: int
     gate_lora_excluded: bool
     slice_bytes: int
+    early_activation_bytes: int
+    early_result_bytes: int
+    late_activation_bytes: int
+    late_result_bytes: int
 
 
 @dataclass(frozen=True)
@@ -161,6 +176,7 @@ class TokenTemplateLayer:
     layer_id: int
     miss_objects: int
     cold_miss_objects: int
+    prefetched_miss_objects: int = 0
 
 
 @dataclass(frozen=True)
@@ -169,6 +185,20 @@ class TokenTemplate:
     token_pos: int
     token_ordinal: int
     layers: Tuple[TokenTemplateLayer, ...]
+
+
+@dataclass(frozen=True)
+class TemporalPrefetchPlan:
+    candidate_event_indices: np.ndarray
+    prediction_count: int
+    matched_step_count: int
+    false_positive_count: int
+
+
+@dataclass(frozen=True)
+class ReplayPolicyState:
+    next_decode_reuse_distance: np.ndarray
+    temporal_prefetch_plan: Optional[TemporalPrefetchPlan]
 
 
 def phase_name_to_id(phase: object) -> int:
@@ -249,6 +279,10 @@ def compute_component_sizes(
     early_object_bytes = int(lora_rank * (hidden_size + moe_intermediate_size) * dtype_nbytes)
     late_object_bytes = int(lora_rank * (moe_intermediate_size + hidden_size) * dtype_nbytes)
     total_object_bytes = int(early_object_bytes + late_object_bytes)
+    early_activation_bytes = int(hidden_size * dtype_nbytes)
+    early_result_bytes = int(moe_intermediate_size * dtype_nbytes)
+    late_activation_bytes = int(moe_intermediate_size * dtype_nbytes)
+    late_result_bytes = int(hidden_size * dtype_nbytes)
     return ComponentSizeBytes(
         early_component_label=str(early_component_label),
         late_component_label=str(late_component_label),
@@ -260,6 +294,10 @@ def compute_component_sizes(
         total_object_slices=int(math.ceil(float(total_object_bytes) / float(slice_bytes))),
         gate_lora_excluded=bool(gate_lora_excluded),
         slice_bytes=int(slice_bytes),
+        early_activation_bytes=early_activation_bytes,
+        early_result_bytes=early_result_bytes,
+        late_activation_bytes=late_activation_bytes,
+        late_result_bytes=late_result_bytes,
     )
 
 
@@ -481,6 +519,7 @@ def build_system_streams(
         CONDITION_JOINT_CORR: np.empty(total_events, dtype=np.uint32),
     }
     phase_ids = np.empty(total_events, dtype=np.uint8)
+    decode_step_ids = np.full(total_events, -1, dtype=np.int64)
     max_object_ids = {condition: 0 for condition in CONDITION_ORDER}
 
     request_offsets = [0]
@@ -500,6 +539,7 @@ def build_system_streams(
 
     decode_layer_steps: List[DecodeLayerStep] = []
     decode_tokens: List[DecodeToken] = []
+    current_decode_step_id = 0
     active_step_req_idx: Optional[int] = None
     active_step_token_pos: Optional[int] = None
     active_step_layer_id: Optional[int] = None
@@ -516,8 +556,10 @@ def build_system_streams(
     def flush_active_step(end_index: int) -> None:
         nonlocal active_step_req_idx, active_step_token_pos, active_step_layer_id, active_step_event_idx
         nonlocal active_step_start_index, active_step_request_ordinal, active_step_token_ordinal
+        nonlocal current_decode_step_id
         if active_step_start_index is None:
             return
+        decode_step_ids[int(active_step_start_index):int(end_index)] = np.int64(current_decode_step_id)
         decode_layer_steps.append(
             DecodeLayerStep(
                 request_ordinal=int(active_step_request_ordinal),
@@ -530,6 +572,7 @@ def build_system_streams(
                 end_index=int(end_index),
             )
         )
+        current_decode_step_id += 1
         active_step_req_idx = None
         active_step_token_pos = None
         active_step_layer_id = None
@@ -705,6 +748,7 @@ def build_system_streams(
         request_offsets=np.asarray(request_offsets, dtype=np.int64),
         condition_buffers=condition_buffers,
         phase_ids=phase_ids,
+        decode_step_ids=decode_step_ids,
         per_request_prefill_events=np.asarray(per_request_prefill_events, dtype=np.int64),
         per_request_decode_events=np.asarray(per_request_decode_events, dtype=np.int64),
         decode_layer_steps=decode_layer_steps,
@@ -718,10 +762,129 @@ def build_system_streams(
     )
 
 
+def build_temporal_prefetch_plan(
+    stream: TokenStructuredStream,
+    access_ids: np.ndarray,
+) -> TemporalPrefetchPlan:
+    candidate_event_indices: List[int] = []
+    prediction_count = 0
+    matched_step_count = 0
+    false_positive_count = 0
+    previous_top1_by_req_layer: Dict[Tuple[int, int], int] = {}
+
+    for step in stream.decode_layer_steps:
+        start_index = int(step.start_index)
+        end_index = int(step.end_index)
+        if end_index <= start_index:
+            continue
+        current_top1 = int(access_ids[start_index])
+        key = (int(step.req_idx), int(step.layer_id))
+        predicted_top1 = previous_top1_by_req_layer.get(key)
+        if predicted_top1 is not None:
+            prediction_count += 1
+            matched_index = -1
+            for event_index in range(start_index, end_index):
+                if int(access_ids[event_index]) == int(predicted_top1):
+                    matched_index = int(event_index)
+                    break
+            if matched_index >= 0:
+                matched_step_count += 1
+                candidate_event_indices.append(int(matched_index))
+            else:
+                false_positive_count += 1
+        previous_top1_by_req_layer[key] = current_top1
+
+    return TemporalPrefetchPlan(
+        candidate_event_indices=np.asarray(candidate_event_indices, dtype=np.int64),
+        prediction_count=int(prediction_count),
+        matched_step_count=int(matched_step_count),
+        false_positive_count=int(false_positive_count),
+    )
+
+
+def build_replay_policy_state(
+    stream: TokenStructuredStream,
+    access_buffer: ConditionAccessBuffer,
+    enable_temporal_prefetch: bool,
+) -> ReplayPolicyState:
+    next_decode_reuse_distance = compute_next_decode_reuse_distance_steps(
+        access_ids=access_buffer.access_ids,
+        phase_ids=stream.phase_ids,
+        decode_step_ids=stream.decode_step_ids,
+        max_object_id=access_buffer.max_object_id,
+    )
+    temporal_prefetch_plan = build_temporal_prefetch_plan(stream, access_buffer.access_ids) if enable_temporal_prefetch else None
+    return ReplayPolicyState(
+        next_decode_reuse_distance=next_decode_reuse_distance,
+        temporal_prefetch_plan=temporal_prefetch_plan,
+    )
+
+
+def simulate_miss_path_replay_with_bitmaps(
+    condition_buffer: ConditionAccessBuffer,
+    stream: TokenStructuredStream,
+    cache_budget: int,
+    miss_handling_mode: str,
+    deferred_promotion_delta_steps: int,
+    policy_state: Optional[ReplayPolicyState],
+) -> PhaseReplayBitmapSummary:
+    if miss_handling_mode == MISS_HANDLING_LOAD_THEN_RUN:
+        return simulate_phase_replay_with_bitmaps(
+            condition_buffer=condition_buffer,
+            phase_ids=stream.phase_ids,
+            request_offsets=stream.request_offsets,
+            cache_budget=cache_budget,
+        )
+    if miss_handling_mode != MISS_HANDLING_EXECUTION_FIRST:
+        raise ValueError(f"unsupported miss handling mode: {miss_handling_mode!r}")
+    if policy_state is None:
+        raise ValueError("execution_first replay requires a precomputed policy_state")
+
+    return simulate_decode_selective_admission_replay_with_bitmaps(
+        condition_buffer=condition_buffer,
+        phase_ids=stream.phase_ids,
+        decode_step_ids=stream.decode_step_ids,
+        next_decode_reuse_distance=policy_state.next_decode_reuse_distance,
+        request_offsets=stream.request_offsets,
+        cache_budget=cache_budget,
+        decode_reuse_threshold_steps=max(int(deferred_promotion_delta_steps), 0),
+    )
+
+
+def apply_temporal_prefetch_hits(
+    replay_summary: PhaseReplayBitmapSummary,
+    plan: Optional[TemporalPrefetchPlan],
+) -> PhaseReplayBitmapSummary:
+    total_events = int(replay_summary.total_events)
+    flags = np.zeros(total_events, dtype=np.uint8)
+    prediction_count = 0
+    matched_step_count = 0
+    false_positive_count = 0
+    miss_hits = 0
+
+    if plan is not None:
+        prediction_count = int(plan.prediction_count)
+        matched_step_count = int(plan.matched_step_count)
+        false_positive_count = int(plan.false_positive_count)
+        if plan.candidate_event_indices.size > 0:
+            candidate_indices = plan.candidate_event_indices.astype(np.int64, copy=False)
+            candidate_miss_flags = replay_summary.miss_flags[candidate_indices]
+            flags[candidate_indices] = candidate_miss_flags
+            miss_hits = int(np.sum(candidate_miss_flags))
+
+    replay_summary.prefetch_hit_flags = flags
+    replay_summary.prefetch_predictions = prediction_count
+    replay_summary.prefetch_matches = matched_step_count
+    replay_summary.prefetch_false_positives = false_positive_count
+    replay_summary.prefetch_miss_hits = miss_hits
+    return replay_summary
+
+
 def build_token_templates(
     stream: TokenStructuredStream,
     miss_flags: np.ndarray,
     cold_miss_flags: np.ndarray,
+    prefetch_hit_flags: Optional[np.ndarray] = None,
 ) -> Dict[int, List[TokenTemplate]]:
     templates: Dict[int, List[TokenTemplate]] = {int(req_idx): [] for req_idx in stream.request_ids}
     for token in stream.decode_tokens:
@@ -729,11 +892,15 @@ def build_token_templates(
         for step in stream.decode_layer_steps[token.step_start:token.step_end]:
             miss_objects = int(np.sum(miss_flags[step.start_index:step.end_index]))
             cold_miss_objects = int(np.sum(cold_miss_flags[step.start_index:step.end_index]))
+            prefetched_miss_objects = (
+                int(np.sum(prefetch_hit_flags[step.start_index:step.end_index])) if prefetch_hit_flags is not None else 0
+            )
             layers.append(
                 TokenTemplateLayer(
                     layer_id=int(step.layer_id),
                     miss_objects=miss_objects,
                     cold_miss_objects=cold_miss_objects,
+                    prefetched_miss_objects=prefetched_miss_objects,
                 )
             )
         templates[int(token.req_idx)].append(

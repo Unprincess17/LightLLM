@@ -23,9 +23,12 @@ from system_tpot_core import (
     CONDITION_LABELS,
     ComponentSizeBytes,
     LayerTransferDecision,
+    MISS_HANDLING_EXECUTION_FIRST,
+    MISS_HANDLING_LOAD_THEN_RUN,
     SchedulerBatchStats,
     TokenStructuredStream,
     TokenTemplate,
+    _interp_from_rows,
     calibration_service_ms,
     summarize_values,
 )
@@ -116,6 +119,39 @@ def calibration_overlap_window_ms_interp(
     if not points:
         raise ValueError(f"no overlap-window points found for window={window_name!r}")
     return _interp_from_pairs(points, float(system_batch))
+
+
+def calibration_cold_path_component_ms_interp(
+    calibration: Mapping[str, object],
+    load_profile: str,
+    stage_name: str,
+    component_name: str,
+    x_key: str,
+    x_value: float,
+    stat_key: str,
+) -> float:
+    if stat_key not in CURVE_STAT_KEYS:
+        raise ValueError(f"unsupported curve stat key: {stat_key}")
+    if x_value <= 0.0:
+        return 0.0
+    cold_path_curves = calibration.get("cold_path_curves", {})
+    if not isinstance(cold_path_curves, Mapping):
+        raise ValueError("calibration is missing cold_path_curves")
+    profiles = cold_path_curves.get("profiles", {})
+    if not isinstance(profiles, Mapping) or load_profile not in profiles:
+        raise ValueError(f"load profile {load_profile!r} is missing from cold_path_curves")
+    profile_payload = profiles[load_profile]
+    if not isinstance(profile_payload, Mapping):
+        raise ValueError(f"unexpected cold_path profile payload for {load_profile!r}")
+    stage_payload = profile_payload.get(stage_name)
+    if not isinstance(stage_payload, Mapping):
+        raise ValueError(f"cold-path stage {stage_name!r} is missing for profile {load_profile!r}")
+    rows = stage_payload.get(component_name)
+    if not isinstance(rows, list) or not rows:
+        raise ValueError(
+            f"cold-path component {component_name!r} is missing for profile {load_profile!r}, stage {stage_name!r}"
+        )
+    return _interp_from_rows(rows, x_key, stat_key, x_value)
 
 
 def choose_layer_transfer_strategy_interp(
@@ -214,6 +250,175 @@ def choose_layer_transfer_strategy_interp(
     )
 
 
+def choose_execution_first_strategy_interp(
+    miss_objects: int,
+    cold_miss_objects: int,
+    prefetched_miss_objects: int,
+    object_sizes: ComponentSizeBytes,
+    calibration: Mapping[str, object],
+    load_profile: str,
+    stat_key: str,
+    system_batch: int,
+    prefetch_cpu_discount: float,
+) -> LayerTransferDecision:
+    capacity_miss_objects = max(int(miss_objects) - int(cold_miss_objects), 0)
+    early_overlap_window_ms = calibration_overlap_window_ms_interp(calibration, system_batch, "early", stat_key)
+    late_overlap_window_ms = calibration_overlap_window_ms_interp(calibration, system_batch, "late", stat_key)
+
+    if miss_objects <= 0:
+        return LayerTransferDecision(
+            strategy="hit_only",
+            miss_objects=0,
+            cold_miss_objects=0,
+            capacity_miss_objects=0,
+            early_bytes=0,
+            late_bytes=0,
+            total_bytes=0,
+            early_slices=0,
+            late_slices=0,
+            total_slices=0,
+            early_service_ms=0.0,
+            late_service_ms=0.0,
+            whole_service_ms=0.0,
+            early_overlap_window_ms=early_overlap_window_ms,
+            late_overlap_window_ms=late_overlap_window_ms,
+            early_exposed_stall_ms=0.0,
+            late_exposed_stall_ms=0.0,
+            total_exposed_stall_ms=0.0,
+        )
+
+    prefetched_miss_objects = min(max(int(prefetched_miss_objects), 0), int(miss_objects))
+    prefetch_fraction = float(prefetched_miss_objects) / float(max(int(miss_objects), 1))
+    cpu_discount = max(0.0, min(float(prefetch_cpu_discount), 1.0)) * prefetch_fraction
+
+    early_bytes = int(miss_objects) * int(object_sizes.early_activation_bytes + object_sizes.early_result_bytes)
+    late_bytes = int(miss_objects) * int(object_sizes.late_activation_bytes + object_sizes.late_result_bytes)
+    total_bytes = int(early_bytes + late_bytes)
+    early_slices = int(math.ceil(float(early_bytes) / float(object_sizes.slice_bytes)))
+    late_slices = int(math.ceil(float(late_bytes) / float(object_sizes.slice_bytes)))
+    total_slices = int(math.ceil(float(total_bytes) / float(object_sizes.slice_bytes)))
+
+    early_pack_ms = calibration_cold_path_component_ms_interp(
+        calibration=calibration,
+        load_profile=load_profile,
+        stage_name="early",
+        component_name="pack_rows",
+        x_key="row_count",
+        x_value=float(miss_objects),
+        stat_key=stat_key,
+    )
+    early_d2h_ms = calibration_cold_path_component_ms_interp(
+        calibration=calibration,
+        load_profile=load_profile,
+        stage_name="early",
+        component_name="d2h_rows",
+        x_key="payload_bytes",
+        x_value=float(int(miss_objects) * int(object_sizes.early_activation_bytes)),
+        stat_key=stat_key,
+    )
+    early_cpu_ms = calibration_cold_path_component_ms_interp(
+        calibration=calibration,
+        load_profile=load_profile,
+        stage_name="early",
+        component_name="cpu_rows",
+        x_key="row_count",
+        x_value=float(miss_objects),
+        stat_key=stat_key,
+    )
+    early_cpu_ms *= 1.0 - cpu_discount
+    early_h2d_ms = calibration_cold_path_component_ms_interp(
+        calibration=calibration,
+        load_profile=load_profile,
+        stage_name="early",
+        component_name="h2d_rows",
+        x_key="payload_bytes",
+        x_value=float(int(miss_objects) * int(object_sizes.early_result_bytes)),
+        stat_key=stat_key,
+    )
+    early_merge_ms = calibration_cold_path_component_ms_interp(
+        calibration=calibration,
+        load_profile=load_profile,
+        stage_name="early",
+        component_name="merge_rows",
+        x_key="row_count",
+        x_value=float(miss_objects),
+        stat_key=stat_key,
+    )
+
+    late_pack_ms = calibration_cold_path_component_ms_interp(
+        calibration=calibration,
+        load_profile=load_profile,
+        stage_name="late",
+        component_name="pack_rows",
+        x_key="row_count",
+        x_value=float(miss_objects),
+        stat_key=stat_key,
+    )
+    late_d2h_ms = calibration_cold_path_component_ms_interp(
+        calibration=calibration,
+        load_profile=load_profile,
+        stage_name="late",
+        component_name="d2h_rows",
+        x_key="payload_bytes",
+        x_value=float(int(miss_objects) * int(object_sizes.late_activation_bytes)),
+        stat_key=stat_key,
+    )
+    late_cpu_ms = calibration_cold_path_component_ms_interp(
+        calibration=calibration,
+        load_profile=load_profile,
+        stage_name="late",
+        component_name="cpu_rows",
+        x_key="row_count",
+        x_value=float(miss_objects),
+        stat_key=stat_key,
+    )
+    late_cpu_ms *= 1.0 - cpu_discount
+    late_h2d_ms = calibration_cold_path_component_ms_interp(
+        calibration=calibration,
+        load_profile=load_profile,
+        stage_name="late",
+        component_name="h2d_rows",
+        x_key="payload_bytes",
+        x_value=float(int(miss_objects) * int(object_sizes.late_result_bytes)),
+        stat_key=stat_key,
+    )
+    late_merge_ms = calibration_cold_path_component_ms_interp(
+        calibration=calibration,
+        load_profile=load_profile,
+        stage_name="late",
+        component_name="merge_rows",
+        x_key="row_count",
+        x_value=float(miss_objects),
+        stat_key=stat_key,
+    )
+
+    early_service_ms = early_pack_ms + early_d2h_ms + early_cpu_ms + early_h2d_ms + early_merge_ms
+    late_service_ms = late_pack_ms + late_d2h_ms + late_cpu_ms + late_h2d_ms + late_merge_ms
+    early_exposed_stall_ms = max(0.0, early_service_ms - early_overlap_window_ms)
+    late_exposed_stall_ms = max(0.0, late_service_ms - late_overlap_window_ms)
+
+    return LayerTransferDecision(
+        strategy="staged_split",
+        miss_objects=int(miss_objects),
+        cold_miss_objects=int(cold_miss_objects),
+        capacity_miss_objects=int(capacity_miss_objects),
+        early_bytes=early_bytes,
+        late_bytes=late_bytes,
+        total_bytes=total_bytes,
+        early_slices=early_slices,
+        late_slices=late_slices,
+        total_slices=total_slices,
+        early_service_ms=float(early_service_ms),
+        late_service_ms=float(late_service_ms),
+        whole_service_ms=0.0,
+        early_overlap_window_ms=float(early_overlap_window_ms),
+        late_overlap_window_ms=float(late_overlap_window_ms),
+        early_exposed_stall_ms=float(early_exposed_stall_ms),
+        late_exposed_stall_ms=float(late_exposed_stall_ms),
+        total_exposed_stall_ms=float(early_exposed_stall_ms + late_exposed_stall_ms),
+    )
+
+
 def validate_against_b8_misses(
     condition: str,
     cache_budget: int,
@@ -249,6 +454,8 @@ def compute_stage1_token_tpot(
     stat_key: str,
     system_batch: int,
     tail_quantile: float,
+    miss_handling_mode: str = MISS_HANDLING_LOAD_THEN_RUN,
+    prefetch_cpu_discount: float = 0.0,
 ) -> Stage1TPOTOutputs:
     if tail_quantile <= 0.0 or tail_quantile >= 1.0:
         raise ValueError(f"tail_quantile must lie in (0, 1), got {tail_quantile}")
@@ -266,26 +473,46 @@ def compute_stage1_token_tpot(
         token_capacity_miss_objects = 0
         token_miss_bytes = 0
         token_miss_slices = 0
+        token_prefetched_miss_objects = 0
 
         for step in stream.decode_layer_steps[token.step_start:token.step_end]:
             miss_objects = int(np.sum(replay_summary.miss_flags[step.start_index:step.end_index]))
             cold_miss_objects = int(np.sum(replay_summary.cold_miss_flags[step.start_index:step.end_index]))
-            decision = choose_layer_transfer_strategy_interp(
-                miss_objects=miss_objects,
-                cold_miss_objects=cold_miss_objects,
-                object_sizes=object_sizes,
-                calibration=calibration,
-                transfer_mode=transfer_mode,
-                load_profile=load_profile,
-                stat_key=stat_key,
-                system_batch=system_batch,
+            prefetched_miss_objects = (
+                int(np.sum(replay_summary.prefetch_hit_flags[step.start_index:step.end_index]))
+                if replay_summary.prefetch_hit_flags is not None
+                else 0
             )
+            if miss_handling_mode == MISS_HANDLING_EXECUTION_FIRST:
+                decision = choose_execution_first_strategy_interp(
+                    miss_objects=miss_objects,
+                    cold_miss_objects=cold_miss_objects,
+                    prefetched_miss_objects=prefetched_miss_objects,
+                    object_sizes=object_sizes,
+                    calibration=calibration,
+                    load_profile=load_profile,
+                    stat_key=stat_key,
+                    system_batch=system_batch,
+                    prefetch_cpu_discount=prefetch_cpu_discount,
+                )
+            else:
+                decision = choose_layer_transfer_strategy_interp(
+                    miss_objects=miss_objects,
+                    cold_miss_objects=cold_miss_objects,
+                    object_sizes=object_sizes,
+                    calibration=calibration,
+                    transfer_mode=transfer_mode,
+                    load_profile=load_profile,
+                    stat_key=stat_key,
+                    system_batch=system_batch,
+                )
             token_exposed_ms += float(decision.total_exposed_stall_ms)
             token_miss_objects += int(decision.miss_objects)
             token_cold_miss_objects += int(decision.cold_miss_objects)
             token_capacity_miss_objects += int(decision.capacity_miss_objects)
             token_miss_bytes += int(decision.total_bytes)
             token_miss_slices += int(decision.total_slices)
+            token_prefetched_miss_objects += int(prefetched_miss_objects)
 
             metrics = layer_metrics.setdefault(
                 int(step.layer_id),
@@ -294,6 +521,7 @@ def compute_stage1_token_tpot(
                     "miss_objects": [],
                     "cold_miss_objects": [],
                     "capacity_miss_objects": [],
+                    "prefetched_miss_objects": [],
                     "miss_bytes": [],
                     "miss_slices": [],
                     "total_exposed_stall_ms": [],
@@ -308,6 +536,7 @@ def compute_stage1_token_tpot(
             metrics["miss_objects"].append(float(decision.miss_objects))
             metrics["cold_miss_objects"].append(float(decision.cold_miss_objects))
             metrics["capacity_miss_objects"].append(float(decision.capacity_miss_objects))
+            metrics["prefetched_miss_objects"].append(float(prefetched_miss_objects))
             metrics["miss_bytes"].append(float(decision.total_bytes))
             metrics["miss_slices"].append(float(decision.total_slices))
             metrics["total_exposed_stall_ms"].append(float(decision.total_exposed_stall_ms))
@@ -322,6 +551,7 @@ def compute_stage1_token_tpot(
             "condition": condition,
             "condition_label": condition_label,
             "cache_budget": int(cache_budget),
+            "miss_handling_mode": str(miss_handling_mode),
             "req_idx": int(token.req_idx),
             "token_pos": int(token.token_pos),
             "token_ordinal": int(token.token_ordinal),
@@ -331,6 +561,7 @@ def compute_stage1_token_tpot(
             "miss_objects": int(token_miss_objects),
             "cold_miss_objects": int(token_cold_miss_objects),
             "capacity_miss_objects": int(token_capacity_miss_objects),
+            "prefetched_miss_objects": int(token_prefetched_miss_objects),
             "miss_bytes": int(token_miss_bytes),
             "miss_slices": int(token_miss_slices),
             "layer_count": int(token.step_end - token.step_start),
@@ -358,6 +589,7 @@ def compute_stage1_token_tpot(
                 "condition": condition,
                 "condition_label": condition_label,
                 "cache_budget": int(cache_budget),
+                "miss_handling_mode": str(miss_handling_mode),
                 "req_idx": int(req_idx),
                 "decode_tokens": int(len(rows)),
                 "mean_tpot_ms": float(sum(tpot_req) / len(tpot_req)) if tpot_req else 0.0,
@@ -369,6 +601,7 @@ def compute_stage1_token_tpot(
                 "total_miss_objects": int(sum(int(row["miss_objects"]) for row in rows)),
                 "total_cold_miss_objects": int(sum(int(row["cold_miss_objects"]) for row in rows)),
                 "total_capacity_miss_objects": int(sum(int(row["capacity_miss_objects"]) for row in rows)),
+                "total_prefetched_miss_objects": int(sum(int(row["prefetched_miss_objects"]) for row in rows)),
             }
         )
 
@@ -382,10 +615,12 @@ def compute_stage1_token_tpot(
                 "condition": condition,
                 "condition_label": condition_label,
                 "cache_budget": int(cache_budget),
+                "miss_handling_mode": str(miss_handling_mode),
                 "layer_id": int(layer_id),
                 "steps": int(total_steps),
                 "mean_miss_objects": float(sum(metrics["miss_objects"]) / total_steps) if total_steps else 0.0,
                 "p95_miss_objects": float(percentile(metrics["miss_objects"], 0.95)) if total_steps else 0.0,
+                "mean_prefetched_miss_objects": float(sum(metrics["prefetched_miss_objects"]) / total_steps) if total_steps else 0.0,
                 "mean_miss_bytes": float(sum(metrics["miss_bytes"]) / total_steps) if total_steps else 0.0,
                 "mean_miss_slices": float(sum(metrics["miss_slices"]) / total_steps) if total_steps else 0.0,
                 "mean_exposed_stall_ms": float(sum(metrics["total_exposed_stall_ms"]) / total_steps) if total_steps else 0.0,
@@ -429,6 +664,8 @@ def _simulate_batch_service_ms(
     transfer_mode: str,
     load_profile: str,
     stat_key: str,
+    miss_handling_mode: str,
+    prefetch_cpu_discount: float,
 ) -> Tuple[float, float]:
     if not batch_tokens:
         return 0.0, 0.0
@@ -447,7 +684,19 @@ def _simulate_batch_service_ms(
                 continue
             layer = token.layers[layer_ordinal]
             decisions.append(
-                choose_layer_transfer_strategy_interp(
+                choose_execution_first_strategy_interp(
+                    miss_objects=int(layer.miss_objects),
+                    cold_miss_objects=int(layer.cold_miss_objects),
+                    prefetched_miss_objects=int(layer.prefetched_miss_objects),
+                    object_sizes=object_sizes,
+                    calibration=calibration,
+                    load_profile=load_profile,
+                    stat_key=stat_key,
+                    system_batch=actual_batch,
+                    prefetch_cpu_discount=prefetch_cpu_discount,
+                )
+                if miss_handling_mode == MISS_HANDLING_EXECUTION_FIRST
+                else choose_layer_transfer_strategy_interp(
                     miss_objects=int(layer.miss_objects),
                     cold_miss_objects=int(layer.cold_miss_objects),
                     object_sizes=object_sizes,
@@ -506,6 +755,8 @@ def simulate_scheduler_sensitivity(
     load_profile: str,
     stat_key: str,
     max_system_batch: int,
+    miss_handling_mode: str = MISS_HANDLING_LOAD_THEN_RUN,
+    prefetch_cpu_discount: float = 0.0,
 ) -> SchedulerSimulationSummary:
     if max_system_batch <= 0:
         raise ValueError(f"max_system_batch must be positive, got {max_system_batch}")
@@ -561,6 +812,8 @@ def simulate_scheduler_sensitivity(
             transfer_mode=transfer_mode,
             load_profile=load_profile,
             stat_key=stat_key,
+            miss_handling_mode=miss_handling_mode,
+            prefetch_cpu_discount=prefetch_cpu_discount,
         )
 
         batch_start_ms = float(current_time_ms)
@@ -603,6 +856,7 @@ def simulate_scheduler_sensitivity(
             "condition": condition,
             "condition_label": condition_label,
             "cache_budget": int(cache_budget),
+            "miss_handling_mode": str(miss_handling_mode),
             "system_batch": int(max_system_batch),
             "token_count": int(len(service_tpots)),
             "batch_count": int(len(batch_stats)),

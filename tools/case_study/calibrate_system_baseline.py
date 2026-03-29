@@ -11,7 +11,7 @@ import os
 import statistics
 import time
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Sequence
+from typing import Callable, Dict, Iterable, List, Mapping, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -38,6 +38,7 @@ from system_tpot_core import (
 
 DEFAULT_BATCH_GRID = (1, 2, 4)
 DEFAULT_PAYLOAD_GRID = (64 * 1024, 128 * 1024, 256 * 1024, 512 * 1024, 1024 * 1024, 2 * 1024 * 1024)
+DEFAULT_COLD_ROW_GRID = (1, 2, 4, 8, 16, 32)
 DEFAULT_HOST_PROFILES = ("idle", "stressed")
 DEFAULT_WARMUP_ITERS = 20
 DEFAULT_MEASURE_ITERS = 80
@@ -56,12 +57,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch_grid", type=str, default=",".join(str(value) for value in DEFAULT_BATCH_GRID), help="Comma-separated batch grid for overlap and compute benchmarks")
     parser.add_argument("--base_tpot_ms", type=str, required=True, help="Batch:value map for hot-cache base TPOT, e.g. 1:1.2,2:1.4,4:1.9")
     parser.add_argument("--payload_grid_bytes", type=str, default=",".join(str(value) for value in DEFAULT_PAYLOAD_GRID), help="Comma-separated packed-payload byte grid")
+    parser.add_argument("--cold_row_grid", type=str, default=",".join(str(value) for value in DEFAULT_COLD_ROW_GRID), help="Comma-separated row-count grid for execution-first cold-path benchmarks")
     parser.add_argument("--fragmented_slice_grid", type=str, default="1,2,4,8,16,32", help="Comma-separated slice-count grid for direct pageable fragmented copies")
     parser.add_argument("--host_profiles", type=str, default=",".join(DEFAULT_HOST_PROFILES), help="Comma-separated host profiles to benchmark")
     parser.add_argument("--warmup_iters", type=int, default=DEFAULT_WARMUP_ITERS, help="Warmup iterations per benchmark point")
     parser.add_argument("--measure_iters", type=int, default=DEFAULT_MEASURE_ITERS, help="Measured iterations per benchmark point")
     parser.add_argument("--stress_workers", type=int, default=max(1, (os.cpu_count() or 4) // 4), help="Background host-stress workers used for the stressed profile")
     parser.add_argument("--stress_array_mb", type=int, default=256, help="Per-worker array footprint in MiB for the stressed host profile")
+    parser.add_argument("--cpu_threads", type=int, default=max(1, min(4, os.cpu_count() or 1)), help="Torch CPU thread count used for cold-path compute benchmarks")
+    parser.add_argument("--cpu_kernel_mode", type=str, default="auto", choices=["auto", "avx", "pytorch"], help="Cold-path CPU kernel selection: auto prefers AVX when available")
     return parser.parse_args()
 
 
@@ -137,9 +141,51 @@ def _measure_cuda_op(fn, warmup_iters: int, measure_iters: int) -> List[float]:
     return values_ms
 
 
+def _measure_cpu_op(fn, warmup_iters: int, measure_iters: int) -> List[float]:
+    for _ in range(warmup_iters):
+        fn()
+    values_ms: List[float] = []
+    for _ in range(measure_iters):
+        start = time.perf_counter()
+        fn()
+        values_ms.append((time.perf_counter() - start) * 1000.0)
+    return values_ms
+
+
+def _resolve_cpu_kernel_mode(
+    kernel_mode: str,
+) -> Tuple[bool, str, Callable[[torch.Tensor, torch.Tensor, torch.Tensor, float], torch.Tensor] | None]:
+    requested_mode = str(kernel_mode).strip().lower()
+    if requested_mode == "pytorch":
+        return False, "pytorch", None
+
+    try:
+        from lightllm._kernels.lora.lora_cpu_kernel import batch_lora_avx, is_available as avx_is_available
+    except Exception as exc:
+        if requested_mode == "avx":
+            raise RuntimeError("AVX CPU kernel was requested but could not be imported") from exc
+        return False, "pytorch", None
+
+    avx_ready = bool(avx_is_available())
+    if requested_mode == "avx" and not avx_ready:
+        raise RuntimeError("AVX CPU kernel was requested but is unavailable on this host")
+    if avx_ready:
+        return True, "avx", batch_lora_avx
+    return False, "pytorch", None
+
+
 def benchmark_packed_h2d(device: torch.device, payload_bytes: int, warmup_iters: int, measure_iters: int) -> Dict[str, float]:
     src = torch.empty(payload_bytes, dtype=torch.uint8, pin_memory=True)
     dst = torch.empty(payload_bytes, dtype=torch.uint8, device=device)
+    values_ms = _measure_cuda_op(lambda: dst.copy_(src, non_blocking=True), warmup_iters, measure_iters)
+    row = {"payload_bytes": int(payload_bytes)}
+    row.update(summarize_ms(values_ms))
+    return row
+
+
+def benchmark_packed_d2h(device: torch.device, payload_bytes: int, warmup_iters: int, measure_iters: int) -> Dict[str, float]:
+    src = torch.empty(payload_bytes, dtype=torch.uint8, device=device)
+    dst = torch.empty(payload_bytes, dtype=torch.uint8, pin_memory=True)
     values_ms = _measure_cuda_op(lambda: dst.copy_(src, non_blocking=True), warmup_iters, measure_iters)
     row = {"payload_bytes": int(payload_bytes)}
     row.update(summarize_ms(values_ms))
@@ -208,6 +254,92 @@ def benchmark_direct_pageable_fragmented(
 
     values_ms = _measure_cuda_op(run_once, warmup_iters, measure_iters)
     row = {"slice_count": int(slice_count), "payload_bytes": int(payload_bytes)}
+    row.update(summarize_ms(values_ms))
+    return row
+
+
+def benchmark_activation_pack_rows(
+    device: torch.device,
+    row_count: int,
+    input_dim: int,
+    dtype: torch.dtype,
+    warmup_iters: int,
+    measure_iters: int,
+) -> Dict[str, float]:
+    activations = torch.randn((int(row_count), int(input_dim)), dtype=dtype, device=device)
+    gather_index = torch.arange(int(row_count) - 1, -1, -1, device=device, dtype=torch.long)
+    values_ms = _measure_cuda_op(lambda: activations.index_select(0, gather_index), warmup_iters, measure_iters)
+    row = {
+        "row_count": int(row_count),
+        "payload_bytes": int(row_count) * int(input_dim) * int(activations.element_size()),
+    }
+    row.update(summarize_ms(values_ms))
+    return row
+
+
+def benchmark_activation_merge_rows(
+    device: torch.device,
+    row_count: int,
+    output_dim: int,
+    dtype: torch.dtype,
+    warmup_iters: int,
+    measure_iters: int,
+) -> Dict[str, float]:
+    total_rows = max(int(row_count) * 2, 1)
+    positions = torch.arange(0, int(row_count), device=device, dtype=torch.long)
+    packed_output = torch.randn((int(row_count), int(output_dim)), dtype=dtype, device=device)
+    destination = torch.zeros((total_rows, int(output_dim)), dtype=dtype, device=device)
+    values_ms = _measure_cuda_op(lambda: destination.index_copy_(0, positions, packed_output), warmup_iters, measure_iters)
+    row = {
+        "row_count": int(row_count),
+        "payload_bytes": int(row_count) * int(output_dim) * int(packed_output.element_size()),
+    }
+    row.update(summarize_ms(values_ms))
+    return row
+
+
+def benchmark_cpu_lora_rows(
+    row_count: int,
+    input_dim: int,
+    output_dim: int,
+    lora_rank: int,
+    dtype: torch.dtype,
+    warmup_iters: int,
+    measure_iters: int,
+    use_avx: bool,
+    avx_batch_fn: Callable[[torch.Tensor, torch.Tensor, torch.Tensor, float], torch.Tensor] | None,
+) -> Dict[str, float]:
+    cpu_dtype = torch.bfloat16 if use_avx else dtype
+    if use_avx and cpu_dtype != torch.bfloat16:
+        raise ValueError("AVX cold-path benchmark requires bfloat16 dtype")
+
+    batch_input = torch.randn((int(row_count), int(input_dim)), dtype=cpu_dtype, device="cpu")
+    if use_avx:
+        batch_input = batch_input.pin_memory()
+    a_cpu = torch.randn((int(lora_rank), int(input_dim)), dtype=cpu_dtype, device="cpu").contiguous()
+    b_cpu = torch.randn((int(lora_rank), int(output_dim)), dtype=cpu_dtype, device="cpu").contiguous()
+
+    if use_avx:
+        if avx_batch_fn is None:
+            raise RuntimeError("AVX batch function is not available")
+
+        def run_once() -> None:
+            _ = avx_batch_fn(batch_input, a_cpu, b_cpu, 1.0)
+
+    else:
+        batch_input_f = batch_input.float().contiguous()
+        a_cpu_f = a_cpu.float().contiguous()
+        b_cpu_f = b_cpu.float().contiguous()
+
+        def run_once() -> None:
+            _ = torch.matmul(torch.matmul(batch_input_f, a_cpu_f.t()), b_cpu_f)
+
+    values_ms = _measure_cpu_op(run_once, warmup_iters, measure_iters)
+    row = {
+        "row_count": int(row_count),
+        "input_payload_bytes": int(row_count) * int(input_dim) * int(batch_input.element_size()),
+        "output_payload_bytes": int(row_count) * int(output_dim) * int(b_cpu.element_size()),
+    }
     row.update(summarize_ms(values_ms))
     return row
 
@@ -310,8 +442,14 @@ def main() -> None:
     batch_grid = parse_batch_grid(args.batch_grid)
     base_tpot_ms = parse_batch_value_map(args.base_tpot_ms)
     payload_grid = [int(token) for token in str(args.payload_grid_bytes).split(",") if token.strip()]
+    cold_row_grid = [int(token) for token in str(args.cold_row_grid).split(",") if token.strip()]
     fragmented_slice_grid = [int(token) for token in str(args.fragmented_slice_grid).split(",") if token.strip()]
     host_profiles = [token.strip() for token in str(args.host_profiles).split(",") if token.strip()]
+    if int(args.cpu_threads) > 0:
+        torch.set_num_threads(int(args.cpu_threads))
+    use_avx_cpu_kernel, effective_cpu_kernel_mode, avx_batch_fn = _resolve_cpu_kernel_mode(args.cpu_kernel_mode)
+    if use_avx_cpu_kernel and dtype != torch.bfloat16:
+        raise ValueError("AVX cold-path benchmark currently requires --dtype bf16")
 
     object_sizes = compute_component_sizes(
         hidden_size=int(text_config["hidden_size"]),
@@ -326,6 +464,7 @@ def main() -> None:
         TRANSFER_MODE_STAGED_PAGEABLE_PACKED: {"profiles": {}},
         TRANSFER_MODE_DIRECT_PAGEABLE_FRAGMENTED: {"profiles": {}},
     }
+    cold_path_curves: Dict[str, dict] = {"profiles": {}}
 
     for profile in host_profiles:
         stressed = profile.lower() == "stressed"
@@ -347,6 +486,114 @@ def main() -> None:
                 benchmark_direct_pageable_fragmented(device, int(args.slice_bytes), int(slice_count), int(args.warmup_iters), int(args.measure_iters))
                 for slice_count in fragmented_slice_grid
             ]
+            cold_early_pack_rows = [
+                benchmark_activation_pack_rows(
+                    device=device,
+                    row_count=int(row_count),
+                    input_dim=int(text_config["hidden_size"]),
+                    dtype=dtype,
+                    warmup_iters=int(args.warmup_iters),
+                    measure_iters=int(args.measure_iters),
+                )
+                for row_count in cold_row_grid
+            ]
+            cold_early_d2h_rows = [
+                benchmark_packed_d2h(
+                    device=device,
+                    payload_bytes=int(row_count) * int(object_sizes.early_activation_bytes),
+                    warmup_iters=int(args.warmup_iters),
+                    measure_iters=int(args.measure_iters),
+                )
+                for row_count in cold_row_grid
+            ]
+            cold_early_h2d_rows = [
+                benchmark_packed_h2d(
+                    device=device,
+                    payload_bytes=int(row_count) * int(object_sizes.early_result_bytes),
+                    warmup_iters=int(args.warmup_iters),
+                    measure_iters=int(args.measure_iters),
+                )
+                for row_count in cold_row_grid
+            ]
+            cold_early_cpu_rows = [
+                benchmark_cpu_lora_rows(
+                    row_count=int(row_count),
+                    input_dim=int(text_config["hidden_size"]),
+                    output_dim=int(text_config["moe_intermediate_size"]),
+                    lora_rank=int(args.lora_rank),
+                    dtype=dtype,
+                    warmup_iters=int(args.warmup_iters),
+                    measure_iters=int(args.measure_iters),
+                    use_avx=use_avx_cpu_kernel,
+                    avx_batch_fn=avx_batch_fn,
+                )
+                for row_count in cold_row_grid
+            ]
+            cold_early_merge_rows = [
+                benchmark_activation_merge_rows(
+                    device=device,
+                    row_count=int(row_count),
+                    output_dim=int(text_config["moe_intermediate_size"]),
+                    dtype=dtype,
+                    warmup_iters=int(args.warmup_iters),
+                    measure_iters=int(args.measure_iters),
+                )
+                for row_count in cold_row_grid
+            ]
+            cold_late_pack_rows = [
+                benchmark_activation_pack_rows(
+                    device=device,
+                    row_count=int(row_count),
+                    input_dim=int(text_config["moe_intermediate_size"]),
+                    dtype=dtype,
+                    warmup_iters=int(args.warmup_iters),
+                    measure_iters=int(args.measure_iters),
+                )
+                for row_count in cold_row_grid
+            ]
+            cold_late_d2h_rows = [
+                benchmark_packed_d2h(
+                    device=device,
+                    payload_bytes=int(row_count) * int(object_sizes.late_activation_bytes),
+                    warmup_iters=int(args.warmup_iters),
+                    measure_iters=int(args.measure_iters),
+                )
+                for row_count in cold_row_grid
+            ]
+            cold_late_h2d_rows = [
+                benchmark_packed_h2d(
+                    device=device,
+                    payload_bytes=int(row_count) * int(object_sizes.late_result_bytes),
+                    warmup_iters=int(args.warmup_iters),
+                    measure_iters=int(args.measure_iters),
+                )
+                for row_count in cold_row_grid
+            ]
+            cold_late_cpu_rows = [
+                benchmark_cpu_lora_rows(
+                    row_count=int(row_count),
+                    input_dim=int(text_config["moe_intermediate_size"]),
+                    output_dim=int(text_config["hidden_size"]),
+                    lora_rank=int(args.lora_rank),
+                    dtype=dtype,
+                    warmup_iters=int(args.warmup_iters),
+                    measure_iters=int(args.measure_iters),
+                    use_avx=use_avx_cpu_kernel,
+                    avx_batch_fn=avx_batch_fn,
+                )
+                for row_count in cold_row_grid
+            ]
+            cold_late_merge_rows = [
+                benchmark_activation_merge_rows(
+                    device=device,
+                    row_count=int(row_count),
+                    output_dim=int(text_config["hidden_size"]),
+                    dtype=dtype,
+                    warmup_iters=int(args.warmup_iters),
+                    measure_iters=int(args.measure_iters),
+                )
+                for row_count in cold_row_grid
+            ]
 
         transfer_modes[TRANSFER_MODE_DIRECT_PINNED_PACKED]["profiles"][profile] = {
             "packed_h2d_rows": pinned_h2d_rows,
@@ -359,6 +606,22 @@ def main() -> None:
         }
         transfer_modes[TRANSFER_MODE_DIRECT_PAGEABLE_FRAGMENTED]["profiles"][profile] = {
             "fragmented_total_rows": fragmented_total_rows,
+        }
+        cold_path_curves["profiles"][profile] = {
+            "early": {
+                "pack_rows": cold_early_pack_rows,
+                "d2h_rows": cold_early_d2h_rows,
+                "cpu_rows": cold_early_cpu_rows,
+                "h2d_rows": cold_early_h2d_rows,
+                "merge_rows": cold_early_merge_rows,
+            },
+            "late": {
+                "pack_rows": cold_late_pack_rows,
+                "d2h_rows": cold_late_d2h_rows,
+                "cpu_rows": cold_late_cpu_rows,
+                "h2d_rows": cold_late_h2d_rows,
+                "merge_rows": cold_late_merge_rows,
+            },
         }
 
     lora_compute_ms = benchmark_lora_compute_rows(
@@ -417,15 +680,27 @@ def main() -> None:
             "late_object_slices": int(object_sizes.late_object_slices),
             "total_object_slices": int(object_sizes.total_object_slices),
             "gate_lora_excluded": bool(object_sizes.gate_lora_excluded),
+            "early_activation_bytes": int(object_sizes.early_activation_bytes),
+            "early_result_bytes": int(object_sizes.early_result_bytes),
+            "late_activation_bytes": int(object_sizes.late_activation_bytes),
+            "late_result_bytes": int(object_sizes.late_result_bytes),
         },
         "assumptions": {
             "host_pool_default": "pageable_with_pinned_staging",
             "pageable_and_pinned_benchmarked": True,
             "packed_scope": "per-layer causal packing only",
             "base_tpot_source": "user_supplied_hot_cache_measurement",
+            "cold_path_payload_model": "pack + pinned_d2h + cpu_lora + pinned_h2d + merge",
+        },
+        "cold_path_config": {
+            "row_grid": [int(value) for value in cold_row_grid],
+            "cpu_threads": int(torch.get_num_threads()),
+            "cpu_kernel_mode_requested": str(args.cpu_kernel_mode),
+            "cpu_kernel_mode_effective": str(effective_cpu_kernel_mode),
         },
         "base_tpot_ms": {str(key): float(value) for key, value in base_tpot_ms.items()},
         "transfer_modes": transfer_modes,
+        "cold_path_curves": cold_path_curves,
         "lora_compute_ms": lora_compute_ms,
         "overlap_windows_ms": overlap_windows_ms,
     }
