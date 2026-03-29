@@ -54,11 +54,12 @@ METAL_FLOOR_MS = 1.2
 FLOOR_TOLERANCE_MS = 0.01
 DEFAULT_TAIL_BUDGET = 4096
 DEFAULT_SYSTEM_TPOT_STAGE = "replay/system_tpot_stressed"
-TAIL_PERCENTILE = 0.999
-TAIL_PERCENTILE_LABEL = "P99.9"
-TAIL_CURVE_PERCENTILES = (0.50, 0.75, 0.90, 0.95, 0.97, 0.98, 0.99, 0.995, TAIL_PERCENTILE)
-TAIL_CURVE_TICK_PERCENTILES = (0.50, 0.90, 0.95, 0.99, 0.995, TAIL_PERCENTILE)
-TAIL_CURVE_TICK_LABELS = ("P50", "P90", "P95", "P99", "P99.5", TAIL_PERCENTILE_LABEL)
+MAX_TAIL_PERCENTILE = 0.999
+MAX_TAIL_PERCENTILE_LABEL = "P99.9"
+TAIL_CURVE_PERCENTILES = (0.50, 0.75, 0.90, 0.95, 0.97, 0.98, 0.99, 0.995, MAX_TAIL_PERCENTILE)
+TAIL_CURVE_TICK_PERCENTILES = (0.50, 0.90, 0.95, 0.99, 0.995, MAX_TAIL_PERCENTILE)
+TAIL_CURVE_TICK_LABELS = ("P50", "P90", "P95", "P99", "P99.5", MAX_TAIL_PERCENTILE_LABEL)
+HEADLINE_PERCENTILES = (0.95, 0.99)
 CAPACITY_TICK_BUDGETS = (128, 512, 2048, 8192, 32768, 65536)
 CAPACITY_TICK_LABELS = ("128", "512", "2K", "8K", "32K", "65K")
 # Stretch the "nines" so the 99th+ percentile tail does not collapse into the plot edge.
@@ -211,6 +212,13 @@ def tail_percentile_axis(percentile: float) -> float:
 
 def tail_curve_latencies(values: Sequence[float], percentiles: Sequence[float]) -> np.ndarray:
     return np.asarray([quantile_from_sorted(values, percentile) for percentile in percentiles], dtype=float)
+
+
+def percentile_index(percentiles: Sequence[float], target: float) -> int:
+    for index, percentile in enumerate(percentiles):
+        if abs(float(percentile) - float(target)) < 1e-12:
+            return index
+    raise ValueError(f"percentile {target} is not present in the configured curve")
 
 
 def plot_root_cause(ax: plt.Axes, popularity_rows: Sequence[Mapping[str, str]]) -> None:
@@ -399,10 +407,19 @@ def plot_tail_blowout(ax: plt.Axes, token_tpot_by_condition: Mapping[str, Sequen
             label=CONDITION_LABELS[condition],
         )
 
-    c0_tail = tail_values["expert_only"][-1]
-    c1_tail = tail_values["joint_indep"][-1]
-    c2_tail = tail_values["joint_corr"][-1]
-    tail_tip_x = tick_x[-1]
+    p50_index = percentile_index(TAIL_CURVE_PERCENTILES, 0.50)
+    p95_index = percentile_index(TAIL_CURVE_PERCENTILES, 0.95)
+    p99_index = percentile_index(TAIL_CURVE_PERCENTILES, 0.99)
+    c0_p50 = float(tail_values["expert_only"][p50_index])
+    c0_p99 = float(tail_values["expert_only"][p99_index])
+    c1_p95 = float(tail_values["joint_indep"][p95_index])
+    c1_p99 = float(tail_values["joint_indep"][p99_index])
+    c2_p95 = float(tail_values["joint_corr"][p95_index])
+    c2_p99 = float(tail_values["joint_corr"][p99_index])
+    headline_x = tail_percentile_axis(0.99)
+    headline_y = max(c1_p99, c2_p99)
+    headline_p95 = max(c1_p95, c2_p95)
+    p99_slowdown = headline_y / max(c0_p99, 1e-9)
     flat_tip_x = tick_x[0]
     max_latency = max(float(np.max(latencies)) for latencies in tail_values.values())
 
@@ -413,28 +430,18 @@ def plot_tail_blowout(ax: plt.Axes, token_tpot_by_condition: Mapping[str, Sequen
     ax.set_xticklabels(TAIL_CURVE_TICK_LABELS)
     ax.set_xlabel("Token Percentile")
     ax.set_ylabel("TPOT (ms)")
-    # ax.legend(
-    #     loc="lower left",
-    #     bbox_to_anchor=(0.0, 0.03),
-    #     frameon=True,
-    #     facecolor="white",
-    #     edgecolor="#D7DCE0",
-    #     borderpad=0.35,
-    #     labelspacing=0.25,
-    #     handlelength=2.0,
-    # )
     ax.annotate(
-        f"C1/C2 {TAIL_PERCENTILE_LABEL} = {max(c1_tail, c2_tail):.2f} ms\n≈ 6× slowdown",
-        xy=(tail_tip_x, max(c1_tail, c2_tail)),
-        xytext=(tail_tip_x - 2, max(c1_tail, c2_tail) - 0.72),
+        f"P95={headline_p95:.2f} ms, P99={headline_y:.2f} ms\n{p99_slowdown:.1f}x vs C0 at P99",
+        xy=(headline_x, headline_y),
+        xytext=(headline_x - 1.25, headline_y - 0.72),
         arrowprops={"arrowstyle": "->", "color": CONDITION_COLORS["joint_corr"], "lw": 1.15},
         fontsize=10,
         bbox={"facecolor": "white", "edgecolor": "#D7DCE0", "boxstyle": "round,pad=0.22"},
     )
     ax.annotate(
-        f"Median (P50) ≈ {c0_tail:.2f} ms",
-        xy=(flat_tip_x, c0_tail),
-        xytext=(flat_tip_x, c0_tail + 0.8),
+        f"C0 P50 ≈ {c0_p50:.2f} ms",
+        xy=(flat_tip_x, c0_p50),
+        xytext=(flat_tip_x + 0.14, c0_p50 + 0.8),
         arrowprops={"arrowstyle": "->", "color": CONDITION_COLORS["expert_only"], "lw": 1.1},
         fontsize=10,
         bbox={"facecolor": "white", "edgecolor": "#D7DCE0", "boxstyle": "round,pad=0.22"},
@@ -529,9 +536,13 @@ def main() -> None:
     c0_practical = topk_coverage(popularity_rows, "expert_only", PRACTICAL_CACHE_LIMIT)
     c1_practical = topk_coverage(popularity_rows, "joint_indep", PRACTICAL_CACHE_LIMIT)
     c2_practical = topk_coverage(popularity_rows, "joint_corr", PRACTICAL_CACHE_LIMIT)
-    c0_p99 = quantile_from_sorted(token_tpot_by_condition["expert_only"], TAIL_PERCENTILE)
-    c1_p99 = quantile_from_sorted(token_tpot_by_condition["joint_indep"], TAIL_PERCENTILE)
-    c2_p99 = quantile_from_sorted(token_tpot_by_condition["joint_corr"], TAIL_PERCENTILE)
+    tail_summary = {
+        condition: {
+            percentile: quantile_from_sorted(token_tpot_by_condition[condition], percentile)
+            for percentile in (*HEADLINE_PERCENTILES, MAX_TAIL_PERCENTILE)
+        }
+        for condition in CONDITION_ORDER
+    }
 
     print(f"Wrote panel A to {panel_a_pdf} and {panel_a_png}")
     print(f"Wrote panel B to {panel_b_pdf} and {panel_b_png}")
@@ -547,8 +558,22 @@ def main() -> None:
         f"metal_floor_ms={METAL_FLOOR_MS:.2f}, tolerance_ms={FLOOR_TOLERANCE_MS:.2f}"
     )
     print(
-        f"Panel C budget={args.tail_budget} {TAIL_PERCENTILE_LABEL} TPOT: "
-        f"C0={c0_p99:.3f} ms, C1={c1_p99:.3f} ms, C2={c2_p99:.3f} ms"
+        f"Panel C budget={args.tail_budget} P95 TPOT: "
+        f"C0={tail_summary['expert_only'][0.95]:.3f} ms, "
+        f"C1={tail_summary['joint_indep'][0.95]:.3f} ms, "
+        f"C2={tail_summary['joint_corr'][0.95]:.3f} ms"
+    )
+    print(
+        f"Panel C budget={args.tail_budget} P99 TPOT: "
+        f"C0={tail_summary['expert_only'][0.99]:.3f} ms, "
+        f"C1={tail_summary['joint_indep'][0.99]:.3f} ms, "
+        f"C2={tail_summary['joint_corr'][0.99]:.3f} ms"
+    )
+    print(
+        f"Panel C budget={args.tail_budget} {MAX_TAIL_PERCENTILE_LABEL} TPOT: "
+        f"C0={tail_summary['expert_only'][MAX_TAIL_PERCENTILE]:.3f} ms, "
+        f"C1={tail_summary['joint_indep'][MAX_TAIL_PERCENTILE]:.3f} ms, "
+        f"C2={tail_summary['joint_corr'][MAX_TAIL_PERCENTILE]:.3f} ms"
     )
 
 

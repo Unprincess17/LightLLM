@@ -83,6 +83,39 @@ Outputs:
 - `artifacts/case_study/<run_id>/adapter_trace/adapter_trace_mapped_indep*.jsonl`
 - `artifacts/case_study/<run_id>/adapter_trace/adapter_trace_mapped_corr*.jsonl`
 
+### B3/B4 Alternative. Build Request-Level Composite LoRA Traces from GenTD26
+
+This is the mainline motivation-trace path when you want real request-level LoRA diversity rather than Azure tenant arrivals.
+Use it instead of `B3` + `B4`.
+
+```bash
+python tools/case_study/preprocess_gentd26_trace.py
+```
+
+Default input:
+
+- `/home/shufan/alibaba-clusterdata/cluster-trace-v2026-GenAI/filtered_lora_args.csv`
+
+This stage:
+
+- treats each CSV row as one LoRA-bearing request in file order
+- parses `lora_args`, ignores `scale`, deduplicates `modelVersionId` within a request, and sorts them lexically
+- maps each unique single-LoRA or multi-LoRA combination to one unique adapter slot
+- writes `adapter_trace_mapped_corr.jsonl` in real file order
+- writes `adapter_trace_mapped_indep.jsonl` as a deterministic permutation of the same request-level adapter multiset
+- omits timestamps intentionally; downstream `B9` replays this trace with `arrival_idx` order semantics
+
+Outputs:
+
+- `artifacts/case_study/<run_id>/adapter_trace/adapter_trace_raw.jsonl`
+- `artifacts/case_study/<run_id>/adapter_trace/adapter_trace_summary.json`
+- `artifacts/case_study/<run_id>/adapter_trace/tenant_popularity.csv`
+- `artifacts/case_study/<run_id>/adapter_trace/composite_adapter_manifest.json`
+- `artifacts/case_study/<run_id>/adapter_trace/mapping_policy.md`
+- `artifacts/case_study/<run_id>/adapter_trace/mapping_summary.json`
+- `artifacts/case_study/<run_id>/adapter_trace/adapter_trace_mapped_indep*.jsonl`
+- `artifacts/case_study/<run_id>/adapter_trace/adapter_trace_mapped_corr*.jsonl`
+
 ### B5. Collect Real Router Trace
 
 This is the main entrypoint for the real-router half of the case study.
@@ -214,6 +247,7 @@ This stage:
 
 - reads `router_summary.json` to get the router request count
 - selects the first `request_count` mapped adapter arrivals in sorted `arrival_idx` order, matching the truncation semantics already used by `replay_fixed_requests.py`
+- for GenTD26-derived mapped traces, this means `corr` keeps the real file-order composite sequence while `indep` uses the deterministic shuffled sequence emitted by `preprocess_gentd26_trace.py`
 - canonicalizes router rows by `req_idx` before emission because the traced router events can contain request-interleaved blocks even though `event_idx` is monotonic within each request
 - explodes `topk_experts` so one joined row equals one selected expert event
 - writes per-mode joined traces plus a QC report and compact projection summary

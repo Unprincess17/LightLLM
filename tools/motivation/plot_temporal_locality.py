@@ -334,8 +334,8 @@ def apply_paper_style() -> None:
 def plot_hit_rate(df: pd.DataFrame, output_path: str | Path) -> None:
     """Generate the temporal locality hit-rate figure.
 
-    Plots Layer Index (X) vs. Average Routing Hit Rate % (Y) with a
-    shaded 5th-95th percentile confidence band.
+    Plots Layer Index (X) vs. average routing hit rate (%) as a
+    single mean trend line.
 
     Parameters
     ----------
@@ -353,16 +353,6 @@ def plot_hit_rate(df: pd.DataFrame, output_path: str | Path) -> None:
 
     x = df["layer_id"].values
     y_mean = df["mean_hit_rate"].values * 100.0   # convert to %
-    y_p5 = df["p5"].values * 100.0
-    y_p95 = df["p95"].values * 100.0
-
-    # Shaded confidence band (5th-95th percentile).
-    ax.fill_between(
-        x, y_p5, y_p95,
-        color=_COLOR_PRIMARY,
-        alpha=0.18,
-        label="5th-95th percentile",
-    )
 
     # Mean hit-rate line with markers.
     ax.plot(
@@ -374,7 +364,6 @@ def plot_hit_rate(df: pd.DataFrame, output_path: str | Path) -> None:
         markerfacecolor=_COLOR_PRIMARY,
         markeredgecolor="white",
         markeredgewidth=0.6,
-        label="Mean hit rate",
         zorder=3,
     )
 
@@ -387,9 +376,6 @@ def plot_hit_rate(df: pd.DataFrame, output_path: str | Path) -> None:
     # X-tick spacing: show every 4th layer for readability with 48 layers.
     tick_step = max(1, len(x) // 12)
     ax.set_xticks(x[::tick_step])
-
-    # Legend.
-    ax.legend(loc="lower right", frameon=True, framealpha=0.9, edgecolor="none")
 
     fig.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)

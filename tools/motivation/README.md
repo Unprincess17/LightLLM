@@ -12,7 +12,7 @@ Measures how much expert-set overlap exists between consecutive decode tokens at
 Hit_Rate(L, t) = |E(L,t) ∩ E(L,t-1)| / |E(L,t)|
 ```
 
-where `E(L,t)` is the set of top-k experts selected at layer `L` for decode token at position `t`. The figure plots the per-layer average of this metric (averaged over all sequences and all valid token transitions) with a 5th-95th percentile confidence band.
+where `E(L,t)` is the set of top-k experts selected at layer `L` for decode token at position `t`. The figure plots the per-layer average of this metric (averaged over all sequences and all valid token transitions) as a single mean trend line.
 
 ### Usage
 
@@ -56,4 +56,4 @@ Generated from the real B5 router trace at `artifacts/case_study/router_lora_cas
 | Highest per-layer mean (L=0) | 95.3% |
 | Lowest per-layer mean (L=22) | 56.8% |
 
-The per-layer hit rate follows a U-shaped curve: early layers (L=0 to L=3) exhibit very high locality (85-95%), middle layers (L=20 to L=35) dip to 58-70%, and the final layers (L=44 to L=47) recover to 80-87%. The 5th-95th percentile band spans roughly 25-100%, reflecting high variance across individual token transitions, but the mean trend remains well above random chance (6.25% for top-8 out of 128 experts).
+The per-layer hit rate follows a U-shaped curve: early layers (L=0 to L=3) exhibit very high locality (85-95%), middle layers (L=20 to L=35) dip to 58-70%, and the final layers (L=44 to L=47) recover to 80-87%. The mean trend remains well above random chance (6.25% for top-8 out of 128 experts).
