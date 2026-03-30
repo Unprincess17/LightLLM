@@ -44,6 +44,15 @@ def test_load_explicit_adapter_trace_orders_by_arrival_idx(tmp_path: Path):
     assert adapter_ids == [None, "lora_a", "lora_b"]
 
 
+def test_build_request_prompts_uses_namespace_prefix():
+    prompts = api_mod.build_request_prompts("Describe the image", 3, "Warmup-Req")
+    assert prompts == [
+        "[Warmup-Req-0] Describe the image",
+        "[Warmup-Req-1] Describe the image",
+        "[Warmup-Req-2] Describe the image",
+    ]
+
+
 def test_join_router_and_adapter_traces_expands_projections():
     joined = replay_mod.join_router_and_adapter_traces(
         router_events=[

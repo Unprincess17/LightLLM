@@ -194,6 +194,123 @@ def test_run_locality_analysis_emits_expected_json_and_csv_outputs(tmp_path: Pat
     assert any(row["condition"] == "joint_indep" and row["reuse_distance"] == "-1" and row["cdf"] == "1.0" for row in reuse_rows)
 
 
+def test_run_locality_analysis_can_incrementally_refresh_joint_corr_only(tmp_path: Path):
+    joined_indep_path = tmp_path / "joined_trace_indep.jsonl"
+    joined_corr_path = tmp_path / "joined_trace_corr.jsonl"
+    qc_report_path = tmp_path / "join_qc_report.json"
+    output_dir = tmp_path / "locality"
+    work_dir = tmp_path / "work"
+
+    indep_rows = [
+        {
+            "arrival_idx": 0,
+            "req_idx": 0,
+            "adapter_id": "lora_0",
+            "mapping_mode": "indep",
+            "event_idx": 0,
+            "layer_id": 0,
+            "token_pos": 0,
+            "phase": "decode",
+            "expert_id": 1,
+        },
+        {
+            "arrival_idx": 1,
+            "req_idx": 1,
+            "adapter_id": "lora_1",
+            "mapping_mode": "indep",
+            "event_idx": 0,
+            "layer_id": 0,
+            "token_pos": 0,
+            "phase": "decode",
+            "expert_id": 1,
+        },
+    ]
+    corr_rows_initial = [
+        {
+            "arrival_idx": 0,
+            "req_idx": 0,
+            "adapter_id": "lora_0",
+            "mapping_mode": "corr",
+            "event_idx": 0,
+            "layer_id": 0,
+            "token_pos": 0,
+            "phase": "decode",
+            "expert_id": 1,
+        },
+        {
+            "arrival_idx": 1,
+            "req_idx": 1,
+            "adapter_id": "lora_0",
+            "mapping_mode": "corr",
+            "event_idx": 0,
+            "layer_id": 0,
+            "token_pos": 0,
+            "phase": "decode",
+            "expert_id": 1,
+        },
+    ]
+    corr_rows_updated = [
+        {
+            "arrival_idx": 0,
+            "req_idx": 0,
+            "adapter_id": "lora_0",
+            "mapping_mode": "corr",
+            "event_idx": 0,
+            "layer_id": 0,
+            "token_pos": 0,
+            "phase": "decode",
+            "expert_id": 1,
+        },
+        {
+            "arrival_idx": 1,
+            "req_idx": 1,
+            "adapter_id": "lora_1",
+            "mapping_mode": "corr",
+            "event_idx": 0,
+            "layer_id": 0,
+            "token_pos": 0,
+            "phase": "decode",
+            "expert_id": 1,
+        },
+    ]
+
+    _write_jsonl(joined_indep_path, indep_rows)
+    _write_jsonl(joined_corr_path, corr_rows_initial)
+    _write_json(qc_report_path, {"checks": {"per_mode_row_counts": {"indep": 2, "corr": 2}}})
+
+    locality_mod.run_locality_analysis(
+        joined_indep_path=joined_indep_path,
+        joined_corr_path=joined_corr_path,
+        qc_report_path=qc_report_path,
+        output_dir=output_dir,
+        work_dir=work_dir,
+        progress_every=0,
+    )
+
+    initial_joint_corr = _read_json(output_dir / "joint_corr_locality.json")
+    initial_joint_indep = _read_json(output_dir / "joint_indep_locality.json")
+
+    _write_jsonl(joined_corr_path, corr_rows_updated)
+    locality_mod.run_locality_analysis(
+        joined_indep_path=joined_indep_path,
+        joined_corr_path=joined_corr_path,
+        qc_report_path=qc_report_path,
+        output_dir=output_dir,
+        work_dir=work_dir,
+        selected_conditions=["joint_corr"],
+        progress_every=0,
+    )
+
+    refreshed_joint_corr = _read_json(output_dir / "joint_corr_locality.json")
+    preserved_joint_indep = _read_json(output_dir / "joint_indep_locality.json")
+    topk_rows = _read_csv_rows(output_dir / "topk_coverage.csv")
+
+    assert initial_joint_corr["total_distinct_objects"] == 1
+    assert refreshed_joint_corr["total_distinct_objects"] == 2
+    assert preserved_joint_indep == initial_joint_indep
+    assert {row["condition"] for row in topk_rows} == {"expert_only", "joint_indep", "joint_corr"}
+
+
 def test_build_access_streams_raises_when_joined_traces_are_not_aligned(tmp_path: Path):
     joined_indep_path = tmp_path / "joined_trace_indep.jsonl"
     joined_corr_path = tmp_path / "joined_trace_corr.jsonl"

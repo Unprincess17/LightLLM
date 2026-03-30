@@ -81,10 +81,12 @@ def test_parse_and_summarize_colora_log_lines():
     log_text = "\n".join(
         [
             "DEBUG 03-13 12:00:01 [x.py:1] [COLoRA] layer=3 hit_tokens=8 miss_tokens=24 queue_depth=2 hit_rate=0.25 "
+            "cache_capacity_slots=96 cache_resident_slots=92 cache_free_slots=4 cache_evictions_total=3 "
             "cpu_compute_time=0.010 gpu_compute_time=0.020 cpu_queue_wait=0.001 d2h_bytes=1024 h2d_bytes=2048 "
             "fallback_degrade_count=1 cpu_queue_depth=3 promotion_drop_total=4 promotion_drop_queue=2 "
             "promotion_drop_cooldown=1 moe_kernel_calls=6 moe_kernel_tokens=24",
             "DEBUG 03-13 12:00:02 [x.py:1] [COLoRA] layer=3 hit_tokens=16 miss_tokens=8 queue_depth=5 hit_rate=0.66 "
+            "cache_capacity_slots=96 cache_resident_slots=96 cache_free_slots=0 cache_evictions_total=5 "
             "cpu_compute_time=0.015 gpu_compute_time=0.025 cpu_queue_wait=0.002 d2h_bytes=512 h2d_bytes=1024 "
             "fallback_degrade_count=0 cpu_queue_depth=4 promotion_drop_total=5 promotion_drop_queue=2 "
             "promotion_drop_cooldown=1 moe_kernel_calls=4 moe_kernel_tokens=16",
@@ -98,6 +100,10 @@ def test_parse_and_summarize_colora_log_lines():
     assert summary["colora_hit_tokens"] == 24
     assert summary["colora_miss_tokens"] == 32
     assert summary["observed_hit_rate"] == 24 / 56
+    assert summary["cache_capacity_slots_max"] == 96
+    assert summary["cache_resident_slots_max"] == 96
+    assert summary["cache_free_slots_min"] == 0
+    assert summary["cache_evictions_total_end"] == 5
     assert summary["promotion_queue_depth_max"] == 5
     assert summary["cpu_queue_depth_max"] == 4
     assert summary["promotion_drop_total_end"] == 5

@@ -221,6 +221,123 @@ def test_run_cache_replay_analysis_emits_expected_metrics_and_csvs(tmp_path: Pat
     )
 
 
+def test_run_cache_replay_analysis_can_incrementally_refresh_joint_corr_only(tmp_path: Path):
+    joined_indep_path = tmp_path / "joined_trace_indep.jsonl"
+    joined_corr_path = tmp_path / "joined_trace_corr.jsonl"
+    qc_report_path = tmp_path / "join_qc_report.json"
+    output_dir = tmp_path / "cache"
+
+    indep_rows = [
+        {
+            "arrival_idx": 0,
+            "req_idx": 0,
+            "adapter_id": "lora_0",
+            "mapping_mode": "indep",
+            "event_idx": 0,
+            "layer_id": 0,
+            "token_pos": 0,
+            "phase": "decode",
+            "expert_id": 1,
+        },
+        {
+            "arrival_idx": 1,
+            "req_idx": 1,
+            "adapter_id": "lora_1",
+            "mapping_mode": "indep",
+            "event_idx": 0,
+            "layer_id": 0,
+            "token_pos": 0,
+            "phase": "decode",
+            "expert_id": 1,
+        },
+    ]
+    corr_rows_initial = [
+        {
+            "arrival_idx": 0,
+            "req_idx": 0,
+            "adapter_id": "lora_0",
+            "mapping_mode": "corr",
+            "event_idx": 0,
+            "layer_id": 0,
+            "token_pos": 0,
+            "phase": "decode",
+            "expert_id": 1,
+        },
+        {
+            "arrival_idx": 1,
+            "req_idx": 1,
+            "adapter_id": "lora_0",
+            "mapping_mode": "corr",
+            "event_idx": 0,
+            "layer_id": 0,
+            "token_pos": 0,
+            "phase": "decode",
+            "expert_id": 1,
+        },
+    ]
+    corr_rows_updated = [
+        {
+            "arrival_idx": 0,
+            "req_idx": 0,
+            "adapter_id": "lora_0",
+            "mapping_mode": "corr",
+            "event_idx": 0,
+            "layer_id": 0,
+            "token_pos": 0,
+            "phase": "decode",
+            "expert_id": 1,
+        },
+        {
+            "arrival_idx": 1,
+            "req_idx": 1,
+            "adapter_id": "lora_1",
+            "mapping_mode": "corr",
+            "event_idx": 0,
+            "layer_id": 0,
+            "token_pos": 0,
+            "phase": "decode",
+            "expert_id": 1,
+        },
+    ]
+
+    _write_jsonl(joined_indep_path, indep_rows)
+    _write_jsonl(joined_corr_path, corr_rows_initial)
+    _write_json(qc_report_path, {"checks": {"per_mode_row_counts": {"indep": 2, "corr": 2}}})
+
+    cache_mod.run_cache_replay_analysis(
+        joined_indep_path=joined_indep_path,
+        joined_corr_path=joined_corr_path,
+        qc_report_path=qc_report_path,
+        output_dir=output_dir,
+        policy="lru",
+        cache_budgets=[1],
+        progress_every=0,
+    )
+
+    metrics_before = _read_json(output_dir / "cache_metrics.json")
+    _write_jsonl(joined_corr_path, corr_rows_updated)
+
+    cache_mod.run_cache_replay_analysis(
+        joined_indep_path=joined_indep_path,
+        joined_corr_path=joined_corr_path,
+        qc_report_path=qc_report_path,
+        output_dir=output_dir,
+        policy="lru",
+        cache_budgets=[1],
+        selected_conditions=["joint_corr"],
+        progress_every=0,
+    )
+
+    metrics_after = _read_json(output_dir / "cache_metrics.json")
+    curve_rows = _read_csv_rows(output_dir / "cache_curve.csv")
+
+    assert metrics_before["conditions"]["joint_corr"]["budgets"]["1"]["hits"] == 1
+    assert metrics_after["conditions"]["joint_corr"]["budgets"]["1"]["hits"] == 0
+    assert metrics_after["conditions"]["joint_indep"] == metrics_before["conditions"]["joint_indep"]
+    assert metrics_after["conditions"]["expert_only"] == metrics_before["conditions"]["expert_only"]
+    assert {row["condition"] for row in curve_rows} == {"expert_only", "joint_indep", "joint_corr"}
+
+
 def test_resolve_cache_budget_grid_rejects_unsorted_duplicates():
     with_ascending = cache_mod.resolve_cache_budget_grid(
         {"case_study": {"replay_cache": {"budget_grid": [0, 8, 16]}}},

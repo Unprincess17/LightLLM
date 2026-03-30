@@ -16,6 +16,7 @@ def _load_module(rel_path: str, module_name: str):
 
 prompt_mod = _load_module("tools/case_study/prepare_prompt_corpus.py", "case_study_prepare_prompt")
 azure_mod = _load_module("tools/case_study/preprocess_azure_trace.py", "case_study_preprocess_azure")
+gentd_mod = _load_module("tools/case_study/preprocess_gentd26_trace.py", "case_study_preprocess_gentd26")
 mapping_mod = _load_module("tools/case_study/map_adapter_trace.py", "case_study_map_adapter")
 collect_mod = _load_module("tools/case_study/collect_router_trace.py", "case_study_collect_router")
 
@@ -89,6 +90,40 @@ def test_adapter_mapping_is_deterministic_and_bounded():
         seed=11,
     )
     assert 0 <= corr_slot < 8
+
+
+def test_gentd26_corr_jitter_permutation_is_deterministic_and_optional():
+    identity = list(range(16))
+    assert gentd_mod.stable_bounded_jitter_permutation(16, seed=11, jitter_window=0) == identity
+
+    first = gentd_mod.stable_bounded_jitter_permutation(16, seed=11, jitter_window=4)
+    second = gentd_mod.stable_bounded_jitter_permutation(16, seed=11, jitter_window=4)
+
+    assert first == second
+    assert sorted(first) == identity
+    assert first != identity
+
+
+def test_gentd26_corr_jitter_reduces_extreme_local_runs():
+    adapter_ids = ["a"] * 12 + ["b"] * 12 + ["c"] * 12
+    permutation = gentd_mod.stable_bounded_jitter_permutation(len(adapter_ids), seed=11, jitter_window=16)
+    reordered = [adapter_ids[index] for index in permutation]
+
+    def max_run(values):
+        longest = 0
+        current = 0
+        previous = None
+        for value in values:
+            if value == previous:
+                current += 1
+            else:
+                previous = value
+                current = 1
+            longest = max(longest, current)
+        return longest
+
+    assert max_run(adapter_ids) == 12
+    assert max_run(reordered) < 12
 
 
 def test_canonicalize_router_trace_adds_event_indices(tmp_path: Path):
