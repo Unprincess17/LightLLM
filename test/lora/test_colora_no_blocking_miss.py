@@ -1,5 +1,6 @@
 import torch
 import importlib.util
+import sys
 from pathlib import Path
 
 from lightllm.server.core.objs.lora_compute_config import LoRAComputeConfig
@@ -11,6 +12,7 @@ _DISPATCH_PATH = Path(__file__).resolve().parents[2] / "lightllm/models/qwen3_vl
 _DISPATCH_SPEC = importlib.util.spec_from_file_location("colora_dispatch_mod", _DISPATCH_PATH)
 dispatch_mod = importlib.util.module_from_spec(_DISPATCH_SPEC)
 assert _DISPATCH_SPEC is not None and _DISPATCH_SPEC.loader is not None
+sys.modules[_DISPATCH_SPEC.name] = dispatch_mod
 _DISPATCH_SPEC.loader.exec_module(dispatch_mod)
 
 
@@ -94,6 +96,14 @@ def test_colora_hybrid_miss_path_returns_without_waiting_for_promotion(monkeypat
     stats = dispatcher.pop_colora_stats()
     assert stats["colora_miss_tokens"] == 2
     assert stats["promotion_queue_depth"] == 0
+    assert "cache_capacity_slots" in stats
+    assert "cache_resident_slots" in stats
+    assert "cache_free_slots" in stats
+    assert "cache_evictions_total" in stats
+    assert "gate_capacity_slots" in stats
+    assert "gate_resident_slots" in stats
+    assert "gate_free_slots" in stats
+    assert "gate_evictions_total" in stats
     assert "cpu_queue_wait_time" in stats
     assert "d2h_bytes" in stats
     assert "h2d_bytes" in stats

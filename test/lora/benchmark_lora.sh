@@ -13,8 +13,14 @@ Core options:
   --delay SEC
   --max_tokens N
   --decode_target_tokens N
+  --warmup_decode_target_tokens N
   --ignore_eos | --no_ignore_eos
   --adapter_ids CSV
+  --warmup_adapter_trace_path PATH
+  --measure_adapter_trace_path PATH
+  --warmup_num_requests N
+  --measure_num_requests N
+  --phase_gap_s SEC
   --poisson_lambda F
   --poisson_seed N
   --adapter_expert_profile [0|1] | --no_adapter_expert_profile
@@ -57,14 +63,21 @@ TEST_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEST_SCRIPT="$TEST_SCRIPT_DIR/test_moe_lora_api.py"
 MAX_TOKENS=1
 DECODE_TARGET_TOKENS=2
+WARMUP_DECODE_TARGET_TOKENS=""
 IGNORE_EOS=1
 SERVER_SCRIPT="$TEST_SCRIPT_DIR/start_server.sh"
 SERVER_HOST="localhost"
 SERVER_PORT=8040
 SERVER_URL="http://$SERVER_HOST:$SERVER_PORT"
 ADAPTER_IDS="lora_dummy_0,lora_dummy_1,lora_dummy_2,lora_dummy_3,lora_dummy_4,lora_dummy_5,lora_dummy_6,lora_dummy_7,lora_dummy_8,lora_dummy_9"
+ADAPTER_IDS_SET="0"
 POISSON_LAMBDA=3.0
 POISSON_SEED=42
+WARMUP_ADAPTER_TRACE_PATH=""
+MEASURE_ADAPTER_TRACE_PATH=""
+WARMUP_NUM_REQUESTS=""
+MEASURE_NUM_REQUESTS=""
+PHASE_GAP_S="0"
 ADAPTER_EXPERT_PROFILE=0
 ADAPTER_EXPERT_LOG_PATH="/tmp/moe_adapter_expert_profile.log"
 PRINT_PER_REQUEST=0
@@ -129,6 +142,54 @@ terminate_server_tree() {
     kill -KILL "$pid" 2>/dev/null || true
 }
 
+build_phase_args() {
+    local -n out_arr="$1"
+    local decode_target_tokens="$2"
+    local adapter_trace_path="$3"
+    local num_requests="$4"
+    local top_k_slowest="$5"
+    local per_request_log_path="$6"
+    local print_per_request="$7"
+    local prompt_namespace="$8"
+
+    out_arr=(
+        --max_tokens "$MAX_TOKENS"
+        --adapter_ids "$ADAPTER_IDS"
+        --poisson_lambda "$POISSON_LAMBDA"
+        --poisson_seed "$POISSON_SEED"
+        --top_k_slowest "$top_k_slowest"
+        --prompt_namespace "$prompt_namespace"
+    )
+    if [[ -n "$decode_target_tokens" ]]; then
+        out_arr+=(--decode_target_tokens "$decode_target_tokens")
+    fi
+    if [[ "$IGNORE_EOS" == "1" ]]; then
+        out_arr+=(--ignore_eos)
+    else
+        out_arr+=(--no_ignore_eos)
+    fi
+    if [[ -n "$adapter_trace_path" ]]; then
+        out_arr+=(--adapter_trace_path "$adapter_trace_path")
+    fi
+    if [[ "$print_per_request" == "1" ]]; then
+        out_arr+=(--print_per_request)
+    fi
+    if [[ -n "$per_request_log_path" ]]; then
+        out_arr+=(--per_request_log_path "$per_request_log_path")
+    fi
+    if [[ -n "$num_requests" ]]; then
+        out_arr+=(--num_requests "$num_requests")
+    fi
+}
+
+run_client_phase() {
+    local phase_name="$1"
+    shift
+
+    echo "===== ${phase_name} =====" | tee -a benchmark_lora.log
+    python "$TEST_SCRIPT" "$@" 2>&1 | tee -a benchmark_lora.log
+}
+
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -137,9 +198,15 @@ while [[ $# -gt 0 ]]; do
         --test_script) TEST_SCRIPT="$2"; shift 2 ;;
         --max_tokens) MAX_TOKENS="$2"; shift 2 ;;
         --decode_target_tokens) DECODE_TARGET_TOKENS="$2"; shift 2 ;;
+        --warmup_decode_target_tokens) WARMUP_DECODE_TARGET_TOKENS="$2"; shift 2 ;;
         --ignore_eos) IGNORE_EOS=1; shift ;;
         --no_ignore_eos) IGNORE_EOS=0; shift ;;
-        --adapter_ids) ADAPTER_IDS="$2"; shift 2 ;;
+        --adapter_ids) ADAPTER_IDS="$2"; ADAPTER_IDS_SET="1"; shift 2 ;;
+        --warmup_adapter_trace_path) WARMUP_ADAPTER_TRACE_PATH="$2"; shift 2 ;;
+        --measure_adapter_trace_path) MEASURE_ADAPTER_TRACE_PATH="$2"; shift 2 ;;
+        --warmup_num_requests) WARMUP_NUM_REQUESTS="$2"; shift 2 ;;
+        --measure_num_requests) MEASURE_NUM_REQUESTS="$2"; shift 2 ;;
+        --phase_gap_s) PHASE_GAP_S="$2"; shift 2 ;;
         --poisson_lambda) POISSON_LAMBDA="$2"; shift 2 ;;
         --poisson_seed) POISSON_SEED="$2"; shift 2 ;;
         --adapter_expert_profile)
@@ -201,6 +268,45 @@ mkdir -p "$(dirname "$SERVER_LOG_PATH")"
 COLORA_SPEC_LAYER_WHITELIST="${COLORA_SPEC_LAYER_WHITELIST//[[:space:]]/}"
 COLORA_TEMPORAL_PREFETCH_LAYER_WHITELIST="${COLORA_TEMPORAL_PREFETCH_LAYER_WHITELIST//[[:space:]]/}"
 
+if [[ -n "$WARMUP_ADAPTER_TRACE_PATH" && ! -f "$WARMUP_ADAPTER_TRACE_PATH" ]]; then
+    echo "ERROR: warmup adapter trace not found: $WARMUP_ADAPTER_TRACE_PATH"
+    exit 1
+fi
+if [[ -n "$MEASURE_ADAPTER_TRACE_PATH" && ! -f "$MEASURE_ADAPTER_TRACE_PATH" ]]; then
+    echo "ERROR: measurement adapter trace not found: $MEASURE_ADAPTER_TRACE_PATH"
+    exit 1
+fi
+if [[ -z "$WARMUP_DECODE_TARGET_TOKENS" ]]; then
+    WARMUP_DECODE_TARGET_TOKENS="$DECODE_TARGET_TOKENS"
+fi
+if [[ "$ADAPTER_IDS_SET" != "1" && -z "$LORA_DIRS" ]]; then
+    DEFAULT_DISCOVERED_ADAPTER_IDS=()
+    shopt -s nullglob
+    DISCOVERED_DEFAULT_LORA_DIRS=(/home/shufan/Qwen-VL-FT/work/lora_dummy_[0-9]*)
+    shopt -u nullglob
+    if (( ${#DISCOVERED_DEFAULT_LORA_DIRS[@]} > 0 )); then
+        while IFS= read -r discovered_dir; do
+            DEFAULT_DISCOVERED_ADAPTER_IDS+=("$(basename "$discovered_dir")")
+        done < <(printf '%s\n' "${DISCOVERED_DEFAULT_LORA_DIRS[@]}" | sort -V)
+        ADAPTER_IDS="$(IFS=,; echo "${DEFAULT_DISCOVERED_ADAPTER_IDS[*]}")"
+    fi
+fi
+if [[ -n "$LORA_DIRS" && "$ADAPTER_IDS_SET" != "1" ]]; then
+    DERIVED_ADAPTER_IDS=()
+    IFS=',' read -r -a _RAW_LORA_DIRS <<< "$LORA_DIRS"
+    for raw_dir in "${_RAW_LORA_DIRS[@]}"; do
+        trimmed_dir="${raw_dir#"${raw_dir%%[![:space:]]*}"}"
+        trimmed_dir="${trimmed_dir%"${trimmed_dir##*[![:space:]]}"}"
+        if [[ -z "$trimmed_dir" ]]; then
+            continue
+        fi
+        DERIVED_ADAPTER_IDS+=("$(basename "$trimmed_dir")")
+    done
+    if (( ${#DERIVED_ADAPTER_IDS[@]} > 0 )); then
+        ADAPTER_IDS="$(IFS=,; echo "${DERIVED_ADAPTER_IDS[*]}")"
+    fi
+fi
+
 # Cleanup function
 cleanup() {
     echo "[Cleanup] Tearing down benchmark processes..."
@@ -248,7 +354,14 @@ echo "Poisson lambda: $POISSON_LAMBDA"
 echo "Poisson seed: $POISSON_SEED"
 echo "Max tokens (fallback): $MAX_TOKENS"
 echo "Decode target tokens: $DECODE_TARGET_TOKENS"
+echo "Warmup decode target tokens: $WARMUP_DECODE_TARGET_TOKENS"
 echo "Ignore EOS: $IGNORE_EOS"
+echo "Warmup prompt namespace: Warmup-Req"
+[[ -n "$WARMUP_ADAPTER_TRACE_PATH" ]] && echo "Warmup adapter trace: $WARMUP_ADAPTER_TRACE_PATH"
+[[ -n "$MEASURE_ADAPTER_TRACE_PATH" ]] && echo "Measurement adapter trace: $MEASURE_ADAPTER_TRACE_PATH"
+[[ -n "$WARMUP_NUM_REQUESTS" ]] && echo "Warmup num requests override: $WARMUP_NUM_REQUESTS"
+[[ -n "$MEASURE_NUM_REQUESTS" ]] && echo "Measurement num requests override: $MEASURE_NUM_REQUESTS"
+echo "Phase gap (s): $PHASE_GAP_S"
 echo "Adapter expert profile: $ADAPTER_EXPERT_PROFILE"
 echo "Adapter expert profile log: $ADAPTER_EXPERT_LOG_PATH"
 echo "Top-K slowest requests: $TOP_K_SLOWEST"
@@ -279,27 +392,37 @@ else
     echo "Per-request metrics log: disabled"
 fi
 
-COMMON_TEST_ARGS=(
-    --max_tokens "$MAX_TOKENS"
-    --adapter_ids "$ADAPTER_IDS"
-    --poisson_lambda "$POISSON_LAMBDA"
-    --poisson_seed "$POISSON_SEED"
-    --top_k_slowest "$TOP_K_SLOWEST"
-)
-if [[ -n "$DECODE_TARGET_TOKENS" ]]; then
-    COMMON_TEST_ARGS+=(--decode_target_tokens "$DECODE_TARGET_TOKENS")
+WARMUP_ENABLED=0
+if [[ -n "$WARMUP_ADAPTER_TRACE_PATH" || -n "$WARMUP_NUM_REQUESTS" ]]; then
+    WARMUP_ENABLED=1
 fi
-if [[ "$IGNORE_EOS" == "1" ]]; then
-    COMMON_TEST_ARGS+=(--ignore_eos)
-else
-    COMMON_TEST_ARGS+=(--no_ignore_eos)
+
+WARMUP_TEST_ARGS=()
+build_phase_args \
+    WARMUP_TEST_ARGS \
+    "$WARMUP_DECODE_TARGET_TOKENS" \
+    "$WARMUP_ADAPTER_TRACE_PATH" \
+    "$WARMUP_NUM_REQUESTS" \
+    "0" \
+    "" \
+    "0" \
+    "Warmup-Req"
+
+MEASURE_TEST_ARGS=()
+MEASURE_PROMPT_NAMESPACE="Req"
+if [[ "$WARMUP_ENABLED" == "1" ]]; then
+    MEASURE_PROMPT_NAMESPACE="Measure-Req"
 fi
-if [[ "$PRINT_PER_REQUEST" == "1" ]]; then
-    COMMON_TEST_ARGS+=(--print_per_request)
-fi
-if [[ -n "$PER_REQUEST_LOG_PATH" ]]; then
-    COMMON_TEST_ARGS+=(--per_request_log_path "$PER_REQUEST_LOG_PATH")
-fi
+echo "Measurement prompt namespace: $MEASURE_PROMPT_NAMESPACE"
+build_phase_args \
+    MEASURE_TEST_ARGS \
+    "$DECODE_TARGET_TOKENS" \
+    "$MEASURE_ADAPTER_TRACE_PATH" \
+    "$MEASURE_NUM_REQUESTS" \
+    "$TOP_K_SLOWEST" \
+    "$PER_REQUEST_LOG_PATH" \
+    "$PRINT_PER_REQUEST" \
+    "$MEASURE_PROMPT_NAMESPACE"
 
 # Step 1: Start nsys profiling with server
 echo "[1/5] Launching server"
@@ -430,18 +553,29 @@ fi
 echo "Waiting additional ${SETUP_DELAY}s before sending test request..."
 sleep "$SETUP_DELAY"
 
-# Step 4: Send test request (nsys is now capturing)
-echo "[3/5] Sending test request..."
+# Step 4: Send warmup + measured requests (nsys is now capturing)
+echo "[3/5] Sending benchmark traffic..."
 echo > benchmark_lora.log
-# REQUEST_COUNTS=(1 1 1 2 4 8 16 32 64 128 256 512 1024 2048)
-REQUEST_COUNTS=(16)
-for i in "${!REQUEST_COUNTS[@]}"; do
-    num_requests="${REQUEST_COUNTS[$i]}"
-    python "$TEST_SCRIPT" "${COMMON_TEST_ARGS[@]}" --num_requests "$num_requests" 2>&1 | tee -a benchmark_lora.log
-    if (( i < ${#REQUEST_COUNTS[@]} - 1 )); then
-        sleep 5
+if [[ "$WARMUP_ENABLED" == "1" ]]; then
+    run_client_phase "Warmup (excluded from measurement)" "${WARMUP_TEST_ARGS[@]}"
+    if [[ "$PHASE_GAP_S" != "0" ]]; then
+        echo "Sleeping ${PHASE_GAP_S}s between warmup and measurement..." | tee -a benchmark_lora.log
+        sleep "$PHASE_GAP_S"
     fi
-done
+fi
+
+if [[ -n "$MEASURE_ADAPTER_TRACE_PATH" || -n "$MEASURE_NUM_REQUESTS" ]]; then
+    run_client_phase "Measurement" "${MEASURE_TEST_ARGS[@]}"
+else
+    REQUEST_COUNTS=(16)
+    for i in "${!REQUEST_COUNTS[@]}"; do
+        num_requests="${REQUEST_COUNTS[$i]}"
+        run_client_phase "Measurement num_requests=${num_requests}" "${MEASURE_TEST_ARGS[@]}" --num_requests "$num_requests"
+        if (( i < ${#REQUEST_COUNTS[@]} - 1 )); then
+            sleep 5
+        fi
+    done
+fi
 
 echo "[4/5] Stopping server before exit..."
 terminate_server_tree "$SERVER_PID"

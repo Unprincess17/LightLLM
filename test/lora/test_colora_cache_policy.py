@@ -96,3 +96,25 @@ def test_colora_promotion_cooldown_blocks_requeue():
     drops = mgr.get_promotion_drop_breakdown()
     assert second == 0
     assert drops["cooldown"] >= 1
+
+
+def test_colora_cache_observability_stats_summarize_projection_state():
+    pool = _build_pool(num_adapters=1)
+    mgr = MoEExpertCacheManager(
+        MoEExpertCacheConfig(
+            cache_budget_mb=1,
+            promote_min_hits=1,
+            promote_window=8,
+            max_promote_per_step=8,
+        )
+    )
+    mgr.register_projection_pool("gate", pool)
+
+    summary = mgr.get_cache_observability_stats()
+    total = summary["total"]
+    gate = summary["by_projection"]["gate"]
+
+    assert total["capacity_slots"] == gate["capacity_slots"]
+    assert total["resident_slots"] == 0
+    assert total["free_slots"] == gate["free_slots"]
+    assert total["evictions_total"] == 0

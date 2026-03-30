@@ -40,6 +40,12 @@ def parse_args():
     parser.add_argument("--model", type=str, default=DEFAULT_MODEL, help="Model name")
     parser.add_argument("--prompt", type=str, default="Describe the image", help="Input prompt")
     parser.add_argument(
+        "--prompt_namespace",
+        type=str,
+        default="Req",
+        help="Prefix namespace used to make prompts distinct across benchmark phases",
+    )
+    parser.add_argument(
         "--max_tokens",
         type=int,
         default=1,
@@ -251,6 +257,11 @@ def _percentile(values: List[float], pct: float) -> float:
     upper_value = ordered[upper]
     weight = position - lower
     return lower_value + (upper_value - lower_value) * weight
+
+
+def build_request_prompts(prompt: str, num_requests: int, prompt_namespace: str = "Req") -> List[str]:
+    normalized_namespace = str(prompt_namespace).strip() or "Req"
+    return [f"[{normalized_namespace}-{i}] {prompt}" for i in range(max(int(num_requests), 0))]
 
 
 def resolve_effective_max_tokens(max_tokens: int, decode_target_tokens: Optional[int]) -> int:
@@ -740,6 +751,7 @@ def main():
     print(f"Max tokens (effective): {effective_max_tokens}")
     if args.decode_target_tokens is not None:
         print(f"Decode target tokens: {args.decode_target_tokens}")
+    print(f"Prompt namespace: {args.prompt_namespace}")
     print(f"Ignore EOS: {args.ignore_eos}")
     print(
         "Adapter Pool: "
@@ -776,8 +788,8 @@ def main():
 
     # Concurrent Batch generation with Cache Evasion
     # if args.num_requests > 1:
-    # Prepend a unique ID to each prompt to bypass the RadixAttention prefix cache
-    prompts = [f"[Req-{i}] {args.prompt}" for i in range(effective_num_requests)]
+    # Prepend a phase-specific unique ID to bypass prompt-cache reuse across phases.
+    prompts = build_request_prompts(args.prompt, effective_num_requests, args.prompt_namespace)
 
     test_batch_generation(
         client,

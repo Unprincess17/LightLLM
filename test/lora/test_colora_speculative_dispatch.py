@@ -471,7 +471,11 @@ class _BindOutcomeDispatcher:
 def _make_bind_layer(spec_layer_enabled: bool):
     layer = object.__new__(layer_infer_mod.Qwen3VLMOETransformerLayerInfer)
     layer.is_moe = True
+    layer.embed_dim_ = 4
     layer._spec_submit_layer_enabled = bool(spec_layer_enabled)
+    layer._temporal_prefetch_layer_enabled = False
+    layer.use_detached_lora_ = False
+    layer.lora_dispatcher_ = None
     layer._tpsp_ffn_tp = object()
     layer._tpsp_ffn_ep = object()
     return layer
@@ -637,13 +641,13 @@ def test_qwen3_vl_moe_wrapper_finalizes_even_if_spec_submit_setup_raises():
             os.environ["MOE_MODE"] = prev_mode
 
 
-def test_qwen3_vl_moe_bind_ffn_keeps_base_impl_when_layer_not_eligible():
+def test_qwen3_vl_moe_bind_ffn_uses_wrapper_for_moe_layers_even_without_speculation():
     prev_mode = os.environ.get("MOE_MODE")
     os.environ["MOE_MODE"] = "TP"
     try:
         layer = _make_bind_layer(spec_layer_enabled=False)
         layer_infer_mod.Qwen3VLMOETransformerLayerInfer._bind_ffn(layer)
-        assert layer._ffn.func is layer_infer_mod.Qwen3MOETransformerLayerInfer._moe_ffn
+        assert layer._ffn.func is layer_infer_mod.Qwen3VLMOETransformerLayerInfer._moe_ffn
     finally:
         if prev_mode is None:
             os.environ.pop("MOE_MODE", None)
@@ -651,7 +655,7 @@ def test_qwen3_vl_moe_bind_ffn_keeps_base_impl_when_layer_not_eligible():
             os.environ["MOE_MODE"] = prev_mode
 
 
-def test_qwen3_vl_moe_bind_ffn_uses_wrapper_only_for_eligible_layers():
+def test_qwen3_vl_moe_bind_ffn_uses_wrapper_when_speculation_is_enabled():
     prev_mode = os.environ.get("MOE_MODE")
     os.environ["MOE_MODE"] = "TP"
     try:
@@ -675,6 +679,7 @@ def test_qwen3_vl_moe_disabled_speculation_keeps_base_ffn_behavior_unchanged():
         )
         layer = _make_bind_layer(spec_layer_enabled=False)
         layer_infer_mod.Qwen3VLMOETransformerLayerInfer._bind_ffn(layer)
+        assert layer._ffn.func is layer_infer_mod.Qwen3VLMOETransformerLayerInfer._moe_ffn
         output = layer._ffn(torch.zeros(2, 4), type("InferState", (), {"is_prefill": False, "decode_step_id": 31})(), None)
         assert torch.equal(output, torch.full((2, 4), 5.0))
     finally:

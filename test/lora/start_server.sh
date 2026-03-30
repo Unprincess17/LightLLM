@@ -38,6 +38,8 @@
 #   --colora_speculative_dispatch      Enable COLoRA speculative dispatch MVP
 #   --no_colora_speculative_dispatch   Disable COLoRA speculative dispatch MVP
 #   --colora_spec_layer_whitelist CSV  Comma-separated speculative layer whitelist
+#   --colora_request_skip 0|1          Enable COLoRA request-level skip-and-reinsert
+#   --colora_max_continuations N       Max concurrent CPU continuations
 #   --adapter_expert_profile Enable adapter x expert routing profiling log
 #   --adapter_expert_log_path PATH Log path for adapter x expert routing profiling
 #   --router_trace Enable ordered per-token router trace logging
@@ -82,6 +84,8 @@ Options:
   --colora_speculative_dispatch
   --no_colora_speculative_dispatch
   --colora_spec_layer_whitelist CSV
+  --colora_request_skip 0|1
+  --colora_max_continuations N
   --adapter_expert_profile
   --adapter_expert_log_path PATH
   --router_trace
@@ -98,9 +102,18 @@ export MOE_PROFILING=1
 MODEL_DIR="/home/shufan/.cache/huggingface/hub/models--Qwen--Qwen3-VL-30B-A3B-Instruct/snapshots/9c4b90e1e4ba969fd3b5378b57d966d725f1b86c"
 MODEL_NAME="Qwen3-VL-30B-A3B-Instruct"
 DEFAULT_LORA_DIRS=()
-for i in {0..9}; do
-    DEFAULT_LORA_DIRS+=("/home/shufan/Qwen-VL-FT/work/lora_dummy_${i}")
-done
+shopt -s nullglob
+DISCOVERED_LORA_DIRS=(/home/shufan/Qwen-VL-FT/work/lora_dummy_[0-9]*)
+shopt -u nullglob
+if (( ${#DISCOVERED_LORA_DIRS[@]} > 0 )); then
+    while IFS= read -r discovered_dir; do
+        DEFAULT_LORA_DIRS+=("$discovered_dir")
+    done < <(printf '%s\n' "${DISCOVERED_LORA_DIRS[@]}" | sort -V)
+else
+    for i in {0..9}; do
+        DEFAULT_LORA_DIRS+=("/home/shufan/Qwen-VL-FT/work/lora_dummy_${i}")
+    done
+fi
 LORA_DIR=$(IFS=,; echo "${DEFAULT_LORA_DIRS[*]}")
 USE_LORA=true
 PORT=8040
@@ -153,8 +166,8 @@ COLORA_TEMPORAL_PREFETCH_LAYER_WHITELIST=""
 COLORA_TEMPORAL_HOT_CACHE_SLOTS=64
 COLORA_SPECULATIVE_DISPATCH=0
 COLORA_SPEC_LAYER_WHITELIST=""
-COLORA_REQUEST_SKIP=""
-COLORA_MAX_CONTINUATIONS=""
+COLORA_REQUEST_SKIP="1"
+COLORA_MAX_CONTINUATIONS="8"
 
 # Environment variables
 LOADWORKER=8
@@ -515,6 +528,8 @@ echo "  COLORA_TEMPORAL_PREFETCH_LAYER_WHITELIST=$COLORA_TEMPORAL_PREFETCH_LAYER
 echo "  COLORA_TEMPORAL_HOT_CACHE_SLOTS=$COLORA_TEMPORAL_HOT_CACHE_SLOTS"
 echo "  COLORA_SPECULATIVE_DISPATCH=$COLORA_SPECULATIVE_DISPATCH"
 echo "  COLORA_SPEC_LAYER_WHITELIST=$COLORA_SPEC_LAYER_WHITELIST"
+echo "  COLORA_REQUEST_SKIP=$COLORA_REQUEST_SKIP"
+echo "  COLORA_MAX_CONTINUATIONS=$COLORA_MAX_CONTINUATIONS"
 echo ""
 
 
