@@ -410,9 +410,12 @@ def parse_numeric_value(raw_value: str) -> object:
     lowered = raw_value.lower()
     if lowered in {"nan", "+nan", "-nan", "inf", "+inf", "-inf"}:
         return float(raw_value)
-    if any(marker in raw_value for marker in (".", "e", "E")):
-        return float(raw_value)
-    return int(raw_value)
+    try:
+        if any(marker in raw_value for marker in (".", "e", "E")):
+            return float(raw_value)
+        return int(raw_value)
+    except ValueError:
+        return raw_value
 
 
 def parse_colora_log_lines(log_text: str) -> List[dict]:
@@ -436,12 +439,22 @@ def summarize_colora_rows(rows: Sequence[Mapping[str, object]]) -> dict:
     cache_hit_rate_samples = [float(row.get("hit_rate", 0.0)) for row in rows]
     queue_depth_samples = [int(row.get("queue_depth", 0)) for row in rows]
     cpu_queue_depth_samples = [int(row.get("cpu_queue_depth", 0)) for row in rows]
+    cache_capacity_samples = [int(row.get("cache_capacity_slots", 0)) for row in rows]
+    cache_resident_samples = [int(row.get("cache_resident_slots", 0)) for row in rows]
+    cache_free_samples = [int(row.get("cache_free_slots", 0)) for row in rows]
+    cache_eviction_samples = [int(row.get("cache_evictions_total", 0)) for row in rows]
+    overlap_modes = sorted({str(row.get("overlap_mode", "")) for row in rows if row.get("overlap_mode") not in (None, "")})
+    miss_policies = sorted({str(row.get("miss_policy", "")) for row in rows if row.get("miss_policy") not in (None, "")})
     return {
         "colora_line_count": len(rows),
         "colora_hit_tokens": hit_tokens,
         "colora_miss_tokens": miss_tokens,
         "observed_hit_rate": observed_hit_rate,
         "cache_hit_rate_max": max(cache_hit_rate_samples) if cache_hit_rate_samples else 0.0,
+        "cache_capacity_slots_max": max(cache_capacity_samples) if cache_capacity_samples else 0,
+        "cache_resident_slots_max": max(cache_resident_samples) if cache_resident_samples else 0,
+        "cache_free_slots_min": min(cache_free_samples) if cache_free_samples else 0,
+        "cache_evictions_total_end": max(cache_eviction_samples) if cache_eviction_samples else 0,
         "promotion_queue_depth_max": max(queue_depth_samples) if queue_depth_samples else 0,
         "cpu_queue_depth_max": max(cpu_queue_depth_samples) if cpu_queue_depth_samples else 0,
         "promotion_drop_total_end": max((int(row.get("promotion_drop_total", 0)) for row in rows), default=0),
@@ -459,6 +472,11 @@ def summarize_colora_rows(rows: Sequence[Mapping[str, object]]) -> dict:
         "cpu_queue_wait_time_sum": sum(float(row.get("cpu_queue_wait", 0.0)) for row in rows),
         "d2h_bytes_sum": sum(float(row.get("d2h_bytes", 0.0)) for row in rows),
         "h2d_bytes_sum": sum(float(row.get("h2d_bytes", 0.0)) for row in rows),
+        "weight_h2d_bytes_sum": sum(float(row.get("weight_h2d_bytes", 0.0)) for row in rows),
+        "weight_h2d_time_sum": sum(float(row.get("weight_h2d_time", 0.0)) for row in rows),
+        "blocking_promotion_count_sum": sum(int(row.get("blocking_promotion_count", 0)) for row in rows),
+        "observed_overlap_modes": overlap_modes,
+        "observed_miss_policies": miss_policies,
         "moe_kernel_calls_sum": sum(int(row.get("moe_kernel_calls", 0)) for row in rows),
         "moe_kernel_tokens_sum": sum(int(row.get("moe_kernel_tokens", 0)) for row in rows),
     }
@@ -557,6 +575,17 @@ def summarize_per_window_counters(per_window_counter_rows: Sequence[Mapping[str,
         ),
         "d2h_bytes_sum": sum(float(row.get("d2h_bytes_sum", 0.0)) for row in per_window_counter_rows),
         "h2d_bytes_sum": sum(float(row.get("h2d_bytes_sum", 0.0)) for row in per_window_counter_rows),
+        "weight_h2d_bytes_sum": sum(float(row.get("weight_h2d_bytes_sum", 0.0)) for row in per_window_counter_rows),
+        "weight_h2d_time_sum": sum(float(row.get("weight_h2d_time_sum", 0.0)) for row in per_window_counter_rows),
+        "blocking_promotion_count_sum": sum(
+            int(row.get("blocking_promotion_count_sum", 0)) for row in per_window_counter_rows
+        ),
+        "observed_overlap_modes": sorted(
+            {mode for row in per_window_counter_rows for mode in row.get("observed_overlap_modes", [])}
+        ),
+        "observed_miss_policies": sorted(
+            {policy for row in per_window_counter_rows for policy in row.get("observed_miss_policies", [])}
+        ),
         "moe_kernel_calls_sum": sum(int(row.get("moe_kernel_calls_sum", 0)) for row in per_window_counter_rows),
         "moe_kernel_tokens_sum": sum(int(row.get("moe_kernel_tokens_sum", 0)) for row in per_window_counter_rows),
     }

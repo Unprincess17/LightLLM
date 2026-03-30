@@ -58,9 +58,19 @@ TRANSFER_MODE_ORDER = (
 )
 MISS_HANDLING_LOAD_THEN_RUN = "load_then_run"
 MISS_HANDLING_EXECUTION_FIRST = "execution_first"
+MISS_HANDLING_NO_CPU_PATH = "no_cpu_path"
+MISS_HANDLING_NO_DEFERRED_SYNC = "no_deferred_sync"
 MISS_HANDLING_MODE_ORDER = (
     MISS_HANDLING_LOAD_THEN_RUN,
     MISS_HANDLING_EXECUTION_FIRST,
+    MISS_HANDLING_NO_CPU_PATH,
+    MISS_HANDLING_NO_DEFERRED_SYNC,
+)
+OVERLAP_POLICY_CALIBRATED = "calibrated"
+OVERLAP_POLICY_DISABLED = "disabled"
+OVERLAP_POLICY_ORDER = (
+    OVERLAP_POLICY_CALIBRATED,
+    OVERLAP_POLICY_DISABLED,
 )
 CURVE_STAT_KEYS = ("mean_ms", "p50_ms", "p90_ms")
 
@@ -199,6 +209,82 @@ class TemporalPrefetchPlan:
 class ReplayPolicyState:
     next_decode_reuse_distance: np.ndarray
     temporal_prefetch_plan: Optional[TemporalPrefetchPlan]
+
+
+def validate_execution_first_calibration(
+    calibration: Mapping[str, object],
+    load_profile: str,
+    *,
+    require_overlap_windows: bool = True,
+    tool_name: str = "analyze_system_tpot.py",
+) -> None:
+    cold_path_curves = calibration.get("cold_path_curves", {})
+    profiles = cold_path_curves.get("profiles", {}) if isinstance(cold_path_curves, Mapping) else {}
+    profile_payload = profiles.get(load_profile) if isinstance(profiles, Mapping) else None
+    if not isinstance(profile_payload, Mapping):
+        raise ValueError(_execution_first_calibration_error(load_profile, tool_name, "missing cold_path_curves profile"))
+
+    required_components = ("pack_rows", "d2h_rows", "cpu_rows", "h2d_rows", "merge_rows")
+    for stage_name in ("early", "late"):
+        stage_payload = profile_payload.get(stage_name)
+        if not isinstance(stage_payload, Mapping):
+            raise ValueError(
+                _execution_first_calibration_error(load_profile, tool_name, f"missing {stage_name!r} cold-path stage")
+            )
+        for component_name in required_components:
+            rows = stage_payload.get(component_name)
+            if not isinstance(rows, list) or not rows:
+                raise ValueError(
+                    _execution_first_calibration_error(
+                        load_profile,
+                        tool_name,
+                        f"missing {stage_name}.{component_name} cold-path curve",
+                    )
+                )
+
+    if not require_overlap_windows:
+        return
+
+    overlap_windows = calibration.get("overlap_windows_ms", {})
+    if not isinstance(overlap_windows, Mapping) or not overlap_windows:
+        raise ValueError(_execution_first_calibration_error(load_profile, tool_name, "missing overlap_windows_ms"))
+    for raw_batch, payload in overlap_windows.items():
+        if not isinstance(payload, Mapping):
+            raise ValueError(
+                _execution_first_calibration_error(load_profile, tool_name, f"invalid overlap window payload for batch={raw_batch!r}")
+            )
+        for window_name in ("early", "late"):
+            window_payload = payload.get(window_name)
+            if not isinstance(window_payload, Mapping):
+                raise ValueError(
+                    _execution_first_calibration_error(
+                        load_profile,
+                        tool_name,
+                        f"missing overlap window {window_name!r} for batch={raw_batch!r}",
+                    )
+                )
+            for stat_key in CURVE_STAT_KEYS:
+                if stat_key not in window_payload:
+                    raise ValueError(
+                        _execution_first_calibration_error(
+                            load_profile,
+                            tool_name,
+                            f"missing overlap stat {stat_key!r} for batch={raw_batch!r}, window={window_name!r}",
+                        )
+                    )
+
+
+def _execution_first_calibration_error(load_profile: str, tool_name: str, reason: str) -> str:
+    return (
+        "execution-first replay requires a populated execution-first calibration manifest; "
+        f"{reason}. load_profile={load_profile!r}. "
+        "Regenerate a real calibration with "
+        "`python tools/case_study/calibrate_system_baseline.py --config configs/global.yaml "
+        "--output_path <path/to/system_baseline_calibration.json> --base_tpot_ms 1:1.20,2:1.45,4:1.90`, "
+        "or generate a schema-valid mock with "
+        "`python tools/ablation/make_mock_calibration.py --output_path <path/to/mock_calibration.json>`. "
+        f"Requested by {tool_name}."
+    )
 
 
 def phase_name_to_id(phase: object) -> int:
@@ -828,7 +914,11 @@ def simulate_miss_path_replay_with_bitmaps(
     deferred_promotion_delta_steps: int,
     policy_state: Optional[ReplayPolicyState],
 ) -> PhaseReplayBitmapSummary:
-    if miss_handling_mode == MISS_HANDLING_LOAD_THEN_RUN:
+    if miss_handling_mode in (
+        MISS_HANDLING_LOAD_THEN_RUN,
+        MISS_HANDLING_NO_CPU_PATH,
+        MISS_HANDLING_NO_DEFERRED_SYNC,
+    ):
         return simulate_phase_replay_with_bitmaps(
             condition_buffer=condition_buffer,
             phase_ids=stream.phase_ids,

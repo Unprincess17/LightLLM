@@ -8,6 +8,7 @@ import hashlib
 import json
 from collections import Counter
 from pathlib import Path
+import tempfile
 from typing import Any, Iterable, Iterator, List, Mapping, Optional, Sequence
 
 import yaml
@@ -129,6 +130,80 @@ def parse_cardinalities(raw_value: Any) -> List[int]:
         return [int(value) for value in raw_value]
     tokens = [token.strip() for token in str(raw_value).split(",") if token.strip()]
     return [int(token) for token in tokens]
+
+
+def parse_condition_subset(raw_value: Any, allowed: Sequence[str]) -> List[str]:
+    allowed_list = [str(value) for value in allowed]
+    if raw_value is None:
+        return list(allowed_list)
+    if isinstance(raw_value, str):
+        requested = [token.strip() for token in raw_value.split(",") if token.strip()]
+    elif isinstance(raw_value, (list, tuple)):
+        requested = [str(token).strip() for token in raw_value if str(token).strip()]
+    else:
+        requested = [str(raw_value).strip()]
+    if not requested:
+        raise ValueError("condition subset must not be empty")
+    allowed_set = set(allowed_list)
+    unknown = [token for token in requested if token not in allowed_set]
+    if unknown:
+        raise ValueError(
+            f"unsupported conditions {unknown}; allowed={allowed_list}"
+        )
+    requested_set = set(requested)
+    return [condition for condition in allowed_list if condition in requested_set]
+
+
+def read_condition_filtered_csv_rows(path: Path, selected_conditions: Sequence[str]) -> List[dict]:
+    selected = {str(condition) for condition in selected_conditions}
+    rows: List[dict] = []
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            if str(row.get("condition", "")) in selected:
+                continue
+            rows.append(dict(row))
+    return rows
+
+
+def prepare_condition_merged_csv(
+    output_path: Path,
+    fieldnames: Sequence[str],
+    selected_conditions: Sequence[str],
+    preserve_existing: bool,
+):
+    ensure_parent_dir(output_path)
+    temp_handle = tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        newline="",
+        dir=str(output_path.parent),
+        prefix=f"{output_path.stem}.",
+        suffix=".tmp",
+        delete=False,
+    )
+    temp_path = Path(temp_handle.name)
+    writer = csv.DictWriter(temp_handle, fieldnames=list(fieldnames))
+    writer.writeheader()
+    if preserve_existing:
+        if not output_path.exists():
+            temp_handle.close()
+            temp_path.unlink(missing_ok=True)
+            raise FileNotFoundError(
+                f"cannot preserve unselected conditions because output is missing: {output_path}"
+            )
+        selected = {str(condition) for condition in selected_conditions}
+        with output_path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                if str(row.get("condition", "")) in selected:
+                    continue
+                writer.writerow(dict(row))
+    return temp_path, temp_handle, writer
+
+
+def finalize_condition_merged_csv(temp_path: Path, output_path: Path) -> None:
+    temp_path.replace(output_path)
 
 
 def percentile(values: Sequence[float], quantile: float) -> float:

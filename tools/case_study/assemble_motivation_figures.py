@@ -48,11 +48,16 @@ CONDITION_LINEWIDTHS = {
     "joint_indep": 2.2,
     "joint_corr": 2.2,
 }
+CONDITION_MARKERS = {
+    'expert_only': 'o',  # Circle (C0)
+    'joint_indep': 's',  # Square (C1)
+    'joint_corr': '^'   # Triangle Up (C2)
+}
 PRACTICAL_CACHE_LIMIT = 1024
 PRACTICAL_CACHE_LABEL = "Cache Limit\n(1K objs)"
 METAL_FLOOR_MS = 1.2
 FLOOR_TOLERANCE_MS = 0.01
-DEFAULT_TAIL_BUDGET = 4096
+DEFAULT_TAIL_BUDGET = 2048
 DEFAULT_SYSTEM_TPOT_STAGE = "replay/system_tpot_stressed"
 MAX_TAIL_PERCENTILE = 0.999
 MAX_TAIL_PERCENTILE_LABEL = "P99.9"
@@ -221,7 +226,7 @@ def percentile_index(percentiles: Sequence[float], target: float) -> int:
     raise ValueError(f"percentile {target} is not present in the configured curve")
 
 
-def plot_root_cause(ax: plt.Axes, popularity_rows: Sequence[Mapping[str, str]]) -> None:
+def plot_root_cause(ax: plt.Axes, popularity_rows: Sequence[Mapping[str, str]], show_legend: bool = True) -> None:
     limit_coverages: dict[str, float] = {}
     for condition in CONDITION_ORDER:
         subset = condition_rows(popularity_rows, condition)
@@ -259,15 +264,15 @@ def plot_root_cause(ax: plt.Axes, popularity_rows: Sequence[Mapping[str, str]]) 
 
     label_offsets = {
         "expert_only": (6, 8),
-        "joint_indep": (6, 2),
-        "joint_corr": (6, -8),
+        "joint_indep": (6, -2),
+        "joint_corr": (6, 8),
     }
     for condition in CONDITION_ORDER:
         coverage = limit_coverages[condition]
         ax.plot(
             PRACTICAL_CACHE_LIMIT,
             coverage,
-            marker="o",
+            marker=CONDITION_MARKERS[condition],
             markersize=5.8,
             color=CONDITION_COLORS[condition],
             markeredgecolor="white",
@@ -293,21 +298,22 @@ def plot_root_cause(ax: plt.Axes, popularity_rows: Sequence[Mapping[str, str]]) 
     ax.set_xlabel("Expert-LoRA Rank")
     ax.set_ylabel("Cumulative Access Fraction")
     ax.yaxis.set_major_formatter(PercentFormatter(xmax=1.0))
-    ax.legend(
-        loc="lower left",
-        frameon=True,
-        framealpha=0.85,
-        fontsize=8.5,
-        facecolor="white",
-        edgecolor="#D7DCE0",
-        borderpad=0.35,
-        labelspacing=0.25,
-        handlelength=1.5,
-        handletextpad=0.4,
-    )
+    if show_legend:
+        ax.legend(
+            loc="lower left",
+            frameon=True,
+            framealpha=0.85,
+            fontsize=8.5,
+            facecolor="white",
+            edgecolor="#D7DCE0",
+            borderpad=0.25,
+            labelspacing=0.25,
+            handlelength=0.8,
+            handletextpad=0.4,
+        )
 
 
-def plot_capacity_illusion(ax: plt.Axes, quantile_rows: Sequence[Mapping[str, str]]) -> None:
+def plot_capacity_illusion(ax: plt.Axes, quantile_rows: Sequence[Mapping[str, str]], show_legend: bool = False) -> None:
     for condition in CONDITION_ORDER:
         subset = sorted(
             (
@@ -322,7 +328,7 @@ def plot_capacity_illusion(ax: plt.Axes, quantile_rows: Sequence[Mapping[str, st
         ax.plot(
             budgets,
             p99s,
-            marker="o",
+            marker=CONDITION_MARKERS[condition],
             markersize=3.8,
             linewidth=2.0,
             color=CONDITION_COLORS[condition],
@@ -390,7 +396,7 @@ def plot_capacity_illusion(ax: plt.Axes, quantile_rows: Sequence[Mapping[str, st
     # )
 
 
-def plot_tail_blowout(ax: plt.Axes, token_tpot_by_condition: Mapping[str, Sequence[float]], _budget: int) -> None:
+def plot_tail_blowout(ax: plt.Axes, token_tpot_by_condition: Mapping[str, Sequence[float]], _budget: int, show_legend: bool = False) -> None:
     curve_x = np.asarray([tail_percentile_axis(percentile) for percentile in TAIL_CURVE_PERCENTILES], dtype=float)
     tick_x = [tail_percentile_axis(percentile) for percentile in TAIL_CURVE_TICK_PERCENTILES]
     tail_values: dict[str, np.ndarray] = {}
@@ -404,6 +410,10 @@ def plot_tail_blowout(ax: plt.Axes, token_tpot_by_condition: Mapping[str, Sequen
             linewidth=CONDITION_LINEWIDTHS[condition],
             alpha=0.85,
             color=CONDITION_COLORS[condition],
+            marker=CONDITION_MARKERS[condition],
+            markersize=4.2,
+            markeredgecolor="white",
+            markeredgewidth=0.6,
             label=CONDITION_LABELS[condition],
         )
 
@@ -441,11 +451,21 @@ def plot_tail_blowout(ax: plt.Axes, token_tpot_by_condition: Mapping[str, Sequen
     ax.annotate(
         f"C0 P50 ≈ {c0_p50:.2f} ms",
         xy=(flat_tip_x, c0_p50),
-        xytext=(flat_tip_x + 0.14, c0_p50 + 0.8),
+        xytext=(flat_tip_x + 0.1, c0_p50 + 0.8),
         arrowprops={"arrowstyle": "->", "color": CONDITION_COLORS["expert_only"], "lw": 1.1},
         fontsize=10,
         bbox={"facecolor": "white", "edgecolor": "#D7DCE0", "boxstyle": "round,pad=0.22"},
     )
+    if show_legend:
+        ax.legend(
+            loc="upper left",
+            frameon=True,
+            framealpha=0.85,
+            fontsize=8.5,
+            facecolor="white",
+            edgecolor="#D7DCE0",
+            borderpad=0.25,
+        )
 
 
 def build_standalone_panel(
@@ -520,15 +540,25 @@ def main() -> None:
     build_standalone_panel(plot_tail_blowout, panel_c_png, token_tpot_by_condition, args.tail_budget)
 
     fig, axes = plt.subplots(3, 1, figsize=COMBINED_VERTICAL_SIZE, constrained_layout=True)
-    plot_root_cause(axes[0], popularity_rows)
+    plot_root_cause(axes[0], popularity_rows, show_legend=False)
     plot_capacity_illusion(axes[1], quantile_rows)
     plot_tail_blowout(axes[2], token_tpot_by_condition, args.tail_budget)
+    # Shared legend for all three subplots
+    handles, labels = axes[-1].get_legend_handles_labels()
+    fig.legend(handles, labels, loc='lower center', ncol=3, frameon=True,
+               framealpha=0.85, fontsize=8.5, facecolor="white",
+               edgecolor="#D7DCE0", borderpad=0.25)
     save_figure(fig, combined_pdf)
 
     fig, axes = plt.subplots(3, 1, figsize=COMBINED_VERTICAL_SIZE, constrained_layout=True)
-    plot_root_cause(axes[0], popularity_rows)
+    plot_root_cause(axes[0], popularity_rows, show_legend=False)
     plot_capacity_illusion(axes[1], quantile_rows)
     plot_tail_blowout(axes[2], token_tpot_by_condition, args.tail_budget)
+    # Shared legend for all three subplots
+    handles, labels = axes[-1].get_legend_handles_labels()
+    fig.legend(handles, labels, loc='lower center', ncol=3, frameon=True,
+               framealpha=0.85, fontsize=8.5, facecolor="white",
+               edgecolor="#D7DCE0", borderpad=0.25)
     save_figure(fig, combined_png)
 
     floor_b0 = condition_floor_budget(quantile_rows, "expert_only")

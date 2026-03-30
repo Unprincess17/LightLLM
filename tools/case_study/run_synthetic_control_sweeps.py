@@ -31,6 +31,10 @@ from system_tpot_core import (
     CONDITION_LABELS,
     MISS_HANDLING_LOAD_THEN_RUN,
     MISS_HANDLING_MODE_ORDER,
+    MISS_HANDLING_NO_CPU_PATH,
+    MISS_HANDLING_NO_DEFERRED_SYNC,
+    OVERLAP_POLICY_CALIBRATED,
+    OVERLAP_POLICY_ORDER,
     TRANSFER_MODE_ORDER,
     TRANSFER_MODE_STAGED_PAGEABLE_PACKED,
     DecodeLayerStep,
@@ -42,6 +46,7 @@ from system_tpot_core import (
     dtype_name_to_torch_dtype,
     load_model_text_config,
     simulate_miss_path_replay_with_bitmaps,
+    validate_execution_first_calibration,
 )
 from system_tpot_sim import compute_stage1_token_tpot
 
@@ -133,6 +138,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--load_profile", type=str, default="stressed", help="Load profile from the calibration manifest")
     parser.add_argument("--calibration_stat", type=str, default="p50_ms", choices=["mean_ms", "p50_ms", "p90_ms"], help="Statistic to pull from the calibration curves")
     parser.add_argument("--miss_handling_mode", type=str, default=MISS_HANDLING_LOAD_THEN_RUN, choices=list(MISS_HANDLING_MODE_ORDER), help="Miss handling model used for the synthetic TPOT sweep")
+    parser.add_argument("--overlap_policy", type=str, default=OVERLAP_POLICY_CALIBRATED, choices=list(OVERLAP_POLICY_ORDER), help="Whether calibrated overlap windows are active for synthetic TPOT modeling")
     parser.add_argument("--deferred_promotion_delta_steps", type=int, default=4, help="Static decode-step reuse threshold delta for execution-first deferred promotion")
     parser.add_argument("--temporal_prefetch", action="store_true", help="Enable lightweight previous-top1 temporal prefetch for execution-first mode")
     parser.add_argument("--temporal_prefetch_cpu_discount", type=float, default=0.20, help="Fractional cold-path CPU-time discount applied to prefetched miss objects")
@@ -493,6 +499,7 @@ def evaluate_condition(
     stat_key: str,
     system_batch: int,
     miss_handling_mode: str,
+    overlap_policy: str,
     deferred_promotion_delta_steps: int,
     temporal_prefetch: bool,
     temporal_prefetch_cpu_discount: float,
@@ -522,11 +529,10 @@ def evaluate_condition(
             deferred_promotion_delta_steps=int(deferred_promotion_delta_steps),
             policy_state=policy_state,
         )
-        if str(miss_handling_mode) != MISS_HANDLING_LOAD_THEN_RUN:
-            replay_summary = apply_temporal_prefetch_hits(
-                replay_summary=replay_summary,
-                plan=policy_state.temporal_prefetch_plan if bool(temporal_prefetch) else None,
-            )
+        replay_summary = apply_temporal_prefetch_hits(
+            replay_summary=replay_summary,
+            plan=policy_state.temporal_prefetch_plan if (policy_state is not None and bool(temporal_prefetch)) else None,
+        )
         stage1 = compute_stage1_token_tpot(
             condition=condition,
             cache_budget=int(cache_budget),
@@ -541,6 +547,7 @@ def evaluate_condition(
             tail_quantile=0.95,
             miss_handling_mode=str(miss_handling_mode),
             prefetch_cpu_discount=float(temporal_prefetch_cpu_discount),
+            overlap_policy=str(overlap_policy),
         )
         metrics_by_budget[int(cache_budget)] = {
             "miss_rate": float(replay_summary.misses / replay_summary.total_events) if replay_summary.total_events else 0.0,
@@ -722,6 +729,7 @@ def run_synthetic_control_sweeps(
     load_profile: str,
     calibration_stat: str,
     miss_handling_mode: str,
+    overlap_policy: str,
     deferred_promotion_delta_steps: int,
     temporal_prefetch: bool,
     temporal_prefetch_cpu_discount: float,
@@ -739,6 +747,14 @@ def run_synthetic_control_sweeps(
     schedule = build_synthetic_schedule(len(templates), synthetic_request_count, template_seed)
     base_stream = build_base_stream(templates, schedule)
     calibration = load_json(calibration_path)
+    effective_overlap_policy = str(overlap_policy) if str(miss_handling_mode) != MISS_HANDLING_NO_CPU_PATH else "disabled"
+    if str(miss_handling_mode) in (MISS_HANDLING_EXECUTION_FIRST, MISS_HANDLING_NO_DEFERRED_SYNC):
+        validate_execution_first_calibration(
+            calibration=calibration,
+            load_profile=str(load_profile),
+            require_overlap_windows=effective_overlap_policy == OVERLAP_POLICY_CALIBRATED,
+            tool_name="tools/case_study/run_synthetic_control_sweeps.py",
+        )
 
     points = build_sweep_points(
         num_loras=num_loras,
@@ -762,6 +778,7 @@ def run_synthetic_control_sweeps(
         stat_key=calibration_stat,
         system_batch=system_batch,
         miss_handling_mode=miss_handling_mode,
+        overlap_policy=effective_overlap_policy,
         deferred_promotion_delta_steps=deferred_promotion_delta_steps,
         temporal_prefetch=temporal_prefetch,
         temporal_prefetch_cpu_discount=temporal_prefetch_cpu_discount,
@@ -797,6 +814,7 @@ def run_synthetic_control_sweeps(
                 stat_key=calibration_stat,
                 system_batch=system_batch,
                 miss_handling_mode=miss_handling_mode,
+                overlap_policy=effective_overlap_policy,
                 deferred_promotion_delta_steps=deferred_promotion_delta_steps,
                 temporal_prefetch=temporal_prefetch,
                 temporal_prefetch_cpu_discount=temporal_prefetch_cpu_discount,
@@ -826,6 +844,7 @@ def run_synthetic_control_sweeps(
                 stat_key=calibration_stat,
                 system_batch=system_batch,
                 miss_handling_mode=miss_handling_mode,
+                overlap_policy=effective_overlap_policy,
                 deferred_promotion_delta_steps=deferred_promotion_delta_steps,
                 temporal_prefetch=temporal_prefetch,
                 temporal_prefetch_cpu_discount=temporal_prefetch_cpu_discount,
@@ -934,6 +953,7 @@ def run_synthetic_control_sweeps(
             "load_profile": load_profile,
             "calibration_stat": calibration_stat,
             "miss_handling_mode": str(miss_handling_mode),
+            "overlap_policy": str(overlap_policy),
             "deferred_promotion_delta_steps": int(deferred_promotion_delta_steps),
             "temporal_prefetch_enabled": bool(temporal_prefetch),
             "temporal_prefetch_cpu_discount": float(temporal_prefetch_cpu_discount),
@@ -1015,6 +1035,7 @@ def main() -> None:
         load_profile=args.load_profile,
         calibration_stat=args.calibration_stat,
         miss_handling_mode=str(args.miss_handling_mode),
+        overlap_policy=str(args.overlap_policy),
         deferred_promotion_delta_steps=int(args.deferred_promotion_delta_steps),
         temporal_prefetch=bool(args.temporal_prefetch),
         temporal_prefetch_cpu_discount=float(args.temporal_prefetch_cpu_discount),

@@ -101,9 +101,13 @@ This stage:
 - treats each CSV row as one LoRA-bearing request in file order
 - parses `lora_args`, ignores `scale`, deduplicates `modelVersionId` within a request, and sorts them lexically
 - maps each unique single-LoRA or multi-LoRA combination to one unique adapter slot
-- writes `adapter_trace_mapped_corr.jsonl` in real file order
+- writes `adapter_trace_mapped_corr.jsonl` as a bounded-jitter local-order schedule derived from file order
 - writes `adapter_trace_mapped_indep.jsonl` as a deterministic permutation of the same request-level adapter multiset
 - omits timestamps intentionally; downstream `B9` replays this trace with `arrival_idx` order semantics
+
+Useful flag:
+
+- `--corr_jitter_window <N>`: allow each correlated request to move by up to `N` positions under a deterministic bounded jitter. `0` restores exact file order.
 
 Outputs:
 
@@ -247,7 +251,7 @@ This stage:
 
 - reads `router_summary.json` to get the router request count
 - selects the first `request_count` mapped adapter arrivals in sorted `arrival_idx` order, matching the truncation semantics already used by `replay_fixed_requests.py`
-- for GenTD26-derived mapped traces, this means `corr` keeps the real file-order composite sequence while `indep` uses the deterministic shuffled sequence emitted by `preprocess_gentd26_trace.py`
+- for GenTD26-derived mapped traces, this means `corr` keeps a locally correlated bounded-jitter sequence derived from file order while `indep` uses the deterministic shuffled sequence emitted by `preprocess_gentd26_trace.py`
 - canonicalizes router rows by `req_idx` before emission because the traced router events can contain request-interleaved blocks even though `event_idx` is monotonic within each request
 - explodes `topk_experts` so one joined row equals one selected expert event
 - writes per-mode joined traces plus a QC report and compact projection summary
@@ -292,6 +296,14 @@ Command:
 python tools/case_study/analyze_locality.py --run_id router_lora_case_v1
 ```
 
+Incremental refresh:
+
+```bash
+python tools/case_study/analyze_locality.py --run_id router_lora_case_v1 --conditions joint_corr
+```
+
+When `--conditions` is a strict subset, the tool recomputes only those conditions and preserves the others from the existing output directory.
+
 Outputs:
 
 - `artifacts/case_study/<run_id>/replay/locality/expert_only_locality.json`
@@ -334,6 +346,14 @@ Command:
 ```bash
 python tools/case_study/analyze_cache_replay.py --run_id router_lora_case_v1
 ```
+
+Incremental refresh:
+
+```bash
+python tools/case_study/analyze_cache_replay.py --run_id router_lora_case_v1 --conditions joint_corr
+```
+
+As in `B7`, subset mode merges the refreshed condition rows into the existing cache outputs.
 
 Outputs:
 
@@ -396,6 +416,17 @@ python tools/case_study/analyze_system_tpot.py \
   --run_id router_lora_case_v1 \
   --calibration_path artifacts/case_study/router_lora_case_v1/calibration/system_baseline_calibration.json
 ```
+
+Incremental refresh:
+
+```bash
+python tools/case_study/analyze_system_tpot.py \
+  --run_id router_lora_case_v1 \
+  --conditions joint_corr \
+  --calibration_path artifacts/case_study/router_lora_case_v1/calibration/system_baseline_calibration.json
+```
+
+Subset mode preserves existing `expert_only` and `joint_indep` TPOT rows and rewrites only the requested condition(s). This mode expects the existing output files to already be present.
 
 Execution-first COLoRA-style replay:
 

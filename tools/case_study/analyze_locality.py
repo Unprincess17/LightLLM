@@ -24,6 +24,8 @@ from common import (
     ensure_dir,
     load_global_config,
     numeric_summary,
+    parse_condition_subset,
+    read_condition_filtered_csv_rows,
     stage_output_dir,
     write_csv,
     write_json,
@@ -132,6 +134,12 @@ def parse_args() -> argparse.Namespace:
         "--keep_work_files",
         action="store_true",
         help="Retained for CLI compatibility; current implementation does not emit temporary work files",
+    )
+    parser.add_argument(
+        "--conditions",
+        type=str,
+        default=None,
+        help="Comma-separated subset of conditions to recompute: expert_only,joint_indep,joint_corr",
     )
     return parser.parse_args()
 
@@ -575,6 +583,10 @@ def selected_topk_coverage(popularity_rows: Sequence[Mapping[str, object]]) -> d
     return coverage
 
 
+def locality_summary_path(output_dir: Path, condition: str) -> Path:
+    return output_dir / f"{condition}_locality.json"
+
+
 def analyze_condition(
     condition: str,
     buffer: ConditionAccessBuffer,
@@ -647,9 +659,9 @@ def write_locality_outputs(
     reuse_cdf_rows: Sequence[Mapping[str, object]],
     topk_rows: Sequence[Mapping[str, object]],
 ) -> None:
-    write_json(output_dir / "expert_only_locality.json", summaries[CONDITION_EXPERT_ONLY])
-    write_json(output_dir / "joint_indep_locality.json", summaries[CONDITION_JOINT_INDEP])
-    write_json(output_dir / "joint_corr_locality.json", summaries[CONDITION_JOINT_CORR])
+    write_json(locality_summary_path(output_dir, CONDITION_EXPERT_ONLY), summaries[CONDITION_EXPERT_ONLY])
+    write_json(locality_summary_path(output_dir, CONDITION_JOINT_INDEP), summaries[CONDITION_JOINT_INDEP])
+    write_json(locality_summary_path(output_dir, CONDITION_JOINT_CORR), summaries[CONDITION_JOINT_CORR])
     write_csv(output_dir / "popularity_rank.csv", POPULARITY_CSV_FIELDS, popularity_rows)
     write_csv(output_dir / "reuse_distance_cdf.csv", REUSE_CDF_CSV_FIELDS, reuse_cdf_rows)
     write_csv(output_dir / "topk_coverage.csv", TOPK_COVERAGE_CSV_FIELDS, topk_rows)
@@ -661,8 +673,11 @@ def run_locality_analysis(
     qc_report_path: Path,
     output_dir: Path,
     work_dir: Path,
+    selected_conditions: Optional[Sequence[str]] = None,
     progress_every: int = PROGRESS_EVERY_ROWS,
 ) -> dict:
+    selected = parse_condition_subset(selected_conditions, CONDITION_ORDER)
+    preserve_existing = len(selected) != len(CONDITION_ORDER)
     qc_report = load_json(qc_report_path)
     total_events = resolve_total_events(qc_report)
     ensure_dir(output_dir)
@@ -680,7 +695,23 @@ def run_locality_analysis(
     reuse_cdf_rows: List[dict] = []
     topk_rows: List[dict] = []
 
+    if preserve_existing:
+        for condition in CONDITION_ORDER:
+            if condition in selected:
+                continue
+            preserved_summary_path = locality_summary_path(output_dir, condition)
+            if not preserved_summary_path.exists():
+                raise FileNotFoundError(
+                    f"cannot preserve unselected condition {condition}; missing {preserved_summary_path}"
+                )
+            summaries[condition] = load_json(preserved_summary_path)
+        popularity_rows.extend(read_condition_filtered_csv_rows(output_dir / "popularity_rank.csv", selected))
+        reuse_cdf_rows.extend(read_condition_filtered_csv_rows(output_dir / "reuse_distance_cdf.csv", selected))
+        topk_rows.extend(read_condition_filtered_csv_rows(output_dir / "topk_coverage.csv", selected))
+
     for condition in CONDITION_ORDER:
+        if condition not in selected:
+            continue
         print(f"computing locality metrics for {condition}")
         condition_summary, condition_popularity_rows, condition_topk_rows, condition_reuse_cdf_rows = analyze_condition(
             condition=condition,
@@ -700,6 +731,15 @@ def run_locality_analysis(
         stream_result.condition_buffers[condition].access_ids = np.empty(0, dtype=np.uint32)
         gc.collect()
 
+    popularity_rows.sort(key=lambda row: (CONDITION_ORDER.index(str(row["condition"])), int(row["rank"])))
+    reuse_cdf_rows.sort(
+        key=lambda row: (
+            CONDITION_ORDER.index(str(row["condition"])),
+            int(row["reuse_distance"]),
+        )
+    )
+    topk_rows.sort(key=lambda row: (CONDITION_ORDER.index(str(row["condition"])), int(row["k"])))
+
     write_locality_outputs(
         output_dir=output_dir,
         summaries=summaries,
@@ -713,9 +753,9 @@ def run_locality_analysis(
         "total_events": total_events,
         "summaries": summaries,
         "outputs": {
-            "expert_only_locality_json": str(output_dir / "expert_only_locality.json"),
-            "joint_indep_locality_json": str(output_dir / "joint_indep_locality.json"),
-            "joint_corr_locality_json": str(output_dir / "joint_corr_locality.json"),
+            "expert_only_locality_json": str(locality_summary_path(output_dir, CONDITION_EXPERT_ONLY)),
+            "joint_indep_locality_json": str(locality_summary_path(output_dir, CONDITION_JOINT_INDEP)),
+            "joint_corr_locality_json": str(locality_summary_path(output_dir, CONDITION_JOINT_CORR)),
             "popularity_rank_csv": str(output_dir / "popularity_rank.csv"),
             "reuse_distance_cdf_csv": str(output_dir / "reuse_distance_cdf.csv"),
             "topk_coverage_csv": str(output_dir / "topk_coverage.csv"),
@@ -742,6 +782,7 @@ def main() -> None:
         qc_report_path=qc_report_path,
         output_dir=output_dir,
         work_dir=work_dir,
+        selected_conditions=args.conditions,
         progress_every=args.progress_every,
     )
 

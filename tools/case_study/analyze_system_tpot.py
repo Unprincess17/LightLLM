@@ -23,13 +23,29 @@ from analyze_locality import (
     OBJECT_KEY_NOTES,
     resolve_total_events,
 )
-from common import ensure_dir, ensure_parent_dir, load_global_config, load_seed_config, parse_cardinalities, stage_output_dir, write_json
+from common import (
+    ensure_dir,
+    ensure_parent_dir,
+    finalize_condition_merged_csv,
+    load_global_config,
+    load_seed_config,
+    parse_cardinalities,
+    parse_condition_subset,
+    prepare_condition_merged_csv,
+    read_condition_filtered_csv_rows,
+    stage_output_dir,
+    write_json,
+)
 from replay_core import simulate_phase_replay_with_bitmaps
 from system_tpot_core import (
     CONDITION_LABELS,
     MISS_HANDLING_EXECUTION_FIRST,
     MISS_HANDLING_LOAD_THEN_RUN,
+    MISS_HANDLING_NO_CPU_PATH,
+    MISS_HANDLING_NO_DEFERRED_SYNC,
     MISS_HANDLING_MODE_ORDER,
+    OVERLAP_POLICY_CALIBRATED,
+    OVERLAP_POLICY_ORDER,
     TRANSFER_MODE_ORDER,
     TRANSFER_MODE_STAGED_PAGEABLE_PACKED,
     apply_temporal_prefetch_hits,
@@ -40,6 +56,7 @@ from system_tpot_core import (
     dtype_name_to_torch_dtype,
     load_model_text_config,
     simulate_miss_path_replay_with_bitmaps,
+    validate_execution_first_calibration,
 )
 from system_tpot_sim import (
     compute_stage1_token_tpot,
@@ -59,6 +76,7 @@ TOKEN_TPOT_FIELDS = [
     "condition_label",
     "cache_budget",
     "miss_handling_mode",
+    "overlap_policy",
     "req_idx",
     "token_pos",
     "token_ordinal",
@@ -78,6 +96,7 @@ TPOT_QUANTILE_FIELDS = [
     "condition_label",
     "cache_budget",
     "miss_handling_mode",
+    "overlap_policy",
     "mean",
     "p50",
     "p90",
@@ -93,6 +112,7 @@ LAYER_BARRIER_FIELDS = [
     "condition_label",
     "cache_budget",
     "miss_handling_mode",
+    "overlap_policy",
     "layer_id",
     "steps",
     "mean_miss_objects",
@@ -110,12 +130,15 @@ LAYER_BARRIER_FIELDS = [
     "share_hit_only",
     "share_whole_object_early",
     "share_staged_split",
+    "share_blocking_promotion_first",
+    "share_execution_first_sync_promotion",
 ]
 REQUEST_DECODE_FIELDS = [
     "condition",
     "condition_label",
     "cache_budget",
     "miss_handling_mode",
+    "overlap_policy",
     "req_idx",
     "decode_tokens",
     "mean_tpot_ms",
@@ -134,6 +157,7 @@ SCHEDULER_FIELDS = [
     "condition_label",
     "cache_budget",
     "miss_handling_mode",
+    "overlap_policy",
     "system_batch",
     "token_count",
     "batch_count",
@@ -158,6 +182,7 @@ BACKGROUND_POLICY_FIELDS = [
     "condition_label",
     "cache_budget",
     "miss_handling_mode",
+    "overlap_policy",
     "deferred_promotion_delta_steps",
     "promotion_admitted",
     "promotion_hits",
@@ -185,6 +210,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--load_profile", type=str, default="stressed", help="Load profile from the calibration manifest")
     parser.add_argument("--calibration_stat", type=str, default=DEFAULT_CALIBRATION_STAT, choices=["mean_ms", "p50_ms", "p90_ms"], help="Statistic to pull from the calibration curves")
     parser.add_argument("--miss_handling_mode", type=str, default=MISS_HANDLING_LOAD_THEN_RUN, choices=list(MISS_HANDLING_MODE_ORDER), help="Miss handling model: baseline load-then-run or COLoRA execution-first")
+    parser.add_argument("--overlap_policy", type=str, default=OVERLAP_POLICY_CALIBRATED, choices=list(OVERLAP_POLICY_ORDER), help="Whether calibrated overlap windows are active for replay service modeling")
     parser.add_argument("--deferred_promotion_delta_steps", type=int, default=4, help="Static decode-step reuse threshold delta for execution-first deferred promotion; 0 disables promotion admission")
     parser.add_argument("--temporal_prefetch", action="store_true", help="Enable the lightweight previous-top1 temporal prefetch model for execution-first mode")
     parser.add_argument("--temporal_prefetch_cpu_discount", type=float, default=0.20, help="Fractional cold-path CPU-time discount applied to prefetched miss objects in execution-first mode")
@@ -196,6 +222,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", type=str, default="bf16", help="LoRA dtype used for byte accounting")
     parser.add_argument("--lora_rank", type=int, default=16, help="LoRA rank used for byte accounting")
     parser.add_argument("--slice_bytes", type=int, default=256 * 1024, help="Audit slice size in bytes")
+    parser.add_argument(
+        "--conditions",
+        type=str,
+        default=None,
+        help="Comma-separated subset of conditions to recompute: expert_only,joint_indep,joint_corr",
+    )
     return parser.parse_args()
 
 
@@ -239,6 +271,26 @@ def open_csv_writer(path: Path, fieldnames: Sequence[str]):
     return handle, writer
 
 
+def write_condition_merged_csv(
+    output_path: Path,
+    fieldnames: Sequence[str],
+    selected_conditions: Sequence[str],
+    preserve_existing: bool,
+    rows: Sequence[Mapping[str, object]],
+) -> None:
+    temp_path, handle, writer = prepare_condition_merged_csv(
+        output_path=output_path,
+        fieldnames=fieldnames,
+        selected_conditions=selected_conditions,
+        preserve_existing=preserve_existing,
+    )
+    try:
+        writer.writerows(rows)
+    finally:
+        handle.close()
+    finalize_condition_merged_csv(temp_path, output_path)
+
+
 def main() -> None:
     args = parse_args()
     config = load_global_config(args.config)
@@ -263,11 +315,35 @@ def main() -> None:
     scheduler_batch_grid = parse_cardinalities(args.scheduler_batch_grid)
     if not scheduler_batch_grid:
         raise ValueError("scheduler_batch_grid must not be empty")
+    selected_conditions = parse_condition_subset(args.conditions, CONDITION_ORDER)
+    preserve_existing = len(selected_conditions) != len(CONDITION_ORDER)
+
+    token_output_path = output_dir / "token_tpot.csv"
+    quantiles_output_path = output_dir / "tpot_quantiles.csv"
+    tail_output_path = output_dir / "tail_token_breakdown.csv"
+    layer_output_path = output_dir / "layer_barrier_breakdown.csv"
+    request_output_path = output_dir / "request_decode_summary.csv"
+    scheduler_output_path = output_dir / "scheduler_sensitivity.csv"
+    background_output_path = output_dir / "background_policy_summary.csv"
+    manifest_output_path = output_dir / "system_tpot_manifest.json"
 
     calibration = load_json(calibration_path)
+    effective_overlap_policy = (
+        str(args.overlap_policy)
+        if str(args.miss_handling_mode) != MISS_HANDLING_NO_CPU_PATH
+        else "disabled"
+    )
+    if str(args.miss_handling_mode) in (MISS_HANDLING_EXECUTION_FIRST, MISS_HANDLING_NO_DEFERRED_SYNC):
+        validate_execution_first_calibration(
+            calibration=calibration,
+            load_profile=str(args.load_profile),
+            require_overlap_windows=effective_overlap_policy == OVERLAP_POLICY_CALIBRATED,
+            tool_name="tools/case_study/analyze_system_tpot.py",
+        )
     qc_payload = load_json(qc_report_path)
     total_events = resolve_total_events(qc_payload)
     expected_b8_misses = load_expected_per_request_misses(per_request_miss_path) if per_request_miss_path.exists() else None
+    existing_manifest = load_json(manifest_output_path) if preserve_existing else {}
 
     text_config = load_model_text_config(model_dir)
     object_sizes = compute_component_sizes(
@@ -299,17 +375,46 @@ def main() -> None:
         for condition in CONDITION_ORDER
     }
 
-    token_handle, token_writer = open_csv_writer(output_dir / "token_tpot.csv", TOKEN_TPOT_FIELDS)
+    token_temp_path, token_handle, token_writer = prepare_condition_merged_csv(
+        output_path=token_output_path,
+        fieldnames=TOKEN_TPOT_FIELDS,
+        selected_conditions=selected_conditions,
+        preserve_existing=preserve_existing,
+    )
     try:
-        quantile_rows: List[dict] = []
-        tail_rows: List[dict] = []
-        layer_rows: List[dict] = []
-        request_rows: List[dict] = []
-        scheduler_rows: List[dict] = []
-        background_policy_rows: List[dict] = []
+        quantile_rows: List[dict] = (
+            read_condition_filtered_csv_rows(quantiles_output_path, selected_conditions) if preserve_existing else []
+        )
+        tail_rows: List[dict] = (
+            read_condition_filtered_csv_rows(tail_output_path, selected_conditions) if preserve_existing else []
+        )
+        layer_rows: List[dict] = (
+            read_condition_filtered_csv_rows(layer_output_path, selected_conditions) if preserve_existing else []
+        )
+        request_rows: List[dict] = (
+            read_condition_filtered_csv_rows(request_output_path, selected_conditions) if preserve_existing else []
+        )
+        scheduler_rows: List[dict] = (
+            read_condition_filtered_csv_rows(scheduler_output_path, selected_conditions) if preserve_existing else []
+        )
+        background_policy_rows: List[dict] = (
+            read_condition_filtered_csv_rows(background_output_path, selected_conditions) if preserve_existing else []
+        )
         per_condition_payloads: Dict[str, dict] = {}
+        if preserve_existing:
+            existing_conditions = existing_manifest.get("conditions", {})
+            if not isinstance(existing_conditions, Mapping):
+                raise ValueError(f"expected conditions map in {manifest_output_path}")
+            for condition in CONDITION_ORDER:
+                if condition in selected_conditions:
+                    continue
+                if condition not in existing_conditions:
+                    raise KeyError(f"missing preserved condition {condition} in {manifest_output_path}")
+                per_condition_payloads[condition] = dict(existing_conditions[condition])
 
         for condition in CONDITION_ORDER:
+            if condition not in selected_conditions:
+                continue
             print(f"replaying calibrated TPOT for {condition}")
             access_buffer = stream.condition_buffers[condition]
             budget_payloads: Dict[str, dict] = {}
@@ -324,7 +429,11 @@ def main() -> None:
                     deferred_promotion_delta_steps=int(args.deferred_promotion_delta_steps),
                     policy_state=policy_state,
                 )
-                if str(args.miss_handling_mode) == MISS_HANDLING_LOAD_THEN_RUN:
+                if str(args.miss_handling_mode) in (
+                    MISS_HANDLING_LOAD_THEN_RUN,
+                    MISS_HANDLING_NO_CPU_PATH,
+                    MISS_HANDLING_NO_DEFERRED_SYNC,
+                ):
                     validate_against_b8_misses(
                         condition=condition,
                         cache_budget=int(cache_budget),
@@ -332,11 +441,10 @@ def main() -> None:
                         observed_per_request_misses=replay_summary.per_request_misses,
                         expected_b8_misses=expected_b8_misses,
                     )
-                else:
-                    replay_summary = apply_temporal_prefetch_hits(
-                        replay_summary=replay_summary,
-                        plan=policy_state.temporal_prefetch_plan if bool(args.temporal_prefetch) else None,
-                    )
+                replay_summary = apply_temporal_prefetch_hits(
+                    replay_summary=replay_summary,
+                    plan=policy_state.temporal_prefetch_plan if bool(args.temporal_prefetch) else None,
+                )
                 stage1 = compute_stage1_token_tpot(
                     condition=condition,
                     cache_budget=int(cache_budget),
@@ -351,6 +459,7 @@ def main() -> None:
                     tail_quantile=float(args.tail_quantile),
                     miss_handling_mode=str(args.miss_handling_mode),
                     prefetch_cpu_discount=float(args.temporal_prefetch_cpu_discount),
+                    overlap_policy=effective_overlap_policy,
                 )
                 for row in stage1.token_rows:
                     token_writer.writerow(row)
@@ -360,6 +469,7 @@ def main() -> None:
                         "condition_label": CONDITION_LABELS[condition],
                         "cache_budget": int(cache_budget),
                         "miss_handling_mode": str(args.miss_handling_mode),
+                        "overlap_policy": effective_overlap_policy,
                         "mean": float(stage1.quantiles["mean"]),
                         "p50": float(stage1.quantiles["p50"]),
                         "p90": float(stage1.quantiles["p90"]),
@@ -379,6 +489,7 @@ def main() -> None:
                         "condition_label": CONDITION_LABELS[condition],
                         "cache_budget": int(cache_budget),
                         "miss_handling_mode": str(args.miss_handling_mode),
+                        "overlap_policy": effective_overlap_policy,
                         "deferred_promotion_delta_steps": int(args.deferred_promotion_delta_steps),
                         "promotion_admitted": int(replay_summary.promotion_admitted),
                         "promotion_hits": int(replay_summary.promotion_hits),
@@ -412,6 +523,7 @@ def main() -> None:
                             max_system_batch=int(system_batch),
                             miss_handling_mode=str(args.miss_handling_mode),
                             prefetch_cpu_discount=float(args.temporal_prefetch_cpu_discount),
+                            overlap_policy=effective_overlap_policy,
                         )
                         scheduler_rows.append(scheduler.summary_row)
                         scheduler_payload[str(system_batch)] = dict(scheduler.summary_row)
@@ -426,6 +538,7 @@ def main() -> None:
                     "stage1_tail_threshold_ms": float(stage1.tail_threshold_ms),
                     "decode_token_count": int(len(stage1.token_rows)),
                     "background_policy": {
+                        "overlap_policy": effective_overlap_policy,
                         "promotion_admitted": int(replay_summary.promotion_admitted),
                         "promotion_hits": int(replay_summary.promotion_hits),
                         "prefetch_predictions": int(replay_summary.prefetch_predictions),
@@ -449,31 +562,51 @@ def main() -> None:
             gc.collect()
     finally:
         token_handle.close()
+    finalize_condition_merged_csv(token_temp_path, token_output_path)
 
-    with (output_dir / "tpot_quantiles.csv").open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=TPOT_QUANTILE_FIELDS)
-        writer.writeheader()
-        writer.writerows(quantile_rows)
-    with (output_dir / "tail_token_breakdown.csv").open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=TAIL_TOKEN_FIELDS)
-        writer.writeheader()
-        writer.writerows(tail_rows)
-    with (output_dir / "layer_barrier_breakdown.csv").open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=LAYER_BARRIER_FIELDS)
-        writer.writeheader()
-        writer.writerows(layer_rows)
-    with (output_dir / "request_decode_summary.csv").open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=REQUEST_DECODE_FIELDS)
-        writer.writeheader()
-        writer.writerows(request_rows)
-    with (output_dir / "scheduler_sensitivity.csv").open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=SCHEDULER_FIELDS)
-        writer.writeheader()
-        writer.writerows(scheduler_rows)
-    with (output_dir / "background_policy_summary.csv").open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=BACKGROUND_POLICY_FIELDS)
-        writer.writeheader()
-        writer.writerows(background_policy_rows)
+    quantile_rows.sort(key=lambda row: (CONDITION_ORDER.index(str(row["condition"])), int(row["cache_budget"])))
+    tail_rows.sort(
+        key=lambda row: (
+            CONDITION_ORDER.index(str(row["condition"])),
+            int(row["cache_budget"]),
+            int(row["req_idx"]),
+            int(row["token_ordinal"]),
+        )
+    )
+    layer_rows.sort(
+        key=lambda row: (
+            CONDITION_ORDER.index(str(row["condition"])),
+            int(row["cache_budget"]),
+            int(row["layer_id"]),
+        )
+    )
+    request_rows.sort(
+        key=lambda row: (
+            CONDITION_ORDER.index(str(row["condition"])),
+            int(row["cache_budget"]),
+            int(row["req_idx"]),
+        )
+    )
+    scheduler_rows.sort(
+        key=lambda row: (
+            CONDITION_ORDER.index(str(row["condition"])),
+            int(row["cache_budget"]),
+            int(row["system_batch"]),
+        )
+    )
+    background_policy_rows.sort(
+        key=lambda row: (
+            CONDITION_ORDER.index(str(row["condition"])),
+            int(row["cache_budget"]),
+        )
+    )
+
+    write_condition_merged_csv(quantiles_output_path, TPOT_QUANTILE_FIELDS, selected_conditions, preserve_existing, quantile_rows)
+    write_condition_merged_csv(tail_output_path, TAIL_TOKEN_FIELDS, selected_conditions, preserve_existing, tail_rows)
+    write_condition_merged_csv(layer_output_path, LAYER_BARRIER_FIELDS, selected_conditions, preserve_existing, layer_rows)
+    write_condition_merged_csv(request_output_path, REQUEST_DECODE_FIELDS, selected_conditions, preserve_existing, request_rows)
+    write_condition_merged_csv(scheduler_output_path, SCHEDULER_FIELDS, selected_conditions, preserve_existing, scheduler_rows)
+    write_condition_merged_csv(background_output_path, BACKGROUND_POLICY_FIELDS, selected_conditions, preserve_existing, background_policy_rows)
 
     manifest = {
         "model_name": "case_study_system_tpot_v1",
@@ -497,6 +630,7 @@ def main() -> None:
             "calibration_stat": str(args.calibration_stat),
             "tail_quantile": float(args.tail_quantile),
             "miss_handling_mode": str(args.miss_handling_mode),
+            "overlap_policy": effective_overlap_policy,
             "deferred_promotion_delta_steps": int(args.deferred_promotion_delta_steps),
             "temporal_prefetch_enabled": bool(args.temporal_prefetch),
             "temporal_prefetch_cpu_discount": float(args.temporal_prefetch_cpu_discount),
@@ -524,27 +658,27 @@ def main() -> None:
         "conditions": per_condition_payloads,
         "seeds": dict(seeds),
         "outputs": {
-            "token_tpot_csv": str(output_dir / "token_tpot.csv"),
-            "tpot_quantiles_csv": str(output_dir / "tpot_quantiles.csv"),
-            "tail_token_breakdown_csv": str(output_dir / "tail_token_breakdown.csv"),
-            "layer_barrier_breakdown_csv": str(output_dir / "layer_barrier_breakdown.csv"),
-            "request_decode_summary_csv": str(output_dir / "request_decode_summary.csv"),
-            "scheduler_sensitivity_csv": str(output_dir / "scheduler_sensitivity.csv"),
-            "background_policy_summary_csv": str(output_dir / "background_policy_summary.csv"),
-            "manifest_json": str(output_dir / "system_tpot_manifest.json"),
+            "token_tpot_csv": str(token_output_path),
+            "tpot_quantiles_csv": str(quantiles_output_path),
+            "tail_token_breakdown_csv": str(tail_output_path),
+            "layer_barrier_breakdown_csv": str(layer_output_path),
+            "request_decode_summary_csv": str(request_output_path),
+            "scheduler_sensitivity_csv": str(scheduler_output_path),
+            "background_policy_summary_csv": str(background_output_path),
+            "manifest_json": str(manifest_output_path),
         },
     }
-    write_json(output_dir / "system_tpot_manifest.json", manifest)
+    write_json(manifest_output_path, manifest)
     print(
         "wrote calibrated TPOT artifacts: "
-        f"{output_dir / 'token_tpot.csv'}, "
-        f"{output_dir / 'tpot_quantiles.csv'}, "
-        f"{output_dir / 'tail_token_breakdown.csv'}, "
-        f"{output_dir / 'layer_barrier_breakdown.csv'}, "
-            f"{output_dir / 'request_decode_summary.csv'}, "
-            f"{output_dir / 'scheduler_sensitivity.csv'}, "
-            f"{output_dir / 'background_policy_summary.csv'}, "
-            f"{output_dir / 'system_tpot_manifest.json'}"
+        f"{token_output_path}, "
+        f"{quantiles_output_path}, "
+        f"{tail_output_path}, "
+        f"{layer_output_path}, "
+            f"{request_output_path}, "
+            f"{scheduler_output_path}, "
+            f"{background_output_path}, "
+            f"{manifest_output_path}"
     )
 
 

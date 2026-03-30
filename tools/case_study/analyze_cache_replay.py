@@ -36,6 +36,8 @@ from common import (
     load_global_config,
     load_seed_config,
     parse_cardinalities,
+    parse_condition_subset,
+    read_condition_filtered_csv_rows,
     stage_output_dir,
     write_csv,
     write_json,
@@ -138,7 +140,22 @@ def parse_args() -> argparse.Namespace:
         default=PROGRESS_EVERY_ROWS,
         help="Print progress after every N aligned joined-trace rows while building the replay stream",
     )
+    parser.add_argument(
+        "--conditions",
+        type=str,
+        default=None,
+        help="Comma-separated subset of conditions to recompute: expert_only,joint_indep,joint_corr",
+    )
     return parser.parse_args()
+
+
+def load_json(path: Path) -> dict:
+    import orjson
+
+    payload = orjson.loads(path.read_bytes())
+    if not isinstance(payload, dict):
+        raise ValueError(f"expected JSON object in {path}")
+    return payload
 
 
 def resolve_cache_section(config: Mapping[str, object]) -> Mapping[str, object]:
@@ -375,9 +392,12 @@ def run_cache_replay_analysis(
     output_dir: Path,
     policy: str,
     cache_budgets: Sequence[int],
+    selected_conditions: Optional[Sequence[str]] = None,
     seed_config: Optional[Mapping[str, object]] = None,
     progress_every: int = PROGRESS_EVERY_ROWS,
 ) -> dict:
+    selected = parse_condition_subset(selected_conditions, CONDITION_ORDER)
+    preserve_existing = len(selected) != len(CONDITION_ORDER)
     import orjson
 
     qc_payload = orjson.loads(qc_report_path.read_bytes())
@@ -398,8 +418,30 @@ def run_cache_replay_analysis(
     eviction_rows: List[dict] = []
     per_condition_metrics: Dict[str, dict] = {}
 
+    if preserve_existing:
+        cache_metrics_path = output_dir / "cache_metrics.json"
+        if not cache_metrics_path.exists():
+            raise FileNotFoundError(
+                f"cannot preserve unselected conditions because {cache_metrics_path} is missing"
+            )
+        existing_metrics = load_json(cache_metrics_path)
+        existing_conditions = existing_metrics.get("conditions", {})
+        if not isinstance(existing_conditions, Mapping):
+            raise ValueError(f"expected conditions map in {cache_metrics_path}")
+        for condition in CONDITION_ORDER:
+            if condition in selected:
+                continue
+            if condition not in existing_conditions:
+                raise KeyError(f"missing preserved condition {condition} in {cache_metrics_path}")
+            per_condition_metrics[condition] = dict(existing_conditions[condition])
+        cache_curve_rows.extend(read_condition_filtered_csv_rows(output_dir / "cache_curve.csv", selected))
+        per_request_rows.extend(read_condition_filtered_csv_rows(output_dir / "per_request_miss_count.csv", selected))
+        eviction_rows.extend(read_condition_filtered_csv_rows(output_dir / "eviction_stats.csv", selected))
+
     print(f"cache budget grid (object slots): {list(cache_budgets)}")
     for condition in CONDITION_ORDER:
+        if condition not in selected:
+            continue
         print(f"replaying cache metrics for {condition} with policy={policy}")
         access_buffer = stream_result.condition_buffers[condition]
         budget_metrics: Dict[str, dict] = {}
@@ -452,10 +494,22 @@ def run_cache_replay_analysis(
         stream_result.condition_buffers[condition].access_ids = np.empty(0, dtype=np.uint32)
         gc.collect()
 
+    cache_curve_rows.sort(key=lambda row: (CONDITION_ORDER.index(str(row["condition"])), int(row["cache_budget"])))
+    per_request_rows.sort(
+        key=lambda row: (
+            CONDITION_ORDER.index(str(row["condition"])),
+            int(row["cache_budget"]),
+            int(row["req_idx"]),
+        )
+    )
+    eviction_rows.sort(key=lambda row: (CONDITION_ORDER.index(str(row["condition"])), int(row["cache_budget"])))
+
+    merged_budget_grid = sorted({int(row["cache_budget"]) for row in cache_curve_rows})
+
     cache_metrics = {
         "cache_policy": policy,
         "budget_unit": "objects",
-        "cache_budget_grid": [int(value) for value in cache_budgets],
+        "cache_budget_grid": merged_budget_grid,
         "comparison_contract": {
             "identical_budget_grid_across_conditions": True,
             "identical_event_ordering_across_conditions": True,
@@ -517,6 +571,7 @@ def main() -> None:
         output_dir=output_dir,
         policy=policy,
         cache_budgets=cache_budgets,
+        selected_conditions=args.conditions,
         seed_config=seeds,
         progress_every=args.progress_every,
     )

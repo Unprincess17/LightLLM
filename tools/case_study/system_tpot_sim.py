@@ -25,6 +25,10 @@ from system_tpot_core import (
     LayerTransferDecision,
     MISS_HANDLING_EXECUTION_FIRST,
     MISS_HANDLING_LOAD_THEN_RUN,
+    MISS_HANDLING_NO_CPU_PATH,
+    MISS_HANDLING_NO_DEFERRED_SYNC,
+    OVERLAP_POLICY_CALIBRATED,
+    OVERLAP_POLICY_DISABLED,
     SchedulerBatchStats,
     TokenStructuredStream,
     TokenTemplate,
@@ -121,6 +125,18 @@ def calibration_overlap_window_ms_interp(
     return _interp_from_pairs(points, float(system_batch))
 
 
+def resolve_overlap_window_ms(
+    calibration: Mapping[str, object],
+    system_batch: int,
+    window_name: str,
+    stat_key: str,
+    overlap_policy: str,
+) -> float:
+    if overlap_policy == OVERLAP_POLICY_DISABLED:
+        return 0.0
+    return calibration_overlap_window_ms_interp(calibration, system_batch, window_name, stat_key)
+
+
 def calibration_cold_path_component_ms_interp(
     calibration: Mapping[str, object],
     load_profile: str,
@@ -163,10 +179,15 @@ def choose_layer_transfer_strategy_interp(
     load_profile: str,
     stat_key: str,
     system_batch: int,
+    overlap_policy: str = OVERLAP_POLICY_CALIBRATED,
 ) -> LayerTransferDecision:
     capacity_miss_objects = max(int(miss_objects) - int(cold_miss_objects), 0)
-    early_overlap_window_ms = calibration_overlap_window_ms_interp(calibration, system_batch, "early", stat_key)
-    late_overlap_window_ms = calibration_overlap_window_ms_interp(calibration, system_batch, "late", stat_key)
+    early_overlap_window_ms = resolve_overlap_window_ms(
+        calibration, system_batch, "early", stat_key, overlap_policy
+    )
+    late_overlap_window_ms = resolve_overlap_window_ms(
+        calibration, system_batch, "late", stat_key, overlap_policy
+    )
 
     if miss_objects <= 0:
         return LayerTransferDecision(
@@ -256,14 +277,21 @@ def choose_execution_first_strategy_interp(
     prefetched_miss_objects: int,
     object_sizes: ComponentSizeBytes,
     calibration: Mapping[str, object],
+    transfer_mode: str,
     load_profile: str,
     stat_key: str,
     system_batch: int,
     prefetch_cpu_discount: float,
+    overlap_policy: str = OVERLAP_POLICY_CALIBRATED,
+    sync_promotion: bool = False,
 ) -> LayerTransferDecision:
     capacity_miss_objects = max(int(miss_objects) - int(cold_miss_objects), 0)
-    early_overlap_window_ms = calibration_overlap_window_ms_interp(calibration, system_batch, "early", stat_key)
-    late_overlap_window_ms = calibration_overlap_window_ms_interp(calibration, system_batch, "late", stat_key)
+    early_overlap_window_ms = resolve_overlap_window_ms(
+        calibration, system_batch, "early", stat_key, overlap_policy
+    )
+    late_overlap_window_ms = resolve_overlap_window_ms(
+        calibration, system_batch, "late", stat_key, overlap_policy
+    )
 
     if miss_objects <= 0:
         return LayerTransferDecision(
@@ -293,7 +321,8 @@ def choose_execution_first_strategy_interp(
 
     early_bytes = int(miss_objects) * int(object_sizes.early_activation_bytes + object_sizes.early_result_bytes)
     late_bytes = int(miss_objects) * int(object_sizes.late_activation_bytes + object_sizes.late_result_bytes)
-    total_bytes = int(early_bytes + late_bytes)
+    weight_bytes = int(miss_objects) * int(object_sizes.total_object_bytes) if sync_promotion else 0
+    total_bytes = int(early_bytes + late_bytes + weight_bytes)
     early_slices = int(math.ceil(float(early_bytes) / float(object_sizes.slice_bytes)))
     late_slices = int(math.ceil(float(late_bytes) / float(object_sizes.slice_bytes)))
     total_slices = int(math.ceil(float(total_bytes) / float(object_sizes.slice_bytes)))
@@ -396,9 +425,21 @@ def choose_execution_first_strategy_interp(
     late_service_ms = late_pack_ms + late_d2h_ms + late_cpu_ms + late_h2d_ms + late_merge_ms
     early_exposed_stall_ms = max(0.0, early_service_ms - early_overlap_window_ms)
     late_exposed_stall_ms = max(0.0, late_service_ms - late_overlap_window_ms)
+    sync_promotion_ms = 0.0
+    if sync_promotion:
+        sync_promotion_ms = float(
+            calibration_service_ms(
+                calibration=calibration,
+                transfer_mode=transfer_mode,
+                load_profile=load_profile,
+                payload_bytes=weight_bytes,
+                stat_key=stat_key,
+            )
+        )
+        early_exposed_stall_ms += sync_promotion_ms
 
     return LayerTransferDecision(
-        strategy="staged_split",
+        strategy="execution_first_sync_promotion" if sync_promotion else "staged_split",
         miss_objects=int(miss_objects),
         cold_miss_objects=int(cold_miss_objects),
         capacity_miss_objects=int(capacity_miss_objects),
@@ -410,12 +451,77 @@ def choose_execution_first_strategy_interp(
         total_slices=total_slices,
         early_service_ms=float(early_service_ms),
         late_service_ms=float(late_service_ms),
-        whole_service_ms=0.0,
+        whole_service_ms=float(early_service_ms + late_service_ms + sync_promotion_ms),
         early_overlap_window_ms=float(early_overlap_window_ms),
         late_overlap_window_ms=float(late_overlap_window_ms),
         early_exposed_stall_ms=float(early_exposed_stall_ms),
         late_exposed_stall_ms=float(late_exposed_stall_ms),
         total_exposed_stall_ms=float(early_exposed_stall_ms + late_exposed_stall_ms),
+    )
+
+
+def choose_blocking_promotion_first_strategy_interp(
+    miss_objects: int,
+    cold_miss_objects: int,
+    object_sizes: ComponentSizeBytes,
+    calibration: Mapping[str, object],
+    transfer_mode: str,
+    load_profile: str,
+    stat_key: str,
+) -> LayerTransferDecision:
+    capacity_miss_objects = max(int(miss_objects) - int(cold_miss_objects), 0)
+    if miss_objects <= 0:
+        return LayerTransferDecision(
+            strategy="hit_only",
+            miss_objects=0,
+            cold_miss_objects=0,
+            capacity_miss_objects=0,
+            early_bytes=0,
+            late_bytes=0,
+            total_bytes=0,
+            early_slices=0,
+            late_slices=0,
+            total_slices=0,
+            early_service_ms=0.0,
+            late_service_ms=0.0,
+            whole_service_ms=0.0,
+            early_overlap_window_ms=0.0,
+            late_overlap_window_ms=0.0,
+            early_exposed_stall_ms=0.0,
+            late_exposed_stall_ms=0.0,
+            total_exposed_stall_ms=0.0,
+        )
+
+    total_bytes = int(miss_objects) * int(object_sizes.total_object_bytes)
+    total_slices = int(math.ceil(float(total_bytes) / float(object_sizes.slice_bytes)))
+    blocking_ms = float(
+        calibration_service_ms(
+            calibration=calibration,
+            transfer_mode=transfer_mode,
+            load_profile=load_profile,
+            payload_bytes=total_bytes,
+            stat_key=stat_key,
+        )
+    )
+    return LayerTransferDecision(
+        strategy="blocking_promotion_first",
+        miss_objects=int(miss_objects),
+        cold_miss_objects=int(cold_miss_objects),
+        capacity_miss_objects=int(capacity_miss_objects),
+        early_bytes=0,
+        late_bytes=0,
+        total_bytes=total_bytes,
+        early_slices=0,
+        late_slices=0,
+        total_slices=total_slices,
+        early_service_ms=0.0,
+        late_service_ms=0.0,
+        whole_service_ms=blocking_ms,
+        early_overlap_window_ms=0.0,
+        late_overlap_window_ms=0.0,
+        early_exposed_stall_ms=blocking_ms,
+        late_exposed_stall_ms=0.0,
+        total_exposed_stall_ms=blocking_ms,
     )
 
 
@@ -456,6 +562,7 @@ def compute_stage1_token_tpot(
     tail_quantile: float,
     miss_handling_mode: str = MISS_HANDLING_LOAD_THEN_RUN,
     prefetch_cpu_discount: float = 0.0,
+    overlap_policy: str = OVERLAP_POLICY_CALIBRATED,
 ) -> Stage1TPOTOutputs:
     if tail_quantile <= 0.0 or tail_quantile >= 1.0:
         raise ValueError(f"tail_quantile must lie in (0, 1), got {tail_quantile}")
@@ -483,17 +590,30 @@ def compute_stage1_token_tpot(
                 if replay_summary.prefetch_hit_flags is not None
                 else 0
             )
-            if miss_handling_mode == MISS_HANDLING_EXECUTION_FIRST:
+            if miss_handling_mode == MISS_HANDLING_NO_CPU_PATH:
+                decision = choose_blocking_promotion_first_strategy_interp(
+                    miss_objects=miss_objects,
+                    cold_miss_objects=cold_miss_objects,
+                    object_sizes=object_sizes,
+                    calibration=calibration,
+                    transfer_mode=transfer_mode,
+                    load_profile=load_profile,
+                    stat_key=stat_key,
+                )
+            elif miss_handling_mode in (MISS_HANDLING_EXECUTION_FIRST, MISS_HANDLING_NO_DEFERRED_SYNC):
                 decision = choose_execution_first_strategy_interp(
                     miss_objects=miss_objects,
                     cold_miss_objects=cold_miss_objects,
                     prefetched_miss_objects=prefetched_miss_objects,
                     object_sizes=object_sizes,
                     calibration=calibration,
+                    transfer_mode=transfer_mode,
                     load_profile=load_profile,
                     stat_key=stat_key,
                     system_batch=system_batch,
                     prefetch_cpu_discount=prefetch_cpu_discount,
+                    overlap_policy=overlap_policy,
+                    sync_promotion=miss_handling_mode == MISS_HANDLING_NO_DEFERRED_SYNC,
                 )
             else:
                 decision = choose_layer_transfer_strategy_interp(
@@ -505,6 +625,7 @@ def compute_stage1_token_tpot(
                     load_profile=load_profile,
                     stat_key=stat_key,
                     system_batch=system_batch,
+                    overlap_policy=overlap_policy,
                 )
             token_exposed_ms += float(decision.total_exposed_stall_ms)
             token_miss_objects += int(decision.miss_objects)
@@ -552,6 +673,7 @@ def compute_stage1_token_tpot(
             "condition_label": condition_label,
             "cache_budget": int(cache_budget),
             "miss_handling_mode": str(miss_handling_mode),
+            "overlap_policy": str(overlap_policy),
             "req_idx": int(token.req_idx),
             "token_pos": int(token.token_pos),
             "token_ordinal": int(token.token_ordinal),
@@ -590,6 +712,7 @@ def compute_stage1_token_tpot(
                 "condition_label": condition_label,
                 "cache_budget": int(cache_budget),
                 "miss_handling_mode": str(miss_handling_mode),
+                "overlap_policy": str(overlap_policy),
                 "req_idx": int(req_idx),
                 "decode_tokens": int(len(rows)),
                 "mean_tpot_ms": float(sum(tpot_req) / len(tpot_req)) if tpot_req else 0.0,
@@ -616,6 +739,7 @@ def compute_stage1_token_tpot(
                 "condition_label": condition_label,
                 "cache_budget": int(cache_budget),
                 "miss_handling_mode": str(miss_handling_mode),
+                "overlap_policy": str(overlap_policy),
                 "layer_id": int(layer_id),
                 "steps": int(total_steps),
                 "mean_miss_objects": float(sum(metrics["miss_objects"]) / total_steps) if total_steps else 0.0,
@@ -633,6 +757,8 @@ def compute_stage1_token_tpot(
                 "share_hit_only": float(strategy_counts.get("hit_only", 0) / total_steps) if total_steps else 0.0,
                 "share_whole_object_early": float(strategy_counts.get("whole_object_early", 0) / total_steps) if total_steps else 0.0,
                 "share_staged_split": float(strategy_counts.get("staged_split", 0) / total_steps) if total_steps else 0.0,
+                "share_blocking_promotion_first": float(strategy_counts.get("blocking_promotion_first", 0) / total_steps) if total_steps else 0.0,
+                "share_execution_first_sync_promotion": float(strategy_counts.get("execution_first_sync_promotion", 0) / total_steps) if total_steps else 0.0,
             }
         )
 
@@ -666,6 +792,7 @@ def _simulate_batch_service_ms(
     stat_key: str,
     miss_handling_mode: str,
     prefetch_cpu_discount: float,
+    overlap_policy: str,
 ) -> Tuple[float, float]:
     if not batch_tokens:
         return 0.0, 0.0
@@ -683,36 +810,57 @@ def _simulate_batch_service_ms(
             if layer_ordinal >= len(token.layers):
                 continue
             layer = token.layers[layer_ordinal]
-            decisions.append(
-                choose_execution_first_strategy_interp(
-                    miss_objects=int(layer.miss_objects),
-                    cold_miss_objects=int(layer.cold_miss_objects),
-                    prefetched_miss_objects=int(layer.prefetched_miss_objects),
-                    object_sizes=object_sizes,
-                    calibration=calibration,
-                    load_profile=load_profile,
-                    stat_key=stat_key,
-                    system_batch=actual_batch,
-                    prefetch_cpu_discount=prefetch_cpu_discount,
+            if miss_handling_mode == MISS_HANDLING_NO_CPU_PATH:
+                decisions.append(
+                    choose_blocking_promotion_first_strategy_interp(
+                        miss_objects=int(layer.miss_objects),
+                        cold_miss_objects=int(layer.cold_miss_objects),
+                        object_sizes=object_sizes,
+                        calibration=calibration,
+                        transfer_mode=transfer_mode,
+                        load_profile=load_profile,
+                        stat_key=stat_key,
+                    )
                 )
-                if miss_handling_mode == MISS_HANDLING_EXECUTION_FIRST
-                else choose_layer_transfer_strategy_interp(
-                    miss_objects=int(layer.miss_objects),
-                    cold_miss_objects=int(layer.cold_miss_objects),
-                    object_sizes=object_sizes,
-                    calibration=calibration,
-                    transfer_mode=transfer_mode,
-                    load_profile=load_profile,
-                    stat_key=stat_key,
-                    system_batch=actual_batch,
+            elif miss_handling_mode in (MISS_HANDLING_EXECUTION_FIRST, MISS_HANDLING_NO_DEFERRED_SYNC):
+                decisions.append(
+                    choose_execution_first_strategy_interp(
+                        miss_objects=int(layer.miss_objects),
+                        cold_miss_objects=int(layer.cold_miss_objects),
+                        prefetched_miss_objects=int(layer.prefetched_miss_objects),
+                        object_sizes=object_sizes,
+                        calibration=calibration,
+                        transfer_mode=transfer_mode,
+                        load_profile=load_profile,
+                        stat_key=stat_key,
+                        system_batch=actual_batch,
+                        prefetch_cpu_discount=prefetch_cpu_discount,
+                        overlap_policy=overlap_policy,
+                        sync_promotion=miss_handling_mode == MISS_HANDLING_NO_DEFERRED_SYNC,
+                    )
                 )
-            )
+            else:
+                decisions.append(
+                    choose_layer_transfer_strategy_interp(
+                        miss_objects=int(layer.miss_objects),
+                        cold_miss_objects=int(layer.cold_miss_objects),
+                        object_sizes=object_sizes,
+                        calibration=calibration,
+                        transfer_mode=transfer_mode,
+                        load_profile=load_profile,
+                        stat_key=stat_key,
+                        system_batch=actual_batch,
+                        overlap_policy=overlap_policy,
+                    )
+                )
 
-        early_window = calibration_overlap_window_ms_interp(calibration, actual_batch, "early", stat_key)
+        early_window = resolve_overlap_window_ms(calibration, actual_batch, "early", stat_key, overlap_policy)
         cursor_ms = 0.0
         early_completion_ms = 0.0
         for decision in decisions:
             if decision.strategy == "whole_object_early":
+                service_ms = float(decision.whole_service_ms)
+            elif decision.strategy in ("blocking_promotion_first", "execution_first_sync_promotion"):
                 service_ms = float(decision.whole_service_ms)
             elif decision.strategy == "staged_split":
                 service_ms = float(decision.early_service_ms)
@@ -726,7 +874,7 @@ def _simulate_batch_service_ms(
             early_completion_ms = max(early_completion_ms, cursor_ms)
         total_stall_ms += max(0.0, early_completion_ms - early_window)
 
-        late_window = calibration_overlap_window_ms_interp(calibration, actual_batch, "late", stat_key)
+        late_window = resolve_overlap_window_ms(calibration, actual_batch, "late", stat_key, overlap_policy)
         cursor_ms = 0.0
         late_completion_ms = 0.0
         for decision in decisions:
@@ -757,6 +905,7 @@ def simulate_scheduler_sensitivity(
     max_system_batch: int,
     miss_handling_mode: str = MISS_HANDLING_LOAD_THEN_RUN,
     prefetch_cpu_discount: float = 0.0,
+    overlap_policy: str = OVERLAP_POLICY_CALIBRATED,
 ) -> SchedulerSimulationSummary:
     if max_system_batch <= 0:
         raise ValueError(f"max_system_batch must be positive, got {max_system_batch}")
@@ -814,6 +963,7 @@ def simulate_scheduler_sensitivity(
             stat_key=stat_key,
             miss_handling_mode=miss_handling_mode,
             prefetch_cpu_discount=prefetch_cpu_discount,
+            overlap_policy=overlap_policy,
         )
 
         batch_start_ms = float(current_time_ms)
@@ -857,6 +1007,7 @@ def simulate_scheduler_sensitivity(
             "condition_label": condition_label,
             "cache_budget": int(cache_budget),
             "miss_handling_mode": str(miss_handling_mode),
+            "overlap_policy": str(overlap_policy),
             "system_batch": int(max_system_batch),
             "token_count": int(len(service_tpots)),
             "batch_count": int(len(batch_stats)),

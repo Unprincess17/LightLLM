@@ -34,6 +34,7 @@ DEFAULT_GENTD26_TRACE_PATH = Path(
 )
 RAW_TRACE_SOURCE = "gentd26_filtered_lora_args"
 TOP_REPORT_LIMIT = 50
+DEFAULT_CORR_JITTER_WINDOW = 2048
 
 
 def parse_args() -> argparse.Namespace:
@@ -49,6 +50,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Deterministic seed for the request-level indep permutation",
+    )
+    parser.add_argument(
+        "--corr_jitter_window",
+        type=int,
+        default=DEFAULT_CORR_JITTER_WINDOW,
+        help=(
+            "Maximum deterministic request displacement applied to the correlated schedule. "
+            "Set to 0 to preserve exact file order."
+        ),
     )
     return parser.parse_args()
 
@@ -117,6 +127,20 @@ def stable_permutation(length: int, seed: int) -> List[int]:
     return sorted(range(length), key=lambda index: (stable_hash_int(f"perm:{index}", seed), index))
 
 
+def stable_bounded_jitter_permutation(length: int, seed: int, jitter_window: int) -> List[int]:
+    if length <= 1 or jitter_window <= 0:
+        return list(range(length))
+    window = int(jitter_window)
+    span = (2 * window) + 1
+    return sorted(
+        range(length),
+        key=lambda index: (
+            index + int(stable_hash_int(f"corr_jitter:{index}", seed) % span) - window,
+            index,
+        ),
+    )
+
+
 def write_jsonl_rows(path: Path, rows: Iterable[Mapping[str, object]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
@@ -125,7 +149,7 @@ def write_jsonl_rows(path: Path, rows: Iterable[Mapping[str, object]]) -> None:
             handle.write("\n")
 
 
-def write_mapping_policy(path: Path, cardinality: int, shuffle_seed: int) -> None:
+def write_mapping_policy(path: Path, cardinality: int, shuffle_seed: int, corr_jitter_window: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
         handle.write("# GenTD26 Composite-Adapter Mapping Policy\n\n")
@@ -144,7 +168,14 @@ def write_mapping_policy(path: Path, cardinality: int, shuffle_seed: int) -> Non
         handle.write("- Assign one unique adapter slot per composite identity.\n")
         handle.write(f"- Primary cardinality is the full observed composite count: `{cardinality}`.\n\n")
         handle.write("## Corr / Indep Semantics\n\n")
-        handle.write("- `corr`: preserve the real file-order composite-adapter request sequence.\n")
+        if corr_jitter_window > 0:
+            handle.write(
+                "- `corr`: preserve local file-order correlation, but apply a deterministic bounded jitter "
+                f"of `+/- {corr_jitter_window}` requests to weaken extreme burstiness.\n"
+            )
+            handle.write("- Use `--corr_jitter_window 0` to recover exact file order.\n")
+        else:
+            handle.write("- `corr`: preserve the exact real file-order composite-adapter request sequence.\n")
         handle.write("- `indep`: apply a deterministic request-level permutation of the same adapter multiset.\n")
         handle.write(f"- Permutation seed: `{shuffle_seed}`.\n\n")
         handle.write("## Time Semantics\n\n")
@@ -263,6 +294,7 @@ def main() -> None:
     paths_config = config.get("paths", {})
     trace_path = Path(args.trace_path or paths_config.get("gentd26_lora_trace", DEFAULT_GENTD26_TRACE_PATH))
     shuffle_seed = int(args.shuffle_seed or seeds.get("adapter_mapping_seed", seeds.get("global_seed", 7)))
+    corr_jitter_window = max(int(args.corr_jitter_window), 0)
 
     raw_records: List[dict] = []
     base_lora_counts: Counter = Counter()
@@ -371,17 +403,18 @@ def main() -> None:
     for composite_key, request_count in composite_counts.items():
         adapter_counts[f"lora_{slot_by_composite[composite_key]}"] = int(request_count)
 
+    corr_permutation = stable_bounded_jitter_permutation(len(raw_records), shuffle_seed, corr_jitter_window)
     corr_rows = (
         build_mapped_payload(
-            record=record,
+            record=raw_records[source_arrival_idx],
             arrival_idx=arrival_idx,
-            adapter_slot=slot_by_composite[str(record["app_id"])],
+            adapter_slot=slot_by_composite[str(raw_records[source_arrival_idx]["app_id"])],
             mapping_mode="corr",
             cardinality=cardinality,
-            source_arrival_idx=int(record["arrival_idx"]),
+            source_arrival_idx=source_arrival_idx,
             shuffle_seed=None,
         )
-        for arrival_idx, record in enumerate(raw_records)
+        for arrival_idx, source_arrival_idx in enumerate(corr_permutation)
     )
     permutation = stable_permutation(len(raw_records), shuffle_seed)
     indep_rows = (
@@ -404,7 +437,12 @@ def main() -> None:
     write_jsonl_rows(indep_primary_path, indep_rows_materialized)
     write_jsonl_rows(indep_cardinality_path, indep_rows_materialized)
 
-    write_mapping_policy(mapping_policy_path, cardinality=cardinality, shuffle_seed=shuffle_seed)
+    write_mapping_policy(
+        mapping_policy_path,
+        cardinality=cardinality,
+        shuffle_seed=shuffle_seed,
+        corr_jitter_window=corr_jitter_window,
+    )
     write_json(
         mapping_summary_path,
         {
@@ -417,9 +455,18 @@ def main() -> None:
             "cardinalities": [cardinality],
             "multi_lora_request_count": int(sum(count for width, count in component_count_hist.items() if width > 1)),
             "sequence_semantics": {
-                "corr": "real request-level composite-adapter sequence in file order",
+                "corr": (
+                    "bounded-jitter local-order composite-adapter sequence derived from file order"
+                    if corr_jitter_window > 0
+                    else "real request-level composite-adapter sequence in exact file order"
+                ),
                 "indep": "deterministic permutation of the same request-level composite-adapter multiset",
                 "time": "order-only arrival_idx semantics; original request timestamps are unavailable",
+            },
+            "corr_order_policy": {
+                "algorithm": "stable_bounded_jitter" if corr_jitter_window > 0 else "identity",
+                "jitter_window": corr_jitter_window,
+                "seed": shuffle_seed,
             },
             "permutation": {
                 "algorithm": "stable_hash_sort",
