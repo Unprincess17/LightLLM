@@ -273,6 +273,22 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
             "colora_miss_tokens": 0,
             "promotion_queue_depth": 0,
             "cache_hit_rate": 0.0,
+            "cache_capacity_slots": 0,
+            "cache_resident_slots": 0,
+            "cache_free_slots": 0,
+            "cache_evictions_total": 0,
+            "gate_capacity_slots": 0,
+            "gate_resident_slots": 0,
+            "gate_free_slots": 0,
+            "gate_evictions_total": 0,
+            "up_capacity_slots": 0,
+            "up_resident_slots": 0,
+            "up_free_slots": 0,
+            "up_evictions_total": 0,
+            "down_capacity_slots": 0,
+            "down_resident_slots": 0,
+            "down_free_slots": 0,
+            "down_evictions_total": 0,
             "cpu_compute_time": 0.0,
             "gpu_compute_time": 0.0,
             "cpu_queue_wait_time": 0.0,
@@ -353,6 +369,22 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
             agg_stats["overlap_ratio_count"] += 1
         agg_stats["promotion_queue_depth"] = int(stats.get("promotion_queue_depth", agg_stats["promotion_queue_depth"]))
         agg_stats["cache_hit_rate"] = float(stats.get("cache_hit_rate", agg_stats["cache_hit_rate"]))
+        agg_stats["cache_capacity_slots"] = int(stats.get("cache_capacity_slots", agg_stats["cache_capacity_slots"]))
+        agg_stats["cache_resident_slots"] = int(stats.get("cache_resident_slots", agg_stats["cache_resident_slots"]))
+        agg_stats["cache_free_slots"] = int(stats.get("cache_free_slots", agg_stats["cache_free_slots"]))
+        agg_stats["cache_evictions_total"] = int(stats.get("cache_evictions_total", agg_stats["cache_evictions_total"]))
+        agg_stats["gate_capacity_slots"] = int(stats.get("gate_capacity_slots", agg_stats["gate_capacity_slots"]))
+        agg_stats["gate_resident_slots"] = int(stats.get("gate_resident_slots", agg_stats["gate_resident_slots"]))
+        agg_stats["gate_free_slots"] = int(stats.get("gate_free_slots", agg_stats["gate_free_slots"]))
+        agg_stats["gate_evictions_total"] = int(stats.get("gate_evictions_total", agg_stats["gate_evictions_total"]))
+        agg_stats["up_capacity_slots"] = int(stats.get("up_capacity_slots", agg_stats["up_capacity_slots"]))
+        agg_stats["up_resident_slots"] = int(stats.get("up_resident_slots", agg_stats["up_resident_slots"]))
+        agg_stats["up_free_slots"] = int(stats.get("up_free_slots", agg_stats["up_free_slots"]))
+        agg_stats["up_evictions_total"] = int(stats.get("up_evictions_total", agg_stats["up_evictions_total"]))
+        agg_stats["down_capacity_slots"] = int(stats.get("down_capacity_slots", agg_stats["down_capacity_slots"]))
+        agg_stats["down_resident_slots"] = int(stats.get("down_resident_slots", agg_stats["down_resident_slots"]))
+        agg_stats["down_free_slots"] = int(stats.get("down_free_slots", agg_stats["down_free_slots"]))
+        agg_stats["down_evictions_total"] = int(stats.get("down_evictions_total", agg_stats["down_evictions_total"]))
 
     def _get_study2_profile_prefix(self, expert_id: int, step_idx: int, token_count: int) -> Optional[str]:
         """Build Study2 NVTX prefix for real-model profiling when enabled via env."""
@@ -1151,6 +1183,10 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
                 overlap_ratio_avg = colora_stats["overlap_ratio_sum"] / float(colora_stats["overlap_ratio_count"])
             logger.debug(
                 "[COLoRA] layer=%s hit_tokens=%s miss_tokens=%s queue_depth=%s hit_rate=%.4f "
+                "cache_capacity_slots=%s cache_resident_slots=%s cache_free_slots=%s cache_evictions_total=%s "
+                "gate_capacity_slots=%s gate_resident_slots=%s gate_free_slots=%s gate_evictions_total=%s "
+                "up_capacity_slots=%s up_resident_slots=%s up_free_slots=%s up_evictions_total=%s "
+                "down_capacity_slots=%s down_resident_slots=%s down_free_slots=%s down_evictions_total=%s "
                 "cpu_compute_time=%.6f gpu_compute_time=%.6f cpu_queue_wait=%.6f "
                 "d2h_bytes=%.0f h2d_bytes=%.0f overlap_ratio=%.4f fallback_degrade_count=%s cpu_queue_depth=%s "
                 "promotion_drop_total=%s promotion_drop_queue=%s promotion_drop_cooldown=%s "
@@ -1164,6 +1200,22 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
                 colora_stats["colora_miss_tokens"],
                 colora_stats["promotion_queue_depth"],
                 colora_stats["cache_hit_rate"],
+                colora_stats["cache_capacity_slots"],
+                colora_stats["cache_resident_slots"],
+                colora_stats["cache_free_slots"],
+                colora_stats["cache_evictions_total"],
+                colora_stats["gate_capacity_slots"],
+                colora_stats["gate_resident_slots"],
+                colora_stats["gate_free_slots"],
+                colora_stats["gate_evictions_total"],
+                colora_stats["up_capacity_slots"],
+                colora_stats["up_resident_slots"],
+                colora_stats["up_free_slots"],
+                colora_stats["up_evictions_total"],
+                colora_stats["down_capacity_slots"],
+                colora_stats["down_resident_slots"],
+                colora_stats["down_free_slots"],
+                colora_stats["down_evictions_total"],
                 colora_stats["cpu_compute_time"],
                 colora_stats["gpu_compute_time"],
                 colora_stats["cpu_queue_wait_time"],

@@ -26,6 +26,22 @@ MONITOR_INFO = {
     "lightllm_cache_length": "Length of tokens which hit prompt cache",
     "lightllm_cache_ratio": "cache length / input_length",
     "lightllm_batch_current_max_tokens": "dynamic max token used for current batch",
+    "lightllm_colora_cache_capacity_slots": "Total COLoRA GPU hot-cache slot capacity",
+    "lightllm_colora_cache_resident_slots": "Total COLoRA GPU hot-cache resident slots",
+    "lightllm_colora_cache_free_slots": "Total COLoRA GPU hot-cache free slots",
+    "lightllm_colora_cache_evictions_total": "Total COLoRA GPU hot-cache evictions",
+    "lightllm_colora_cache_capacity_slots_gate": "COLoRA gate-projection GPU hot-cache slot capacity",
+    "lightllm_colora_cache_resident_slots_gate": "COLoRA gate-projection GPU hot-cache resident slots",
+    "lightllm_colora_cache_free_slots_gate": "COLoRA gate-projection GPU hot-cache free slots",
+    "lightllm_colora_cache_evictions_total_gate": "COLoRA gate-projection GPU hot-cache evictions",
+    "lightllm_colora_cache_capacity_slots_up": "COLoRA up-projection GPU hot-cache slot capacity",
+    "lightllm_colora_cache_resident_slots_up": "COLoRA up-projection GPU hot-cache resident slots",
+    "lightllm_colora_cache_free_slots_up": "COLoRA up-projection GPU hot-cache free slots",
+    "lightllm_colora_cache_evictions_total_up": "COLoRA up-projection GPU hot-cache evictions",
+    "lightllm_colora_cache_capacity_slots_down": "COLoRA down-projection GPU hot-cache slot capacity",
+    "lightllm_colora_cache_resident_slots_down": "COLoRA down-projection GPU hot-cache resident slots",
+    "lightllm_colora_cache_free_slots_down": "COLoRA down-projection GPU hot-cache free slots",
+    "lightllm_colora_cache_evictions_total_down": "COLoRA down-projection GPU hot-cache evictions",
 }
 
 
@@ -88,6 +104,22 @@ class Monitor:
         self.create_gauge("lightllm_batch_current_size")
         self.create_gauge("lightllm_batch_pause_size")
         self.create_gauge("lightllm_batch_current_max_tokens")
+        self.create_gauge("lightllm_colora_cache_capacity_slots")
+        self.create_gauge("lightllm_colora_cache_resident_slots")
+        self.create_gauge("lightllm_colora_cache_free_slots")
+        self.create_gauge("lightllm_colora_cache_evictions_total")
+        self.create_gauge("lightllm_colora_cache_capacity_slots_gate")
+        self.create_gauge("lightllm_colora_cache_resident_slots_gate")
+        self.create_gauge("lightllm_colora_cache_free_slots_gate")
+        self.create_gauge("lightllm_colora_cache_evictions_total_gate")
+        self.create_gauge("lightllm_colora_cache_capacity_slots_up")
+        self.create_gauge("lightllm_colora_cache_resident_slots_up")
+        self.create_gauge("lightllm_colora_cache_free_slots_up")
+        self.create_gauge("lightllm_colora_cache_evictions_total_up")
+        self.create_gauge("lightllm_colora_cache_capacity_slots_down")
+        self.create_gauge("lightllm_colora_cache_resident_slots_down")
+        self.create_gauge("lightllm_colora_cache_free_slots_down")
+        self.create_gauge("lightllm_colora_cache_evictions_total_down")
         batch_size_buckets = [i + 1 for i in range(0, 128)]
         self.create_histogram("lightllm_batch_next_size", batch_size_buckets)
 

@@ -154,15 +154,15 @@ class _JointAccessState:
 
 @dataclass
 class ColoraCompletionTask:
-    """Task for COLaRA request-level completion on CPU after pausing mid-layer."""
+    """Task for COLoRA request-level completion of one paused MoE layer."""
     req_obj: 'InferReq'
-    current_layer: int
-    hidden_input: torch.Tensor  # CPU tensor, shape [1, hidden_dim]
-    expert_ids: List[int]
-    adapter_bin: int
     layer_id: int
-    all_layers: List[Any]
-    all_weights: List[Any]
+    hidden_after_attention: torch.Tensor
+    partial_ffn_output: torch.Tensor
+    cold_expert_ids: List[int]
+    cold_routing_weights: List[float]
+    adapter_bin: int
+    layer_weight: Any
 
 
 @dataclass
@@ -561,6 +561,7 @@ class Qwen3VLMoELoRADispatcher:
         # COLaRA request-level skip-and-reinsert
         colora_request_skip: bool = True,
         colora_max_continuations: int = 8,
+        metric_client: Optional[Any] = None,
     ):
         self.num_layers = num_layers
         self.lora_compute_config = lora_compute_config or LoRAComputeConfig()
@@ -608,6 +609,7 @@ class Qwen3VLMoELoRADispatcher:
         # COLaRA request-level skip-and-reinsert
         self.colora_request_skip = bool(colora_request_skip)
         self.colora_max_continuations = max(int(colora_max_continuations), 1)
+        self.metric_client = metric_client
         self._cpu_executor: Optional[ThreadPoolExecutor] = None
         self._prefetch_executor: Optional[ThreadPoolExecutor] = None
         self._cpu_queue_lock = threading.Lock()
@@ -649,6 +651,22 @@ class Qwen3VLMoELoRADispatcher:
             "colora_miss_tokens": 0,
             "promotion_queue_depth": 0,
             "cache_hit_rate": 0.0,
+            "cache_capacity_slots": 0,
+            "cache_resident_slots": 0,
+            "cache_free_slots": 0,
+            "cache_evictions_total": 0,
+            "gate_capacity_slots": 0,
+            "gate_resident_slots": 0,
+            "gate_free_slots": 0,
+            "gate_evictions_total": 0,
+            "up_capacity_slots": 0,
+            "up_resident_slots": 0,
+            "up_free_slots": 0,
+            "up_evictions_total": 0,
+            "down_capacity_slots": 0,
+            "down_resident_slots": 0,
+            "down_free_slots": 0,
+            "down_evictions_total": 0,
             "cpu_compute_time": 0.0,
             "gpu_compute_time": 0.0,
             "cpu_queue_wait_time": 0.0,
@@ -1241,6 +1259,22 @@ class Qwen3VLMoELoRADispatcher:
             "colora_miss_tokens": 0,
             "promotion_queue_depth": 0,
             "cache_hit_rate": 0.0,
+            "cache_capacity_slots": 0,
+            "cache_resident_slots": 0,
+            "cache_free_slots": 0,
+            "cache_evictions_total": 0,
+            "gate_capacity_slots": 0,
+            "gate_resident_slots": 0,
+            "gate_free_slots": 0,
+            "gate_evictions_total": 0,
+            "up_capacity_slots": 0,
+            "up_resident_slots": 0,
+            "up_free_slots": 0,
+            "up_evictions_total": 0,
+            "down_capacity_slots": 0,
+            "down_resident_slots": 0,
+            "down_free_slots": 0,
+            "down_evictions_total": 0,
             "cpu_compute_time": 0.0,
             "gpu_compute_time": 0.0,
             "cpu_queue_wait_time": 0.0,
@@ -1812,9 +1846,61 @@ class Qwen3VLMoELoRADispatcher:
             self._last_colora_stats["prefetch_slot_overwrite"] = int(
                 self._temporal_hot_cache.get_slot_overwrite_count()
             )
+        self._append_cache_observability_stats(self._last_colora_stats)
         stats = dict(self._last_colora_stats)
+        self._publish_cache_observability_metrics(stats)
         self._reset_colora_stats()
         return stats
+
+    def _append_cache_observability_stats(self, stats: Dict[str, float]) -> None:
+        manager = self.expert_cache_manager
+        if manager is None or not hasattr(manager, "get_cache_observability_stats"):
+            return
+
+        cache_stats = manager.get_cache_observability_stats()
+        total = cache_stats.get("total", {})
+        by_projection = cache_stats.get("by_projection", {})
+
+        stats["cache_capacity_slots"] = int(total.get("capacity_slots", 0))
+        stats["cache_resident_slots"] = int(total.get("resident_slots", 0))
+        stats["cache_free_slots"] = int(total.get("free_slots", 0))
+        stats["cache_evictions_total"] = int(total.get("evictions_total", 0))
+
+        for projection in ("gate", "up", "down"):
+            projection_stats = by_projection.get(projection, {})
+            stats[f"{projection}_capacity_slots"] = int(projection_stats.get("capacity_slots", 0))
+            stats[f"{projection}_resident_slots"] = int(projection_stats.get("resident_slots", 0))
+            stats[f"{projection}_free_slots"] = int(projection_stats.get("free_slots", 0))
+            stats[f"{projection}_evictions_total"] = int(projection_stats.get("evictions_total", 0))
+
+    def _publish_cache_observability_metrics(self, stats: Dict[str, float]) -> None:
+        metric_client = self.metric_client
+        if metric_client is None:
+            return
+
+        gauge_values = {
+            "lightllm_colora_cache_capacity_slots": stats.get("cache_capacity_slots", 0),
+            "lightllm_colora_cache_resident_slots": stats.get("cache_resident_slots", 0),
+            "lightllm_colora_cache_free_slots": stats.get("cache_free_slots", 0),
+            "lightllm_colora_cache_evictions_total": stats.get("cache_evictions_total", 0),
+            "lightllm_colora_cache_capacity_slots_gate": stats.get("gate_capacity_slots", 0),
+            "lightllm_colora_cache_resident_slots_gate": stats.get("gate_resident_slots", 0),
+            "lightllm_colora_cache_free_slots_gate": stats.get("gate_free_slots", 0),
+            "lightllm_colora_cache_evictions_total_gate": stats.get("gate_evictions_total", 0),
+            "lightllm_colora_cache_capacity_slots_up": stats.get("up_capacity_slots", 0),
+            "lightllm_colora_cache_resident_slots_up": stats.get("up_resident_slots", 0),
+            "lightllm_colora_cache_free_slots_up": stats.get("up_free_slots", 0),
+            "lightllm_colora_cache_evictions_total_up": stats.get("up_evictions_total", 0),
+            "lightllm_colora_cache_capacity_slots_down": stats.get("down_capacity_slots", 0),
+            "lightllm_colora_cache_resident_slots_down": stats.get("down_resident_slots", 0),
+            "lightllm_colora_cache_free_slots_down": stats.get("down_free_slots", 0),
+            "lightllm_colora_cache_evictions_total_down": stats.get("down_evictions_total", 0),
+        }
+        for gauge_name, value in gauge_values.items():
+            try:
+                metric_client.gauge_set(gauge_name, float(value))
+            except Exception as e:
+                logger.debug("[COLoRA] Failed to update gauge %s: %s", gauge_name, e)
 
     def _batch_apply_moe_lora_hybrid(
         self,
@@ -2952,6 +3038,7 @@ def create_vl_moe_lora_dispatcher(
     colora_temporal_hot_cache_slots: int = 64,
     colora_request_skip: bool = True,
     colora_max_continuations: int = 8,
+    metric_client: Optional[Any] = None,
 ) -> Qwen3VLMoELoRADispatcher:
     """
     Factory function to create a VL-MoE LoRA dispatcher with S-LoRA batched mode.
@@ -2994,6 +3081,7 @@ def create_vl_moe_lora_dispatcher(
         colora_temporal_hot_cache_slots=colora_temporal_hot_cache_slots,
         colora_request_skip=colora_request_skip,
         colora_max_continuations=colora_max_continuations,
+        metric_client=metric_client,
     )
 
 

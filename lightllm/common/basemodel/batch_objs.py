@@ -94,6 +94,8 @@ class ModelOutput:
     logits: torch.Tensor
     # 用于判断 mem_indexes 是否成功写入 req manager 中的事件对象。
     prefill_mem_indexes_ready_event: torch.Event = None
+    # Decode-only: map each output row back to its original input-batch row.
+    active_request_positions: Optional[torch.Tensor] = None
 
     # 专有变量，用于一些特殊的模型，特殊的模式下, 传递一些特殊
     # 的输出变量。只在特殊的模型模式下才会具体使用和生效。
@@ -107,3 +109,5 @@ class ModelOutput:
         self.logits = tensor_to_no_ref_tensor(self.logits)
         if self.deepseekv3_mtp_main_output_hiddens is not None:
             self.deepseekv3_mtp_main_output_hiddens = tensor_to_no_ref_tensor(self.deepseekv3_mtp_main_output_hiddens)
+        if self.active_request_positions is not None:
+            self.active_request_positions = tensor_to_no_ref_tensor(self.active_request_positions)

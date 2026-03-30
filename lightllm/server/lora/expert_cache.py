@@ -77,11 +77,14 @@ class MoEExpertCacheManager:
         self._dropped_promotions_by_cooldown = 0
         self._dropped_promotions_by_no_slot = 0
         self._dropped_promotions_by_missing_source = 0
+        self._evictions_total = 0
+        self._evictions_by_projection: Dict[str, int] = {}
         self._schedule_step = 0
 
     def register_projection_pool(self, projection: str, pool) -> None:
         """Register source CPU pool and allocate GPU cache buffers for one projection."""
         self._source_pools[projection] = pool
+        self._evictions_by_projection[projection] = 0
 
         if pool is None:
             return
@@ -145,6 +148,40 @@ class MoEExpertCacheManager:
             "cooldown": int(self._dropped_promotions_by_cooldown),
             "no_slot": int(self._dropped_promotions_by_no_slot),
             "missing_source": int(self._dropped_promotions_by_missing_source),
+        }
+
+    def get_cache_observability_stats(self) -> Dict[str, Dict[str, Dict[str, int]]]:
+        with self._lock:
+            by_projection: Dict[str, Dict[str, int]] = {}
+            total_capacity = 0
+            total_resident = 0
+            total_free = 0
+            total_evictions = 0
+
+            for projection, state in self._states.items():
+                capacity_slots = int(state.max_slots)
+                resident_slots = int(len(state.slot_to_key))
+                free_slots = int(len(state.free_slots))
+                evictions_total = int(self._evictions_by_projection.get(projection, 0))
+                by_projection[projection] = {
+                    "capacity_slots": capacity_slots,
+                    "resident_slots": resident_slots,
+                    "free_slots": free_slots,
+                    "evictions_total": evictions_total,
+                }
+                total_capacity += capacity_slots
+                total_resident += resident_slots
+                total_free += free_slots
+                total_evictions += evictions_total
+
+        return {
+            "total": {
+                "capacity_slots": int(total_capacity),
+                "resident_slots": int(total_resident),
+                "free_slots": int(total_free),
+                "evictions_total": int(total_evictions),
+            },
+            "by_projection": by_projection,
         }
 
     def _get_queue_high_watermark(self) -> int:
@@ -320,6 +357,8 @@ class MoEExpertCacheManager:
         slot_id = entry.slot_id
         del state.entries[candidate_key]
         state.slot_to_key.pop(slot_id, None)
+        self._evictions_total += 1
+        self._evictions_by_projection[projection] = int(self._evictions_by_projection.get(projection, 0)) + 1
         return slot_id
 
     def apply_completed_promotions(self) -> int:

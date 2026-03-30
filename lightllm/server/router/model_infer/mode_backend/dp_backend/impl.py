@@ -99,12 +99,10 @@ class DPChunkedPrefillBackend(ModeBackend):
                 # Process completed COLoRA continuations
                 # CPU workers push completed tasks to the completion queue
                 # We just need to acknowledge them - state is already updated in callback
-                if hasattr(self, 'lora_dispatcher'):
-                    for dispatcher in self.lora_dispatcher.values():
-                        if hasattr(dispatcher, 'colora_completion_queue'):
-                            while not dispatcher.colora_completion_queue.empty():
-                                # Task completion already updated request state in the callback
-                                dispatcher.colora_completion_queue.get()
+                for dispatcher in getattr(self, "lora_dispatchers", []):
+                    if hasattr(dispatcher, "colora_completion_queue"):
+                        while not dispatcher.colora_completion_queue.empty():
+                            dispatcher.colora_completion_queue.get()
 
                 prefill_reqs, decode_reqs = self._get_classed_reqs(
                     no_decode=self.classed_req_no_decode,
@@ -217,122 +215,125 @@ class DPChunkedPrefillBackend(ModeBackend):
             model_input, run_reqs_norm = padded_prepare_decode_inputs(
                 req_objs=normal_decode_reqs, decode_step_id=decode_step_id
             )
-            run_reqs.extend(run_reqs_norm)
-            model_input: ModelInput = model_input
-            run_reqs_num = len(run_reqs)
             with torch.cuda.stream(g_infer_context.get_overlap_stream()):
                 model_output = self.model.forward(model_input)
-                if run_reqs_num > 0:
+                active_logits, active_b_req_idx, active_b_mtp_index, active_run_reqs = self._select_active_decode_outputs(
+                    model_output,
+                    model_input.b_req_idx,
+                    model_input.b_mtp_index,
+                    run_reqs_norm,
+                )
+                if active_run_reqs:
                     _, nti_cpu, ntp_cpu = self._sample_and_scatter_token(
-                        logits=model_output.logits[:run_reqs_num],
-                        b_req_idx=model_input.b_req_idx[:run_reqs_num],
-                        b_mtp_index=model_input.b_mtp_index[:run_reqs_num],
-                        run_reqs=run_reqs_norm,
+                        logits=active_logits,
+                        b_req_idx=active_b_req_idx,
+                        b_mtp_index=active_b_mtp_index,
+                        run_reqs=active_run_reqs,
                         is_prefill=False,
                         mask_func=None,
                     )
+                    run_reqs.extend(active_run_reqs)
                     next_token_ids_cpu.extend(nti_cpu)
                     next_token_logprobs_cpu.extend(ntp_cpu)
-                    sync_event = torch.cuda.Event()
-                    sync_event.record()
+                sync_event = torch.cuda.Event()
+                sync_event.record()
 
         # Process COLaRA continuation requests
         if continuation_reqs:
             from lightllm.common.basemodel.batch_objs import ModelInput
 
-            # Build continuation model input
-            batch_size = len(continuation_reqs)
-            b_req_idx = []
-            b_adapter_bin = []
-            b_trace_req_id = []
-            b_mtp_index = []
-            b_seq_len = []
-            resume_from_layer = []
-            resumed_hidden = []
-            mem_indexes_cpu = []
-            multimodal_params = []
-
+            grouped_continuations: dict[int, List[InferReq]] = {}
             for req in continuation_reqs:
                 cont = req.colora_continuation
-                b_req_idx.append(req.req_idx)
-                from lightllm.server.router.model_infer.infer_batch import get_req_adapter_bin
-                adapter_bin = get_req_adapter_bin(req)
-                b_adapter_bin.append(adapter_bin)
-                b_trace_req_id.append(req.req_id)
-                b_mtp_index.append(0)
-                seq_len = req.get_cur_total_len()
-                b_seq_len.append(seq_len)
-                resume_from_layer.append(cont.resume_layer)
-                resumed_hidden.append(cont.saved_hidden)
-                mem_indexes_cpu.append(cont.mem_index)
-                multimodal_params.append(req.multimodal_params)
+                if cont is None:
+                    continue
+                grouped_continuations.setdefault(int(cont.resume_layer), []).append(req)
 
-            # All resumed hidden should have same resume_from_layer
-            resume_from_layer = resume_from_layer[0]
+            for resume_from_layer, grouped_reqs in grouped_continuations.items():
+                batch_size = len(grouped_reqs)
+                b_req_idx = []
+                b_adapter_bin = []
+                b_trace_req_id = []
+                b_mtp_index = []
+                b_seq_len = []
+                resumed_hidden = []
+                mem_indexes_cpu = []
+                multimodal_params = []
 
-            # Concatenate all resumed hiddens
-            resumed_hidden = torch.cat(resumed_hidden, dim=0)
-            b_req_idx = torch.tensor(b_req_idx, dtype=torch.int32, device='cpu')
-            b_adapter_bin = torch.tensor(b_adapter_bin, dtype=torch.int32, device='cpu')
-            b_trace_req_id = torch.tensor(b_trace_req_id, dtype=torch.int64, device='cpu')
-            b_mtp_index = torch.tensor(b_mtp_index, dtype=torch.int32, device='cpu')
-            b_seq_len = torch.tensor(b_seq_len, dtype=torch.int32, device='cpu')
-            max_len_in_batch = max(b_seq_len)
-            max_kv_seq_len = max(b_seq_len)
+                for req in grouped_reqs:
+                    cont = req.colora_continuation
+                    b_req_idx.append(req.req_idx)
+                    from lightllm.server.router.model_infer.infer_batch import get_req_adapter_bin
+                    adapter_bin = get_req_adapter_bin(req)
+                    b_adapter_bin.append(adapter_bin)
+                    b_trace_req_id.append(req.req_id)
+                    b_mtp_index.append(0)
+                    seq_len = req.get_cur_total_len()
+                    b_seq_len.append(seq_len)
+                    resumed_hidden.append(cont.saved_hidden)
+                    mem_indexes_cpu.append(cont.mem_index)
+                    multimodal_params.append(req.multimodal_params)
 
-            cont_model_input = ModelInput()
-            cont_model_input.b_req_idx = b_req_idx
-            cont_model_input.b_adapter_bin = b_adapter_bin
-            cont_model_input.b_trace_req_id = b_trace_req_id
-            cont_model_input.b_mtp_index = b_mtp_index
-            cont_model_input.b_seq_len = b_seq_len
-            cont_model_input.max_len_in_batch = max_len_in_batch
-            cont_model_input.max_kv_seq_len = max_kv_seq_len
-            cont_model_input.multimodal_params = multimodal_params
-            cont_model_input.is_prefill = False
-            cont_model_input.resume_from_layer = resume_from_layer
-            cont_model_input.resumed_hidden = resumed_hidden
-            cont_model_input.is_continuation_batch = True
-            cont_model_input.mem_indexes = torch.cat(mem_indexes_cpu, dim=0)
+                resumed_hidden = torch.cat(resumed_hidden, dim=0)
+                b_req_idx = torch.tensor(b_req_idx, dtype=torch.int32, device='cpu')
+                b_adapter_bin = torch.tensor(b_adapter_bin, dtype=torch.int32, device='cpu')
+                b_trace_req_id = torch.tensor(b_trace_req_id, dtype=torch.int64, device='cpu')
+                b_mtp_index = torch.tensor(b_mtp_index, dtype=torch.int32, device='cpu')
+                b_seq_len = torch.tensor(b_seq_len, dtype=torch.int32, device='cpu')
+                max_len_in_batch = max(b_seq_len)
+                max_kv_seq_len = max(b_seq_len)
+                max_q_seq_len = 1
+                mem_indexes_cpu = torch.cat(mem_indexes_cpu, dim=0)
 
-            cont_run_reqs = continuation_reqs
-            run_reqs.extend(continuation_reqs)
-
-            with torch.cuda.stream(g_infer_context.get_overlap_stream()):
-                cont_model_output = self.model.forward(cont_model_input)
-                _, nti_cpu, ntp_cpu = self._sample_and_scatter_token(
-                    logits=cont_model_output.logits,
-                    b_req_idx=cont_model_input.b_req_idx,
-                    b_mtp_index=cont_model_input.b_mtp_index,
-                    run_reqs=continuation_reqs,
+                cont_model_input = ModelInput(
+                    batch_size=batch_size,
+                    total_token_num=sum(b_seq_len),
+                    max_len_in_batch=max_len_in_batch,
+                    max_q_seq_len=max_q_seq_len,
+                    max_kv_seq_len=max_kv_seq_len,
+                    input_ids=None,
+                    mem_indexes_cpu=mem_indexes_cpu,
+                    b_req_idx=b_req_idx,
+                    b_adapter_bin=b_adapter_bin,
+                    b_trace_req_id=b_trace_req_id,
+                    b_mtp_index=b_mtp_index,
+                    b_seq_len=b_seq_len,
                     is_prefill=False,
-                    mask_func=None,
+                    decode_step_id=decode_step_id,
+                    is_continuation_batch=True,
+                    resume_from_layer=resume_from_layer,
+                    resumed_hidden=resumed_hidden,
                 )
-                # Clear the continuation since we're done with it
-                for req in continuation_reqs:
-                    req.colora_continuation = None
-                next_token_ids_cpu.extend(nti_cpu)
-                next_token_logprobs_cpu.extend(ntp_cpu)
-                # sync_event is created only if we have normal decoding, else create it
-                if not normal_decode_reqs:
-                    sync_event = torch.cuda.Event()
-                    sync_event.record()
+                cont_model_input.multimodal_params = multimodal_params
+
+                with torch.cuda.stream(g_infer_context.get_overlap_stream()):
+                    cont_model_output = self.model.forward(cont_model_input)
+                    active_logits, active_b_req_idx, active_b_mtp_index, active_run_reqs = self._select_active_decode_outputs(
+                        cont_model_output,
+                        cont_model_input.b_req_idx,
+                        cont_model_input.b_mtp_index,
+                        grouped_reqs,
+                    )
+                    if active_run_reqs:
+                        _, nti_cpu, ntp_cpu = self._sample_and_scatter_token(
+                            logits=active_logits,
+                            b_req_idx=active_b_req_idx,
+                            b_mtp_index=active_b_mtp_index,
+                            run_reqs=active_run_reqs,
+                            is_prefill=False,
+                            mask_func=None,
+                        )
+                        run_reqs.extend(active_run_reqs)
+                        next_token_ids_cpu.extend(nti_cpu)
+                        next_token_logprobs_cpu.extend(ntp_cpu)
+                    for req in grouped_reqs:
+                        if req.colora_continuation is not None and req.colora_continuation.completed:
+                            req.colora_continuation = None
+                    if not normal_decode_reqs:
+                        sync_event = torch.cuda.Event()
+                        sync_event.record()
 
         run_reqs_num = len(run_reqs)
-        with torch.cuda.stream(g_infer_context.get_overlap_stream()):
-            model_output = self.model.forward(model_input)
-            if run_reqs_num > 0:
-                _, next_token_ids_cpu, next_token_logprobs_cpu = self._sample_and_scatter_token(
-                    logits=model_output.logits[:run_reqs_num],
-                    b_req_idx=model_input.b_req_idx[:run_reqs_num],
-                    b_mtp_index=model_input.b_mtp_index[:run_reqs_num],
-                    run_reqs=run_reqs,
-                    is_prefill=False,
-                    mask_func=None,
-                )
-                sync_event = torch.cuda.Event()
-                sync_event.record()
-
         if run_reqs_num > 0:
             # 第二阶段
             event_pack.notify_post_handle_and_wait_pre_post_handle()

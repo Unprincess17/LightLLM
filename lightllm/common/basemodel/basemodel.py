@@ -330,6 +330,11 @@ class TpPartBaseModel:
         infer_state.resume_from_layer = model_input.resume_from_layer
         infer_state.resumed_hidden = model_input.resumed_hidden
         infer_state.is_continuation = model_input.is_continuation_batch
+        infer_state.active_request_positions = torch.arange(
+            model_input.batch_size,
+            dtype=torch.long,
+            device=infer_state.b_req_idx.device,
+        )
 
         return infer_state
 
@@ -613,6 +618,18 @@ class TpPartBaseModel:
             layer = self.layers_infer[i]
             layer_method = (layer.token_forward, layer.tpsp_token_forward)[run_mode_index]
             input_embs: torch.Tensor = layer_method(input_embs, infer_state, self.trans_layers_weight[i])
+            if infer_state.batch_size == 0:
+                break
+
+        if infer_state.batch_size == 0:
+            logits = torch.empty(
+                (0, self.pre_post_weight.lm_head_weight_.shape[0]),
+                dtype=torch.float32,
+                device=input_embs.device,
+            )
+            model_output = ModelOutput(logits=logits)
+            model_output.active_request_positions = infer_state.active_request_positions
+            return model_output
 
         post_method = (self.post_infer.token_forward, self.post_infer.tpsp_token_forward)[run_mode_index]
         predict_logits: torch.Tensor = post_method(input_embs, infer_state, self.pre_post_weight)
@@ -621,6 +638,7 @@ class TpPartBaseModel:
             graph_out_hiddens = input_embs.contiguous()
 
         model_output = ModelOutput(logits=predict_logits.contiguous())
+        model_output.active_request_positions = infer_state.active_request_positions
 
         # 特殊模型特殊模式的额外输出
         if self.is_deepseekv3_mtp_mode:
@@ -651,11 +669,24 @@ class TpPartBaseModel:
             layer = self.layers_infer[i]
             layer_method = (layer.token_forward, layer.tpsp_token_forward)[run_mode_index]
             input_embs: torch.Tensor = layer_method(input_embs, infer_state, self.trans_layers_weight[i])
+            if infer_state.batch_size == 0:
+                break
+
+        if infer_state.batch_size == 0:
+            logits = torch.empty(
+                (0, self.pre_post_weight.lm_head_weight_.shape[0]),
+                dtype=torch.float32,
+                device=input_embs.device,
+            )
+            model_output = ModelOutput(logits=logits)
+            model_output.active_request_positions = infer_state.active_request_positions
+            return model_output
 
         post_method = (self.post_infer.token_forward, self.post_infer.tpsp_token_forward)[run_mode_index]
         predict_logits: torch.Tensor = post_method(input_embs, infer_state, self.pre_post_weight)
 
         model_output = ModelOutput(logits=predict_logits.contiguous())
+        model_output.active_request_positions = infer_state.active_request_positions
 
         if self.is_deepseekv3_mtp_mode:
             model_output.deepseekv3_mtp_main_output_hiddens = input_embs.contiguous()

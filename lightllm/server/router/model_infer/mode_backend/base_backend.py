@@ -45,6 +45,7 @@ from lightllm.models.deepseek_mtp.model import Deepseek3MTPModel
 from lightllm.server.router.model_infer.mode_backend.generic_post_process import sample
 from lightllm.common.basemodel.triton_kernel.gather_token_id import scatter_token
 from lightllm.server.pd_io_struct import NIXLChunckedTransTaskRet
+from lightllm.server.metrics.manager import MetricClient
 from .multi_level_kv_cache import MultiLevelKvCacheModule
 from lightllm.server.embed_cache.embed_cache_client import CpuEmbedCacheClient
 
@@ -80,6 +81,7 @@ class ModeBackend:
         self._enable_radix_tree_timer_merge: bool = enable_radix_tree_timer_merge()
         self._radix_tree_merge_update_delta: int = get_radix_tree_merge_update_delta()
         self._decode_step_id: int = 0
+        self.colora_metric_client: Optional[MetricClient] = None
         pass
 
     def _alloc_decode_step_id(self) -> int:
@@ -865,6 +867,44 @@ class ModeBackend:
         )
         return next_token_ids, next_token_ids_cpu, next_token_logprobs_cpu
 
+    def _select_active_decode_outputs(
+        self,
+        model_output: ModelOutput,
+        b_req_idx: torch.Tensor,
+        b_mtp_index: torch.Tensor,
+        run_reqs: List[InferReq],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[InferReq]]:
+        logits = model_output.logits
+        active_positions = getattr(model_output, "active_request_positions", None)
+
+        if active_positions is None:
+            usable = min(int(logits.shape[0]), len(run_reqs), int(b_req_idx.shape[0]))
+            if usable <= 0:
+                empty_logits = logits[:0]
+                empty_req_idx = b_req_idx[:0]
+                empty_mtp_index = b_mtp_index[:0]
+                return empty_logits, empty_req_idx, empty_mtp_index, []
+            orig_positions = torch.arange(usable, dtype=torch.long, device=b_req_idx.device)
+            row_positions = torch.arange(usable, dtype=torch.long, device=logits.device)
+        else:
+            active_positions = active_positions.to(device=b_req_idx.device, dtype=torch.long)
+            real_mask = active_positions < len(run_reqs)
+            if real_mask.numel() == 0 or not bool(torch.any(real_mask)):
+                empty_logits = logits[:0]
+                empty_req_idx = b_req_idx[:0]
+                empty_mtp_index = b_mtp_index[:0]
+                return empty_logits, empty_req_idx, empty_mtp_index, []
+            row_positions = torch.nonzero(real_mask, as_tuple=False).squeeze(-1).to(device=logits.device, dtype=torch.long)
+            orig_positions = active_positions.index_select(
+                0, row_positions.to(device=active_positions.device, dtype=torch.long)
+            )
+
+        selected_logits = logits.index_select(0, row_positions)
+        selected_b_req_idx = b_req_idx.index_select(0, orig_positions)
+        selected_b_mtp_index = b_mtp_index.index_select(0, orig_positions)
+        selected_run_reqs = [run_reqs[idx] for idx in orig_positions.detach().cpu().tolist()]
+        return selected_logits, selected_b_req_idx, selected_b_mtp_index, selected_run_reqs
+
     def _dp_all_gather_prefill_and_decode_req_num(
         self, prefill_reqs: List[InferReq], decode_reqs: List[InferReq]
     ) -> Tuple[np.ndarray, np.ndarray]:
@@ -1203,6 +1243,11 @@ class ModeBackend:
             async_fallback_enabled = bool(int(async_fallback_raw))
         except (TypeError, ValueError):
             async_fallback_enabled = bool(async_fallback_raw)
+        if self.colora_metric_client is None and self.args.metric_port is not None and get_global_rank() == 0:
+            try:
+                self.colora_metric_client = MetricClient(self.args.metric_port)
+            except Exception as e:
+                self.logger.warning(f"[COLoRA] Failed to connect metric client for cache gauges: {e}")
         for layer_id in range(num_layers):
             dispatcher_kwargs = dict(
                 num_layers=1,  # Single layer dispatcher
@@ -1221,6 +1266,7 @@ class ModeBackend:
                 colora_temporal_hot_cache_slots=int(getattr(self.args, "colora_temporal_hot_cache_slots", 64)),
                 colora_request_skip=bool(getattr(self.args, "colora_request_skip", True)),
                 colora_max_continuations=int(getattr(self.args, "colora_max_continuations", 8)),
+                metric_client=self.colora_metric_client,
             )
             try:
                 dispatcher = self._create_lora_dispatcher_fn(**dispatcher_kwargs)

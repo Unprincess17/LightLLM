@@ -84,6 +84,7 @@ class InferStateInfo:
         self.resume_from_layer: Optional[int] = None
         self.resumed_hidden: Optional[torch.Tensor] = None
         self.is_continuation: bool = False
+        self.active_request_positions: Optional[torch.Tensor] = None
 
         # 在单节点多dp的运行模式下，在进行prefill的阶段，如果出现了dp之间数据不平衡的现象，
         # 可以将推理的数据，进行重新分配到各个dp，在做 att 之前，重新 all to all 到各自的
@@ -122,6 +123,68 @@ class InferStateInfo:
             # TODO: check the correctness
             self.max_kv_seq_len = self.max_len_in_batch
             self.b_start_loc = self.b1_cu_kv_seq_len[0:-1]
+
+    def prune_decode_batch(self, keep_indices: torch.Tensor):
+        if self.is_prefill:
+            raise RuntimeError("prune_decode_batch only supports decode batches")
+
+        if keep_indices.device.type != self.b_req_idx.device.type:
+            keep_indices = keep_indices.to(device=self.b_req_idx.device)
+        keep_indices = keep_indices.to(dtype=torch.long)
+        if keep_indices.dim() != 1:
+            keep_indices = keep_indices.view(-1)
+
+        self.b_req_idx = self.b_req_idx.index_select(0, keep_indices)
+        if self.b_adapter_bin is not None:
+            self.b_adapter_bin = self.b_adapter_bin.index_select(0, keep_indices)
+        if self.b_trace_req_id is not None:
+            self.b_trace_req_id = self.b_trace_req_id.index_select(0, keep_indices)
+        if self.b_mtp_index is not None:
+            self.b_mtp_index = self.b_mtp_index.index_select(0, keep_indices)
+        if self.b_seq_len is not None:
+            self.b_seq_len = self.b_seq_len.index_select(0, keep_indices)
+        if self.mem_index is not None:
+            self.mem_index = self.mem_index.index_select(0, keep_indices)
+        if self.b_shared_seq_len is not None:
+            self.b_shared_seq_len = self.b_shared_seq_len.index_select(0, keep_indices)
+        if self.b_mark_shared_group is not None:
+            self.b_mark_shared_group = self.b_mark_shared_group.index_select(0, keep_indices)
+        if self.active_request_positions is not None:
+            self.active_request_positions = self.active_request_positions.index_select(0, keep_indices)
+
+        if self.multimodal_params is not None:
+            keep_list = keep_indices.detach().cpu().tolist()
+            self.multimodal_params = [self.multimodal_params[idx] for idx in keep_list]
+
+        try:
+            (
+                self.b_q_seq_len,
+                self.b1_cu_q_seq_len,
+                self.b_kv_seq_len,
+                self.b1_cu_kv_seq_len,
+                self.position_ids,
+            ) = gen_decode_params(self.b_seq_len)
+        except KeyError:
+            self.b_kv_seq_len = self.b_seq_len
+            self.position_ids = self.b_seq_len - 1
+            self.b_q_seq_len = torch.ones(self.b_seq_len.shape[0], dtype=torch.int32, device=self.b_seq_len.device)
+            self.b1_cu_q_seq_len = torch.zeros(self.b_q_seq_len.shape[0] + 1, dtype=torch.int32, device=self.b_seq_len.device)
+            self.b1_cu_kv_seq_len = torch.zeros(self.b_kv_seq_len.shape[0] + 1, dtype=torch.int32, device=self.b_seq_len.device)
+            if self.b_q_seq_len.numel() > 0:
+                self.b1_cu_q_seq_len[1:] = torch.cumsum(self.b_q_seq_len, dim=0, dtype=torch.int32)
+                self.b1_cu_kv_seq_len[1:] = torch.cumsum(self.b_kv_seq_len, dim=0, dtype=torch.int32)
+        self.b_start_loc = self.b1_cu_kv_seq_len[0:-1]
+
+        if hasattr(self, "position_cos") and self.position_cos is not None:
+            self.position_cos = self.position_cos.index_select(0, keep_indices)
+        if hasattr(self, "position_sin") and self.position_sin is not None:
+            self.position_sin = self.position_sin.index_select(0, keep_indices)
+
+        self.batch_size = int(self.b_req_idx.shape[0])
+        self.total_token_num = int(self.b_seq_len.sum().item()) if self.b_seq_len.numel() > 0 else 0
+        self.max_len_in_batch = int(self.b_seq_len.max().item()) if self.b_seq_len.numel() > 0 else 0
+        self.max_kv_seq_len = self.max_len_in_batch
+        self.max_q_seq_len = int(self.b_q_seq_len.max().item()) if self.b_q_seq_len.numel() > 0 else 0
 
     def copy_for_cuda_graph(self, new_infer_state: "InferStateInfo"):
         for attr_name, attr_value in vars(new_infer_state).items():
