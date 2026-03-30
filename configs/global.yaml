@@ -17,6 +17,28 @@ paths:
     - /home/shufan/Qwen-VL-FT/work/lora_dummy_7
     - /home/shufan/Qwen-VL-FT/work/lora_dummy_8
     - /home/shufan/Qwen-VL-FT/work/lora_dummy_9
+    - /home/shufan/Qwen-VL-FT/work/lora_dummy_10
+    - /home/shufan/Qwen-VL-FT/work/lora_dummy_11
+    - /home/shufan/Qwen-VL-FT/work/lora_dummy_12
+    - /home/shufan/Qwen-VL-FT/work/lora_dummy_13
+    - /home/shufan/Qwen-VL-FT/work/lora_dummy_14
+    - /home/shufan/Qwen-VL-FT/work/lora_dummy_15
+    - /home/shufan/Qwen-VL-FT/work/lora_dummy_16
+    - /home/shufan/Qwen-VL-FT/work/lora_dummy_17
+    - /home/shufan/Qwen-VL-FT/work/lora_dummy_18
+    - /home/shufan/Qwen-VL-FT/work/lora_dummy_19
+    - /home/shufan/Qwen-VL-FT/work/lora_dummy_20
+    - /home/shufan/Qwen-VL-FT/work/lora_dummy_21
+    - /home/shufan/Qwen-VL-FT/work/lora_dummy_22
+    - /home/shufan/Qwen-VL-FT/work/lora_dummy_23
+    - /home/shufan/Qwen-VL-FT/work/lora_dummy_24
+    - /home/shufan/Qwen-VL-FT/work/lora_dummy_25
+    - /home/shufan/Qwen-VL-FT/work/lora_dummy_26
+    - /home/shufan/Qwen-VL-FT/work/lora_dummy_27
+    - /home/shufan/Qwen-VL-FT/work/lora_dummy_28
+    - /home/shufan/Qwen-VL-FT/work/lora_dummy_29
+    - /home/shufan/Qwen-VL-FT/work/lora_dummy_30
+    - /home/shufan/Qwen-VL-FT/work/lora_dummy_31
 
 case_study:
   default_run_id: router_lora_case_v1
