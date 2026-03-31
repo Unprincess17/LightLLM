@@ -58,3 +58,32 @@
 | D. Background opts | 2 | 1 | 0 | 0 |
 | E. Observability | 2 | 0 | 0 | 1 |
 | **Total** | **13** | **1** | **0** | **3** |
+
+## Test gate — 2026-03-31
+
+All 25 COLoRA-targeted unit tests passed:
+- `test_colora_no_blocking_miss.py` (3 tests)
+- `test_colora_background_optimizations.py` (6 tests)
+- `test_colora_request_skip_runtime.py` (5 tests)
+- `test_case_study_system_tpot_tools.py` (3 tests)
+- `test_case_study_live_validation_tools.py` (6 tests)
+- `test_colora_cli_args.py` (2 tests)
+
+## Measured evidence — 2026-03-31
+
+### System-TPOT replay
+- **Modes available:** load_then_run (baseline only — execution_first requires `cold_path_profile` in calibration, which is absent)
+- **Conditions:** expert_only, joint_indep, joint_corr
+- **Budgets:** 0, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536
+- Verified by `tpot_quantiles.csv`: P99.9 TPOT reaches 7.06 ms under joint conditions at budget=2048 vs 1.35 ms for expert-only (confirms paper's tail-blowout claim)
+- Verified by `background_policy_summary.csv`: deferred promotion and prefetch counters present and zero under load_then_run (expected — background opts only active in execution_first)
+- **Blocker:** execution_first/no_deferred_sync replays blocked on missing `cold_path_profile` in calibration JSON — requires recalibration with COLoRA cold-path measurement enabled
+- Still unverified: speculative dispatch contribution remains unisolated (D3)
+- Still unverified: coalesced activation roundtrip in isolation (C1)
+- Still unverified: stream-level overlap measurement (C3)
+
+### Motivation figures
+- Panel A (root cause): practical-limit coverage at rank=1024: C0=89.5%, C1=9.1%, C2=13.5%
+- Panel B (capacity illusion): floor budgets: C0=2048, C2=65536
+- Panel C (tail blowout): budget=2048 P99 TPOT: C0=1.20 ms, C1=2.31 ms, C2=2.16 ms; P99.9: C0=1.35 ms, C1=7.06 ms, C2=7.06 ms
+- All panels regenerated without missing-input errors
