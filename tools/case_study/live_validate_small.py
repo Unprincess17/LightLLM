@@ -466,6 +466,16 @@ def summarize_colora_rows(rows: Sequence[Mapping[str, object]]) -> dict:
             (int(row.get("promotion_drop_cooldown", 0)) for row in rows),
             default=0,
         ),
+        "promotion_admitted_sum": sum(int(row.get("promotion_admitted", 0)) for row in rows),
+        "promotion_reject_delta_sum": sum(int(row.get("promotion_reject_delta", 0)) for row in rows),
+        "promotion_reject_no_ema_sum": sum(int(row.get("promotion_reject_no_ema", 0)) for row in rows),
+        "tracker_queue_drop_sum": sum(int(row.get("tracker_queue_drop", 0)) for row in rows),
+        "prefetch_submitted_sum": sum(int(row.get("prefetch_submitted", 0)) for row in rows),
+        "prefetch_ready_hits_sum": sum(int(row.get("prefetch_ready_hits", 0)) for row in rows),
+        "prefetch_not_ready_sum": sum(int(row.get("prefetch_not_ready", 0)) for row in rows),
+        "prefetch_stale_sum": sum(int(row.get("prefetch_stale", 0)) for row in rows),
+        "prefetch_false_positives_sum": sum(int(row.get("prefetch_false_positives", 0)) for row in rows),
+        "prefetch_slot_overwrite_end": max((int(row.get("prefetch_slot_overwrite", 0)) for row in rows), default=0),
         "fallback_degrade_count_sum": sum(int(row.get("fallback_degrade_count", 0)) for row in rows),
         "cpu_compute_time_sum": sum(float(row.get("cpu_compute_time", 0.0)) for row in rows),
         "gpu_compute_time_sum": sum(float(row.get("gpu_compute_time", 0.0)) for row in rows),
@@ -548,6 +558,22 @@ def summarize_per_window_counters(per_window_counter_rows: Sequence[Mapping[str,
         "colora_miss_tokens": total_misses,
         "observed_hit_rate": (float(total_hits) / float(total_tokens)) if total_tokens else 0.0,
         "cache_hit_rate_max": max((float(row.get("cache_hit_rate_max", 0.0)) for row in per_window_counter_rows), default=0.0),
+        "cache_capacity_slots_max": max(
+            (int(row.get("cache_capacity_slots_max", 0)) for row in per_window_counter_rows),
+            default=0,
+        ),
+        "cache_resident_slots_max": max(
+            (int(row.get("cache_resident_slots_max", 0)) for row in per_window_counter_rows),
+            default=0,
+        ),
+        "cache_free_slots_min": min(
+            (int(row.get("cache_free_slots_min", 0)) for row in per_window_counter_rows),
+            default=0,
+        ),
+        "cache_evictions_total_end": max(
+            (int(row.get("cache_evictions_total_end", 0)) for row in per_window_counter_rows),
+            default=0,
+        ),
         "promotion_queue_depth_max": max(
             (int(row.get("promotion_queue_depth_max", 0)) for row in per_window_counter_rows),
             default=0,
@@ -563,6 +589,25 @@ def summarize_per_window_counters(per_window_counter_rows: Sequence[Mapping[str,
         ),
         "promotion_drop_cooldown_end": max(
             (int(row.get("promotion_drop_cooldown_end", 0)) for row in per_window_counter_rows),
+            default=0,
+        ),
+        "promotion_admitted_sum": sum(int(row.get("promotion_admitted_sum", 0)) for row in per_window_counter_rows),
+        "promotion_reject_delta_sum": sum(
+            int(row.get("promotion_reject_delta_sum", 0)) for row in per_window_counter_rows
+        ),
+        "promotion_reject_no_ema_sum": sum(
+            int(row.get("promotion_reject_no_ema_sum", 0)) for row in per_window_counter_rows
+        ),
+        "tracker_queue_drop_sum": sum(int(row.get("tracker_queue_drop_sum", 0)) for row in per_window_counter_rows),
+        "prefetch_submitted_sum": sum(int(row.get("prefetch_submitted_sum", 0)) for row in per_window_counter_rows),
+        "prefetch_ready_hits_sum": sum(int(row.get("prefetch_ready_hits_sum", 0)) for row in per_window_counter_rows),
+        "prefetch_not_ready_sum": sum(int(row.get("prefetch_not_ready_sum", 0)) for row in per_window_counter_rows),
+        "prefetch_stale_sum": sum(int(row.get("prefetch_stale_sum", 0)) for row in per_window_counter_rows),
+        "prefetch_false_positives_sum": sum(
+            int(row.get("prefetch_false_positives_sum", 0)) for row in per_window_counter_rows
+        ),
+        "prefetch_slot_overwrite_end": max(
+            (int(row.get("prefetch_slot_overwrite_end", 0)) for row in per_window_counter_rows),
             default=0,
         ),
         "fallback_degrade_count_sum": sum(
