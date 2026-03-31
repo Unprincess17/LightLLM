@@ -115,6 +115,20 @@ def test_write_condition_merged_csv_preserves_unselected_conditions(tmp_path: Pa
     assert by_condition["joint_corr"]["p99"] == "9.0"
 
 
+def test_system_tpot_modes_cover_paper_comparison_set():
+    """E3: verify the system-TPOT tooling exposes all modes the paper compares."""
+    expected_modes = {
+        "load_then_run",
+        "execution_first",
+        "no_cpu_path",
+        "no_deferred_sync",
+    }
+    actual_modes = set(system_tpot_mod.MISS_HANDLING_MODE_ORDER)
+    assert actual_modes == expected_modes, f"Mode mismatch: extra={actual_modes - expected_modes}, missing={expected_modes - actual_modes}"
+    assert system_tpot_mod.MISS_HANDLING_MODE_ORDER[0] == "load_then_run"
+    assert system_tpot_mod.MISS_HANDLING_MODE_ORDER[1] == "execution_first"
+
+
 def test_validate_execution_first_calibration_rejects_missing_cold_path_profile():
     with pytest.raises(ValueError, match="execution-first replay requires a populated execution-first calibration manifest"):
         system_tpot_mod.validate_execution_first_calibration(
