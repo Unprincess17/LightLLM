@@ -46,7 +46,7 @@
 |---|-------|-----------|-----------|-------|--------|-------|-------------|
 | E1 | Runtime emits enough counters for paper claims (hit/miss, queueing, overlap, promotion, prefetch) | SS3 | `lora_dispatch.py:656-706` defines 39+ counters; `transformer_layer_infer.py:270-387` aggregates via `_merge_colora_stats` | `test_colora_no_blocking_miss.py` | Implemented | Full surface: hit/miss tokens, promotion breakdown, prefetch stats, overlap ratio, kernel calls, timing, bytes | -- |
 | E2 | Case-study scripts can consume counters or calibrated artifacts | Tools | `analyze_system_tpot.py` reads calibration JSON + cache replay; `live_validate_small.py` parses `[COLoRA]` debug lines from server log | `test_case_study_system_tpot_tools.py`, `test_case_study_live_validation_tools.py` | Implemented | CSV merge preserves conditions; live parser aggregates all counter fields | -- |
-| E3 | System-TPOT tooling covers the paper's comparison modes | SS3, eval | `system_tpot_core.py:59-67` defines `MISS_HANDLING_MODE_ORDER`: load_then_run, execution_first, no_cpu_path, no_deferred_sync | -- | Unverified | Constants exist but no test asserts the set matches the paper's intended comparison | test addition |
+| E3 | System-TPOT tooling covers the paper's comparison modes | SS3, eval | `system_tpot_core.py:59-67` defines `MISS_HANDLING_MODE_ORDER`: load_then_run, execution_first, no_cpu_path, no_deferred_sync | `test_case_study_system_tpot_tools.py::test_system_tpot_modes_cover_paper_comparison_set` | Implemented | Mode set and ordering locked by test | -- |
 
 ## Summary
 
@@ -56,8 +56,8 @@
 | B. Request-skip | 4 | 0 | 0 | 0 |
 | C. CPU cold-path | 1 | 0 | 0 | 2 |
 | D. Background opts | 2 | 1 | 0 | 0 |
-| E. Observability | 2 | 0 | 0 | 1 |
-| **Total** | **13** | **1** | **0** | **3** |
+| E. Observability | 3 | 0 | 0 | 0 |
+| **Total** | **14** | **1** | **0** | **2** |
 
 ## Test gate — 2026-03-31
 
@@ -87,3 +87,26 @@ All 25 COLoRA-targeted unit tests passed:
 - Panel B (capacity illusion): floor budgets: C0=2048, C2=65536
 - Panel C (tail blowout): budget=2048 P99 TPOT: C0=1.20 ms, C1=2.31 ms, C2=2.16 ms; P99.9: C0=1.35 ms, C1=7.06 ms, C2=7.06 ms
 - All panels regenerated without missing-input errors
+
+## Patch list
+
+### 1. Must fix before paper claims are credible
+
+| Item | Category | Action |
+|------|----------|--------|
+| Calibration missing `cold_path_profile` | E2E validation | measurement run: recalibrate with COLoRA cold-path measurement enabled to produce `cold_path_profile` in calibration JSON, then re-run execution_first and no_deferred_sync replays |
+
+### 2. Should fix for stronger end-to-end evidence
+
+| Item | Category | Action |
+|------|----------|--------|
+| C1: Coalesced activation roundtrip untested | CPU cold-path | test addition: unit test for `_dispatch_lora_with_coalesced_cpu_roundtrip` exercising pack -> D2H -> compute -> H2D -> scatter |
+| C3: Stream-level async overlap unverified | CPU cold-path | measurement run: NVTX trace or CUDA event timing showing overlap between GPU hot-path and CPU cold-path |
+| D3: Speculative dispatch untested at runtime | Background opts | test addition: unit test exercising `begin_spec_step` -> `maybe_submit_fused_gate_up_spec_job` -> `try_bind_gate_up_job_with_status` -> `retire_unbound_gate_up_jobs` cycle |
+
+### 3. Nice to have / future work
+
+| Item | Category | Action |
+|------|----------|--------|
+| Adaptive delta for deferred promotion | Background opts | paper wording change: currently static delta=4, adaptive online tuning is stated as future work |
+| Layer-selective temporal prefetch | Background opts | paper wording change: U-shaped locality profile (App. A) motivates layer-selective policy but current implementation is uniform |
