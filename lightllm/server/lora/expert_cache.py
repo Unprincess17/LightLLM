@@ -61,6 +61,13 @@ class _ProjectionState:
     queued: set = field(default_factory=set)
 
 
+@dataclass(frozen=True)
+class PromotionApplyResult:
+    ready_slots: Dict[ExpertCacheKey, int]
+    promoted_count: int
+    transferred_bytes: int
+
+
 class MoEExpertCacheManager:
     """Expert-level GPU hot cache for COLoRA hybrid decode path."""
 
@@ -361,6 +368,110 @@ class MoEExpertCacheManager:
         self._evictions_by_projection[projection] = int(self._evictions_by_projection.get(projection, 0)) + 1
         return slot_id
 
+    def _remove_queued_key_locked(self, state: _ProjectionState, key: ExpertCacheKey) -> None:
+        if key not in state.queued:
+            return
+        state.queued.discard(key)
+        state.promotion_queue = deque(queued_key for queued_key in state.promotion_queue if queued_key != key)
+
+    def _promote_key_locked(
+        self,
+        projection: str,
+        state: _ProjectionState,
+        src_pool,
+        key: ExpertCacheKey,
+        *,
+        non_blocking: bool,
+    ) -> Tuple[Optional[int], int]:
+        entry = state.entries.get(key)
+        if entry is None:
+            entry = _CacheEntry(
+                slot_id=-1,
+                state=ExpertCacheSlotState.INVALID,
+                utility=1.0,
+                last_access=time.time(),
+                access_count=1,
+                last_queued_step=-1,
+            )
+            state.entries[key] = entry
+
+        if entry.state == ExpertCacheSlotState.READY and entry.slot_id >= 0:
+            entry.last_access = time.time()
+            return int(entry.slot_id), 0
+
+        slot_id = entry.slot_id if entry.slot_id >= 0 else None
+        if slot_id is None:
+            if state.free_slots:
+                slot_id = state.free_slots.pop()
+            else:
+                slot_id = self.evict_one(projection)
+                if slot_id is None:
+                    entry.state = ExpertCacheSlotState.INVALID
+                    self._dropped_promotions += 1
+                    self._dropped_promotions_by_no_slot += 1
+                    return None, 0
+
+        src_slot = self._get_source_slot(src_pool, key)
+        if src_slot is None:
+            entry.state = ExpertCacheSlotState.INVALID
+            self._dropped_promotions += 1
+            self._dropped_promotions_by_missing_source += 1
+            return None, 0
+
+        rank = self._get_adapter_rank(src_pool, key.adapter_idx)
+        rank = max(min(rank, state.max_rank), 0)
+        if state.a_buffer is None or state.b_buffer is None:
+            entry.state = ExpertCacheSlotState.INVALID
+            return None, 0
+
+        if rank > 0:
+            state.a_buffer[slot_id, :rank].copy_(src_pool.key_buffer[src_slot, :rank], non_blocking=non_blocking)
+            state.b_buffer[slot_id, :rank].copy_(src_pool.value_buffer[src_slot, :rank], non_blocking=non_blocking)
+        if rank < state.max_rank:
+            state.a_buffer[slot_id, rank:].zero_()
+            state.b_buffer[slot_id, rank:].zero_()
+
+        entry.slot_id = int(slot_id)
+        entry.state = ExpertCacheSlotState.READY
+        entry.last_access = time.time()
+        state.slot_to_key[int(slot_id)] = key
+        transferred_bytes = int(rank) * int(
+            (src_pool.key_buffer.shape[2] + src_pool.value_buffer.shape[2]) * state.a_buffer.element_size()
+        )
+        return int(slot_id), transferred_bytes
+
+    def promote_blocking(self, keys: List[ExpertCacheKey]) -> PromotionApplyResult:
+        ready: Dict[ExpertCacheKey, int] = {}
+        promoted_count = 0
+        transferred_bytes = 0
+        with self._lock:
+            for key in keys:
+                state = self._states.get(key.projection)
+                src_pool = self._source_pools.get(key.projection)
+                if state is None or src_pool is None or state.max_slots <= 0:
+                    raise RuntimeError(
+                        f"blocking promotion requires a GPU cache for projection={key.projection!r}"
+                    )
+                self._remove_queued_key_locked(state, key)
+                slot_id, key_bytes = self._promote_key_locked(
+                    key.projection,
+                    state,
+                    src_pool,
+                    key,
+                    non_blocking=False,
+                )
+                if slot_id is None:
+                    raise RuntimeError(f"blocking promotion failed for projection={key.projection!r}, key={key!r}")
+                ready[key] = int(slot_id)
+                transferred_bytes += int(key_bytes)
+                if key_bytes > 0:
+                    promoted_count += 1
+        return PromotionApplyResult(
+            ready_slots=ready,
+            promoted_count=int(promoted_count),
+            transferred_bytes=int(transferred_bytes),
+        )
+
     def apply_completed_promotions(self) -> int:
         """Apply up to max_promote_per_step queued promotions."""
         promoted = 0
@@ -378,47 +489,15 @@ class MoEExpertCacheManager:
                     key = state.promotion_queue.popleft()
                     state.queued.discard(key)
 
-                    entry = state.entries.get(key)
-                    if entry is None:
-                        continue
-                    if entry.state == ExpertCacheSlotState.READY and entry.slot_id >= 0:
-                        continue
-
-                    slot_id = entry.slot_id if entry.slot_id >= 0 else None
-                    if slot_id is None:
-                        if state.free_slots:
-                            slot_id = state.free_slots.pop()
-                        else:
-                            slot_id = self.evict_one(projection)
-                            if slot_id is None:
-                                entry.state = ExpertCacheSlotState.INVALID
-                                self._dropped_promotions += 1
-                                self._dropped_promotions_by_no_slot += 1
-                                continue
-
-                    src_slot = self._get_source_slot(src_pool, key)
-                    if src_slot is None:
-                        entry.state = ExpertCacheSlotState.INVALID
-                        self._dropped_promotions += 1
-                        self._dropped_promotions_by_missing_source += 1
-                        continue
-
-                    rank = self._get_adapter_rank(src_pool, key.adapter_idx)
-                    rank = max(min(rank, state.max_rank), 0)
-
-                    assert state.a_buffer is not None and state.b_buffer is not None
-                    if rank > 0:
-                        state.a_buffer[slot_id, :rank].copy_(src_pool.key_buffer[src_slot, :rank], non_blocking=True)
-                        state.b_buffer[slot_id, :rank].copy_(src_pool.value_buffer[src_slot, :rank], non_blocking=True)
-                    if rank < state.max_rank:
-                        state.a_buffer[slot_id, rank:].zero_()
-                        state.b_buffer[slot_id, rank:].zero_()
-
-                    entry.slot_id = slot_id
-                    entry.state = ExpertCacheSlotState.READY
-                    entry.last_access = time.time()
-                    state.slot_to_key[slot_id] = key
-                    promoted += 1
+                    slot_id, key_bytes = self._promote_key_locked(
+                        projection,
+                        state,
+                        src_pool,
+                        key,
+                        non_blocking=True,
+                    )
+                    if slot_id is not None and key_bytes > 0:
+                        promoted += 1
 
         return promoted
 

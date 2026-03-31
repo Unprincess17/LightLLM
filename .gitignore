@@ -26,6 +26,8 @@ test/lora/*.sqlite
 jupyter.log
 test/lora/benchmark_lora.log
 
+.worktrees/
+
 test/lora/avx/*.csv
 test/lora/avx/*.nsys-rep
 test/lora/avx/*.sqlite

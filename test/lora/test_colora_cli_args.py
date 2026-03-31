@@ -7,6 +7,7 @@ def test_colora_cli_defaults():
     assert args.colora_deferred_promotion_delta_steps == 4
     assert args.colora_promotion_ema_alpha == 0.5
     assert args.colora_miss_policy == "cpu_first"
+    assert args.colora_overlap_mode == "full"
     assert args.colora_async_fallback == 1
     assert args.colora_cpu_workers == 4
     assert args.colora_cpu_queue_depth == 256
@@ -26,7 +27,9 @@ def test_colora_cli_overrides():
     args = parser.parse_args(
         [
             "--colora_miss_policy",
-            "load_then_run",
+            "no_cpu_path",
+            "--colora_overlap_mode",
+            "no_overlap",
             "--colora_async_fallback",
             "0",
             "--colora_cpu_workers",
@@ -55,7 +58,8 @@ def test_colora_cli_overrides():
     )
     assert args.colora_deferred_promotion_delta_steps == 7
     assert args.colora_promotion_ema_alpha == 0.3
-    assert args.colora_miss_policy == "load_then_run"
+    assert args.colora_miss_policy == "no_cpu_path"
+    assert args.colora_overlap_mode == "no_overlap"
     assert args.colora_async_fallback == 0
     assert args.colora_cpu_workers == 8
     assert args.colora_cpu_queue_depth == 64

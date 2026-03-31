@@ -320,4 +320,17 @@ def test_temporal_prefetch_missing_or_not_ready_falls_back_cleanly(monkeypatch):
         assert dispatcher._last_colora_stats["prefetch_ready_hits"] == 0
     finally:
         dispatcher.cleanup_temporal_prefetch_state()
+
+
+def test_no_overlap_disables_async_overlap_gate():
+    dispatcher = dispatch_mod.Qwen3VLMoELoRADispatcher(
+        num_layers=1,
+        gate_lora_rank=2,
+        lora_compute_config=LoRAComputeConfig(moe_storage="cpu", moe_compute="hybrid"),
+        colora_async_fallback=True,
+        colora_overlap_mode="no_overlap",
+    )
+    try:
+        assert dispatcher._should_use_async_cpu_fallback(has_hit=True) is False
+    finally:
         dispatcher._promotion_interval_tracker.close()

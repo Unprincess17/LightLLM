@@ -3,6 +3,8 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import pytest
+
 
 _ROOT = Path(__file__).resolve().parents[2]
 
@@ -38,6 +40,7 @@ def test_write_condition_merged_csv_preserves_unselected_conditions(tmp_path: Pa
                     "condition_label": "B0",
                     "cache_budget": 1,
                     "miss_handling_mode": "load_then_run",
+                    "overlap_policy": "calibrated",
                     "mean": 1.0,
                     "p50": 1.0,
                     "p90": 1.0,
@@ -52,6 +55,7 @@ def test_write_condition_merged_csv_preserves_unselected_conditions(tmp_path: Pa
                     "condition_label": "B1",
                     "cache_budget": 1,
                     "miss_handling_mode": "load_then_run",
+                    "overlap_policy": "calibrated",
                     "mean": 2.0,
                     "p50": 2.0,
                     "p90": 2.0,
@@ -66,6 +70,7 @@ def test_write_condition_merged_csv_preserves_unselected_conditions(tmp_path: Pa
                     "condition_label": "B2",
                     "cache_budget": 1,
                     "miss_handling_mode": "load_then_run",
+                    "overlap_policy": "calibrated",
                     "mean": 3.0,
                     "p50": 3.0,
                     "p90": 3.0,
@@ -89,6 +94,7 @@ def test_write_condition_merged_csv_preserves_unselected_conditions(tmp_path: Pa
                 "condition_label": "B2",
                 "cache_budget": 1,
                 "miss_handling_mode": "load_then_run",
+                "overlap_policy": "disabled",
                 "mean": 9.0,
                 "p50": 9.0,
                 "p90": 9.0,
@@ -107,3 +113,11 @@ def test_write_condition_merged_csv_preserves_unselected_conditions(tmp_path: Pa
     assert by_condition["expert_only"]["p99"] == "1.0"
     assert by_condition["joint_indep"]["p99"] == "2.0"
     assert by_condition["joint_corr"]["p99"] == "9.0"
+
+
+def test_validate_execution_first_calibration_rejects_missing_cold_path_profile():
+    with pytest.raises(ValueError, match="execution-first replay requires a populated execution-first calibration manifest"):
+        system_tpot_mod.validate_execution_first_calibration(
+            calibration={"overlap_windows_ms": {"1": {"early": {"p50_ms": 0.1, "mean_ms": 0.1, "p90_ms": 0.1}, "late": {"p50_ms": 0.1, "mean_ms": 0.1, "p90_ms": 0.1}}}},
+            load_profile="stressed",
+        )

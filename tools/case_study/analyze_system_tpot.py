@@ -369,7 +369,7 @@ def main() -> None:
                 access_buffer=stream.condition_buffers[condition],
                 enable_temporal_prefetch=bool(args.temporal_prefetch),
             )
-            if str(args.miss_handling_mode) == MISS_HANDLING_EXECUTION_FIRST
+            if str(args.miss_handling_mode) in (MISS_HANDLING_EXECUTION_FIRST, MISS_HANDLING_NO_DEFERRED_SYNC)
             else None
         )
         for condition in CONDITION_ORDER

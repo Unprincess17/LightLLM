@@ -1096,6 +1096,12 @@ class ModeBackend:
                 effective_lora_compute_config is not None
                 and effective_lora_compute_config.should_compute_hybrid("moe")
             )
+            colora_miss_policy = str(getattr(self.args, "colora_miss_policy", "cpu_first"))
+            colora_overlap_mode = str(getattr(self.args, "colora_overlap_mode", "full"))
+            if (colora_miss_policy in ("no_cpu_path", "no_deferred_sync") or colora_overlap_mode == "no_overlap") and not use_colora_hybrid:
+                raise RuntimeError(
+                    "COLoRA baseline modes require moe_compute=hybrid so the GPU expert cache and CPU miss path are both available."
+                )
             if (
                 use_colora_hybrid
                 and effective_lora_compute_config is not None
@@ -1155,7 +1161,7 @@ class ModeBackend:
                     max_promote_per_step=getattr(self.args, "colora_max_promote_per_step", 8),
                     decay=getattr(self.args, "colora_decay", 0.9),
                     deferred_promotion_delta_steps=getattr(self.args, "colora_deferred_promotion_delta_steps", 4),
-                    miss_policy=getattr(self.args, "colora_miss_policy", "cpu_first"),
+                    miss_policy=colora_miss_policy,
                     queue_high_watermark=getattr(self.args, "colora_promote_window", 128),
                     promote_cooldown_steps=4,
                 )
@@ -1163,6 +1169,11 @@ class ModeBackend:
                 self.moe_expert_cache_manager.register_projection_pool("gate", self.lora_mem_pool.moe_gate_pool)
                 self.moe_expert_cache_manager.register_projection_pool("up", self.lora_mem_pool.moe_up_pool)
                 self.moe_expert_cache_manager.register_projection_pool("down", self.lora_mem_pool.moe_down_pool)
+                cache_stats = self.moe_expert_cache_manager.get_cache_observability_stats()
+                if colora_miss_policy in ("no_cpu_path", "no_deferred_sync") and int(cache_stats["total"]["capacity_slots"]) <= 0:
+                    raise RuntimeError(
+                        f"COLoRA miss policy {colora_miss_policy!r} requires a non-empty GPU expert cache, but no cache slots were allocated."
+                    )
                 self.logger.info(
                     "[COLoRA] Expert cache initialized: budget_mb=%s, promote_min_hits=%s, "
                     "window=%s, max_promote_per_step=%s, decay=%.4f, deferred_delta=%s, miss_policy=%s, queue_hwm=%s",
@@ -1243,6 +1254,15 @@ class ModeBackend:
             async_fallback_enabled = bool(int(async_fallback_raw))
         except (TypeError, ValueError):
             async_fallback_enabled = bool(async_fallback_raw)
+        request_skip_enabled = bool(getattr(self.args, "colora_request_skip", True))
+        overlap_mode = str(getattr(self.args, "colora_overlap_mode", "full"))
+        if overlap_mode == "no_overlap":
+            if async_fallback_enabled:
+                self.logger.info("[COLoRA] overlap_mode=no_overlap forcing colora_async_fallback=0")
+            if request_skip_enabled:
+                self.logger.info("[COLoRA] overlap_mode=no_overlap forcing colora_request_skip=0")
+            async_fallback_enabled = False
+            request_skip_enabled = False
         if self.colora_metric_client is None and self.args.metric_port is not None and get_global_rank() == 0:
             try:
                 self.colora_metric_client = MetricClient(self.args.metric_port)
@@ -1262,9 +1282,10 @@ class ModeBackend:
                     getattr(self.args, "colora_deferred_promotion_delta_steps", 4)
                 ),
                 colora_promotion_ema_alpha=float(getattr(self.args, "colora_promotion_ema_alpha", 0.5)),
+                colora_overlap_mode=overlap_mode,
                 colora_temporal_prefetch=bool(getattr(self.args, "colora_temporal_prefetch", False)),
                 colora_temporal_hot_cache_slots=int(getattr(self.args, "colora_temporal_hot_cache_slots", 64)),
-                colora_request_skip=bool(getattr(self.args, "colora_request_skip", True)),
+                colora_request_skip=request_skip_enabled,
                 colora_max_continuations=int(getattr(self.args, "colora_max_continuations", 8)),
                 metric_client=self.colora_metric_client,
             )

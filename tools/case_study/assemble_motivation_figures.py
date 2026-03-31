@@ -17,6 +17,7 @@ if "ipykernel" not in sys.modules:
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.lines import Line2D
 from matplotlib.ticker import PercentFormatter
 
 if __package__ in (None, ""):
@@ -61,9 +62,9 @@ DEFAULT_TAIL_BUDGET = 2048
 DEFAULT_SYSTEM_TPOT_STAGE = "replay/system_tpot_stressed"
 MAX_TAIL_PERCENTILE = 0.999
 MAX_TAIL_PERCENTILE_LABEL = "P99.9"
-TAIL_CURVE_PERCENTILES = (0.50, 0.75, 0.90, 0.95, 0.97, 0.98, 0.99, 0.995, MAX_TAIL_PERCENTILE)
-TAIL_CURVE_TICK_PERCENTILES = (0.50, 0.90, 0.95, 0.99, 0.995, MAX_TAIL_PERCENTILE)
-TAIL_CURVE_TICK_LABELS = ("P50", "P90", "P95", "P99", "P99.5", MAX_TAIL_PERCENTILE_LABEL)
+TAIL_CURVE_PERCENTILES = (0.50, 0.75, 0.90, 0.95, 0.97, 0.98, 0.99, MAX_TAIL_PERCENTILE)
+TAIL_CURVE_TICK_PERCENTILES = (0.50, 0.90, 0.95, 0.99, MAX_TAIL_PERCENTILE)
+TAIL_CURVE_TICK_LABELS = ("P50", "P90", "P95", "P99", MAX_TAIL_PERCENTILE_LABEL)
 HEADLINE_PERCENTILES = (0.95, 0.99)
 CAPACITY_TICK_BUDGETS = (128, 512, 2048, 8192, 32768, 65536)
 CAPACITY_TICK_LABELS = ("128", "512", "2K", "8K", "32K", "65K")
@@ -226,6 +227,28 @@ def percentile_index(percentiles: Sequence[float], target: float) -> int:
     raise ValueError(f"percentile {target} is not present in the configured curve")
 
 
+def condition_legend_handles(
+    label_map: Mapping[str, str],
+    *,
+    markersize: float = 5.2,
+    markeredgewidth: float = 0.8,
+) -> list[Line2D]:
+    return [
+        Line2D(
+            [0],
+            [0],
+            color=CONDITION_COLORS[condition],
+            linewidth=max(2.0, CONDITION_LINEWIDTHS.get(condition, 2.0)),
+            marker=CONDITION_MARKERS[condition],
+            markersize=markersize,
+            markeredgecolor="white",
+            markeredgewidth=markeredgewidth,
+            label=label_map[condition],
+        )
+        for condition in CONDITION_ORDER
+    ]
+
+
 def plot_root_cause(ax: plt.Axes, popularity_rows: Sequence[Mapping[str, str]], show_legend: bool = True) -> None:
     limit_coverages: dict[str, float] = {}
     for condition in CONDITION_ORDER:
@@ -300,6 +323,7 @@ def plot_root_cause(ax: plt.Axes, popularity_rows: Sequence[Mapping[str, str]], 
     ax.yaxis.set_major_formatter(PercentFormatter(xmax=1.0))
     if show_legend:
         ax.legend(
+            handles=condition_legend_handles(FIRST_CONDITION_LABELS, markersize=5.8),
             loc="lower left",
             frameon=True,
             framealpha=0.85,
@@ -430,10 +454,15 @@ def plot_tail_blowout(ax: plt.Axes, token_tpot_by_condition: Mapping[str, Sequen
     headline_y = max(c1_p99, c2_p99)
     headline_p95 = max(c1_p95, c2_p95)
     p99_slowdown = headline_y / max(c0_p99, 1e-9)
+    headline_target_y = 0.5 * (c1_p99 + c2_p99)
     flat_tip_x = tick_x[0]
     max_latency = max(float(np.max(latencies)) for latencies in tail_values.values())
+    tail_band_left = headline_x - 0.05
+    tail_band_right = curve_x[-1] + 0.04
 
     ax.axhline(METAL_FLOOR_MS, color="#7A7F85", linewidth=1.0, linestyle="--", alpha=0.9)
+    ax.axvline(headline_x, color="#B08F7A", linewidth=0.95, linestyle=":", alpha=0.85, zorder=1)
+    ax.axvspan(tail_band_left, tail_band_right, color="#F4E6D8", alpha=0.36, zorder=0)
     ax.set_xlim(curve_x[0] - 0.06, curve_x[-1] + 0.18)
     ax.set_ylim(1.0, max_latency + 0.35)
     ax.set_xticks(tick_x)
@@ -441,23 +470,24 @@ def plot_tail_blowout(ax: plt.Axes, token_tpot_by_condition: Mapping[str, Sequen
     ax.set_xlabel("Token Percentile")
     ax.set_ylabel("TPOT (ms)")
     ax.annotate(
-        f"P95={headline_p95:.2f} ms, P99={headline_y:.2f} ms\n{p99_slowdown:.1f}x vs C0 at P99",
-        xy=(headline_x, headline_y),
-        xytext=(headline_x - 1.25, headline_y - 0.72),
-        arrowprops={"arrowstyle": "->", "color": CONDITION_COLORS["joint_corr"], "lw": 1.15},
+        f"Joint LoRAs: P95={headline_p95:.2f} ms, P99={headline_y:.2f} ms\n{p99_slowdown:.1f}x vs C0 at P99",
+        xy=(headline_x + 0.02, headline_target_y),
+        xytext=(curve_x[1] + 0.06, max_latency - 1.55),
+        arrowprops={"arrowstyle": "->", "color": "#8A5A44", "lw": 1.15},
         fontsize=10,
         bbox={"facecolor": "white", "edgecolor": "#D7DCE0", "boxstyle": "round,pad=0.22"},
     )
     ax.annotate(
         f"C0 P50 ≈ {c0_p50:.2f} ms",
         xy=(flat_tip_x, c0_p50),
-        xytext=(flat_tip_x + 0.1, c0_p50 + 0.8),
+        xytext=(flat_tip_x + 0.24, c0_p50 + 0.5),
         arrowprops={"arrowstyle": "->", "color": CONDITION_COLORS["expert_only"], "lw": 1.1},
         fontsize=10,
         bbox={"facecolor": "white", "edgecolor": "#D7DCE0", "boxstyle": "round,pad=0.22"},
     )
     if show_legend:
         ax.legend(
+            handles=condition_legend_handles(CONDITION_LABELS, markersize=4.8, markeredgewidth=0.6),
             loc="upper left",
             frameon=True,
             framealpha=0.85,
@@ -543,9 +573,7 @@ def main() -> None:
     plot_root_cause(axes[0], popularity_rows, show_legend=False)
     plot_capacity_illusion(axes[1], quantile_rows)
     plot_tail_blowout(axes[2], token_tpot_by_condition, args.tail_budget)
-    # Shared legend for all three subplots
-    handles, labels = axes[-1].get_legend_handles_labels()
-    fig.legend(handles, labels, loc='lower center', ncol=3, frameon=True,
+    fig.legend(handles=condition_legend_handles(CONDITION_LABELS), loc='lower center', ncol=3, frameon=True,
                framealpha=0.85, fontsize=8.5, facecolor="white",
                edgecolor="#D7DCE0", borderpad=0.25)
     save_figure(fig, combined_pdf)
@@ -554,9 +582,7 @@ def main() -> None:
     plot_root_cause(axes[0], popularity_rows, show_legend=False)
     plot_capacity_illusion(axes[1], quantile_rows)
     plot_tail_blowout(axes[2], token_tpot_by_condition, args.tail_budget)
-    # Shared legend for all three subplots
-    handles, labels = axes[-1].get_legend_handles_labels()
-    fig.legend(handles, labels, loc='lower center', ncol=3, frameon=True,
+    fig.legend(handles=condition_legend_handles(CONDITION_LABELS), loc='lower center', ncol=3, frameon=True,
                framealpha=0.85, fontsize=8.5, facecolor="white",
                edgecolor="#D7DCE0", borderpad=0.25)
     save_figure(fig, combined_png)

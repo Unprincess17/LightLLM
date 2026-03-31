@@ -83,6 +83,7 @@ def test_parse_and_summarize_colora_log_lines():
             "DEBUG 03-13 12:00:01 [x.py:1] [COLoRA] layer=3 hit_tokens=8 miss_tokens=24 queue_depth=2 hit_rate=0.25 "
             "cache_capacity_slots=96 cache_resident_slots=92 cache_free_slots=4 cache_evictions_total=3 "
             "cpu_compute_time=0.010 gpu_compute_time=0.020 cpu_queue_wait=0.001 d2h_bytes=1024 h2d_bytes=2048 "
+            "weight_h2d_bytes=4096 weight_h2d_time=0.003 blocking_promotion_count=1 miss_policy=no_cpu_path overlap_mode=no_overlap "
             "fallback_degrade_count=1 cpu_queue_depth=3 promotion_drop_total=4 promotion_drop_queue=2 "
             "promotion_drop_cooldown=1 promotion_admitted=2 promotion_reject_delta=3 promotion_reject_no_ema=4 "
             "tracker_queue_drop=5 prefetch_submitted=6 prefetch_ready_hits=7 prefetch_not_ready=8 "
@@ -91,6 +92,7 @@ def test_parse_and_summarize_colora_log_lines():
             "DEBUG 03-13 12:00:02 [x.py:1] [COLoRA] layer=3 hit_tokens=16 miss_tokens=8 queue_depth=5 hit_rate=0.66 "
             "cache_capacity_slots=96 cache_resident_slots=96 cache_free_slots=0 cache_evictions_total=5 "
             "cpu_compute_time=0.015 gpu_compute_time=0.025 cpu_queue_wait=0.002 d2h_bytes=512 h2d_bytes=1024 "
+            "weight_h2d_bytes=2048 weight_h2d_time=0.001 blocking_promotion_count=2 miss_policy=no_deferred_sync overlap_mode=full "
             "fallback_degrade_count=0 cpu_queue_depth=4 promotion_drop_total=5 promotion_drop_queue=2 "
             "promotion_drop_cooldown=1 promotion_admitted=1 promotion_reject_delta=0 promotion_reject_no_ema=1 "
             "tracker_queue_drop=0 prefetch_submitted=2 prefetch_ready_hits=3 prefetch_not_ready=4 "
@@ -126,6 +128,11 @@ def test_parse_and_summarize_colora_log_lines():
     assert summary["prefetch_false_positives_sum"] == 16
     assert summary["prefetch_slot_overwrite_end"] == 12
     assert summary["fallback_degrade_count_sum"] == 1
+    assert summary["weight_h2d_bytes_sum"] == 6144
+    assert abs(summary["weight_h2d_time_sum"] - 0.004) < 1e-9
+    assert summary["blocking_promotion_count_sum"] == 3
+    assert summary["observed_overlap_modes"] == ["full", "no_overlap"]
+    assert summary["observed_miss_policies"] == ["no_cpu_path", "no_deferred_sync"]
     assert summary["moe_kernel_calls_sum"] == 10
     assert summary["moe_kernel_tokens_sum"] == 40
 

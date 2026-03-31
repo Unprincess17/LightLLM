@@ -1188,7 +1188,9 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
                 "up_capacity_slots=%s up_resident_slots=%s up_free_slots=%s up_evictions_total=%s "
                 "down_capacity_slots=%s down_resident_slots=%s down_free_slots=%s down_evictions_total=%s "
                 "cpu_compute_time=%.6f gpu_compute_time=%.6f cpu_queue_wait=%.6f "
-                "d2h_bytes=%.0f h2d_bytes=%.0f overlap_ratio=%.4f fallback_degrade_count=%s cpu_queue_depth=%s "
+                "d2h_bytes=%.0f h2d_bytes=%.0f weight_h2d_bytes=%.0f weight_h2d_time=%.6f "
+                "overlap_ratio=%.4f fallback_degrade_count=%s blocking_promotion_count=%s "
+                "miss_policy=%s overlap_mode=%s cpu_queue_depth=%s "
                 "promotion_drop_total=%s promotion_drop_queue=%s promotion_drop_cooldown=%s "
                 "promotion_admitted=%s promotion_reject_delta=%s promotion_reject_no_ema=%s tracker_queue_drop=%s "
                 "prefetch_submitted=%s prefetch_ready_hits=%s prefetch_not_ready=%s prefetch_stale=%s "
@@ -1221,8 +1223,13 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
                 colora_stats["cpu_queue_wait_time"],
                 colora_stats["d2h_bytes"],
                 colora_stats["h2d_bytes"],
+                colora_stats["weight_h2d_bytes"],
+                colora_stats["weight_h2d_time"],
                 overlap_ratio_avg,
                 colora_stats["fallback_degrade_count"],
+                colora_stats["blocking_promotion_count"],
+                colora_stats["miss_policy"],
+                colora_stats["overlap_mode"],
                 colora_stats["cpu_queue_depth"],
                 colora_stats["promotion_drop_total"],
                 colora_stats["promotion_drop_queue_high_watermark"],

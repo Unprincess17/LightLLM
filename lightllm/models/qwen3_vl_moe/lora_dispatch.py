@@ -37,6 +37,13 @@ _LOG_LEVEL = getattr(logging, _LOG_LEVEL, logging.INFO)
 logger = logging.getLogger("lightllm.lora.dispatch")
 logger.setLevel(_LOG_LEVEL)
 
+MISS_POLICY_CPU_FIRST = "cpu_first"
+MISS_POLICY_LOAD_THEN_RUN = "load_then_run"
+MISS_POLICY_NO_CPU_PATH = "no_cpu_path"
+MISS_POLICY_NO_DEFERRED_SYNC = "no_deferred_sync"
+OVERLAP_MODE_FULL = "full"
+OVERLAP_MODE_NO_OVERLAP = "no_overlap"
+
 # Try to import dispatch_bgmv kernel, fall back to naive implementation
 try:
     from lightllm._kernels.lora.bgmv import (
@@ -556,6 +563,7 @@ class Qwen3VLMoELoRADispatcher:
         colora_cpu_batch_timeout_us: int = 50,
         colora_deferred_promotion_delta_steps: int = 4,
         colora_promotion_ema_alpha: float = 0.5,
+        colora_overlap_mode: str = OVERLAP_MODE_FULL,
         colora_temporal_prefetch: bool = False,
         colora_temporal_hot_cache_slots: int = 64,
         # COLaRA request-level skip-and-reinsert
@@ -606,6 +614,7 @@ class Qwen3VLMoELoRADispatcher:
         self.colora_cpu_workers = max(int(colora_cpu_workers), 1)
         self.colora_cpu_queue_depth = max(int(colora_cpu_queue_depth), 1)
         self.colora_cpu_batch_timeout_us = max(int(colora_cpu_batch_timeout_us), 0)
+        self.colora_overlap_mode = str(colora_overlap_mode)
         # COLaRA request-level skip-and-reinsert
         self.colora_request_skip = bool(colora_request_skip)
         self.colora_max_continuations = max(int(colora_max_continuations), 1)
@@ -672,8 +681,13 @@ class Qwen3VLMoELoRADispatcher:
             "cpu_queue_wait_time": 0.0,
             "d2h_bytes": 0.0,
             "h2d_bytes": 0.0,
+            "weight_h2d_bytes": 0.0,
+            "weight_h2d_time": 0.0,
             "overlap_ratio": 0.0,
             "fallback_degrade_count": 0,
+            "blocking_promotion_count": 0,
+            "miss_policy": MISS_POLICY_CPU_FIRST,
+            "overlap_mode": self.colora_overlap_mode,
             "cpu_queue_depth": 0,
             "promotion_drop_total": 0,
             "promotion_drop_queue_high_watermark": 0,
@@ -918,18 +932,21 @@ class Qwen3VLMoELoRADispatcher:
         manager = self.expert_cache_manager
         if manager is None or not self._should_use_hybrid_moe_compute():
             return
+        miss_policy = str(getattr(getattr(manager, "config", None), "miss_policy", MISS_POLICY_CPU_FIRST))
 
         unique_adapter_bins = sorted({int(adapter_bin) for adapter_bin in adapter_bins if int(adapter_bin) >= 0})
         for adapter_bin in unique_adapter_bins:
             joint_key = self._build_joint_object_key(layer_id, adapter_bin, expert_id)
-            if not self._promotion_interval_tracker.submit_access(joint_key, int(decode_step_id)):
-                self._record_background_stat("tracker_queue_drop", 1)
             promotion_keys = [
                 ExpertCacheKey("gate", adapter_bin, int(layer_id), int(expert_id)),
                 ExpertCacheKey("up", adapter_bin, int(layer_id), int(expert_id)),
                 ExpertCacheKey("down", adapter_bin, int(layer_id), int(expert_id)),
             ]
             manager.record_access(promotion_keys)
+            if miss_policy in (MISS_POLICY_NO_CPU_PATH, MISS_POLICY_NO_DEFERRED_SYNC):
+                continue
+            if not self._promotion_interval_tracker.submit_access(joint_key, int(decode_step_id)):
+                self._record_background_stat("tracker_queue_drop", 1)
             if self._deferred_promotion_delta_steps <= 0:
                 continue
             if self._is_joint_ready(layer_id, adapter_bin, expert_id):
@@ -1254,6 +1271,8 @@ class Qwen3VLMoELoRADispatcher:
         return output, kernel_calls, kernel_tokens
 
     def _reset_colora_stats(self) -> None:
+        manager = getattr(self, "expert_cache_manager", None)
+        default_miss_policy = str(getattr(getattr(manager, "config", None), "miss_policy", MISS_POLICY_CPU_FIRST))
         self._last_colora_stats = {
             "colora_hit_tokens": 0,
             "colora_miss_tokens": 0,
@@ -1280,8 +1299,13 @@ class Qwen3VLMoELoRADispatcher:
             "cpu_queue_wait_time": 0.0,
             "d2h_bytes": 0.0,
             "h2d_bytes": 0.0,
+            "weight_h2d_bytes": 0.0,
+            "weight_h2d_time": 0.0,
             "overlap_ratio": 0.0,
             "fallback_degrade_count": 0,
+            "blocking_promotion_count": 0,
+            "miss_policy": default_miss_policy,
+            "overlap_mode": self.colora_overlap_mode,
             "cpu_queue_depth": 0,
             "promotion_drop_total": 0,
             "promotion_drop_queue_high_watermark": 0,
@@ -1302,7 +1326,7 @@ class Qwen3VLMoELoRADispatcher:
 
     def _should_use_async_cpu_fallback(self, has_hit: bool) -> bool:
         # Async fallback only helps if GPU hit-path can overlap with CPU miss compute.
-        return self.colora_async_fallback and has_hit
+        return self.colora_async_fallback and self.colora_overlap_mode != OVERLAP_MODE_NO_OVERLAP and has_hit
 
     def _get_or_create_cpu_executor(self) -> ThreadPoolExecutor:
         if self._cpu_executor is None:
@@ -1968,17 +1992,31 @@ class Qwen3VLMoELoRADispatcher:
 
         if decode_context is None:
             manager.record_access(keys)
+        miss_policy = str(getattr(getattr(manager, "config", None), "miss_policy", MISS_POLICY_CPU_FIRST))
         ready_slots = manager.lookup_many(keys)
         miss_keys = [key for key in keys if key not in ready_slots]
         allow_inline_promotion_schedule = decode_context is None
-        if allow_inline_promotion_schedule:
+        if allow_inline_promotion_schedule and miss_policy in (MISS_POLICY_CPU_FIRST, MISS_POLICY_LOAD_THEN_RUN):
             manager.schedule_promotion(miss_keys)
-        if miss_keys and getattr(getattr(manager, "config", None), "miss_policy", "cpu_first") == "load_then_run":
+        blocking_promotion_time = 0.0
+        blocking_promotion_bytes = 0.0
+        blocking_promotion_count = 0
+        if miss_keys and miss_policy == MISS_POLICY_LOAD_THEN_RUN:
             manager.apply_completed_promotions()
             promoted_now = manager.lookup_many(miss_keys)
             if promoted_now:
                 ready_slots.update(promoted_now)
                 miss_keys = [key for key in miss_keys if key not in promoted_now]
+        if miss_keys and miss_policy == MISS_POLICY_NO_CPU_PATH:
+            promotion_t0 = time.perf_counter()
+            promotion_result = manager.promote_blocking(miss_keys)
+            blocking_promotion_time += max(time.perf_counter() - promotion_t0, 0.0)
+            blocking_promotion_bytes += float(promotion_result.transferred_bytes)
+            blocking_promotion_count += int(promotion_result.promoted_count)
+            ready_slots.update(promotion_result.ready_slots)
+            miss_keys = [key for key in miss_keys if key not in promotion_result.ready_slots]
+            if miss_keys:
+                raise RuntimeError(f"COLoRA no_cpu_path left unresolved misses: {miss_keys!r}")
 
         hit_adapters = {key.adapter_idx for key in ready_slots.keys()}
         hit_mask = torch.zeros_like(valid_bins, dtype=torch.bool)
@@ -2093,6 +2131,10 @@ class Qwen3VLMoELoRADispatcher:
                     gpu_compute_time += time.perf_counter() - t0
             else:
                 # Kernel unavailable or GPU cache not ready: degrade to CPU path.
+                if miss_policy == MISS_POLICY_NO_CPU_PATH:
+                    raise RuntimeError(
+                        "COLoRA no_cpu_path requires GPU cached execution on the promoted hot path; CPU fallback is not allowed."
+                    )
                 hit_mask = torch.zeros_like(valid_bins, dtype=torch.bool)
                 miss_mask = torch.ones_like(valid_bins, dtype=torch.bool)
                 if miss_pos is None:
@@ -2109,6 +2151,8 @@ class Qwen3VLMoELoRADispatcher:
 
         if torch.any(miss_mask):
             assert miss_pos is not None and miss_bins is not None
+            if miss_policy == MISS_POLICY_NO_CPU_PATH:
+                raise RuntimeError("COLoRA no_cpu_path cannot execute remaining misses on the CPU path.")
             if miss_future is not None:
                 with NvtxAnnotate("COLoRA_CPU_Miss_Path_AsyncJoin"):
                     miss_output, queue_wait, cpu_t, kernel_calls, kernel_tokens = miss_future.result()
@@ -2133,6 +2177,12 @@ class Qwen3VLMoELoRADispatcher:
             cpu_queue_wait_time += queue_wait
             moe_kernel_calls += int(kernel_calls)
             moe_kernel_tokens += int(kernel_tokens)
+            if miss_policy == MISS_POLICY_NO_DEFERRED_SYNC and miss_keys:
+                promotion_t0 = time.perf_counter()
+                promotion_result = manager.promote_blocking(miss_keys)
+                blocking_promotion_time += max(time.perf_counter() - promotion_t0, 0.0)
+                blocking_promotion_bytes += float(promotion_result.transferred_bytes)
+                blocking_promotion_count += int(promotion_result.promoted_count)
 
         overlap_ratio = 0.0
         if async_overlap_used and cpu_compute_time > 0.0 and gpu_compute_time > 0.0:
@@ -2152,8 +2202,13 @@ class Qwen3VLMoELoRADispatcher:
             "cpu_queue_wait_time": cpu_queue_wait_time,
             "d2h_bytes": d2h_bytes,
             "h2d_bytes": h2d_bytes,
+            "weight_h2d_bytes": blocking_promotion_bytes,
+            "weight_h2d_time": blocking_promotion_time,
             "overlap_ratio": overlap_ratio,
             "fallback_degrade_count": int(fallback_degrade_count),
+            "blocking_promotion_count": int(blocking_promotion_count),
+            "miss_policy": miss_policy,
+            "overlap_mode": self.colora_overlap_mode,
             "cpu_queue_depth": self._get_cpu_queue_depth(),
             "promotion_drop_total": int(drop_breakdown.get("total", 0)),
             "promotion_drop_queue_high_watermark": int(drop_breakdown.get("queue_high_watermark", 0)),
@@ -3034,6 +3089,7 @@ def create_vl_moe_lora_dispatcher(
     colora_cpu_batch_timeout_us: int = 50,
     colora_deferred_promotion_delta_steps: int = 4,
     colora_promotion_ema_alpha: float = 0.5,
+    colora_overlap_mode: str = OVERLAP_MODE_FULL,
     colora_temporal_prefetch: bool = False,
     colora_temporal_hot_cache_slots: int = 64,
     colora_request_skip: bool = True,
@@ -3077,6 +3133,7 @@ def create_vl_moe_lora_dispatcher(
         colora_cpu_batch_timeout_us=colora_cpu_batch_timeout_us,
         colora_deferred_promotion_delta_steps=colora_deferred_promotion_delta_steps,
         colora_promotion_ema_alpha=colora_promotion_ema_alpha,
+        colora_overlap_mode=colora_overlap_mode,
         colora_temporal_prefetch=colora_temporal_prefetch,
         colora_temporal_hot_cache_slots=colora_temporal_hot_cache_slots,
         colora_request_skip=colora_request_skip,

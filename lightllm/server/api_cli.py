@@ -183,8 +183,15 @@ def make_argument_parser() -> argparse.ArgumentParser:
         "--colora_miss_policy",
         type=str,
         default="cpu_first",
-        choices=["cpu_first", "load_then_run"],
+        choices=["cpu_first", "load_then_run", "no_cpu_path", "no_deferred_sync"],
         help="COLoRA miss handling policy. cpu_first keeps request non-blocking by default.",
+    )
+    parser.add_argument(
+        "--colora_overlap_mode",
+        type=str,
+        default="full",
+        choices=["full", "no_overlap"],
+        help="COLoRA overlap mode. no_overlap disables async miss overlap and request skip/continuation.",
     )
     parser.add_argument(
         "--colora_async_fallback",

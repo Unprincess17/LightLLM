@@ -144,6 +144,7 @@ class StartArgs:
     colora_deferred_promotion_delta_steps: int = field(default=4)
     colora_promotion_ema_alpha: float = field(default=0.5)
     colora_miss_policy: str = field(default="cpu_first")
+    colora_overlap_mode: str = field(default="full")
     colora_async_fallback: bool = field(default=True)
     colora_cpu_workers: int = field(default=4)
     colora_cpu_queue_depth: int = field(default=256)
