@@ -1,10 +1,13 @@
 import torch
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 from lightllm.common.basemodel.batch_objs import ModelOutput
 from lightllm.common.basemodel.infer_struct import InferStateInfo
 from lightllm.models.qwen3_vl_moe.layer_infer.transformer_layer_infer import Qwen3VLMOETransformerLayerInfer
 from lightllm.server.router.model_infer.mode_backend.base_backend import ModeBackend
+from lightllm.server.router.model_infer.mode_backend.dp_backend.impl import DPChunkedPrefillBackend
+from lightllm.server.core.objs.lora_compute_config import LoRAComputeConfig
 
 
 def test_select_active_decode_outputs_filters_paused_rows_and_padding():
@@ -95,3 +98,205 @@ def test_complete_paused_layer_on_cpu_merges_hot_and_cold_outputs():
     assert torch.allclose(req_obj.colora_continuation.saved_hidden, expected_saved_hidden)
     assert req_obj.colora_continuation.completed is True
     assert req_obj.colora_paused is False
+
+
+def test_init_batched_lora_adapters_disables_request_skip_and_async_fallback_only_in_no_overlap(monkeypatch):
+    def _run_init(overlap_mode):
+        captured_kwargs = []
+
+        class _DummyPool:
+            def __init__(self):
+                self.adapter_dirs = []
+                self.tp_rank_ = 0
+                self.moe_gate_pool = object()
+                self.moe_up_pool = object()
+                self.moe_down_pool = object()
+
+            def load_adapter(self, adapter_dir, rank, scaling, layer_weights):
+                self.adapter_dirs.append(adapter_dir)
+
+        class _DummyAdapter:
+            max_rank = 8
+            lora_alpha = 16
+
+            @staticmethod
+            def get_all_weights():
+                return {}
+
+        backend = object.__new__(ModeBackend)
+        backend.args = SimpleNamespace(
+            colora_async_fallback=1,
+            colora_request_skip=1,
+            colora_overlap_mode=overlap_mode,
+            colora_cpu_workers=2,
+            colora_cpu_queue_depth=16,
+            colora_cpu_batch_timeout_us=10,
+            colora_deferred_promotion_delta_steps=4,
+            colora_promotion_ema_alpha=0.5,
+            colora_temporal_prefetch=False,
+            colora_temporal_hot_cache_slots=8,
+            colora_max_continuations=8,
+            metric_port=None,
+        )
+        backend.logger = SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None, error=lambda *a, **k: None)
+        backend.model = SimpleNamespace(
+            config={
+                "num_hidden_layers": 1,
+                "num_attention_heads": 1,
+                "num_key_value_heads": 1,
+                "head_dim": 8,
+                "intermediate_size": 16,
+                "hidden_size": 32,
+                "vocab_size": 128,
+            },
+            data_type=torch.float16,
+            layers_num=1,
+            layers_infer=[],
+        )
+        backend.rank_in_node = 0
+        backend._lora_compute_config = LoRAComputeConfig(moe_storage="cpu", moe_compute="hybrid")
+        backend.colora_metric_client = None
+        backend._load_lora_adapter_fn = lambda **kwargs: _DummyAdapter()
+        backend._create_lora_dispatcher_fn = lambda **kwargs: captured_kwargs.append(kwargs) or SimpleNamespace()
+
+        import lightllm.server.lora as lora_pkg
+
+        monkeypatch.setattr(lora_pkg, "create_lora_mem_pool", lambda **kwargs: _DummyPool())
+
+        class _DummyCacheManager:
+            def register_projection_pool(self, projection, pool):
+                return None
+
+            def get_cache_observability_stats(self):
+                return {
+                    "capacity_slots": 0,
+                    "resident_slots": 0,
+                    "free_slots": 0,
+                    "evictions_total": 0,
+                    "gate_capacity_slots": 0,
+                    "gate_resident_slots": 0,
+                    "gate_free_slots": 0,
+                    "gate_evictions_total": 0,
+                }
+
+        monkeypatch.setattr(lora_pkg, "MoEExpertCacheManager", lambda cfg: _DummyCacheManager())
+
+        import lightllm.server.router.model_infer.mode_backend.base_backend as base_backend_mod
+
+        monkeypatch.setattr(base_backend_mod, "get_global_world_size", lambda: 1)
+
+        backend.init_batched_lora_adapters({"1": "/tmp/adapter"})
+
+        assert len(captured_kwargs) == 1
+        return captured_kwargs[0]
+
+    overlap_kwargs = _run_init("overlap")
+    no_overlap_kwargs = _run_init("no_overlap")
+
+    assert overlap_kwargs["colora_request_skip"] is True
+    assert overlap_kwargs["colora_async_fallback"] is True
+    assert no_overlap_kwargs["colora_request_skip"] is False
+    assert no_overlap_kwargs["colora_async_fallback"] is False
+
+
+
+def test_decode_normal_groups_completed_continuations_by_resume_layer(monkeypatch):
+    forward_inputs = []
+    sampled_run_reqs = []
+    pre_post_inputs = []
+
+    @contextmanager
+    def _noop_stream(_stream):
+        yield
+
+    class _DummyEvent:
+        def record(self):
+            return None
+
+        def synchronize(self):
+            return None
+
+    import lightllm.server.router.model_infer.mode_backend.dp_backend.impl as dp_impl
+
+    monkeypatch.setattr(dp_impl.torch.cuda, "stream", _noop_stream)
+    monkeypatch.setattr(dp_impl.torch.cuda, "Event", _DummyEvent)
+    monkeypatch.setattr(dp_impl.g_infer_context, "get_overlap_stream", lambda: None)
+
+    def _fake_select_active(_model_output, b_req_idx, b_mtp_index, run_reqs):
+        logits = torch.zeros((len(run_reqs), 1), dtype=torch.float32)
+        return logits, b_req_idx, b_mtp_index, run_reqs
+
+    def _fake_sample(**kwargs):
+        sampled_run_reqs.append(kwargs["run_reqs"])
+        n = len(kwargs["run_reqs"])
+        return None, [11] * n, [0.1] * n
+
+    backend = object.__new__(DPChunkedPrefillBackend)
+    backend.model = SimpleNamespace(
+        forward=lambda model_input: forward_inputs.append(model_input) or ModelOutput(
+            logits=torch.zeros((model_input.batch_size, 4), dtype=torch.float32)
+        )
+    )
+    backend._alloc_decode_step_id = lambda: 7
+    backend._select_active_decode_outputs = _fake_select_active
+    backend._sample_and_scatter_token = _fake_sample
+    backend._pre_post_handle = lambda run_reqs, is_chuncked_mode: pre_post_inputs.append((run_reqs, is_chuncked_mode)) or {}
+    backend._post_handle = lambda **kwargs: None
+    backend.extra_post_req_handle_func = None
+
+    req_a = SimpleNamespace(
+        req_idx=1,
+        req_id=101,
+        multimodal_params={"id": "a"},
+        colora_continuation=SimpleNamespace(
+            completed=True,
+            resume_layer=3,
+            saved_hidden=torch.ones((1, 2), dtype=torch.float32),
+            mem_index=torch.tensor([11], dtype=torch.int32),
+        ),
+        get_cur_total_len=lambda: 5,
+    )
+    req_b = SimpleNamespace(
+        req_idx=2,
+        req_id=102,
+        multimodal_params={"id": "b"},
+        colora_continuation=SimpleNamespace(
+            completed=True,
+            resume_layer=3,
+            saved_hidden=torch.ones((1, 2), dtype=torch.float32) * 2,
+            mem_index=torch.tensor([12], dtype=torch.int32),
+        ),
+        get_cur_total_len=lambda: 6,
+    )
+    req_c = SimpleNamespace(
+        req_idx=3,
+        req_id=103,
+        multimodal_params={"id": "c"},
+        colora_continuation=SimpleNamespace(
+            completed=True,
+            resume_layer=5,
+            saved_hidden=torch.ones((1, 2), dtype=torch.float32) * 3,
+            mem_index=torch.tensor([13], dtype=torch.int32),
+        ),
+        get_cur_total_len=lambda: 7,
+    )
+
+    event_pack = SimpleNamespace(
+        notify_post_handle_and_wait_pre_post_handle=lambda: None,
+        notify_forward_and_wait_post_handle=lambda: None,
+        notify_pre_post_handle=lambda: None,
+    )
+
+    DPChunkedPrefillBackend.decode_normal(backend, event_pack, [req_a, req_b, req_c])
+
+    assert len(forward_inputs) == 2
+    assert {forward_inputs[0].resume_from_layer, forward_inputs[1].resume_from_layer} == {3, 5}
+    assert all(inp.is_continuation_batch for inp in forward_inputs)
+    assert sorted(inp.batch_size for inp in forward_inputs) == [1, 2]
+    assert any(batch == [req_a, req_b] for batch in sampled_run_reqs)
+    assert any(batch == [req_c] for batch in sampled_run_reqs)
+    assert len(pre_post_inputs) == 1
+    assert len(pre_post_inputs[0][0]) == 3
+    assert req_a.colora_continuation is None
+    assert req_b.colora_continuation is None
+    assert req_c.colora_continuation is None

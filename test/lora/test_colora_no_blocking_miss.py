@@ -94,20 +94,65 @@ def test_colora_hybrid_miss_path_returns_without_waiting_for_promotion(monkeypat
 
     assert out.shape == x.shape
     stats = dispatcher.pop_colora_stats()
+    required_observability_fields = {
+        # hit/miss and queueing
+        "colora_miss_tokens",
+        "promotion_queue_depth",
+        "cpu_queue_depth",
+        # cache observability (total + per projection)
+        "cache_capacity_slots",
+        "cache_resident_slots",
+        "cache_free_slots",
+        "cache_evictions_total",
+        "gate_capacity_slots",
+        "gate_resident_slots",
+        "gate_free_slots",
+        "gate_evictions_total",
+        "up_capacity_slots",
+        "up_resident_slots",
+        "up_free_slots",
+        "up_evictions_total",
+        "down_capacity_slots",
+        "down_resident_slots",
+        "down_free_slots",
+        "down_evictions_total",
+        # transfer/overlap/fallback
+        "cpu_queue_wait_time",
+        "d2h_bytes",
+        "h2d_bytes",
+        "overlap_ratio",
+        "fallback_degrade_count",
+        # promotion policy/drop accounting
+        "promotion_drop_total",
+        "promotion_drop_queue_high_watermark",
+        "promotion_drop_cooldown",
+        "promotion_admitted",
+        "promotion_reject_delta",
+        "promotion_reject_no_ema",
+        "tracker_queue_drop",
+        # prefetch observability
+        "prefetch_submitted",
+        "prefetch_ready_hits",
+        "prefetch_not_ready",
+        "prefetch_stale",
+        "prefetch_false_positives",
+        "prefetch_slot_overwrite",
+        # kernel accounting
+        "moe_kernel_calls",
+        "moe_kernel_tokens",
+    }
+    missing = sorted(required_observability_fields - set(stats.keys()))
+    assert not missing, f"missing COLoRA observability fields: {missing}"
+
+    assert stats["colora_hit_tokens"] == 0
     assert stats["colora_miss_tokens"] == 2
+    assert stats["cache_hit_rate"] == 0.0
     assert stats["promotion_queue_depth"] == 0
-    assert "cache_capacity_slots" in stats
-    assert "cache_resident_slots" in stats
-    assert "cache_free_slots" in stats
-    assert "cache_evictions_total" in stats
-    assert "gate_capacity_slots" in stats
-    assert "gate_resident_slots" in stats
-    assert "gate_free_slots" in stats
-    assert "gate_evictions_total" in stats
-    assert "cpu_queue_wait_time" in stats
-    assert "d2h_bytes" in stats
-    assert "h2d_bytes" in stats
-    assert "overlap_ratio" in stats
-    assert "fallback_degrade_count" in stats
+    assert stats["promotion_admitted"] == 0
+    assert stats["cpu_queue_wait_time"] == 0.0
+    assert stats["fallback_degrade_count"] == 0
+    assert stats["cpu_compute_time"] > 0.0
+    assert stats["gpu_compute_time"] == 0.0
+    assert stats["h2d_bytes"] > 0.0
     assert stats["moe_kernel_calls"] > 0
     assert stats["moe_kernel_tokens"] == 2

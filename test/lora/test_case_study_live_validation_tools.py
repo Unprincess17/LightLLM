@@ -84,12 +84,18 @@ def test_parse_and_summarize_colora_log_lines():
             "cache_capacity_slots=96 cache_resident_slots=92 cache_free_slots=4 cache_evictions_total=3 "
             "cpu_compute_time=0.010 gpu_compute_time=0.020 cpu_queue_wait=0.001 d2h_bytes=1024 h2d_bytes=2048 "
             "fallback_degrade_count=1 cpu_queue_depth=3 promotion_drop_total=4 promotion_drop_queue=2 "
-            "promotion_drop_cooldown=1 moe_kernel_calls=6 moe_kernel_tokens=24",
+            "promotion_drop_cooldown=1 promotion_admitted=2 promotion_reject_delta=3 promotion_reject_no_ema=4 "
+            "tracker_queue_drop=5 prefetch_submitted=6 prefetch_ready_hits=7 prefetch_not_ready=8 "
+            "prefetch_stale=9 prefetch_false_positives=10 prefetch_slot_overwrite=11 "
+            "moe_kernel_calls=6 moe_kernel_tokens=24",
             "DEBUG 03-13 12:00:02 [x.py:1] [COLoRA] layer=3 hit_tokens=16 miss_tokens=8 queue_depth=5 hit_rate=0.66 "
             "cache_capacity_slots=96 cache_resident_slots=96 cache_free_slots=0 cache_evictions_total=5 "
             "cpu_compute_time=0.015 gpu_compute_time=0.025 cpu_queue_wait=0.002 d2h_bytes=512 h2d_bytes=1024 "
             "fallback_degrade_count=0 cpu_queue_depth=4 promotion_drop_total=5 promotion_drop_queue=2 "
-            "promotion_drop_cooldown=1 moe_kernel_calls=4 moe_kernel_tokens=16",
+            "promotion_drop_cooldown=1 promotion_admitted=1 promotion_reject_delta=0 promotion_reject_no_ema=1 "
+            "tracker_queue_drop=0 prefetch_submitted=2 prefetch_ready_hits=3 prefetch_not_ready=4 "
+            "prefetch_stale=5 prefetch_false_positives=6 prefetch_slot_overwrite=12 "
+            "moe_kernel_calls=4 moe_kernel_tokens=16",
         ]
     )
 
@@ -107,9 +113,121 @@ def test_parse_and_summarize_colora_log_lines():
     assert summary["promotion_queue_depth_max"] == 5
     assert summary["cpu_queue_depth_max"] == 4
     assert summary["promotion_drop_total_end"] == 5
+    assert summary["promotion_drop_queue_high_watermark_end"] == 2
+    assert summary["promotion_drop_cooldown_end"] == 1
+    assert summary["promotion_admitted_sum"] == 3
+    assert summary["promotion_reject_delta_sum"] == 3
+    assert summary["promotion_reject_no_ema_sum"] == 5
+    assert summary["tracker_queue_drop_sum"] == 5
+    assert summary["prefetch_submitted_sum"] == 8
+    assert summary["prefetch_ready_hits_sum"] == 10
+    assert summary["prefetch_not_ready_sum"] == 12
+    assert summary["prefetch_stale_sum"] == 14
+    assert summary["prefetch_false_positives_sum"] == 16
+    assert summary["prefetch_slot_overwrite_end"] == 12
     assert summary["fallback_degrade_count_sum"] == 1
     assert summary["moe_kernel_calls_sum"] == 10
     assert summary["moe_kernel_tokens_sum"] == 40
+
+
+def test_summarize_per_window_counters_preserves_extended_colora_fields():
+    per_window_rows = [
+        {
+            "colora_line_count": 1,
+            "colora_hit_tokens": 8,
+            "colora_miss_tokens": 24,
+            "cache_hit_rate_max": 0.25,
+            "cache_capacity_slots_max": 96,
+            "cache_resident_slots_max": 92,
+            "cache_free_slots_min": 4,
+            "cache_evictions_total_end": 3,
+            "promotion_queue_depth_max": 2,
+            "cpu_queue_depth_max": 3,
+            "promotion_drop_total_end": 4,
+            "promotion_drop_queue_high_watermark_end": 2,
+            "promotion_drop_cooldown_end": 1,
+            "promotion_admitted_sum": 2,
+            "promotion_reject_delta_sum": 3,
+            "promotion_reject_no_ema_sum": 4,
+            "tracker_queue_drop_sum": 5,
+            "prefetch_submitted_sum": 6,
+            "prefetch_ready_hits_sum": 7,
+            "prefetch_not_ready_sum": 8,
+            "prefetch_stale_sum": 9,
+            "prefetch_false_positives_sum": 10,
+            "prefetch_slot_overwrite_end": 11,
+            "fallback_degrade_count_sum": 1,
+            "cpu_compute_time_sum": 0.01,
+            "gpu_compute_time_sum": 0.02,
+            "cpu_queue_wait_time_sum": 0.001,
+            "d2h_bytes_sum": 1024.0,
+            "h2d_bytes_sum": 2048.0,
+            "weight_h2d_bytes_sum": 0.0,
+            "weight_h2d_time_sum": 0.0,
+            "blocking_promotion_count_sum": 0,
+            "observed_overlap_modes": ["none"],
+            "observed_miss_policies": ["cpu_first"],
+            "moe_kernel_calls_sum": 6,
+            "moe_kernel_tokens_sum": 24,
+        },
+        {
+            "colora_line_count": 1,
+            "colora_hit_tokens": 16,
+            "colora_miss_tokens": 8,
+            "cache_hit_rate_max": 0.66,
+            "cache_capacity_slots_max": 96,
+            "cache_resident_slots_max": 96,
+            "cache_free_slots_min": 0,
+            "cache_evictions_total_end": 5,
+            "promotion_queue_depth_max": 5,
+            "cpu_queue_depth_max": 4,
+            "promotion_drop_total_end": 5,
+            "promotion_drop_queue_high_watermark_end": 2,
+            "promotion_drop_cooldown_end": 1,
+            "promotion_admitted_sum": 1,
+            "promotion_reject_delta_sum": 0,
+            "promotion_reject_no_ema_sum": 1,
+            "tracker_queue_drop_sum": 0,
+            "prefetch_submitted_sum": 2,
+            "prefetch_ready_hits_sum": 3,
+            "prefetch_not_ready_sum": 4,
+            "prefetch_stale_sum": 5,
+            "prefetch_false_positives_sum": 6,
+            "prefetch_slot_overwrite_end": 12,
+            "fallback_degrade_count_sum": 0,
+            "cpu_compute_time_sum": 0.015,
+            "gpu_compute_time_sum": 0.025,
+            "cpu_queue_wait_time_sum": 0.002,
+            "d2h_bytes_sum": 512.0,
+            "h2d_bytes_sum": 1024.0,
+            "weight_h2d_bytes_sum": 0.0,
+            "weight_h2d_time_sum": 0.0,
+            "blocking_promotion_count_sum": 0,
+            "observed_overlap_modes": ["async"],
+            "observed_miss_policies": ["cpu_first"],
+            "moe_kernel_calls_sum": 4,
+            "moe_kernel_tokens_sum": 16,
+        },
+    ]
+
+    summary = live_mod.summarize_per_window_counters(per_window_rows)
+
+    assert summary["colora_hit_tokens"] == 24
+    assert summary["colora_miss_tokens"] == 32
+    assert summary["cache_capacity_slots_max"] == 96
+    assert summary["cache_resident_slots_max"] == 96
+    assert summary["cache_free_slots_min"] == 0
+    assert summary["cache_evictions_total_end"] == 5
+    assert summary["promotion_admitted_sum"] == 3
+    assert summary["promotion_reject_delta_sum"] == 3
+    assert summary["promotion_reject_no_ema_sum"] == 5
+    assert summary["tracker_queue_drop_sum"] == 5
+    assert summary["prefetch_submitted_sum"] == 8
+    assert summary["prefetch_ready_hits_sum"] == 10
+    assert summary["prefetch_not_ready_sum"] == 12
+    assert summary["prefetch_stale_sum"] == 14
+    assert summary["prefetch_false_positives_sum"] == 16
+    assert summary["prefetch_slot_overwrite_end"] == 12
 
 
 def test_summarize_reuse_agreement_marks_later_hits_as_agree():

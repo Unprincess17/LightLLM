@@ -54,11 +54,11 @@ def _build_projection_pool(dtype=torch.float32):
     return pool
 
 
-def _build_dummy_lora_mem_pool():
+def _build_dummy_lora_mem_pool(dtype=torch.float32):
     return SimpleNamespace(
-        moe_gate_pool=_build_projection_pool(),
-        moe_up_pool=_build_projection_pool(),
-        moe_down_pool=_build_projection_pool(),
+        moe_gate_pool=_build_projection_pool(dtype=dtype),
+        moe_up_pool=_build_projection_pool(dtype=dtype),
+        moe_down_pool=_build_projection_pool(dtype=dtype),
     )
 
 
@@ -172,6 +172,152 @@ def test_temporal_hot_cache_exact_lookup_uses_step_scoped_key():
         assert stale_weights is None
         assert stale_handle is None
         assert stale_status == "missing"
+    finally:
+        dispatcher.cleanup_temporal_prefetch_state()
+        dispatcher._promotion_interval_tracker.close()
+
+
+def test_deferred_promotion_rejection_does_not_block_cpu_fallback(monkeypatch):
+    lora_mem_pool = _build_dummy_lora_mem_pool(dtype=torch.bfloat16)
+    cache_mgr = MoEExpertCacheManager(
+        MoEExpertCacheConfig(
+            cache_budget_mb=1,
+            promote_min_hits=1,
+            promote_window=1,
+            max_promote_per_step=1,
+            queue_high_watermark=1,
+        )
+    )
+    cache_mgr.register_projection_pool("gate", lora_mem_pool.moe_gate_pool)
+    cache_mgr.register_projection_pool("up", lora_mem_pool.moe_up_pool)
+    cache_mgr.register_projection_pool("down", lora_mem_pool.moe_down_pool)
+
+    dispatcher = dispatch_mod.Qwen3VLMoELoRADispatcher(
+        num_layers=1,
+        gate_lora_rank=2,
+        up_lora_rank=2,
+        down_lora_rank=2,
+        lora_compute_config=LoRAComputeConfig(moe_storage="cpu", moe_compute="hybrid"),
+        colora_deferred_promotion_delta_steps=1,
+    )
+    dispatcher.init_batched_mode(
+        lora_mem_pool=lora_mem_pool,
+        req_bins=torch.tensor([0], dtype=torch.long),
+        expert_cache_manager=cache_mgr,
+    )
+
+    monkeypatch.setattr(dispatcher, "_require_moe_cpu_kernel", lambda mode: None)
+    monkeypatch.setattr(dispatcher, "_select_moe_stage2_kernel", lambda projection: dispatch_mod.moe_batch_lora_up_avx)
+
+    joint_key = dispatch_mod.JointObjectKey(layer_id=0, adapter_bin=0, expert_id=0)
+    with dispatcher._promotion_interval_tracker._lock:
+        dispatcher._promotion_interval_tracker._states[joint_key] = dispatch_mod._JointAccessState(
+            last_decode_step_id=3,
+            ema_interval_steps=5.0,
+            interval_sample_count=2,
+        )
+
+    input_tensor = torch.tensor([[1.0, 2.0, 3.0, 4.0]], dtype=torch.bfloat16)
+    baseline_out, _, _ = dispatcher._strict_moe_cpu_batch_lora(
+        input_tensor=input_tensor,
+        layer_id=0,
+        pool=lora_mem_pool.moe_gate_pool,
+        req_bins=torch.tensor([0], dtype=torch.long),
+        projection="gate",
+    )
+
+    try:
+        dispatcher.note_decode_joint_access(
+            decode_step_id=9,
+            layer_id=0,
+            expert_id=0,
+            adapter_bins=[0],
+        )
+        assert cache_mgr.get_promotion_queue_depth() == 0
+
+        dispatcher.begin_decode_joint_context(decode_step_id=9, layer_id=0, expert_id=0)
+        out = dispatcher._batch_apply_moe_lora_hybrid(
+            input_tensor=input_tensor,
+            layer_id=0,
+            buffer_layer_id=0,
+            pool=lora_mem_pool.moe_gate_pool,
+            bins=torch.tensor([0], dtype=torch.long),
+            projection="gate",
+            expert_id=0,
+        )
+        dispatcher.end_decode_joint_context()
+
+        assert torch.allclose(out.float(), baseline_out.float(), atol=1e-3, rtol=1e-3)
+        assert dispatcher._last_colora_stats["promotion_reject_delta"] == 1
+        assert dispatcher._last_colora_stats["promotion_admitted"] == 0
+        assert dispatcher._last_colora_stats["colora_miss_tokens"] == 1
+        assert dispatcher._last_colora_stats["moe_kernel_calls"] >= 1
+        assert dispatcher._last_colora_stats["moe_kernel_tokens"] == 1
+        assert cache_mgr.get_promotion_queue_depth() == 0
+    finally:
+        dispatcher.end_decode_joint_context()
+        dispatcher._promotion_interval_tracker.close()
+
+
+def test_temporal_prefetch_missing_or_not_ready_falls_back_cleanly(monkeypatch):
+    lora_mem_pool = _build_dummy_lora_mem_pool(dtype=torch.bfloat16)
+    dispatcher = dispatch_mod.Qwen3VLMoELoRADispatcher(
+        num_layers=1,
+        gate_lora_rank=2,
+        up_lora_rank=2,
+        down_lora_rank=2,
+        lora_compute_config=LoRAComputeConfig(moe_storage="cpu", moe_compute="hybrid"),
+        colora_temporal_prefetch=True,
+        colora_temporal_hot_cache_slots=2,
+    )
+    dispatcher.init_batched_mode(
+        lora_mem_pool=lora_mem_pool,
+        req_bins=torch.tensor([0], dtype=torch.long),
+        expert_cache_manager=None,
+    )
+
+    monkeypatch.setattr(dispatcher, "_require_moe_cpu_kernel", lambda mode: None)
+    monkeypatch.setattr(dispatcher, "_select_moe_stage2_kernel", lambda projection: dispatch_mod.moe_batch_lora_up_avx)
+
+    input_tensor = torch.tensor([[0.5, 1.0, -2.0, 0.25]], dtype=torch.bfloat16)
+    expected_out, _, _ = dispatcher._strict_moe_cpu_batch_lora(
+        input_tensor=input_tensor,
+        layer_id=0,
+        pool=lora_mem_pool.moe_gate_pool,
+        req_bins=torch.tensor([0], dtype=torch.long),
+        projection="gate",
+    )
+
+    try:
+        assert dispatcher.begin_temporal_prefetch_step(17)["retired_active"] == 0
+        assert dispatcher._temporal_hot_cache is not None
+        filling_key = dispatch_mod.TemporalPrefetchJobKey(layer_id=0, decode_step_id=17, adapter_bin=0, expert_id=0)
+        slot_ref = dispatcher._temporal_hot_cache.reserve_slot(filling_key)
+        assert slot_ref is not None
+        assert dispatcher._temporal_hot_cache.get_status(filling_key) == "filling"
+
+        not_ready_out, _, _ = dispatcher._strict_moe_cpu_batch_lora(
+            input_tensor=input_tensor,
+            layer_id=0,
+            pool=lora_mem_pool.moe_gate_pool,
+            req_bins=torch.tensor([0], dtype=torch.long),
+            projection="gate",
+            temporal_prefetch_context=(17, 0, 0),
+        )
+        assert torch.allclose(not_ready_out.float(), expected_out.float(), atol=1e-3, rtol=1e-3)
+        assert dispatcher._last_colora_stats["prefetch_not_ready"] == 1
+
+        missing_out, _, _ = dispatcher._strict_moe_cpu_batch_lora(
+            input_tensor=input_tensor,
+            layer_id=0,
+            pool=lora_mem_pool.moe_gate_pool,
+            req_bins=torch.tensor([0], dtype=torch.long),
+            projection="gate",
+            temporal_prefetch_context=(18, 0, 0),
+        )
+        assert torch.allclose(missing_out.float(), expected_out.float(), atol=1e-3, rtol=1e-3)
+        assert dispatcher._last_colora_stats["prefetch_not_ready"] == 1
+        assert dispatcher._last_colora_stats["prefetch_ready_hits"] == 0
     finally:
         dispatcher.cleanup_temporal_prefetch_state()
         dispatcher._promotion_interval_tracker.close()
