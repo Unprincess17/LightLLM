@@ -1,0 +1,93 @@
+import pytest
+from pathlib import Path
+import tempfile
+from tools.evaluation.live_e2e.manifest import load_manifest, LiveE2EManifest, LiveE2ERun
+
+
+def _write_temp_manifest(tmp_path: Path, content: str) -> Path:
+    manifest_path = tmp_path / "manifest.yaml"
+    manifest_path.write_text(content, encoding="utf-8")
+    return manifest_path
+
+
+def test_load_valid_paper_manifest():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        content = """
+run_id: test_paper_suite
+description: "Test paper suite"
+runs:
+  - run_label: baseline_lora_gpu
+    suite_kind: paper
+    mode_label: baseline
+    compute_device: "gpu:gpu,gpu:gpu"
+    warmup_requests: 2
+  - run_label: colora_execution_first
+    suite_kind: paper
+    mode_label: execution_first
+    compute_device: "vl_storage:gpu,vl_compute:gpu,attn_storage:gpu,attn_compute:gpu,moe_storage:cpu,moe_compute:hybrid"
+    miss_handling_mode: execution_first
+    overlap_policy: calibrated
+    cpu_workers: 2
+    cpu_queue_depth: 8
+    nsys_enabled: false
+"""
+        manifest_path = _write_temp_manifest(tmp_path, content)
+        manifest = load_manifest(manifest_path)
+        assert isinstance(manifest, LiveE2EManifest)
+        assert manifest.run_id == "test_paper_suite"
+        assert len(manifest.runs) == 2
+        assert manifest.runs[0].run_label == "baseline_lora_gpu"
+        assert manifest.runs[0].suite_kind == "paper"
+        assert manifest.runs[0].nsys_enabled is False
+        assert manifest.runs[1].miss_handling_mode == "execution_first"
+        assert manifest.runs[1].cpu_workers == 2
+
+
+def test_reject_invalid_suite_kind():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        content = """
+run_id: bad_test
+runs:
+  - run_label: test
+    suite_kind: invalid
+    mode_label: test
+    compute_device: "gpu:gpu"
+"""
+        manifest_path = _write_temp_manifest(tmp_path, content)
+        with pytest.raises(ValueError, match="Invalid suite_kind"):
+            load_manifest(manifest_path)
+
+
+def test_canonical_paper_suite_has_three_runs():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        content = """
+run_id: paper_canonical_1
+description: "Canonical three-run comparison for paper"
+runs:
+  - run_label: baseline_lora_gpu
+    suite_kind: paper
+    mode_label: baseline
+    compute_device: "gpu:gpu,gpu:gpu"
+  - run_label: colora_execution_first
+    suite_kind: paper
+    mode_label: execution_first
+    compute_device: "vl_storage:gpu,vl_compute:gpu,attn_storage:gpu,attn_compute:gpu,moe_storage:cpu,moe_compute:hybrid"
+    miss_handling_mode: execution_first
+    overlap_policy: calibrated
+    nsys_enabled: false
+  - run_label: colora_load_then_run
+    suite_kind: paper
+    mode_label: load_then_run
+    compute_device: "vl_storage:gpu,vl_compute:gpu,attn_storage:gpu,attn_compute:gpu,moe_storage:cpu,moe_compute:hybrid"
+    miss_handling_mode: load_then_run
+    overlap_policy: calibrated
+    nsys_enabled: false
+"""
+        manifest_path = _write_temp_manifest(tmp_path, content)
+        manifest = load_manifest(manifest_path)
+        assert len(manifest.runs) == 3
+        expected_labels = {"baseline_lora_gpu", "colora_execution_first", "colora_load_then_run"}
+        assert {r.run_label for r in manifest.runs} == expected_labels
