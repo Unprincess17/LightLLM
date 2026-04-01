@@ -131,3 +131,63 @@ def test_build_benchmark_command_colora():
     assert "--colora-cpu-workers 2" in cmd
     assert "--colora-cpu-queue-depth 8" in cmd
     assert "--colora-async-fallback true" in cmd
+
+
+def test_example_paper_suite_manifest_parses_and_builds_commands():
+    from tools.evaluation.live_e2e.manifest import load_manifest
+    from tools.evaluation.live_e2e.runner import build_benchmark_command, get_run_output_dir
+
+    manifest_path = Path(__file__).resolve().parents[2] / "configs/live_e2e/paper_suite_example.yaml"
+    assert manifest_path.exists()
+
+    manifest = load_manifest(manifest_path)
+    assert manifest.run_id == "canonical_paper_suite_01"
+    assert len(manifest.runs) == 3
+
+    # Check output paths follow the spec layout
+    for run in manifest.runs:
+        output_dir = get_run_output_dir(manifest, run)
+        assert str(output_dir).endswith(f"paper_runs/{run.run_label}")
+        assert "artifacts/evaluation/live_e2e" in str(output_dir)
+
+    # Build all three commands and check expected flags are present
+    cmds = []
+    for run in manifest.runs:
+        cmd = build_benchmark_command(run, "test/lora/benchmark_lora.sh")
+        cmds.append(cmd)
+
+    # Baseline command has all-gpu
+    assert "all:gpu" in cmds[0]
+
+    # execution_first has correct policy
+    assert "execution_first" in cmds[1]
+    assert "calibrated" in cmds[1]
+    assert "cpu-workers 2" in cmds[1]
+    assert "speculative-dispatch true" in cmds[1]
+
+    # load_then_run has correct policy
+    assert "load_then_run" in cmds[2]
+    assert "calibrated" in cmds[2]
+    assert "speculative-dispatch false" in cmds[2]
+
+
+def test_nsys_wrapper_builds_correct_command():
+    from tools.evaluation.live_e2e.manifest import LiveE2ERun
+    from tools.evaluation.live_e2e.runner import build_benchmark_command, build_nsys_command
+
+    run = LiveE2ERun(
+        run_label="diagnostic_execution_first",
+        suite_kind="diagnostic",
+        mode_label="execution_first",
+        compute_device="vl_storage:gpu,vl_compute:gpu",
+        miss_handling_mode="execution_first",
+        nsys_enabled=True,
+        nsys_output_prefix="debug_execution_first",
+    )
+
+    base_cmd = build_benchmark_command(run, "test/lora/benchmark_lora.sh")
+    nsys_cmd = build_nsys_command(base_cmd, Path("/tmp/output"), run)
+
+    assert "nsys profile" in nsys_cmd
+    assert "--output /tmp/output/debug_execution_first" in nsys_cmd
+    assert "execution_first" in nsys_cmd
