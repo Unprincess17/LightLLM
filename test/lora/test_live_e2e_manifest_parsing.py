@@ -91,3 +91,43 @@ runs:
         assert len(manifest.runs) == 3
         expected_labels = {"baseline_lora_gpu", "colora_execution_first", "colora_load_then_run"}
         assert {r.run_label for r in manifest.runs} == expected_labels
+
+
+def test_build_benchmark_command_baseline():
+    from tools.evaluation.live_e2e.runner import build_benchmark_command
+    from tools.evaluation.live_e2e.manifest import LiveE2ERun
+
+    run = LiveE2ERun(
+        run_label="baseline_lora_gpu",
+        suite_kind="paper",
+        mode_label="baseline",
+        compute_device="all:gpu",
+    )
+
+    cmd = build_benchmark_command(run, benchmark_script="/path/benchmark_lora.sh")
+    assert "/path/benchmark_lora.sh" in cmd
+    assert "--compute-device all:gpu" in cmd
+
+
+def test_build_benchmark_command_colora():
+    from tools.evaluation.live_e2e.runner import build_benchmark_command
+    from tools.evaluation.live_e2e.manifest import LiveE2ERun
+
+    run = LiveE2ERun(
+        run_label="colora_execution_first",
+        suite_kind="paper",
+        mode_label="execution_first",
+        compute_device="vl_storage:gpu,vl_compute:gpu,attn_storage:gpu,attn_compute:gpu,moe_storage:cpu,moe_compute:hybrid",
+        miss_handling_mode="execution_first",
+        overlap_policy="calibrated",
+        cpu_workers=2,
+        cpu_queue_depth=8,
+        async_fallback=True,
+    )
+
+    cmd = build_benchmark_command(run, benchmark_script="/path/benchmark_lora.sh")
+    assert "--colora-miss-policy execution_first" in cmd
+    assert "--colora-overlap-policy calibrated" in cmd
+    assert "--colora-cpu-workers 2" in cmd
+    assert "--colora-cpu-queue-depth 8" in cmd
+    assert "--colora-async-fallback true" in cmd
