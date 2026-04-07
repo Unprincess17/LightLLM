@@ -37,16 +37,26 @@ Server pass-through options:
   --max_req_total_len N
   --mem_fraction F
   --batch_max_tokens N
+  --trust_remote_code | --no_trust_remote_code
+  --disable_cudagraph | --no_disable_cudagraph
+  --enable_multimodal | --no_enable_multimodal
+  --lora_max_size N
+  --mock_prefill_logits | --no_mock_prefill_logits
   --colora_cache_budget_mb MB
   --colora_promote_min_hits N
   --colora_promote_window N
   --colora_max_promote_per_step N
   --colora_decay F
+  --colora_deferred_promotion_delta_steps N
+  --colora_promotion_ema_alpha F
   --colora_miss_policy STR
   --colora_async_fallback 0|1
   --colora_cpu_workers N
   --colora_cpu_queue_depth N
   --colora_cpu_batch_timeout_us N
+  --colora_temporal_prefetch | --no_colora_temporal_prefetch
+  --colora_temporal_prefetch_layer_whitelist CSV
+  --colora_temporal_hot_cache_slots N
   --colora_speculative_dispatch | --no_colora_speculative_dispatch
   --colora_spec_layer_whitelist CSV
   --server_log_path PATH
@@ -57,7 +67,7 @@ USAGE
 
 # Default values
 SETUP_DELAY=10
-MAX_WAIT=1200
+MAX_WAIT=2000
 OUTPUT_PREFIX="moe_offload_profile"
 TEST_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEST_SCRIPT="$TEST_SCRIPT_DIR/test_moe_lora_api.py"
@@ -91,6 +101,11 @@ FORCE_SLOW_LORA_PATH="1"
 MAX_REQ_TOTAL_LEN=""
 MEM_FRACTION=""
 BATCH_MAX_TOKENS=""
+TRUST_REMOTE_CODE=""
+DISABLE_CUDAGRAPH=""
+ENABLE_MULTIMODAL=""
+LORA_MAX_SIZE=""
+MOCK_PREFILL_LOGITS=""
 COLORA_CACHE_BUDGET_MB=""
 COLORA_PROMOTE_MIN_HITS="1"
 COLORA_PROMOTE_WINDOW="512"
@@ -187,6 +202,14 @@ run_client_phase() {
     shift
 
     echo "===== ${phase_name} =====" | tee -a benchmark_lora.log
+
+    # Print exact client command
+    printf "Running client command: python %q" "$TEST_SCRIPT"
+    for arg in "$@"; do
+        printf " %q" "$arg"
+    done
+    printf "\n" | tee -a benchmark_lora.log
+
     python "$TEST_SCRIPT" "$@" 2>&1 | tee -a benchmark_lora.log
 }
 
@@ -229,6 +252,15 @@ while [[ $# -gt 0 ]]; do
         --max_req_total_len) MAX_REQ_TOTAL_LEN="$2"; shift 2 ;;
         --mem_fraction) MEM_FRACTION="$2"; shift 2 ;;
         --batch_max_tokens) BATCH_MAX_TOKENS="$2"; shift 2 ;;
+        --trust_remote_code) TRUST_REMOTE_CODE="1"; shift ;;
+        --no_trust_remote_code) TRUST_REMOTE_CODE="0"; shift ;;
+        --disable_cudagraph) DISABLE_CUDAGRAPH="1"; shift ;;
+        --no_disable_cudagraph) DISABLE_CUDAGRAPH="0"; shift ;;
+        --enable_multimodal) ENABLE_MULTIMODAL="1"; shift ;;
+        --no_enable_multimodal) ENABLE_MULTIMODAL="0"; shift ;;
+        --lora_max_size) LORA_MAX_SIZE="$2"; shift 2 ;;
+        --mock_prefill_logits) MOCK_PREFILL_LOGITS="1"; shift ;;
+        --no_mock_prefill_logits) MOCK_PREFILL_LOGITS="0"; shift ;;
         --colora_cache_budget_mb) COLORA_CACHE_BUDGET_MB="$2"; shift 2 ;;
         --colora_promote_min_hits) COLORA_PROMOTE_MIN_HITS="$2"; shift 2 ;;
         --colora_promote_window) COLORA_PROMOTE_WINDOW="$2"; shift 2 ;;
@@ -312,16 +344,16 @@ cleanup() {
     echo "[Cleanup] Tearing down benchmark processes..."
     trap - INT TERM EXIT # Disable traps to avoid recursion
 
-    if [[ -n "$SERVER_PID" ]]; then
-        # Fast kill - skip the 20-second wait in terminate_server_tree
-        kill -INT "$SERVER_PID" 2>/dev/null || true
-        sleep 2
-        # Hard kill immediately if still running
-        pkill -KILL -P "$SERVER_PID" 2>/dev/null || true
-        kill -KILL "$SERVER_PID" 2>/dev/null || true
-        wait "$SERVER_PID" 2>/dev/null || true
-        SERVER_PID=""
-    fi
+    # if [[ -n "$SERVER_PID" ]]; then
+    #     # Fast kill - skip the 20-second wait in terminate_server_tree
+    #     kill -INT "$SERVER_PID" 2>/dev/null || true
+    #     sleep 2
+    #     # Hard kill immediately if still running
+    #     pkill -KILL -P "$SERVER_PID" 2>/dev/null || true
+    #     kill -KILL "$SERVER_PID" 2>/dev/null || true
+    #     wait "$SERVER_PID" 2>/dev/null || true
+    #     SERVER_PID=""
+    # fi
 
     # Force kill all remaining processes
     pkill -9 -f "lightllm.server|lightllm::|gunicorn|python.*api_server" 2>/dev/null || true
@@ -350,6 +382,7 @@ echo "=============================================="
 echo "Starting MoE Profiling"
 echo "=============================================="
 echo "Adapter IDs: $ADAPTER_IDS"
+echo "Number of adapters: $(echo "$ADAPTER_IDS" | tr ',' '\n' | wc -l)"
 echo "Poisson lambda: $POISSON_LAMBDA"
 echo "Poisson seed: $POISSON_SEED"
 echo "Max tokens (fallback): $MAX_TOKENS"
@@ -456,6 +489,29 @@ fi
 if [[ -n "$BATCH_MAX_TOKENS" ]]; then
     SERVER_ARGS+=(--batch_max_tokens "$BATCH_MAX_TOKENS")
 fi
+if [[ "$TRUST_REMOTE_CODE" == "1" ]]; then
+    SERVER_ARGS+=(--trust_remote_code)
+elif [[ "$TRUST_REMOTE_CODE" == "0" ]]; then
+    SERVER_ARGS+=(--no_trust_remote_code)
+fi
+if [[ "$DISABLE_CUDAGRAPH" == "1" ]]; then
+    SERVER_ARGS+=(--disable_cudagraph)
+elif [[ "$DISABLE_CUDAGRAPH" == "0" ]]; then
+    SERVER_ARGS+=(--no_disable_cudagraph)
+fi
+if [[ "$ENABLE_MULTIMODAL" == "1" ]]; then
+    SERVER_ARGS+=(--enable_multimodal)
+elif [[ "$ENABLE_MULTIMODAL" == "0" ]]; then
+    SERVER_ARGS+=(--no_enable_multimodal)
+fi
+if [[ -n "$LORA_MAX_SIZE" ]]; then
+    SERVER_ARGS+=(--lora_max_size "$LORA_MAX_SIZE")
+fi
+if [[ "$MOCK_PREFILL_LOGITS" == "1" ]]; then
+    SERVER_ARGS+=(--mock_prefill_logits)
+elif [[ "$MOCK_PREFILL_LOGITS" == "0" ]]; then
+    SERVER_ARGS+=(--no_mock_prefill_logits)
+fi
 if [[ -n "$COLORA_CACHE_BUDGET_MB" ]]; then
     SERVER_ARGS+=(--colora_cache_budget_mb "$COLORA_CACHE_BUDGET_MB")
 fi
@@ -534,18 +590,38 @@ start_time=$SECONDS
 echo "[2/5] Waiting for server to be healthy..."
 
 while (( SECONDS - start_time < MAX_WAIT )); do
-    if nc -vz "$SERVER_HOST" "$SERVER_PORT" 2>/dev/null; then
+    # First check if process is still alive
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
         echo ""
-        echo "Server is UP (port $SERVER_PORT open)"
-        break
+        echo "ERROR: Server process exited early (PID $SERVER_PID)."
+        echo "Check server log at: $SERVER_LOG_PATH"
+        exit 1
+    fi
+
+    # First check port open
+    if nc -vz "$SERVER_HOST" "$SERVER_PORT" 2>/dev/null; then
+        # Port is open, try health checks
+        # Try /healthz first
+        if curl -sf "http://$SERVER_HOST:$SERVER_PORT/healthz" >/dev/null 2>&1; then
+            echo ""
+            echo "Server is HEALTHY (healthz check passed)"
+            break
+        fi
+        # Fallback to /health
+        if curl -sf "http://$SERVER_HOST:$SERVER_PORT/health" >/dev/null 2>&1; then
+            echo ""
+            echo "Server is HEALTHY (health check passed)"
+            break
+        fi
     fi
     echo -n "."
     sleep 5
 done
 
-# Check if server is ready (break sets server_ready=true)
+# Check if we timed out
 if [[ $(($SECONDS - start_time)) -ge $MAX_WAIT ]]; then
-    echo "ERROR: Server failed to start within ${MAX_WAIT}s."
+    echo "ERROR: Server failed to become healthy within ${MAX_WAIT}s."
+    echo "Check server log at: $SERVER_LOG_PATH"
     exit 1
 fi
 

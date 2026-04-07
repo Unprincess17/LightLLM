@@ -16,6 +16,28 @@ This will:
 3.  Automatically run summarization after all runs complete
 4.  Emit `live_e2e_comparison.csv` with p50/p95/p99 latency and throughput for paper use
 
+### Manual smoke commands
+
+Paper suite single-run smoke command:
+
+```bash
+python -m tools.evaluation.live_e2e --manifest configs/live_e2e/paper_suite_example.yaml
+```
+
+Diagnostic nsys smoke command:
+
+```bash
+python -m tools.evaluation.live_e2e --manifest path/to/diagnostic_manifest.yaml
+```
+
+Use a diagnostic manifest containing at least one run with:
+
+```yaml
+suite_kind: diagnostic
+nsys_enabled: true
+nsys_output_prefix: smoke_profile
+```
+
 ### Run summarization only on existing results
 
 ```bash

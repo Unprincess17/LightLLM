@@ -625,6 +625,8 @@ def build_system_streams(
 
     decode_layer_steps: List[DecodeLayerStep] = []
     decode_tokens: List[DecodeToken] = []
+    # Match runtime semantics: decode_step_id advances once per decode iteration,
+    # not once per layer within the same token.
     current_decode_step_id = 0
     active_step_req_idx: Optional[int] = None
     active_step_token_pos: Optional[int] = None
@@ -633,6 +635,7 @@ def build_system_streams(
     active_step_start_index: Optional[int] = None
     active_step_request_ordinal = -1
     active_step_token_ordinal = -1
+    active_step_decode_step_id = -1
     active_token_req_idx: Optional[int] = None
     active_token_pos: Optional[int] = None
     active_token_step_start = 0
@@ -642,10 +645,10 @@ def build_system_streams(
     def flush_active_step(end_index: int) -> None:
         nonlocal active_step_req_idx, active_step_token_pos, active_step_layer_id, active_step_event_idx
         nonlocal active_step_start_index, active_step_request_ordinal, active_step_token_ordinal
-        nonlocal current_decode_step_id
+        nonlocal active_step_decode_step_id
         if active_step_start_index is None:
             return
-        decode_step_ids[int(active_step_start_index):int(end_index)] = np.int64(current_decode_step_id)
+        decode_step_ids[int(active_step_start_index):int(end_index)] = np.int64(active_step_decode_step_id)
         decode_layer_steps.append(
             DecodeLayerStep(
                 request_ordinal=int(active_step_request_ordinal),
@@ -658,7 +661,6 @@ def build_system_streams(
                 end_index=int(end_index),
             )
         )
-        current_decode_step_id += 1
         active_step_req_idx = None
         active_step_token_pos = None
         active_step_layer_id = None
@@ -666,10 +668,12 @@ def build_system_streams(
         active_step_start_index = None
         active_step_request_ordinal = -1
         active_step_token_ordinal = -1
+        active_step_decode_step_id = -1
 
     def flush_active_token() -> None:
         nonlocal active_token_req_idx, active_token_pos, active_token_step_start
         nonlocal active_token_request_ordinal, active_token_ordinal
+        nonlocal current_decode_step_id
         if active_token_req_idx is None:
             return
         decode_tokens.append(
@@ -687,6 +691,7 @@ def build_system_streams(
         active_token_request_ordinal = -1
         active_token_ordinal = -1
         active_token_step_start = len(decode_layer_steps)
+        current_decode_step_id += 1
 
     indep_iter = iter_jsonl_bytes(joined_indep_path)
     corr_iter = iter_jsonl_bytes(joined_corr_path)
@@ -785,6 +790,7 @@ def build_system_streams(
                 active_step_start_index = buffer_index
                 active_step_request_ordinal = current_request_ordinal
                 active_step_token_ordinal = current_token_ordinal
+                active_step_decode_step_id = current_decode_step_id
             elif step_key != active_step_key:
                 flush_active_step(buffer_index)
                 if token_key != (active_token_req_idx, active_token_pos):
@@ -802,6 +808,7 @@ def build_system_streams(
                 active_step_start_index = buffer_index
                 active_step_request_ordinal = current_request_ordinal
                 active_step_token_ordinal = current_token_ordinal
+                active_step_decode_step_id = current_decode_step_id
 
         if progress_every > 0 and rows_seen % progress_every == 0:
             print(f"materialized {rows_seen}/{total_events} aligned cache-access objects for system TPOT replay")

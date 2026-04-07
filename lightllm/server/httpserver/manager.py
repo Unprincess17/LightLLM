@@ -11,6 +11,7 @@ import copy
 import hashlib
 import datetime
 import pickle
+import json
 from frozendict import frozendict
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -40,6 +41,27 @@ from lightllm.utils.auto_shm_cleanup import register_cleanup_callback
 from rpyc.utils.classic import obtain
 
 logger = init_logger(__name__)
+
+# Debug session instrumentation (temporary).
+_AGENT_DEBUG_LOG_PATH = "/home/shufan/LightLLM-integrate-to-SLoRA/.cursor/debug-93213c.log"
+_AGENT_DEBUG_SESSION_ID = "93213c"
+
+
+def _agent_debug_log(location: str, message: str, data: dict, hypothesis_id: str, run_id: str = "pre-fix") -> None:
+    try:
+        payload = {
+            "sessionId": _AGENT_DEBUG_SESSION_ID,
+            "runId": run_id,
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": int(time.time() * 1000),
+        }
+        with open(_AGENT_DEBUG_LOG_PATH, "a", encoding="utf-8") as _f:
+            _f.write(json.dumps(payload, ensure_ascii=True) + "\n")
+    except Exception:
+        pass
 
 
 class HttpServerManager:
@@ -174,20 +196,42 @@ class HttpServerManager:
         if adapter_name.lower() in {"", "default", "none", "null", "base", "base_model"}:
             return 0
 
+        resolution = "unknown_to_base"
+        resolved_adapter_id = 0
         if adapter_name.isdigit():
-            return max(int(adapter_name), 0)
+            resolution = "numeric"
+            resolved_adapter_id = max(int(adapter_name), 0)
+        elif adapter_name in self.lora_name_to_id:
+            resolution = "direct_map"
+            resolved_adapter_id = int(self.lora_name_to_id[adapter_name])
+        else:
+            abs_name = os.path.abspath(adapter_name)
+            if abs_name in self.lora_name_to_id:
+                resolution = "abs_map"
+                resolved_adapter_id = int(self.lora_name_to_id[abs_name])
+            else:
+                base_name = os.path.basename(os.path.normpath(adapter_name))
+                if base_name in self.lora_name_to_id:
+                    resolution = "basename_map"
+                    resolved_adapter_id = int(self.lora_name_to_id[base_name])
 
-        if adapter_name in self.lora_name_to_id:
-            return self.lora_name_to_id[adapter_name]
+        # #region agent log
+        _agent_debug_log(
+            location="server/httpserver/manager.py:_resolve_request_adapter_id",
+            message="Resolved request adapter token",
+            data={
+                "request_index": int(request_index),
+                "adapter_token": adapter_name,
+                "resolved_adapter_id": int(resolved_adapter_id),
+                "resolution": resolution,
+                "known_map_size": int(len(self.lora_name_to_id)),
+            },
+            hypothesis_id="H1",
+        )
+        # #endregion
 
-        abs_name = os.path.abspath(adapter_name)
-        if abs_name in self.lora_name_to_id:
-            return self.lora_name_to_id[abs_name]
-
-        base_name = os.path.basename(os.path.normpath(adapter_name))
-        if base_name in self.lora_name_to_id:
-            return self.lora_name_to_id[base_name]
-
+        if resolved_adapter_id > 0:
+            return resolved_adapter_id
         if adapter_name not in self._unknown_adapter_warned:
             logger.warning(f"[LoRA] Unknown adapter name '{adapter_name}', falling back to base model.")
             self._unknown_adapter_warned.add(adapter_name)

@@ -294,9 +294,14 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
             "cpu_queue_wait_time": 0.0,
             "d2h_bytes": 0.0,
             "h2d_bytes": 0.0,
+            "weight_h2d_bytes": 0.0,
+            "weight_h2d_time": 0.0,
             "overlap_ratio_sum": 0.0,
             "overlap_ratio_count": 0,
             "fallback_degrade_count": 0,
+            "blocking_promotion_count": 0,
+            "miss_policy": "unknown",
+            "overlap_mode": "unknown",
             "cpu_queue_depth": 0,
             "promotion_drop_total": 0,
             "promotion_drop_queue_high_watermark": 0,
@@ -340,7 +345,12 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
         agg_stats["cpu_queue_wait_time"] += float(stats.get("cpu_queue_wait_time", 0.0))
         agg_stats["d2h_bytes"] += float(stats.get("d2h_bytes", 0.0))
         agg_stats["h2d_bytes"] += float(stats.get("h2d_bytes", 0.0))
+        agg_stats["weight_h2d_bytes"] += float(stats.get("weight_h2d_bytes", 0.0))
+        agg_stats["weight_h2d_time"] += float(stats.get("weight_h2d_time", 0.0))
         agg_stats["fallback_degrade_count"] += int(stats.get("fallback_degrade_count", 0))
+        agg_stats["blocking_promotion_count"] += int(stats.get("blocking_promotion_count", 0))
+        agg_stats["miss_policy"] = str(stats.get("miss_policy", agg_stats["miss_policy"]))
+        agg_stats["overlap_mode"] = str(stats.get("overlap_mode", agg_stats["overlap_mode"]))
         agg_stats["cpu_queue_depth"] = int(stats.get("cpu_queue_depth", agg_stats["cpu_queue_depth"]))
         agg_stats["promotion_drop_total"] = int(stats.get("promotion_drop_total", agg_stats["promotion_drop_total"]))
         agg_stats["promotion_drop_queue_high_watermark"] = int(

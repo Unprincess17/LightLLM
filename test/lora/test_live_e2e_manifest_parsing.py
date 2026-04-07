@@ -1,4 +1,6 @@
 import pytest
+import subprocess
+import sys
 from pathlib import Path
 import tempfile
 from tools.evaluation.live_e2e.manifest import load_manifest, LiveE2EManifest, LiveE2ERun
@@ -106,7 +108,7 @@ def test_build_benchmark_command_baseline():
 
     cmd = build_benchmark_command(run, benchmark_script="/path/benchmark_lora.sh")
     assert "/path/benchmark_lora.sh" in cmd
-    assert "--compute-device all:gpu" in cmd
+    assert "--compute_device all:gpu" in cmd
 
 
 def test_build_benchmark_command_colora():
@@ -126,11 +128,11 @@ def test_build_benchmark_command_colora():
     )
 
     cmd = build_benchmark_command(run, benchmark_script="/path/benchmark_lora.sh")
-    assert "--colora-miss-policy execution_first" in cmd
-    assert "--colora-overlap-policy calibrated" in cmd
-    assert "--colora-cpu-workers 2" in cmd
-    assert "--colora-cpu-queue-depth 8" in cmd
-    assert "--colora-async-fallback true" in cmd
+    assert "--colora_miss_policy execution_first" in cmd
+    assert "--colora_overlap_mode calibrated" in cmd
+    assert "--colora_cpu_workers 2" in cmd
+    assert "--colora_cpu_queue_depth 8" in cmd
+    assert "--colora_async_fallback true" in cmd
 
 
 def test_example_paper_suite_manifest_parses_and_builds_commands():
@@ -162,13 +164,28 @@ def test_example_paper_suite_manifest_parses_and_builds_commands():
     # execution_first has correct policy
     assert "execution_first" in cmds[1]
     assert "calibrated" in cmds[1]
-    assert "cpu-workers 2" in cmds[1]
-    assert "speculative-dispatch true" in cmds[1]
+    assert "cpu_workers 2" in cmds[1]
+    assert "--colora_speculative_dispatch" in cmds[1]
 
     # load_then_run has correct policy
     assert "load_then_run" in cmds[2]
     assert "calibrated" in cmds[2]
-    assert "speculative-dispatch false" in cmds[2]
+    assert "--no_colora_speculative_dispatch" in cmds[2]
+
+
+def test_cli_help_includes_manifest_and_summarize_only_flags():
+    repo_root = Path(__file__).resolve().parents[2]
+    proc = subprocess.run(
+        [sys.executable, "-m", "tools.evaluation.live_e2e", "--help"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0
+    assert "--manifest" in proc.stdout
+    assert "--summarize-only" in proc.stdout
 
 
 def test_nsys_wrapper_builds_correct_command():

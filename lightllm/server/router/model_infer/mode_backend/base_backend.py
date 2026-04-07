@@ -1,4 +1,5 @@
 import os
+import json
 import numpy as np
 import torch
 import time
@@ -51,6 +52,27 @@ from lightllm.server.embed_cache.embed_cache_client import CpuEmbedCacheClient
 
 import sys
 print(f"DEBUG: Loading base_backend from {__file__}", file=sys.stderr)
+
+_AGENT_DEBUG_LOG_PATH = "/home/shufan/LightLLM-integrate-to-SLoRA/.cursor/debug-93213c.log"
+_AGENT_DEBUG_SESSION_ID = "93213c"
+
+
+def _agent_debug_log(location: str, message: str, data: dict, hypothesis_id: str, run_id: str = "pre-fix") -> None:
+    try:
+        payload = {
+            "sessionId": _AGENT_DEBUG_SESSION_ID,
+            "runId": run_id,
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": int(time.time() * 1000),
+        }
+        with open(_AGENT_DEBUG_LOG_PATH, "a", encoding="utf-8") as _f:
+            _f.write(json.dumps(payload, ensure_ascii=True) + "\n")
+    except Exception:
+        pass
+
 class ModeBackend:
     def __init__(self) -> None:
         self.shm_req_manager = ShmReqManager()
@@ -427,13 +449,81 @@ class ModeBackend:
 
     def _try_read_new_reqs_normal(self):
         if self.is_master_in_node:
-            if self.shm_reqs_io_buffer.is_ready():
-                self.node_broadcast_tensor.fill_(1)
-            else:
-                self.node_broadcast_tensor.fill_(0)
+            # #region agent log
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                _agent_debug_log(
+                    location="server/router/model_infer/mode_backend/base_backend.py:_try_read_new_reqs_normal",
+                    message="CUDA sync succeeded before node_broadcast fill",
+                    data={"is_master_in_node": bool(self.is_master_in_node)},
+                    hypothesis_id="H10",
+                )
+            except Exception as e:
+                _agent_debug_log(
+                    location="server/router/model_infer/mode_backend/base_backend.py:_try_read_new_reqs_normal",
+                    message="CUDA sync failed before node_broadcast fill",
+                    data={"error": str(e)},
+                    hypothesis_id="H10",
+                )
+                raise
+            # #endregion
+            # #region agent log
+            ready_flag = bool(self.shm_reqs_io_buffer.is_ready())
+            _agent_debug_log(
+                location="server/router/model_infer/mode_backend/base_backend.py:_try_read_new_reqs_normal",
+                message="About to fill node_broadcast_tensor",
+                data={
+                    "ready_flag": ready_flag,
+                    "tensor_device": str(self.node_broadcast_tensor.device),
+                    "tensor_dtype": str(self.node_broadcast_tensor.dtype),
+                },
+                hypothesis_id="H30",
+            )
+            try:
+                if ready_flag:
+                    self.node_broadcast_tensor.fill_(1)
+                else:
+                    self.node_broadcast_tensor.fill_(0)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                _agent_debug_log(
+                    location="server/router/model_infer/mode_backend/base_backend.py:_try_read_new_reqs_normal",
+                    message="Filled node_broadcast_tensor successfully",
+                    data={"ready_flag": ready_flag},
+                    hypothesis_id="H30",
+                )
+            except Exception as e:
+                _agent_debug_log(
+                    location="server/router/model_infer/mode_backend/base_backend.py:_try_read_new_reqs_normal",
+                    message="Failed while filling node_broadcast_tensor",
+                    data={"ready_flag": ready_flag, "error": str(e)},
+                    hypothesis_id="H30",
+                )
+                raise
+            # #endregion
 
         src_rank_id = self.args.node_rank * self.node_world_size
         dist.broadcast(self.node_broadcast_tensor, src=src_rank_id, group=self.node_nccl_group, async_op=False)
+        # #region agent log
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            _agent_debug_log(
+                location="server/router/model_infer/mode_backend/base_backend.py:_try_read_new_reqs_normal",
+                message="CUDA sync succeeded after dist.broadcast",
+                data={"src_rank_id": int(src_rank_id)},
+                hypothesis_id="H11",
+            )
+        except Exception as e:
+            _agent_debug_log(
+                location="server/router/model_infer/mode_backend/base_backend.py:_try_read_new_reqs_normal",
+                message="CUDA sync failed after dist.broadcast",
+                data={"src_rank_id": int(src_rank_id), "error": str(e)},
+                hypothesis_id="H11",
+            )
+            raise
+        # #endregion
         new_buffer_is_ready = self.node_broadcast_tensor.detach().item()
         if new_buffer_is_ready:
             self._read_reqs_buffer_and_init_reqs()

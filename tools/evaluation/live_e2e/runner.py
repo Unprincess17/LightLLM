@@ -12,26 +12,29 @@ from tools.evaluation.live_e2e.manifest import load_manifest
 def build_benchmark_command(run: LiveE2ERun, benchmark_script: str) -> str:
     """Build the benchmark_lora.sh command string from a run definition."""
     parts = [benchmark_script]
-    parts.append(f"--compute-device {run.compute_device}")
+    parts.append(f"--compute_device {run.compute_device}")
 
     if run.miss_handling_mode is not None:
-        parts.append(f"--colora-miss-policy {run.miss_handling_mode}")
+        parts.append(f"--colora_miss_policy {run.miss_handling_mode}")
     if run.overlap_policy is not None:
-        parts.append(f"--colora-overlap-policy {run.overlap_policy}")
+        parts.append(f"--colora_overlap_mode {run.overlap_policy}")
     if run.async_fallback is not None:
-        parts.append(f"--colora-async-fallback {str(run.async_fallback).lower()}")
+        parts.append(f"--colora_async_fallback {str(run.async_fallback).lower()}")
     if run.cpu_workers is not None:
-        parts.append(f"--colora-cpu-workers {run.cpu_workers}")
+        parts.append(f"--colora_cpu_workers {run.cpu_workers}")
     if run.cpu_queue_depth is not None:
-        parts.append(f"--colora-cpu-queue-depth {run.cpu_queue_depth}")
+        parts.append(f"--colora_cpu_queue_depth {run.cpu_queue_depth}")
     if run.cpu_batch_timeout_us is not None:
-        parts.append(f"--colora-cpu-batch-timeout-us {run.cpu_batch_timeout_us}")
+        parts.append(f"--colora_cpu_batch_timeout_us {run.cpu_batch_timeout_us}")
     if run.speculative_dispatch is not None:
-        parts.append(f"--colora-speculative-dispatch {str(run.speculative_dispatch).lower()}")
+        if run.speculative_dispatch:
+            parts.append("--colora_speculative_dispatch")
+        else:
+            parts.append("--no_colora_speculative_dispatch")
     if run.warmup_requests is not None:
-        parts.append(f"--warmup-requests {run.warmup_requests}")
+        parts.append(f"--warmup_num_requests {run.warmup_requests}")
     if run.measurement_requests is not None:
-        parts.append(f"--measurement-requests {run.measurement_requests}")
+        parts.append(f"--measure_num_requests {run.measurement_requests}")
 
     # The per-request log path will be determined at runtime in the run directory
     return " ".join(parts)
@@ -74,7 +77,7 @@ def run_single(manifest: LiveE2EManifest, run: LiveE2ERun, capture_stdout: bool 
     base_cmd = build_benchmark_command(run, manifest.benchmark_script)
     # Append the per-request log path to our output directory
     per_request_log_path = output_dir / "per_request_metrics.jsonl"
-    base_cmd += f" --per-request-log {per_request_log_path}"
+    base_cmd += f" --per_request_log_path {per_request_log_path}"
 
     if run.nsys_enabled:
         cmd = build_nsys_command(base_cmd, output_dir, run)

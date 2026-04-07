@@ -1,5 +1,6 @@
 import torch
 import time
+import json
 from typing import List, Optional, Callable, Dict, Any
 from queue import Queue
 from lightllm.server.router.model_infer.mode_backend.base_backend import ModeBackend
@@ -28,11 +29,39 @@ from .control_state import ControlState
 
 logger = init_logger(__name__)
 
+_AGENT_DEBUG_LOG_PATH = "/home/shufan/LightLLM-integrate-to-SLoRA/.cursor/debug-93213c.log"
+_AGENT_DEBUG_SESSION_ID = "93213c"
+
+
+def _agent_debug_log(location: str, message: str, data: dict, hypothesis_id: str, run_id: str = "pre-fix") -> None:
+    try:
+        payload = {
+            "sessionId": _AGENT_DEBUG_SESSION_ID,
+            "runId": run_id,
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": int(time.time() * 1000),
+        }
+        with open(_AGENT_DEBUG_LOG_PATH, "a", encoding="utf-8") as _f:
+            _f.write(json.dumps(payload, ensure_ascii=True) + "\n")
+    except Exception:
+        pass
+
 
 def _use_mock_prefill() -> bool:
     """Check if mock prefill mode is enabled via environment variable."""
     import os
     return os.environ.get("MOCK_PREFILL_LOGITS", "").lower() == "true"
+
+
+def _count_completed_continuations(reqs: List[InferReq]) -> int:
+    count = 0
+    for req in reqs:
+        if hasattr(req, "colora_continuation") and req.colora_continuation is not None and req.colora_continuation.completed:
+            count += 1
+    return count
 
 
 class ChunkedPrefillBackend(ModeBackend):
@@ -121,24 +150,115 @@ class ChunkedPrefillBackend(ModeBackend):
                 )
 
                 run_way = self.control_state_machine.select_run_way(prefill_reqs=prefill_reqs, decode_reqs=decode_reqs)
+                # #region agent log
+                _agent_debug_log(
+                    location="server/router/model_infer/mode_backend/chunked_prefill/impl.py:infer_loop",
+                    message="selected run way",
+                    data={
+                        "is_prefill": bool(run_way.is_prefill()),
+                        "is_decode": bool(run_way.is_decode()),
+                        "prefill_count": int(len(prefill_reqs)),
+                        "decode_count": int(len(decode_reqs)),
+                        "decode_completed_continuations": int(_count_completed_continuations(decode_reqs)),
+                        "mock_prefill": bool(_use_mock_prefill()),
+                    },
+                    hypothesis_id="H27",
+                )
+                # #endregion
 
                 if run_way.is_prefill():
                     # 进行一次流同步，保证 _try_read_new_reqs 中的一些算子操作，必然已经完成。
                     # 防止后续的推理流程读取到显存中可能存在错误的数据。
                     g_infer_context.get_overlap_stream().wait_stream(torch.cuda.current_stream())
+                    # #region agent log
+                    try:
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                        _agent_debug_log(
+                            location="server/router/model_infer/mode_backend/chunked_prefill/impl.py:infer_loop",
+                            message="CUDA sync succeeded before prefill()",
+                            data={"prefill_reqs": int(len(prefill_reqs))},
+                            hypothesis_id="H15",
+                        )
+                    except Exception as e:
+                        _agent_debug_log(
+                            location="server/router/model_infer/mode_backend/chunked_prefill/impl.py:infer_loop",
+                            message="CUDA sync failed before prefill()",
+                            data={"error": str(e)},
+                            hypothesis_id="H15",
+                        )
+                        raise
+                    # #endregion
                     self.prefill(
                         event_pack=event_pack,
                         prefill_reqs=prefill_reqs,
                     )
+                    # #region agent log
+                    try:
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                        _agent_debug_log(
+                            location="server/router/model_infer/mode_backend/chunked_prefill/impl.py:infer_loop",
+                            message="CUDA sync succeeded after prefill()",
+                            data={"prefill_reqs": int(len(prefill_reqs))},
+                            hypothesis_id="H16",
+                        )
+                    except Exception as e:
+                        _agent_debug_log(
+                            location="server/router/model_infer/mode_backend/chunked_prefill/impl.py:infer_loop",
+                            message="CUDA sync failed after prefill()",
+                            data={"error": str(e), "prefill_reqs": int(len(prefill_reqs))},
+                            hypothesis_id="H16",
+                        )
+                        raise
+                    # #endregion
                     continue
                 elif run_way.is_decode():
                     # 进行一次流同步，保证 _try_read_new_reqs 中的一些算子操作，必然已经完成。
                     # 防止后续的推理流程读取到显存中可能存在错误的数据。
                     g_infer_context.get_overlap_stream().wait_stream(torch.cuda.current_stream())
+                    # #region agent log
+                    try:
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                        _agent_debug_log(
+                            location="server/router/model_infer/mode_backend/chunked_prefill/impl.py:infer_loop",
+                            message="CUDA sync succeeded before decode()",
+                            data={"decode_reqs": int(len(decode_reqs))},
+                            hypothesis_id="H17",
+                        )
+                    except Exception as e:
+                        _agent_debug_log(
+                            location="server/router/model_infer/mode_backend/chunked_prefill/impl.py:infer_loop",
+                            message="CUDA sync failed before decode()",
+                            data={"error": str(e)},
+                            hypothesis_id="H17",
+                        )
+                        raise
+                    # #endregion
                     self.decode(
                         event_pack=event_pack,
                         decode_reqs=decode_reqs,
                     )
+                    # #region agent log
+                    try:
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                        _agent_debug_log(
+                            location="server/router/model_infer/mode_backend/chunked_prefill/impl.py:infer_loop",
+                            message="CUDA sync succeeded after decode()",
+                            data={"decode_reqs": int(len(decode_reqs))},
+                            hypothesis_id="H18",
+                        )
+                    except Exception as e:
+                        _agent_debug_log(
+                            location="server/router/model_infer/mode_backend/chunked_prefill/impl.py:infer_loop",
+                            message="CUDA sync failed after decode()",
+                            data={"error": str(e), "decode_reqs": int(len(decode_reqs))},
+                            hypothesis_id="H18",
+                        )
+                        raise
+                    # #endregion
                     continue
                 elif run_way.is_pass():
                     event_pack.notify_post_handle_and_wait_pre_post_handle()
@@ -148,6 +268,14 @@ class ChunkedPrefillBackend(ModeBackend):
                     continue
 
         except BaseException as e:
+            # #region agent log
+            _agent_debug_log(
+                location="server/router/model_infer/mode_backend/chunked_prefill/impl.py:infer_loop",
+                message="infer_loop exception raised",
+                data={"error": str(e), "mock_prefill": bool(_use_mock_prefill())},
+                hypothesis_id="H28",
+            )
+            # #endregion
             self.logger.exception(str(e))
             raise e
 
@@ -233,6 +361,25 @@ class ChunkedPrefillBackend(ModeBackend):
         )
         # 第四阶段
         event_pack.notify_pre_post_handle()
+        # #region agent log
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            _agent_debug_log(
+                location="server/router/model_infer/mode_backend/chunked_prefill/impl.py:decode_normal",
+                message="CUDA sync succeeded after notify_pre_post_handle (decode tail)",
+                data={"run_reqs": int(len(run_reqs))},
+                hypothesis_id="H31",
+            )
+        except Exception as e:
+            _agent_debug_log(
+                location="server/router/model_infer/mode_backend/chunked_prefill/impl.py:decode_normal",
+                message="CUDA sync failed after notify_pre_post_handle (decode tail)",
+                data={"error": str(e), "run_reqs": int(len(run_reqs))},
+                hypothesis_id="H31",
+            )
+            raise
+        # #endregion
         return
 
     def decode_normal(
@@ -262,6 +409,20 @@ class ChunkedPrefillBackend(ModeBackend):
         # Process normal decode requests
         if normal_decode_reqs:
             model_input, run_reqs_norm = prepare_decode_inputs(normal_decode_reqs, decode_step_id=decode_step_id)
+            # #region agent log
+            _agent_debug_log(
+                location="server/router/model_infer/mode_backend/chunked_prefill/impl.py:decode_normal",
+                message="decode inputs prepared",
+                data={
+                    "decode_step_id": int(decode_step_id),
+                    "normal_decode_reqs": int(len(normal_decode_reqs)),
+                    "continuation_reqs": int(len(continuation_reqs)),
+                    "total_token_num": int(model_input.total_token_num),
+                    "max_len_in_batch": int(model_input.max_len_in_batch),
+                },
+                hypothesis_id="H28",
+            )
+            # #endregion
             with torch.cuda.stream(g_infer_context.get_overlap_stream()):
                 model_output = self.model.forward(model_input)
                 active_logits, active_b_req_idx, active_b_mtp_index, active_run_reqs = self._select_active_decode_outputs(

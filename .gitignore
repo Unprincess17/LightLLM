@@ -31,3 +31,7 @@ test/lora/benchmark_lora.log
 test/lora/avx/*.csv
 test/lora/avx/*.nsys-rep
 test/lora/avx/*.sqlite
+benchmark_lora.log
+
+.specstory/
+.cursor/

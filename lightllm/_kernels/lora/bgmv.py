@@ -163,6 +163,8 @@ def dispatch_bgmv(
         layer_id: The current layer ID for computing slot location (slot = a_start + layer_id).
     """
     batch_size = x.shape[0]
+    if batch_size == 0:
+        return
 
     # Infer dimensions if not provided
     h_in = a_hidden_dim if a_hidden_dim is not None else x.shape[1]
@@ -174,8 +176,12 @@ def dispatch_bgmv(
 
     assert h_in == buf_h_in, f"Input dim mismatch: x({h_in}) vs a_buffer({buf_h_in})"
     assert h_out == buf_h_out, f"Output dim mismatch: y({h_out}) vs b_buffer({buf_h_out})"
-    
+
     assert a_len.shape[0] != 0, f"a_len tensor is empty, cannot proceed with dispatch_bgmv"
+
+    # Debug: Check that slot location is within pool bounds
+    max_slot = (a_start + layer_id).max().item()
+    assert max_slot < pool_size, f"Slot location out of bounds: max slot {max_slot} >= pool size {pool_size}"
 
     # Helper to pick block size
     def get_block_n(dim):
