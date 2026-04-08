@@ -652,6 +652,54 @@ class Qwen3VLMOETransformerLayerInfer(Qwen3MOETransformerLayerInfer):
             return False
         return getattr(self.lora_dispatcher_, "expert_cache_manager", None) is not None
 
+    def _strict_single_request_moe_cpu_lora(
+        self,
+        input_tensor: torch.Tensor,
+        layer_id: int,
+        adapter_bin: int,
+        expert_id: int,
+        projection: str,
+        out_dim: int,
+    ) -> torch.Tensor:
+        """Single-token strict MoE CPU LoRA residual.
+
+        This is glue for the paused-request CPU completion path:
+        it forces the dispatcher strict MoE CPU kernel path (AVX) for one token.
+        """
+        if out_dim <= 0:
+            raise ValueError(f"out_dim must be > 0, got {out_dim}")
+        if projection not in ("gate", "up", "down"):
+            raise ValueError(f"invalid projection: {projection}")
+        if adapter_bin < 0:
+            return torch.zeros((input_tensor.shape[0], out_dim), dtype=input_tensor.dtype, device=input_tensor.device)
+
+        dispatcher = self.lora_dispatcher_
+        if dispatcher is None or getattr(dispatcher, "lora_mem_pool", None) is None:
+            return torch.zeros((input_tensor.shape[0], out_dim), dtype=input_tensor.dtype, device=input_tensor.device)
+
+        pool = getattr(dispatcher.lora_mem_pool, f"moe_{projection}_pool", None)
+        if pool is None:
+            return torch.zeros((input_tensor.shape[0], out_dim), dtype=input_tensor.dtype, device=input_tensor.device)
+
+        # Cache a 1-element CPU req_bins tensor to avoid per-call allocations.
+        req_bins = getattr(self, "_colora_single_req_bins_cpu", None)
+        if req_bins is None or not isinstance(req_bins, torch.Tensor) or req_bins.numel() != 1:
+            req_bins = torch.empty((1,), dtype=torch.long, device="cpu")
+            setattr(self, "_colora_single_req_bins_cpu", req_bins)
+        req_bins[0] = int(adapter_bin)
+
+        buffer_layer_id = dispatcher._get_moe_buffer_layer_id(pool, layer_id, expert_id)
+        out_cpu, _, _ = dispatcher._strict_moe_cpu_batch_lora(
+            input_tensor,
+            buffer_layer_id,
+            pool,
+            req_bins,
+            projection=projection,
+            return_to_original_device=False,
+        )
+        # Always return on the original device/dtype expected by the caller.
+        return out_cpu.to(device=input_tensor.device, dtype=input_tensor.dtype, non_blocking=True)
+
     def token_forward(self, input_embdings, infer_state: Qwen3VLInferStateInfo, layer_weight):
         with NvtxAnnotate(f"Layer {self.layer_num_}"):
             input1 = self._att_norm(input_embdings, infer_state, layer_weight)
@@ -1083,6 +1131,7 @@ class Qwen3VLMOETransformerLayerInfer(Qwen3MOETransformerLayerInfer):
                     adapter_bin=adapter_bin,
                     expert_id=expert_id,
                     projection="gate",
+                    out_dim=int(experts.experts_gate_projs[expert_id].shape[0]),
                 )
                 up_lora = self._strict_single_request_moe_cpu_lora(
                     expert_input,
@@ -1090,6 +1139,7 @@ class Qwen3VLMOETransformerLayerInfer(Qwen3MOETransformerLayerInfer):
                     adapter_bin=adapter_bin,
                     expert_id=expert_id,
                     projection="up",
+                    out_dim=int(experts.experts_up_projs[expert_id].shape[0]),
                 )
             else:
                 gate_lora = torch.zeros((expert_input.shape[0], experts.experts_gate_projs[expert_id].shape[0]), dtype=expert_input.dtype, device=expert_input.device)
@@ -1110,6 +1160,7 @@ class Qwen3VLMOETransformerLayerInfer(Qwen3MOETransformerLayerInfer):
                     adapter_bin=adapter_bin,
                     expert_id=expert_id,
                     projection="down",
+                    out_dim=int(down_weight.shape[0]),
                 )
             else:
                 down_lora = torch.zeros((up_gate_out.shape[0], down_weight.shape[0]), dtype=up_gate_out.dtype, device=up_gate_out.device)
