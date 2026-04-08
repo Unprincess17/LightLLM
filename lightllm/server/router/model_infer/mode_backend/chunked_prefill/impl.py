@@ -5,7 +5,7 @@ from typing import List, Optional, Callable, Dict, Any
 from queue import Queue
 from lightllm.server.router.model_infer.mode_backend.base_backend import ModeBackend
 from lightllm.server.router.model_infer.mode_backend.overlap_events import OverlapEventPack
-from lightllm.server.router.model_infer.infer_batch import InferReq
+from lightllm.server.router.model_infer.infer_batch import InferReq, normalize_req_adapter_id
 from lightllm.server.router.model_infer.mode_backend.pre import (
     prepare_prefill_inputs,
     prepare_decode_inputs,
@@ -29,39 +29,11 @@ from .control_state import ControlState
 
 logger = init_logger(__name__)
 
-_AGENT_DEBUG_LOG_PATH = "/home/shufan/LightLLM-integrate-to-SLoRA/.cursor/debug-93213c.log"
-_AGENT_DEBUG_SESSION_ID = "93213c"
-
-
-def _agent_debug_log(location: str, message: str, data: dict, hypothesis_id: str, run_id: str = "pre-fix") -> None:
-    try:
-        payload = {
-            "sessionId": _AGENT_DEBUG_SESSION_ID,
-            "runId": run_id,
-            "hypothesisId": hypothesis_id,
-            "location": location,
-            "message": message,
-            "data": data,
-            "timestamp": int(time.time() * 1000),
-        }
-        with open(_AGENT_DEBUG_LOG_PATH, "a", encoding="utf-8") as _f:
-            _f.write(json.dumps(payload, ensure_ascii=True) + "\n")
-    except Exception:
-        pass
-
 
 def _use_mock_prefill() -> bool:
     """Check if mock prefill mode is enabled via environment variable."""
     import os
     return os.environ.get("MOCK_PREFILL_LOGITS", "").lower() == "true"
-
-
-def _count_completed_continuations(reqs: List[InferReq]) -> int:
-    count = 0
-    for req in reqs:
-        if hasattr(req, "colora_continuation") and req.colora_continuation is not None and req.colora_continuation.completed:
-            count += 1
-    return count
 
 
 class ChunkedPrefillBackend(ModeBackend):
@@ -74,6 +46,10 @@ class ChunkedPrefillBackend(ModeBackend):
         # Mock prefill buffer for performance testing (avoids torch.randn overhead)
         self._mock_logit_buffer = None
         self._mock_kv_buffer = None
+
+        # Skip redundant batched-LoRA prep + dispatcher init when batch composition is unchanged
+        self._batched_lora_sig = None
+        self._batched_lora_req_bins_cache = None
 
         # 在 mtp 模式下切换绑定的prefill 和 decode 函数
         logger.debug(f"MTP mode: {get_env_start_args().mtp_mode}")
@@ -102,7 +78,26 @@ class ChunkedPrefillBackend(ModeBackend):
             batch = Batch(current_reqs)
             enable_detached_lora = batch.has_lora_adapters()
             if enable_detached_lora:
-                req_bins = self._prepare_batched_lora_for_batch(batch)
+                sig = tuple(
+                    (
+                        r.req_idx,
+                        normalize_req_adapter_id(getattr(r, "adapter_id", 0)),
+                        r.get_cur_total_len(),
+                    )
+                    for r in sorted(batch.reqs, key=lambda x: x.req_idx)
+                )
+                if sig != self._batched_lora_sig:
+                    self._batched_lora_sig = sig
+                    req_bins = self._prepare_batched_lora_for_batch(batch)
+                    self._batched_lora_req_bins_cache = req_bins
+                else:
+                    req_bins = self._batched_lora_req_bins_cache
+            else:
+                self._batched_lora_sig = None
+                self._batched_lora_req_bins_cache = None
+        else:
+            self._batched_lora_sig = None
+            self._batched_lora_req_bins_cache = None
 
         # Disabled: don't switch to single_adapter_mode when there are no LoRA adapters in batch
         # if not enable_detached_lora:
@@ -129,6 +124,12 @@ class ChunkedPrefillBackend(ModeBackend):
 
                 self._try_read_new_reqs()
 
+                # Ack COLoRA CPU completions (state updated in callbacks; drain avoids queue growth)
+                for dispatcher in getattr(self, "lora_dispatchers", []):
+                    if hasattr(dispatcher, "colora_completion_queue"):
+                        while not dispatcher.colora_completion_queue.empty():
+                            dispatcher.colora_completion_queue.get()
+
                 # =================================================================
                 # S-LoRA Batched LoRA Mode
                 # Always use batched mode to support multiple adapters in a single batch
@@ -138,11 +139,6 @@ class ChunkedPrefillBackend(ModeBackend):
                     self._sync_batched_lora_state_for_current_reqs(current_reqs)
                 # =================================================================
 
-                for dispatcher in getattr(self, "lora_dispatchers", []):
-                    if hasattr(dispatcher, "colora_completion_queue"):
-                        while not dispatcher.colora_completion_queue.empty():
-                            dispatcher.colora_completion_queue.get()
-
                 prefill_reqs, decode_reqs = self._get_classed_reqs(
                     no_decode=self.classed_req_no_decode,
                     strict_prefill=self.classed_req_strict_prefill,
@@ -150,115 +146,24 @@ class ChunkedPrefillBackend(ModeBackend):
                 )
 
                 run_way = self.control_state_machine.select_run_way(prefill_reqs=prefill_reqs, decode_reqs=decode_reqs)
-                # #region agent log
-                _agent_debug_log(
-                    location="server/router/model_infer/mode_backend/chunked_prefill/impl.py:infer_loop",
-                    message="selected run way",
-                    data={
-                        "is_prefill": bool(run_way.is_prefill()),
-                        "is_decode": bool(run_way.is_decode()),
-                        "prefill_count": int(len(prefill_reqs)),
-                        "decode_count": int(len(decode_reqs)),
-                        "decode_completed_continuations": int(_count_completed_continuations(decode_reqs)),
-                        "mock_prefill": bool(_use_mock_prefill()),
-                    },
-                    hypothesis_id="H27",
-                )
-                # #endregion
 
                 if run_way.is_prefill():
                     # 进行一次流同步，保证 _try_read_new_reqs 中的一些算子操作，必然已经完成。
                     # 防止后续的推理流程读取到显存中可能存在错误的数据。
                     g_infer_context.get_overlap_stream().wait_stream(torch.cuda.current_stream())
-                    # #region agent log
-                    try:
-                        if torch.cuda.is_available():
-                            torch.cuda.synchronize()
-                        _agent_debug_log(
-                            location="server/router/model_infer/mode_backend/chunked_prefill/impl.py:infer_loop",
-                            message="CUDA sync succeeded before prefill()",
-                            data={"prefill_reqs": int(len(prefill_reqs))},
-                            hypothesis_id="H15",
-                        )
-                    except Exception as e:
-                        _agent_debug_log(
-                            location="server/router/model_infer/mode_backend/chunked_prefill/impl.py:infer_loop",
-                            message="CUDA sync failed before prefill()",
-                            data={"error": str(e)},
-                            hypothesis_id="H15",
-                        )
-                        raise
-                    # #endregion
                     self.prefill(
                         event_pack=event_pack,
                         prefill_reqs=prefill_reqs,
                     )
-                    # #region agent log
-                    try:
-                        if torch.cuda.is_available():
-                            torch.cuda.synchronize()
-                        _agent_debug_log(
-                            location="server/router/model_infer/mode_backend/chunked_prefill/impl.py:infer_loop",
-                            message="CUDA sync succeeded after prefill()",
-                            data={"prefill_reqs": int(len(prefill_reqs))},
-                            hypothesis_id="H16",
-                        )
-                    except Exception as e:
-                        _agent_debug_log(
-                            location="server/router/model_infer/mode_backend/chunked_prefill/impl.py:infer_loop",
-                            message="CUDA sync failed after prefill()",
-                            data={"error": str(e), "prefill_reqs": int(len(prefill_reqs))},
-                            hypothesis_id="H16",
-                        )
-                        raise
-                    # #endregion
                     continue
                 elif run_way.is_decode():
                     # 进行一次流同步，保证 _try_read_new_reqs 中的一些算子操作，必然已经完成。
                     # 防止后续的推理流程读取到显存中可能存在错误的数据。
                     g_infer_context.get_overlap_stream().wait_stream(torch.cuda.current_stream())
-                    # #region agent log
-                    try:
-                        if torch.cuda.is_available():
-                            torch.cuda.synchronize()
-                        _agent_debug_log(
-                            location="server/router/model_infer/mode_backend/chunked_prefill/impl.py:infer_loop",
-                            message="CUDA sync succeeded before decode()",
-                            data={"decode_reqs": int(len(decode_reqs))},
-                            hypothesis_id="H17",
-                        )
-                    except Exception as e:
-                        _agent_debug_log(
-                            location="server/router/model_infer/mode_backend/chunked_prefill/impl.py:infer_loop",
-                            message="CUDA sync failed before decode()",
-                            data={"error": str(e)},
-                            hypothesis_id="H17",
-                        )
-                        raise
-                    # #endregion
                     self.decode(
                         event_pack=event_pack,
                         decode_reqs=decode_reqs,
                     )
-                    # #region agent log
-                    try:
-                        if torch.cuda.is_available():
-                            torch.cuda.synchronize()
-                        _agent_debug_log(
-                            location="server/router/model_infer/mode_backend/chunked_prefill/impl.py:infer_loop",
-                            message="CUDA sync succeeded after decode()",
-                            data={"decode_reqs": int(len(decode_reqs))},
-                            hypothesis_id="H18",
-                        )
-                    except Exception as e:
-                        _agent_debug_log(
-                            location="server/router/model_infer/mode_backend/chunked_prefill/impl.py:infer_loop",
-                            message="CUDA sync failed after decode()",
-                            data={"error": str(e), "decode_reqs": int(len(decode_reqs))},
-                            hypothesis_id="H18",
-                        )
-                        raise
-                    # #endregion
                     continue
                 elif run_way.is_pass():
                     event_pack.notify_post_handle_and_wait_pre_post_handle()
@@ -268,14 +173,6 @@ class ChunkedPrefillBackend(ModeBackend):
                     continue
 
         except BaseException as e:
-            # #region agent log
-            _agent_debug_log(
-                location="server/router/model_infer/mode_backend/chunked_prefill/impl.py:infer_loop",
-                message="infer_loop exception raised",
-                data={"error": str(e), "mock_prefill": bool(_use_mock_prefill())},
-                hypothesis_id="H28",
-            )
-            # #endregion
             self.logger.exception(str(e))
             raise e
 
@@ -361,25 +258,6 @@ class ChunkedPrefillBackend(ModeBackend):
         )
         # 第四阶段
         event_pack.notify_pre_post_handle()
-        # #region agent log
-        try:
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            _agent_debug_log(
-                location="server/router/model_infer/mode_backend/chunked_prefill/impl.py:decode_normal",
-                message="CUDA sync succeeded after notify_pre_post_handle (decode tail)",
-                data={"run_reqs": int(len(run_reqs))},
-                hypothesis_id="H31",
-            )
-        except Exception as e:
-            _agent_debug_log(
-                location="server/router/model_infer/mode_backend/chunked_prefill/impl.py:decode_normal",
-                message="CUDA sync failed after notify_pre_post_handle (decode tail)",
-                data={"error": str(e), "run_reqs": int(len(run_reqs))},
-                hypothesis_id="H31",
-            )
-            raise
-        # #endregion
         return
 
     def decode_normal(
@@ -409,138 +287,149 @@ class ChunkedPrefillBackend(ModeBackend):
         # Process normal decode requests
         if normal_decode_reqs:
             model_input, run_reqs_norm = prepare_decode_inputs(normal_decode_reqs, decode_step_id=decode_step_id)
-            # #region agent log
-            _agent_debug_log(
-                location="server/router/model_infer/mode_backend/chunked_prefill/impl.py:decode_normal",
-                message="decode inputs prepared",
-                data={
-                    "decode_step_id": int(decode_step_id),
-                    "normal_decode_reqs": int(len(normal_decode_reqs)),
-                    "continuation_reqs": int(len(continuation_reqs)),
-                    "total_token_num": int(model_input.total_token_num),
-                    "max_len_in_batch": int(model_input.max_len_in_batch),
-                },
-                hypothesis_id="H28",
-            )
-            # #endregion
-            with torch.cuda.stream(g_infer_context.get_overlap_stream()):
+            overlap_stream = g_infer_context.get_overlap_stream()
+            with torch.cuda.stream(overlap_stream):
                 model_output = self.model.forward(model_input)
-                active_logits, active_b_req_idx, active_b_mtp_index, active_run_reqs = self._select_active_decode_outputs(
-                    model_output,
-                    model_input.b_req_idx,
-                    model_input.b_mtp_index,
-                    run_reqs_norm,
+            # Forward runs on overlap_stream; force completion so CUDA errors surface here
+            # (not later at unrelated ops like node_broadcast_tensor.fill_ on another sync).
+            overlap_stream.synchronize()
+            logits_rows = int(model_output.logits.shape[0])
+            if logits_rows != len(run_reqs_norm):
+                # region agent log
+                try:
+                    with open("/home/shufan/LightLLM-integrate-to-SLoRA/.cursor/debug-93213c.log", "a", encoding="utf-8") as f:
+                        f.write(
+                            json.dumps(
+                                {
+                                    "sessionId": "93213c",
+                                    "runId": "post-fix",
+                                    "hypothesisId": "R2-H1",
+                                    "location": "chunked_prefill/impl.py:decode_normal:align_before_sample",
+                                    "message": "aligning decode inputs with logits rows",
+                                    "data": {
+                                        "logits_rows": logits_rows,
+                                        "run_reqs_norm_len_before": len(run_reqs_norm),
+                                        "b_req_idx_len_before": int(model_input.b_req_idx.shape[0]),
+                                        "b_mtp_index_len_before": int(model_input.b_mtp_index.shape[0]),
+                                    },
+                                    "timestamp": int(time.time() * 1000),
+                                }
+                            )
+                            + "\n"
+                        )
+                except Exception:
+                    pass
+                # endregion
+                run_reqs_norm = run_reqs_norm[:logits_rows]
+                model_input.b_req_idx = model_input.b_req_idx[:logits_rows]
+                model_input.b_mtp_index = model_input.b_mtp_index[:logits_rows]
+
+            run_reqs.extend(run_reqs_norm)
+            if run_reqs_norm:
+                _, nti_cpu, ntp_cpu = self._sample_and_scatter_token(
+                    logits=model_output.logits,
+                    b_req_idx=model_input.b_req_idx,
+                    b_mtp_index=model_input.b_mtp_index,
+                    run_reqs=run_reqs_norm,
+                    is_prefill=False,
+                    mask_func=self.decode_mask_func,
                 )
-                if active_run_reqs:
-                    _, nti_cpu, ntp_cpu = self._sample_and_scatter_token(
-                        logits=active_logits,
-                        b_req_idx=active_b_req_idx,
-                        b_mtp_index=active_b_mtp_index,
-                        run_reqs=active_run_reqs,
-                        is_prefill=False,
-                        mask_func=self.decode_mask_func,
-                    )
-                    run_reqs.extend(active_run_reqs)
-                    next_token_ids_cpu.extend(nti_cpu)
-                    next_token_logprobs_cpu.extend(ntp_cpu)
-                sync_event = torch.cuda.Event()
-                sync_event.record()
+                next_token_ids_cpu.extend(nti_cpu)
+                next_token_logprobs_cpu.extend(ntp_cpu)
+            sync_event = torch.cuda.Event()
+            sync_event.record()
 
         # Process COLaRA continuation requests
         if continuation_reqs:
             from lightllm.common.basemodel.batch_objs import ModelInput
 
-            grouped_continuations: Dict[int, List[InferReq]] = {}
+            # Build continuation model input
+            batch_size = len(continuation_reqs)
+            b_req_idx = []
+            b_adapter_bin = []
+            b_trace_req_id = []
+            b_mtp_index = []
+            b_seq_len = []
+            resume_from_layer = []
+            resumed_hidden = []
+            mem_indexes_cpu = []
+            multimodal_params = []
+
             for req in continuation_reqs:
                 cont = req.colora_continuation
-                if cont is None:
-                    continue
-                grouped_continuations.setdefault(int(cont.resume_layer), []).append(req)
+                b_req_idx.append(req.req_idx)
+                from lightllm.server.router.model_infer.infer_batch import get_req_adapter_bin
+                adapter_bin = get_req_adapter_bin(req)
+                b_adapter_bin.append(adapter_bin)
+                b_trace_req_id.append(req.req_id)
+                b_mtp_index.append(0)
+                seq_len = req.get_cur_total_len()
+                b_seq_len.append(seq_len)
+                resume_from_layer.append(cont.resume_layer)
+                resumed_hidden.append(cont.saved_hidden)
+                mem_indexes_cpu.append(cont.mem_index)
+                multimodal_params.append(req.multimodal_params)
 
-            for resume_from_layer, grouped_reqs in grouped_continuations.items():
-                batch_size = len(grouped_reqs)
-                b_req_idx = []
-                b_adapter_bin = []
-                b_trace_req_id = []
-                b_mtp_index = []
-                b_seq_len = []
-                resumed_hidden = []
-                mem_indexes_cpu = []
-                multimodal_params = []
+            assert len(resume_from_layer) == batch_size
+            # All resumed hidden should have same resume_from_layer since continuation is after layer L, resume at L+1
+            resume_from_layer = resume_from_layer[0]
 
-                for req in grouped_reqs:
-                    cont = req.colora_continuation
-                    b_req_idx.append(req.req_idx)
-                    from lightllm.server.router.model_infer.infer_batch import get_req_adapter_bin
-                    adapter_bin = get_req_adapter_bin(req)
-                    b_adapter_bin.append(adapter_bin)
-                    b_trace_req_id.append(req.req_id)
-                    b_mtp_index.append(0)
-                    seq_len = req.get_cur_total_len()
-                    b_seq_len.append(seq_len)
-                    resumed_hidden.append(cont.saved_hidden)
-                    mem_indexes_cpu.append(cont.mem_index)
-                    multimodal_params.append(req.multimodal_params)
+            # Concatenate all resumed hiddens
+            resumed_hidden = torch.cat(resumed_hidden, dim=0)
+            b_req_idx = torch.tensor(b_req_idx, dtype=torch.int32, device='cpu')
+            b_adapter_bin = torch.tensor(b_adapter_bin, dtype=torch.int32, device='cpu')
+            b_trace_req_id = torch.tensor(b_trace_req_id, dtype=torch.int64, device='cpu')
+            b_mtp_index = torch.tensor(b_mtp_index, dtype=torch.int32, device='cpu')
+            b_seq_len = torch.tensor(b_seq_len, dtype=torch.int32, device='cpu')
+            max_len_in_batch = max(b_seq_len)
+            max_kv_seq_len = max(b_seq_len)
+            max_q_seq_len = 1
+            mem_indexes_cpu = torch.cat(mem_indexes_cpu, dim=0)
 
-                resumed_hidden = torch.cat(resumed_hidden, dim=0)
-                b_req_idx = torch.tensor(b_req_idx, dtype=torch.int32, device='cpu')
-                b_adapter_bin = torch.tensor(b_adapter_bin, dtype=torch.int32, device='cpu')
-                b_trace_req_id = torch.tensor(b_trace_req_id, dtype=torch.int64, device='cpu')
-                b_mtp_index = torch.tensor(b_mtp_index, dtype=torch.int32, device='cpu')
-                b_seq_len = torch.tensor(b_seq_len, dtype=torch.int32, device='cpu')
-                max_len_in_batch = max(b_seq_len)
-                max_kv_seq_len = max(b_seq_len)
-                max_q_seq_len = 1
-                mem_indexes_cpu = torch.cat(mem_indexes_cpu, dim=0)
+            # Build continuation model input
+            cont_model_input = ModelInput(
+                batch_size=batch_size,
+                total_token_num=sum(b_seq_len),
+                max_len_in_batch=max_len_in_batch,
+                max_q_seq_len=max_q_seq_len,
+                max_kv_seq_len=max_kv_seq_len,
+                max_cache_len=max_len_in_batch,
+                input_ids=None,
+                mem_indexes_cpu=mem_indexes_cpu,
+                b_req_idx=b_req_idx,
+                b_adapter_bin=b_adapter_bin,
+                b_trace_req_id=b_trace_req_id,
+                b_mtp_index=b_mtp_index,
+                b_seq_len=b_seq_len,
+                is_prefill=False,
+                decode_step_id=decode_step_id,
+                is_continuation_batch=True,
+                resume_from_layer=resume_from_layer,
+                resumed_hidden=resumed_hidden,
+            )
+            cont_model_input.multimodal_params = multimodal_params
 
-                cont_model_input = ModelInput(
-                    batch_size=batch_size,
-                    total_token_num=sum(b_seq_len),
-                    max_len_in_batch=max_len_in_batch,
-                    max_q_seq_len=max_q_seq_len,
-                    max_kv_seq_len=max_kv_seq_len,
-                    max_cache_len=max_len_in_batch,
-                    input_ids=None,
-                    mem_indexes_cpu=mem_indexes_cpu,
-                    b_req_idx=b_req_idx,
-                    b_adapter_bin=b_adapter_bin,
-                    b_trace_req_id=b_trace_req_id,
-                    b_mtp_index=b_mtp_index,
-                    b_seq_len=b_seq_len,
+            with torch.cuda.stream(g_infer_context.get_overlap_stream()):
+                cont_model_output = self.model.forward(cont_model_input)
+                _, nti_cpu, ntp_cpu = self._sample_and_scatter_token(
+                    logits=cont_model_output.logits,
+                    b_req_idx=cont_model_input.b_req_idx,
+                    b_mtp_index=cont_model_input.b_mtp_index,
+                    run_reqs=continuation_reqs,
                     is_prefill=False,
-                    decode_step_id=decode_step_id,
-                    is_continuation_batch=True,
-                    resume_from_layer=resume_from_layer,
-                    resumed_hidden=resumed_hidden,
+                    mask_func=self.decode_mask_func,
                 )
-                cont_model_input.multimodal_params = multimodal_params
+                # Clear the continuation since we're done with it
+                for req in continuation_reqs:
+                    req.colora_continuation = None
+                next_token_ids_cpu.extend(nti_cpu)
+                next_token_logprobs_cpu.extend(ntp_cpu)
+                # sync_event is created only if we have normal decoding, else create it
+                if not normal_decode_reqs:
+                    sync_event = torch.cuda.Event()
+                    sync_event.record()
 
-                with torch.cuda.stream(g_infer_context.get_overlap_stream()):
-                    cont_model_output = self.model.forward(cont_model_input)
-                    active_logits, active_b_req_idx, active_b_mtp_index, active_run_reqs = self._select_active_decode_outputs(
-                        cont_model_output,
-                        cont_model_input.b_req_idx,
-                        cont_model_input.b_mtp_index,
-                        grouped_reqs,
-                    )
-                    if active_run_reqs:
-                        _, nti_cpu, ntp_cpu = self._sample_and_scatter_token(
-                            logits=active_logits,
-                            b_req_idx=active_b_req_idx,
-                            b_mtp_index=active_b_mtp_index,
-                            run_reqs=active_run_reqs,
-                            is_prefill=False,
-                            mask_func=self.decode_mask_func,
-                        )
-                        run_reqs.extend(active_run_reqs)
-                        next_token_ids_cpu.extend(nti_cpu)
-                        next_token_logprobs_cpu.extend(ntp_cpu)
-                    for req in grouped_reqs:
-                        if req.colora_continuation is not None and req.colora_continuation.completed:
-                            req.colora_continuation = None
-                    if not normal_decode_reqs:
-                        sync_event = torch.cuda.Event()
-                        sync_event.record()
+        run_reqs.extend(continuation_reqs)
 
         # 第二阶段
         event_pack.notify_post_handle_and_wait_pre_post_handle()
