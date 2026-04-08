@@ -4,6 +4,7 @@ import torch.distributed as dist
 import numpy as np
 import os
 import logging
+from contextlib import nullcontext
 from functools import partial
 from typing import Tuple, Optional, Dict, Any, List
 from lightllm.common.basemodel.infer_struct import InferStateInfo
@@ -13,6 +14,7 @@ from lightllm.models.qwen3_moe.layer_weights.transformer_layer_weight import Qwe
 from lightllm.models.llama.layer_infer.transformer_layer_infer import LlamaTransformerLayerInfer
 from lightllm.models.llama.infer_struct import LlamaInferStateInfo
 from lightllm.models.qwen3_vl.infer_struct import Qwen3VLInferStateInfo
+from lightllm.common.fused_moe.topk_select import select_experts
 from lightllm.models.qwen3.triton_kernel.qk_norm import qk_rmsnorm_forward
 from lightllm.distributed import all_reduce
 from lightllm.utils.dist_utils import get_global_world_size
@@ -82,14 +84,7 @@ class Qwen3VLMOETransformerLayerInfer(Qwen3MOETransformerLayerInfer):
 
     def _bind_ffn(self):
         super()._bind_ffn()
-        if (
-            self.is_moe
-            and os.environ.get("MOE_MODE", "TP") != "EP"
-            and (
-                bool(getattr(self, "_spec_submit_layer_enabled", False))
-                or bool(getattr(self, "_temporal_prefetch_layer_enabled", False))
-            )
-        ):
+        if self.is_moe and os.environ.get("MOE_MODE", "TP") != "EP":
             self._ffn = partial(Qwen3VLMOETransformerLayerInfer._moe_ffn, self)
 
     def set_lora_dispatcher(self, dispatcher: Any, use_detached_lora: bool = True):
@@ -643,6 +638,58 @@ class Qwen3VLMOETransformerLayerInfer(Qwen3MOETransformerLayerInfer):
         self._update_decode_spec_predictor(topk_ids, infer_state, num_tokens)
         self._update_decode_temporal_predictor(topk_ids, infer_state, num_tokens)
 
+    def _should_enable_request_skip(self, infer_state: Optional[Qwen3VLInferStateInfo]) -> bool:
+        if infer_state is None or getattr(infer_state, "is_prefill", True):
+            return False
+        if getattr(infer_state, "is_cuda_graph", False):
+            return False
+        if not (self.use_detached_lora_ and self.lora_dispatcher_ is not None):
+            return False
+        if not getattr(self.lora_dispatcher_, "colora_request_skip", False):
+            return False
+        if getattr(infer_state, "b_req_idx", None) is None or getattr(infer_state, "b_adapter_bin", None) is None:
+            return False
+        if getattr(infer_state, "colora_pre_ffn_hidden", None) is None:
+            return False
+        return getattr(self.lora_dispatcher_, "expert_cache_manager", None) is not None
+
+    def token_forward(self, input_embdings, infer_state: Qwen3VLInferStateInfo, layer_weight):
+        with NvtxAnnotate(f"Layer {self.layer_num_}"):
+            input1 = self._att_norm(input_embdings, infer_state, layer_weight)
+            q, cache_kv = self._get_qkv(input1, infer_state, layer_weight)
+            input1 = None
+            self._post_cache_kv(cache_kv, infer_state, layer_weight)
+            o = self._token_attention_kernel(q, infer_state, layer_weight)
+            q = None
+            o = self._get_o(o, infer_state, layer_weight)
+            if self.tp_world_size_ > 1:
+                all_reduce(o, op=dist.ReduceOp.SUM, group=infer_state.dist_group, async_op=False)
+            input_embdings.add_(o.view(-1, self.embed_dim_))
+            o = None
+
+            infer_state.colora_pre_ffn_hidden = input_embdings
+            infer_state.colora_keep_indices = None
+            input1 = self._ffn_norm(input_embdings, infer_state, layer_weight)
+            ffn_out = self._ffn(input1, infer_state, layer_weight)
+            input1 = None
+
+            keep_indices = getattr(infer_state, "colora_keep_indices", None)
+            if keep_indices is not None:
+                input_embdings = input_embdings.index_select(0, keep_indices)
+                infer_state.prune_decode_batch(keep_indices)
+                infer_state.colora_keep_indices = None
+            infer_state.colora_pre_ffn_hidden = None
+
+            if self.tp_world_size_ > 1:
+                all_reduce(ffn_out, op=dist.ReduceOp.SUM, group=infer_state.dist_group, async_op=False)
+            input_embdings.add_(ffn_out.view(-1, self.embed_dim_))
+            apply_deepstack_features(
+                input_embeddings=input_embdings,
+                infer_state=infer_state,
+                layer_num=self.layer_num_,
+            )
+            return input_embdings
+
     def _moe_ffn(
         self,
         input: torch.Tensor,
@@ -660,8 +707,7 @@ class Qwen3VLMOETransformerLayerInfer(Qwen3MOETransformerLayerInfer):
             hidden_states = input.view(-1, self.embed_dim_)
             num_tokens = hidden_states.shape[0]
 
-            # Check if COLoRA request-level skip is enabled
-            if not hasattr(self.lora_dispatcher_, 'colora_request_skip') or not self.lora_dispatcher_.colora_request_skip:
+            if not self._should_enable_request_skip(infer_state):
                 self._maybe_submit_decode_temporal_prefetch(infer_state)
                 self._maybe_submit_decode_spec_gate_up(hidden_states, infer_state)
                 output = super()._moe_ffn(input, infer_state, layer_weight)
@@ -1148,16 +1194,12 @@ class Qwen3VLMOETransformerLayerInfer(Qwen3MOETransformerLayerInfer):
         hidden: torch.Tensor,
         adapter_bin: int,
         expert_ids: List[int],
+        routing_weights: List[float],
         layer_weight: Qwen3MOETransformerLayerWeight,
     ) -> torch.Tensor:
-        """CPU forward for one full layer when request is fully cold.
-
-        Attention already computed on GPU for previous layers, we only
-        need to compute the FFN (MoE) part on CPU with all LoRA projections.
-        """
-        # hidden shape: [1, hidden_dim]
+        """Finish the current layer on CPU for a paused request."""
         input1 = self._ffn_norm_cpu(hidden, layer_weight)
-        ffn_out = self._moe_ffn_cpu(input1, adapter_bin, expert_ids, layer_weight)
+        ffn_out = self._moe_ffn_cpu(input1, adapter_bin, expert_ids, routing_weights, layer_weight)
         return hidden + ffn_out
 
     def _ffn_norm_cpu(self, hidden: torch.Tensor, layer_weight: Qwen3MOETransformerLayerWeight):
@@ -1174,87 +1216,64 @@ class Qwen3VLMOETransformerLayerInfer(Qwen3MOETransformerLayerInfer):
         input: torch.Tensor,
         adapter_bin: int,
         expert_ids: List[int],
+        routing_weights: List[float],
         layer_weight: Qwen3MOETransformerLayerWeight,
     ) -> torch.Tensor:
-        """CPU version of MoE FFN for a single request with one token.
-
-        All experts are computed on CPU with LoRA projections using existing
-        COLoRA CPU kernels.
-        """
+        """CPU version of MoE FFN for one paused request in one layer."""
         hidden_dim = self.embed_dim_
         input = input.view(-1, hidden_dim)
         num_tokens = input.shape[0]
         assert num_tokens == 1
 
         final_output = torch.zeros_like(input)
+        experts = layer_weight.experts
 
-        for expert_id in expert_ids:
-            # Get the expert input
+        for expert_id, routing_weight in zip(expert_ids, routing_weights):
             expert_input = input
 
-            # Apply LoRA for gate, up, down projections using existing CPU kernels
             if self.use_detached_lora_ and self.lora_dispatcher_ is not None:
-                gate_lora = self.lora_dispatcher_.strict_moe_cpu_batch_lora(
-                    expert_input, layer_weight.layer_num_, [adapter_bin], [expert_id], "gate"
+                gate_lora = self._strict_single_request_moe_cpu_lora(
+                    expert_input,
+                    layer_id=layer_weight.layer_num_,
+                    adapter_bin=adapter_bin,
+                    expert_id=expert_id,
+                    projection="gate",
                 )
-                up_lora = self.lora_dispatcher_.strict_moe_cpu_batch_lora(
-                    expert_input, layer_weight.layer_num_, [adapter_bin], [expert_id], "up"
+                up_lora = self._strict_single_request_moe_cpu_lora(
+                    expert_input,
+                    layer_id=layer_weight.layer_num_,
+                    adapter_bin=adapter_bin,
+                    expert_id=expert_id,
+                    projection="up",
                 )
             else:
-                gate_lora = torch.zeros_like(expert_input)
-                up_lora = torch.zeros_like(expert_input)
+                gate_lora = torch.zeros((expert_input.shape[0], experts.experts_gate_projs[expert_id].shape[0]), dtype=expert_input.dtype, device=expert_input.device)
+                up_lora = torch.zeros((expert_input.shape[0], experts.experts_up_projs[expert_id].shape[0]), dtype=expert_input.dtype, device=expert_input.device)
 
-            # Base GEMM + LoRA
-            gate_out = layer_weight.experts.experts_gate_projs[expert_id].mm(expert_input) + gate_lora
-            up_gate_out = layer_weight.experts.experts_up_projs[expert_id].mm(gate_out) + up_lora
+            gate_weight = experts.experts_gate_projs[expert_id].to(device=expert_input.device, dtype=expert_input.dtype)
+            up_weight = experts.experts_up_projs[expert_id].to(device=expert_input.device, dtype=expert_input.dtype)
+            down_weight = experts.w2_list[expert_id].to(device=expert_input.device, dtype=expert_input.dtype)
 
-            # Apply activation
-            up_gate_out = self.act_fn(up_gate_out)
+            gate_out = torch.mm(expert_input, gate_weight.t()) + gate_lora
+            up_out = torch.mm(expert_input, up_weight.t()) + up_lora
+            up_gate_out = torch.nn.functional.silu(gate_out) * up_out
 
-            # Down projection with LoRA
             if self.use_detached_lora_ and self.lora_dispatcher_ is not None:
-                down_lora = self.lora_dispatcher_.strict_moe_cpu_batch_lora(
-                    up_gate_out, layer_weight.layer_num_, [adapter_bin], [expert_id], "down"
+                down_lora = self._strict_single_request_moe_cpu_lora(
+                    up_gate_out,
+                    layer_id=layer_weight.layer_num_,
+                    adapter_bin=adapter_bin,
+                    expert_id=expert_id,
+                    projection="down",
                 )
             else:
-                down_lora = torch.zeros_like(up_gate_out)
+                down_lora = torch.zeros((up_gate_out.shape[0], down_weight.shape[0]), dtype=up_gate_out.dtype, device=up_gate_out.device)
 
-            expert_out = layer_weight.experts.experts_down_projs[expert_id].mm(up_gate_out) + down_lora
-            final_output += expert_out
+            expert_out = torch.mm(up_gate_out, down_weight.t()) + down_lora
+            final_output += expert_out * float(routing_weight)
 
         return final_output.view(num_tokens, hidden_dim)
 
     def _complete_layer_on_cpu(self, task):
-        """Complete the remaining layers starting from current_layer on CPU.
-
-        This is called by the CPU executor after a request was paused mid-layer
-        due to all experts being cold. The result (final hidden states after
-        all layers complete) is stored in req_obj.colora_continuation.saved_hidden
-        and marked completed.
-        """
-        from lightllm.common.basemodel.infer_lock import g_infer_state_lock
-
-        hidden = task.hidden_input
-        current_layer = task.current_layer
-
-        # Compute all remaining layers starting from current_layer
-        for layer_id in range(current_layer, len(task.all_layers)):
-            layer = task.all_layers[layer_id]
-            weight = task.all_weights[layer_id]
-            # Each layer does full CPU forward pass including attention + FFN
-            # Attention was already done on GPU before we got here
-            # We only need to compute FFN since attention is already done
-            hidden = layer.token_forward_cpu(hidden, task.adapter_bin, task.expert_ids, weight)
-
-        # Store result back to request with global lock for thread safety
-        with g_infer_state_lock:
-            if task.req_obj.colora_continuation is not None:
-                task.req_obj.colora_continuation.saved_hidden = hidden
-                task.req_obj.colora_continuation.completed = True
-                task.req_obj.colora_paused = False
-
-        # Release the async queue slot
-        if hasattr(self.lora_dispatcher_, '_release_async_queue_slot'):
-            self.lora_dispatcher_._release_async_queue_slot()
-
-        return None
+        """Backward-compatible wrapper for the layer-local CPU completion path."""
+        return self._complete_paused_layer_on_cpu(task)
