@@ -1,0 +1,35 @@
+run_id: baseline_LoadThenRun_BatchWait_01
+description: >
+  Lock stable baseline before Skip-and-reinsert stabilization.
+  Focus: promotion-first style load_then_run with synchronous batch wait
+  (no overlap / no request-skip), plus optional all-GPU baseline.
+
+benchmark_script: test/lora/benchmark_lora.sh
+
+runs:
+  # # Optional reference baseline
+  # - run_label: baseline_lora_gpu
+  #   suite_kind: paper
+  #   mode_label: baseline_gpu
+  #   compute_device: "vl_storage:gpu,vl_compute:gpu,attn_storage:gpu,attn_compute:gpu,moe_storage:gpu,moe_compute:gpu"
+  #   warmup_requests: 4
+  #   measurement_requests: 32
+  #   nsys_enabled: false
+  #   output_root: artifacts/evaluation/live_e2e
+
+  # Primary lock-down baseline for current stage
+  - run_label: colora_load_then_run_sync
+    suite_kind: paper
+    mode_label: load_then_run_sync
+    compute_device: "vl_storage:gpu,vl_compute:gpu,attn_storage:gpu,attn_compute:gpu,moe_storage:cpu,moe_compute:gpu"
+    miss_handling_mode: load_then_run
+    overlap_policy: no_overlap
+    async_fallback: false
+    cpu_workers: 0
+    cpu_queue_depth: 8
+    cpu_batch_timeout_us: 500
+    speculative_dispatch: false
+    warmup_requests: 4
+    measurement_requests: 32
+    nsys_enabled: false
+    output_root: artifacts/evaluation/live_e2e

@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 from datetime import datetime
 import json
+import threading
 
 from tools.case_study.common import ensure_dir, write_json
 from tools.evaluation.live_e2e.manifest import LiveE2EManifest, LiveE2ERun
@@ -17,9 +18,15 @@ def build_benchmark_command(run: LiveE2ERun, benchmark_script: str) -> str:
     if run.miss_handling_mode is not None:
         parts.append(f"--colora_miss_policy {run.miss_handling_mode}")
     if run.overlap_policy is not None:
-        parts.append(f"--colora_overlap_mode {run.overlap_policy}")
+        # benchmark_lora.sh does not accept --colora_overlap_mode.
+        # Translate overlap policy into currently-supported control flags.
+        # no_overlap => disable request-level skip-and-reinsert.
+        if str(run.overlap_policy).strip().lower() == "no_overlap":
+            parts.append("--colora_request_skip 0")
+        else:
+            parts.append("--colora_request_skip 1")
     if run.async_fallback is not None:
-        parts.append(f"--colora_async_fallback {str(run.async_fallback).lower()}")
+        parts.append(f"--colora_async_fallback {1 if run.async_fallback else 0}")
     if run.cpu_workers is not None:
         parts.append(f"--colora_cpu_workers {run.cpu_workers}")
     if run.cpu_queue_depth is not None:
@@ -64,6 +71,16 @@ def get_summaries_dir(manifest: LiveE2EManifest) -> Path:
     return manifest.runs[0].output_root / manifest.run_id / "summaries"
 
 
+def _stream_pipe(pipe, log_file, output_stream):
+    """Stream a subprocess pipe to terminal and log file (tee-style)."""
+    for line in iter(pipe.readline, ""):
+        log_file.write(line)
+        log_file.flush()
+        output_stream.write(line)
+        output_stream.flush()
+    pipe.close()
+
+
 def run_single(manifest: LiveE2EManifest, run: LiveE2ERun, capture_stdout: bool = True) -> dict:
     """Execute a single run, capture outputs, return run result metadata."""
     output_dir = get_run_output_dir(manifest, run)
@@ -93,13 +110,36 @@ def run_single(manifest: LiveE2EManifest, run: LiveE2ERun, capture_stdout: bool 
     stderr_path = output_dir / "benchmark_stderr.log"
 
     start_time = datetime.now()
+    proc = None
     try:
-        proc = subprocess.run(
-            cmd,
-            shell=True,
-            capture_output=capture_stdout,
-            text=True,
-        )
+        if capture_stdout:
+            with stdout_path.open("w", encoding="utf-8") as stdout_file, stderr_path.open("w", encoding="utf-8") as stderr_file:
+                proc = subprocess.Popen(
+                    cmd,
+                    shell=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,
+                )
+                t_out = threading.Thread(
+                    target=_stream_pipe, args=(proc.stdout, stdout_file, sys.stdout), daemon=True
+                )
+                t_err = threading.Thread(
+                    target=_stream_pipe, args=(proc.stderr, stderr_file, sys.stderr), daemon=True
+                )
+                t_out.start()
+                t_err.start()
+                proc.wait()
+                t_out.join()
+                t_err.join()
+        else:
+            proc = subprocess.run(
+                cmd,
+                shell=True,
+                capture_output=False,
+                text=True,
+            )
     except Exception as e:
         end_time = datetime.now()
         result = {
@@ -117,10 +157,6 @@ def run_single(manifest: LiveE2EManifest, run: LiveE2ERun, capture_stdout: bool 
         return result
 
     end_time = datetime.now()
-
-    if capture_stdout:
-        stdout_path.write_text(proc.stdout, encoding="utf-8")
-        stderr_path.write_text(proc.stderr, encoding="utf-8")
 
     # Validate result
     valid = True

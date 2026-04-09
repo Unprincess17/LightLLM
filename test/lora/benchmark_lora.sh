@@ -141,7 +141,8 @@ terminate_server_tree() {
 
     echo "[Cleanup] Stopping server tree rooted at PID $pid..."
 
-    kill -INT "$pid" 2>/dev/null || true
+    # Prefer signaling the whole process group to stop launcher + workers together.
+    kill -INT -- "-$pid" 2>/dev/null || kill -INT "$pid" 2>/dev/null || true
     for _ in $(seq 1 20); do
         if ! kill -0 "$pid" 2>/dev/null; then
             return 0
@@ -150,11 +151,11 @@ terminate_server_tree() {
     done
 
     pkill -TERM -P "$pid" 2>/dev/null || true
-    kill -TERM "$pid" 2>/dev/null || true
+    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
     sleep 2
 
     pkill -KILL -P "$pid" 2>/dev/null || true
-    kill -KILL "$pid" 2>/dev/null || true
+    kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
 }
 
 build_phase_args() {
@@ -571,14 +572,16 @@ if [[ -n "$COLORA_MAX_CONTINUATIONS" ]]; then
 fi
 # Redirect server output
 if [[ -n "$SERVER_STDOUT_LOG" ]]; then
-    # User specified explicit output location for stdout/stderr
-    bash "$SERVER_SCRIPT" "${SERVER_ARGS[@]}" 2>&1 | tee -a "$SERVER_STDOUT_LOG" &
+    # User specified explicit output location for stdout/stderr.
+    # Use process substitution so $! is the server launcher PID (not tee PID).
+    bash "$SERVER_SCRIPT" "${SERVER_ARGS[@]}" > >(tee -a "$SERVER_STDOUT_LOG") 2>&1 &
 elif [[ -z "$SERVER_LOG_PATH" || "$SERVER_LOG_PATH" == "/dev/null" ]]; then
     # Output only to stdout/stderr
     bash "$SERVER_SCRIPT" "${SERVER_ARGS[@]}" &
 else
-    # Default: output to both server log file AND stdout (so you see it in real time)
-    bash "$SERVER_SCRIPT" "${SERVER_ARGS[@]}" 2>&1 | tee "$SERVER_LOG_PATH" &
+    # Default: output to both server log file AND stdout.
+    # Use process substitution so shutdown targets the real server launcher tree.
+    bash "$SERVER_SCRIPT" "${SERVER_ARGS[@]}" > >(tee "$SERVER_LOG_PATH") 2>&1 &
 fi
 SERVER_PID=$!
 echo "Server PID: $SERVER_PID"
