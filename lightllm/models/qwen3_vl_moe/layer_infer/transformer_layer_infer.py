@@ -876,9 +876,18 @@ class Qwen3VLMOETransformerLayerInfer(Qwen3MOETransformerLayerInfer):
                             device="cpu", copy=True
                         )
 
-                    # Get current mem_index for KV reuse
+                    # KV slot for this decode row only (same semantics as prepare_decode_inputs:
+                    # one mem index per row in b_seq_len). Storing the full req_to_token_indexs row
+                    # breaks continuation batches: copy_kv_index_to_req requires len(memindex) == len(b_seq_len).
                     seq_len = req_obj.get_cur_total_len()
-                    mem_index = infer_state.req_manager.req_to_token_indexs[req_obj.req_idx].clone().detach().cpu()
+                    mem_row = getattr(infer_state, "mem_index", None)
+                    if mem_row is None or token_idx >= int(mem_row.shape[0]):
+                        logger.error(
+                            "[COLoRA] Cannot pause: bad infer_state.mem_index "
+                            f"(token_idx={token_idx}, mem_row_len={None if mem_row is None else mem_row.shape[0]})"
+                        )
+                        continue
+                    mem_index = mem_row[token_idx : token_idx + 1].detach().cpu().contiguous()
 
                     # Create continuation state
                     from lightllm.server.router.model_infer.infer_batch import ColoraContinuation
