@@ -1,0 +1,25 @@
+run_id: next_ExecuteFirst_Overlap_Calibrated_02
+description: >
+  Next-step single run after locked load_then_run baselines and ablations.
+  Goal: measure execution-first with overlap mechanisms enabled to determine
+  whether no-overlap ablation regressions are recovered under intended COLoRA
+  scheduling behavior.
+
+benchmark_script: test/lora/benchmark_lora.sh
+
+runs:
+  - run_label: colora_execution_first_overlap
+    suite_kind: paper
+    mode_label: execution_first_overlap
+    compute_device: "vl_storage:gpu,vl_compute:gpu,attn_storage:gpu,attn_compute:gpu,moe_storage:cpu,moe_compute:hybrid"
+    miss_handling_mode: cpu_first
+    overlap_policy: calibrated
+    async_fallback: true
+    cpu_workers: 4
+    cpu_queue_depth: 32
+    cpu_batch_timeout_us: 200
+    speculative_dispatch: false
+    warmup_requests: 4
+    measurement_requests: 32
+    nsys_enabled: false
+    output_root: artifacts/evaluation/live_e2e
