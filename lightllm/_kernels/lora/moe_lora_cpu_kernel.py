@@ -118,7 +118,7 @@ def moe_batch_lora_up_avx(
     output = torch.zeros(x.shape[0], B.shape[1], dtype=x.dtype, device=x.device)
     _moe_lora_cpu_kernel.moe_batch_lora_up_avx(
         x, B, output,
-        x.shape[0], x.shape[1], B.shape[0], scaling
+        x.shape[0], x.shape[1], B.shape[1], scaling
     )
     return output
 
@@ -141,6 +141,6 @@ def moe_batch_lora_down_avx(
     output = torch.zeros(x.shape[0], B.shape[1], dtype=x.dtype, device=x.device)
     _moe_lora_cpu_kernel.moe_batch_lora_down_avx(
         x, B, output,
-        x.shape[0], x.shape[1], B.shape[0], scaling
+        x.shape[0], x.shape[1], B.shape[1], scaling
     )
     return output

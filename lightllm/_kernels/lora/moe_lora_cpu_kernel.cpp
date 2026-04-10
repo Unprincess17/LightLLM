@@ -329,129 +329,40 @@ void moe_lora_gate_kernel(
 }
 
 // Specialized kernel for Up phase of MoE
+// Computes out[n,h] += sum_r x[n,r] * B[r,h] * scaling with B stored row-major [R, H].
+// (Prior SIMD path used _mm512_cvtph_ps on BF16 data and a broken tail loop; this
+// reference matches torch.matmul(x, B) * scaling in float32 reduce.)
 void moe_lora_up_kernel(
     const bf16* x, const bf16* B_mat, bf16* out,
     int N, int R, int H, float scaling) {
 
-    const int cache_block_h = 256;
-    const int rank_block = 8;
-
     #pragma omp parallel for schedule(dynamic, 2)
     for (int n = 0; n < N; ++n) {
         const bf16* x_ptr = x + n * R;
-
-        for (int r = 0; r < R; r += rank_block) {
-            __m512 rank_acc[8];
-            for (int i = 0; i < rank_block && (r + i) < R; ++i) {
-                rank_acc[i] = _mm512_setzero_ps();
+        for (int hh = 0; hh < H; ++hh) {
+            float acc = 0.0f;
+            for (int rr = 0; rr < R; ++rr) {
+                acc += (float)x_ptr[rr] * (float)B_mat[rr * H + hh] * scaling;
             }
-
-            int h = 0;
-            for (; h + cache_block_h <= H; h += cache_block_h) {
-                for (int i = 0; i < rank_block && (r + i) < R; ++i) {
-                    float x_val = (float)x_ptr[r + i];
-                    if (x_val == 0.0f) continue;
-
-                    const bf16* B_ptr = B_mat + (r + i) * H + h;
-
-                    int j = 0;
-                    for (; j + 15 < cache_block_h; j += 16) {
-                        auto v_B = _mm256_loadu_si256((const __m256i*)(B_ptr + j));
-                        rank_acc[i] = _mm512_fmadd_ps(_mm512_set1_ps(x_val * scaling),
-                                                    _mm512_cvtph_ps(v_B), rank_acc[i]);
-                    }
-
-                    for (; j < cache_block_h; ++j) {
-                        float b_val = (float)B_ptr[j];
-                        rank_acc[i][0] += x_val * scaling * b_val;
-                    }
-                }
-
-                for (int i = 0; i < rank_block && (r + i) < R; ++i) {
-                    float acc_arr[16];
-                    _mm256_storeu_ps(acc_arr, _mm512_castps512_ps256(rank_acc[i]));
-                    for (int j = 0; j < 16; ++j) {
-                        if (h + j < H) {
-                            out[n * H + (h + j)] += bf16(acc_arr[j]);
-                        }
-                    }
-                }
-            }
-
-            for (int i = 0; i < rank_block && (r + i) < R; ++i) {
-                float x_val = (float)x_ptr[r + i];
-                if (x_val == 0.0f) continue;
-
-                const bf16* B_ptr = B_mat + (r + i) * H + h;
-                for (; h < H; ++h) {
-                    float b_val = (float)B_ptr[h];
-                    out[n * H + h] += bf16(x_val * scaling * b_val);
-                }
-            }
+            out[n * H + hh] += bf16(acc);
         }
     }
 }
 
-// Specialized kernel for Down phase of MoE
+// Same layout/matmul as moe_lora_up_kernel (down uses identical [N,R]@[R,H]->[N,H] here).
 void moe_lora_down_kernel(
     const bf16* x, const bf16* B_mat, bf16* out,
     int N, int R, int H, float scaling) {
 
-    const int cache_block_h = 512;
-    const int rank_block = 16;
-
     #pragma omp parallel for schedule(dynamic, 1)
     for (int n = 0; n < N; ++n) {
         const bf16* x_ptr = x + n * R;
-
-        for (int r = 0; r < R; r += rank_block) {
-            __m512 rank_acc[16];
-            for (int i = 0; i < rank_block && (r + i) < R; ++i) {
-                rank_acc[i] = _mm512_setzero_ps();
+        for (int hh = 0; hh < H; ++hh) {
+            float acc = 0.0f;
+            for (int rr = 0; rr < R; ++rr) {
+                acc += (float)x_ptr[rr] * (float)B_mat[rr * H + hh] * scaling;
             }
-
-            int h = 0;
-            for (; h + cache_block_h <= H; h += cache_block_h) {
-                for (int i = 0; i < rank_block && (r + i) < R; ++i) {
-                    float x_val = (float)x_ptr[r + i];
-                    if (x_val == 0.0f) continue;
-
-                    const bf16* B_ptr = B_mat + (r + i) * H + h;
-
-                    int j = 0;
-                    for (; j + 15 < cache_block_h; j += 16) {
-                        auto v_B = _mm256_loadu_si256((const __m256i*)(B_ptr + j));
-                        rank_acc[i] = _mm512_fmadd_ps(_mm512_set1_ps(x_val * scaling),
-                                                    _mm512_cvtph_ps(v_B), rank_acc[i]);
-                    }
-
-                    for (; j < cache_block_h; ++j) {
-                        float b_val = (float)B_ptr[j];
-                        rank_acc[i][0] += x_val * scaling * b_val;
-                    }
-                }
-
-                for (int i = 0; i < rank_block && (r + i) < R; ++i) {
-                    float acc_arr[16];
-                    _mm256_storeu_ps(acc_arr, _mm512_castps512_ps256(rank_acc[i]));
-                    for (int j = 0; j < 16; ++j) {
-                        if (h + j < H) {
-                            out[n * H + (h + j)] += bf16(acc_arr[j]);
-                        }
-                    }
-                }
-            }
-
-            for (int i = 0; i < rank_block && (r + i) < R; ++i) {
-                float x_val = (float)x_ptr[r + i];
-                if (x_val == 0.0f) continue;
-
-                const bf16* B_ptr = B_mat + (r + i) * H + h;
-                for (; h < H; ++h) {
-                    float b_val = (float)B_ptr[h];
-                    out[n * H + h] += bf16(x_val * scaling * b_val);
-                }
-            }
+            out[n * H + hh] += bf16(acc);
         }
     }
 }

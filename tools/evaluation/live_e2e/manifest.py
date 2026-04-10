@@ -17,6 +17,8 @@ class LiveE2ERun:
     cpu_workers: Optional[int] = None
     cpu_queue_depth: Optional[int] = None
     cpu_batch_timeout_us: Optional[int] = None
+    cpu_kernel_mode: Optional[str] = None
+    coalescing_packer: Optional[bool] = None
     speculative_dispatch: Optional[bool] = None
     requests_path: str = "fixed_requests.jsonl"
     adapter_trace_path: str = "adapter_trace.jsonl"
@@ -39,6 +41,8 @@ class LiveE2ERun:
             "cpu_workers": self.cpu_workers,
             "cpu_queue_depth": self.cpu_queue_depth,
             "cpu_batch_timeout_us": self.cpu_batch_timeout_us,
+            "cpu_kernel_mode": self.cpu_kernel_mode,
+            "coalescing_packer": self.coalescing_packer,
             "speculative_dispatch": self.speculative_dispatch,
             "requests_path": self.requests_path,
             "adapter_trace_path": self.adapter_trace_path,

@@ -129,10 +129,27 @@ def test_build_benchmark_command_colora():
 
     cmd = build_benchmark_command(run, benchmark_script="/path/benchmark_lora.sh")
     assert "--colora_miss_policy execution_first" in cmd
-    assert "--colora_overlap_mode calibrated" in cmd
+    assert "--colora_request_skip 1" in cmd
     assert "--colora_cpu_workers 2" in cmd
     assert "--colora_cpu_queue_depth 8" in cmd
-    assert "--colora_async_fallback true" in cmd
+    assert "--colora_async_fallback 1" in cmd
+
+
+def test_build_benchmark_command_injects_kernel_and_packer_env():
+    from tools.evaluation.live_e2e.runner import build_benchmark_command
+    from tools.evaluation.live_e2e.manifest import LiveE2ERun
+
+    run = LiveE2ERun(
+        run_label="colora_kernel_packer",
+        suite_kind="paper",
+        mode_label="execution_first",
+        compute_device="moe_storage:cpu,moe_compute:hybrid",
+        cpu_kernel_mode="naive",
+        coalescing_packer=False,
+    )
+    cmd = build_benchmark_command(run, benchmark_script="/path/benchmark_lora.sh")
+    assert cmd.startswith("MOE_COALESCING_PACKER=0 COLORA_CPU_KERNEL_MODE=naive ")
+    assert "/path/benchmark_lora.sh" in cmd
 
 
 def test_example_paper_suite_manifest_parses_and_builds_commands():
@@ -163,13 +180,13 @@ def test_example_paper_suite_manifest_parses_and_builds_commands():
 
     # execution_first has correct policy
     assert "execution_first" in cmds[1]
-    assert "calibrated" in cmds[1]
+    assert "--colora_request_skip 1" in cmds[1]
     assert "cpu_workers 2" in cmds[1]
     assert "--colora_speculative_dispatch" in cmds[1]
 
     # load_then_run has correct policy
     assert "load_then_run" in cmds[2]
-    assert "calibrated" in cmds[2]
+    assert "--colora_request_skip 1" in cmds[2]
     assert "--no_colora_speculative_dispatch" in cmds[2]
 
 

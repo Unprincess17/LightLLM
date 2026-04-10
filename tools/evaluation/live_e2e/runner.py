@@ -12,7 +12,12 @@ from tools.evaluation.live_e2e.manifest import load_manifest
 
 def build_benchmark_command(run: LiveE2ERun, benchmark_script: str) -> str:
     """Build the benchmark_lora.sh command string from a run definition."""
-    parts = [benchmark_script]
+    parts = []
+    if run.coalescing_packer is not None:
+        parts.append(f"MOE_COALESCING_PACKER={1 if run.coalescing_packer else 0}")
+    if run.cpu_kernel_mode is not None:
+        parts.append(f"COLORA_CPU_KERNEL_MODE={str(run.cpu_kernel_mode).strip().lower()}")
+    parts.append(benchmark_script)
     parts.append(f"--compute_device {run.compute_device}")
 
     if run.miss_handling_mode is not None:

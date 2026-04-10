@@ -87,6 +87,27 @@ except Exception:
     MOE_AVX_AVAILABLE = False
 
 
+def _colora_resolved_cpu_kernel_mode() -> str:
+    """Return ``naive`` or ``avx`` (default) from ``COLORA_CPU_KERNEL_MODE``."""
+    raw = os.environ.get("COLORA_CPU_KERNEL_MODE", "").strip().lower()
+    if raw == "naive":
+        return "naive"
+    return "avx"
+
+
+def _naive_moe_lora_gate(
+    batch_input: torch.Tensor, A: torch.Tensor, scaling: float
+) -> torch.Tensor:
+    _ = scaling
+    return torch.matmul(batch_input, A.transpose(0, 1))
+
+
+def _naive_moe_lora_stage2(
+    intermediate: torch.Tensor, B: torch.Tensor, scaling: float
+) -> torch.Tensor:
+    return torch.matmul(intermediate, B) * scaling
+
+
 def is_moe_cpu_kernel_available() -> bool:
     """Expose MoE kernel readiness for backend startup checks."""
     return bool(MOE_AVX_AVAILABLE)
@@ -1162,8 +1183,10 @@ class Qwen3VLMoELoRADispatcher:
         return_to_original_device: bool = True,
         temporal_prefetch_context: Optional[Tuple[int, int, int]] = None,
     ) -> Tuple[torch.Tensor, int, int]:
-        """Strict MoE CPU fallback: force MoE-specific AVX kernel path."""
-        self._require_moe_cpu_kernel(mode=projection)
+        """Strict MoE CPU fallback: AVX MoE kernels or PyTorch reference (``naive``)."""
+        cpu_kernel_mode = _colora_resolved_cpu_kernel_mode()
+        if cpu_kernel_mode != "naive":
+            self._require_moe_cpu_kernel(mode=projection)
 
         if req_bins is None:
             req_bins = self.req_bins
@@ -1195,7 +1218,18 @@ class Qwen3VLMoELoRADispatcher:
                 adapter_to_indices.setdefault(idx, []).append(i)
             adapter_groups = tuple((adapter_idx, tuple(indices)) for adapter_idx, indices in adapter_to_indices.items())
 
-        stage2_kernel = self._select_moe_stage2_kernel(projection)
+        if cpu_kernel_mode == "naive":
+            gate_kernel = _naive_moe_lora_gate
+            proj_lower = projection.lower()
+            if proj_lower in ("gate", "up", "down"):
+                stage2_kernel = _naive_moe_lora_stage2
+            else:
+                raise ValueError(
+                    f"Unsupported MoE projection '{projection}', expected gate|up|down"
+                )
+        else:
+            gate_kernel = moe_batch_lora_gate_avx
+            stage2_kernel = self._select_moe_stage2_kernel(projection)
         kernel_calls = 0
         kernel_tokens = 0
 
@@ -1254,7 +1288,7 @@ class Qwen3VLMoELoRADispatcher:
                     batch_input = batch_input.contiguous()
 
                 # Stage-1: x @ A^T
-                intermediate = moe_batch_lora_gate_avx(batch_input, A, scaling=1.0)
+                intermediate = gate_kernel(batch_input, A, 1.0)
                 # Stage-2: intermediate @ B, projection-specific kernel.
                 batch_output = stage2_kernel(intermediate, B, scaling=a_scaling)
                 output[req_indices] = batch_output
