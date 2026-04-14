@@ -16,7 +16,8 @@ runs:
     cpu_workers: 1
     cpu_queue_depth: 8
     cpu_batch_timeout_us: 500
-    speculative_dispatch: false
+    cpu_kernel_mode: naive
+    coalescing_packer: false
     warmup_requests: 4
     measurement_requests: 32
     nsys_enabled: false

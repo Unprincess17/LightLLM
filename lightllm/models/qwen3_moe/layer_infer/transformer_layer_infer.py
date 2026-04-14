@@ -144,38 +144,44 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
         - adapter_offsets: prefix-sum offsets into packed activations
         - token_positions: positions in original activations for each packed row
         """
-        if req_bins is None or activations.numel() == 0:
-            return None
+        nvtx_coalesce = f"MoE_CoalesceLoraActivations/L{int(self.layer_num_)}"
+        with NvtxAnnotate(nvtx_coalesce):
+            if req_bins is None or activations.numel() == 0:
+                return None
 
-        bins = req_bins.to(device=activations.device, dtype=torch.long)
-        valid_mask = bins >= 0
-        if not torch.any(valid_mask):
-            return None
+            with NvtxAnnotate(f"{nvtx_coalesce}/BinCastValidMask"):
+                bins = req_bins.to(device=activations.device, dtype=torch.long)
+                valid_mask = bins >= 0
+                if not torch.any(valid_mask):
+                    return None
 
-        token_positions = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1)
-        valid_bins = bins.index_select(0, token_positions)
+                token_positions = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1)
+                valid_bins = bins.index_select(0, token_positions)
 
-        # Group rows by adapter to maximize contiguous D2H/H2D transfer efficiency.
-        if valid_bins.numel() > 1:
-            sorted_bins, sort_idx = torch.sort(valid_bins)
-            token_positions = token_positions.index_select(0, sort_idx)
-        else:
-            sorted_bins = valid_bins
+            # Group rows by adapter to maximize contiguous D2H/H2D transfer efficiency.
+            if valid_bins.numel() > 1:
+                with NvtxAnnotate(f"{nvtx_coalesce}/SortByAdapterBin"):
+                    sorted_bins, sort_idx = torch.sort(valid_bins)
+                    token_positions = token_positions.index_select(0, sort_idx)
+            else:
+                sorted_bins = valid_bins
 
-        packed_activations = activations.index_select(0, token_positions).contiguous()
+            with NvtxAnnotate(f"{nvtx_coalesce}/GatherContiguous"):
+                packed_activations = activations.index_select(0, token_positions).contiguous()
 
-        adapter_ids, adapter_counts = torch.unique_consecutive(sorted_bins, return_counts=True)
-        adapter_offsets = torch.empty(adapter_counts.numel() + 1, dtype=torch.int32, device=activations.device)
-        adapter_offsets[0] = 0
-        adapter_offsets[1:] = torch.cumsum(adapter_counts.to(torch.int32), dim=0)
+            with NvtxAnnotate(f"{nvtx_coalesce}/AdapterOffsetsCSR"):
+                adapter_ids, adapter_counts = torch.unique_consecutive(sorted_bins, return_counts=True)
+                adapter_offsets = torch.empty(adapter_counts.numel() + 1, dtype=torch.int32, device=activations.device)
+                adapter_offsets[0] = 0
+                adapter_offsets[1:] = torch.cumsum(adapter_counts.to(torch.int32), dim=0)
 
-        return {
-            "packed_activations": packed_activations,
-            "packed_bins": sorted_bins.contiguous(),
-            "token_positions": token_positions,
-            "adapter_ids": adapter_ids,
-            "adapter_offsets": adapter_offsets,
-        }
+            return {
+                "packed_activations": packed_activations,
+                "packed_bins": sorted_bins.contiguous(),
+                "token_positions": token_positions,
+                "adapter_ids": adapter_ids,
+                "adapter_offsets": adapter_offsets,
+            }
 
     def _scatter_lora_from_packed(
         self,
@@ -184,13 +190,16 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
         total_tokens: int,
     ) -> torch.Tensor:
         """Scatter packed LoRA output back to the original expert token order."""
-        full_output = torch.zeros(
-            (total_tokens, packed_output.shape[1]),
-            dtype=packed_output.dtype,
-            device=packed_output.device,
-        )
+        nvtx_scatter = f"MoE_CoalescedAct_Scatter/L{int(self.layer_num_)}"
+        with NvtxAnnotate(f"{nvtx_scatter}/AllocZeroBuffer"):
+            full_output = torch.zeros(
+                (total_tokens, packed_output.shape[1]),
+                dtype=packed_output.dtype,
+                device=packed_output.device,
+            )
         if packed_output.numel() > 0:
-            full_output.index_copy_(0, token_positions, packed_output)
+            with NvtxAnnotate(f"{nvtx_scatter}/IndexCopyRows"):
+                full_output.index_copy_(0, token_positions, packed_output)
         return full_output
 
     def _dispatch_lora_with_optional_coalescing(
@@ -225,18 +234,22 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
         if reuse_packed_input:
             packed_input = pack_meta["packed_activations"]
         else:
-            packed_input = input_tensor.index_select(0, pack_meta["token_positions"]).contiguous()
-        packed_out = dispatch_fn(
-            packed_input,
-            layer_id,
-            pack_meta["packed_bins"],
-            expert_id=expert_id,
-        )
-        return self._scatter_lora_from_packed(
-            packed_output=packed_out,
-            token_positions=pack_meta["token_positions"],
-            total_tokens=input_tensor.shape[0],
-        )
+            with NvtxAnnotate(f"MoE_CoalescedAct_GatherInput/L{layer_id}/E{expert_id}/{phase_name or 'LoRA'}"):
+                packed_input = input_tensor.index_select(0, pack_meta["token_positions"]).contiguous()
+        lora_nvtx = f"MoE_CoalescedAct_LoRA_GPU/L{layer_id}/E{expert_id}/{phase_name or 'LoRA'}"
+        with NvtxAnnotate(lora_nvtx):
+            packed_out = dispatch_fn(
+                packed_input,
+                layer_id,
+                pack_meta["packed_bins"],
+                expert_id=expert_id,
+            )
+        with NvtxAnnotate(f"MoE_CoalescedAct_ScatterOutput/L{layer_id}/E{expert_id}/{phase_name or 'LoRA'}"):
+            return self._scatter_lora_from_packed(
+                packed_output=packed_out,
+                token_positions=pack_meta["token_positions"],
+                total_tokens=input_tensor.shape[0],
+            )
 
     def _should_use_moe_cpu_compute(self) -> bool:
         """Best-effort detection for MoE CPU-compute mode across dispatcher variants."""
@@ -386,57 +399,62 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
         study2_prefix: Optional[str],
     ) -> torch.Tensor:
         """Coalesced D2H->CPU compute->H2D path using packed activation order."""
+        phase_suffix = phase_name if phase_name else "LoRA"
+
+        def _nvtx(name: str) -> str:
+            if study2_prefix is not None:
+                return f"{study2_prefix}/{name}"
+            return name
+
         if reuse_packed_input:
             packed_input_gpu = pack_meta["packed_activations"]
         else:
-            packed_input_gpu = input_tensor.index_select(0, pack_meta["token_positions"]).contiguous()
+            with NvtxAnnotate(
+                _nvtx(f"MoE_CoalescedAct_GatherInput/L{layer_id}/E{expert_id}/{phase_suffix}")
+            ):
+                packed_input_gpu = input_tensor.index_select(0, pack_meta["token_positions"]).contiguous()
 
         if "packed_bins_cpu" not in pack_meta:
-            pack_meta["packed_bins_cpu"] = pack_meta["packed_bins"].to(device="cpu", non_blocking=False)
+            with NvtxAnnotate(_nvtx(f"MoE_CoalescedAct_BinsToCPU/L{layer_id}/E{expert_id}/{phase_suffix}")):
+                pack_meta["packed_bins_cpu"] = pack_meta["packed_bins"].to(device="cpu", non_blocking=False)
         packed_bins_cpu = pack_meta["packed_bins_cpu"]
 
         if packed_input_gpu.device.type != "cuda":
-            packed_out = dispatch_fn(
-                packed_input_gpu,
-                layer_id,
-                packed_bins_cpu.to(device=packed_input_gpu.device),
-                expert_id=expert_id,
-            )
-            return self._scatter_lora_from_packed(
-                packed_output=packed_out,
-                token_positions=pack_meta["token_positions"],
-                total_tokens=input_tensor.shape[0],
-            )
+            with NvtxAnnotate(
+                _nvtx(f"MoE_CoalescedAct_LoRA_CPU/L{layer_id}/E{expert_id}/{phase_suffix}")
+            ):
+                packed_out = dispatch_fn(
+                    packed_input_gpu,
+                    layer_id,
+                    packed_bins_cpu.to(device=packed_input_gpu.device),
+                    expert_id=expert_id,
+                )
+            with NvtxAnnotate(_nvtx(f"MoE_CoalescedAct_ScatterOutput/L{layer_id}/E{expert_id}/{phase_suffix}")):
+                return self._scatter_lora_from_packed(
+                    packed_output=packed_out,
+                    token_positions=pack_meta["token_positions"],
+                    total_tokens=input_tensor.shape[0],
+                )
 
-        phase_suffix = phase_name if phase_name else "LoRA"
-        to_cpu_label = (
-            f"{study2_prefix}/Transfer_ToCPU/{phase_suffix}"
-            if study2_prefix is not None
-            else "MoE_COLoRA_D2H_Activation"
-        )
-        cpu_compute_label = (
-            f"{study2_prefix}/CPU_AVX_Compute/{phase_suffix}"
-            if study2_prefix is not None
-            else "MoE_COLoRA_CPU_AVX_Compute"
-        )
-        to_gpu_label = (
-            f"{study2_prefix}/Transfer_ToGPU/{phase_suffix}"
-            if study2_prefix is not None
-            else "MoE_COLoRA_H2D_Activation"
-        )
+        d2h_nvtx = _nvtx(f"MoE_CoalescedAct_D2H_PackedActivations/L{layer_id}/E{expert_id}/{phase_suffix}")
+        cpu_nvtx = _nvtx(f"MoE_CoalescedAct_LoRA_CPU/L{layer_id}/E{expert_id}/{phase_suffix}")
+        h2d_nvtx = _nvtx(f"MoE_CoalescedAct_H2D_PackedLoRAOut/L{layer_id}/E{expert_id}/{phase_suffix}")
 
-        with NvtxAnnotate(to_cpu_label):
-            packed_input_cpu = torch.empty(
-                packed_input_gpu.shape,
-                dtype=packed_input_gpu.dtype,
-                device="cpu",
-                pin_memory=True,
-            )
-            packed_input_cpu.copy_(packed_input_gpu, non_blocking=True)
+        with NvtxAnnotate(d2h_nvtx):
+            with NvtxAnnotate(f"{d2h_nvtx}/AllocPinnedHost"):
+                packed_input_cpu = torch.empty(
+                    packed_input_gpu.shape,
+                    dtype=packed_input_gpu.dtype,
+                    device="cpu",
+                    pin_memory=True,
+                )
+            with NvtxAnnotate(f"{d2h_nvtx}/CopyAsync"):
+                packed_input_cpu.copy_(packed_input_gpu, non_blocking=True)
             # CPU kernel consumes host data directly; ensure D2H completion first.
-            torch.cuda.current_stream().synchronize()
+            with NvtxAnnotate(f"{d2h_nvtx}/StreamSync"):
+                torch.cuda.current_stream().synchronize()
 
-        with NvtxAnnotate(cpu_compute_label):
+        with NvtxAnnotate(cpu_nvtx):
             packed_out_cpu = dispatch_fn(
                 packed_input_cpu,
                 layer_id,
@@ -445,35 +463,39 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
             )
 
         if packed_out_cpu.device.type != "cpu":
+            with NvtxAnnotate(_nvtx(f"MoE_CoalescedAct_ScatterOutput/L{layer_id}/E{expert_id}/{phase_suffix}")):
+                return self._scatter_lora_from_packed(
+                    packed_output=packed_out_cpu,
+                    token_positions=pack_meta["token_positions"],
+                    total_tokens=input_tensor.shape[0],
+                )
+
+        with NvtxAnnotate(h2d_nvtx):
+            # Keep H2D contiguous and pinned to maximize PCIe bandwidth.
+            packed_out_cpu = packed_out_cpu.contiguous()
+            with NvtxAnnotate(f"{h2d_nvtx}/PinStaging"):
+                packed_out_cpu_pinned = torch.empty(
+                    packed_out_cpu.shape,
+                    dtype=packed_out_cpu.dtype,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                packed_out_cpu_pinned.copy_(packed_out_cpu, non_blocking=False)
+
+            with NvtxAnnotate(f"{h2d_nvtx}/ToDevice"):
+                packed_out_gpu = torch.empty(
+                    packed_out_cpu_pinned.shape,
+                    dtype=packed_out_cpu_pinned.dtype,
+                    device=input_tensor.device,
+                )
+                packed_out_gpu.copy_(packed_out_cpu_pinned, non_blocking=True)
+
+        with NvtxAnnotate(_nvtx(f"MoE_CoalescedAct_ScatterOutput/L{layer_id}/E{expert_id}/{phase_suffix}")):
             return self._scatter_lora_from_packed(
-                packed_output=packed_out_cpu,
+                packed_output=packed_out_gpu,
                 token_positions=pack_meta["token_positions"],
                 total_tokens=input_tensor.shape[0],
             )
-
-        with NvtxAnnotate(to_gpu_label):
-            # Keep H2D contiguous and pinned to maximize PCIe bandwidth.
-            packed_out_cpu = packed_out_cpu.contiguous()
-            packed_out_cpu_pinned = torch.empty(
-                packed_out_cpu.shape,
-                dtype=packed_out_cpu.dtype,
-                device="cpu",
-                pin_memory=True,
-            )
-            packed_out_cpu_pinned.copy_(packed_out_cpu, non_blocking=False)
-
-            packed_out_gpu = torch.empty(
-                packed_out_cpu_pinned.shape,
-                dtype=packed_out_cpu_pinned.dtype,
-                device=input_tensor.device,
-            )
-            packed_out_gpu.copy_(packed_out_cpu_pinned, non_blocking=True)
-
-        return self._scatter_lora_from_packed(
-            packed_output=packed_out_gpu,
-            token_positions=pack_meta["token_positions"],
-            total_tokens=input_tensor.shape[0],
-        )
 
     def _bind_func(self):
         super()._bind_func()
@@ -1048,7 +1070,14 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
                     enable_coalescing = os.environ.get("MOE_COALESCING_PACKER", "1") == "1"
                     pack_meta = None
                     if enable_coalescing:
-                        pack_label = f"{study2_prefix}/Gather" if study2_prefix is not None else "MoE_COLoRA_CoalescePack"
+                        pack_label = (
+                            f"{study2_prefix}/CoalescedPacker"
+                            if study2_prefix is not None
+                            else (
+                                f"MoE_CoalescedPacker_CallSite/L{int(layer_weight.layer_num_)}"
+                                f"/E{int(local_expert_idx)}"
+                            )
+                        )
                         with NvtxAnnotate(pack_label):
                             pack_meta = self._coalesce_lora_activations(
                                 activations=expert_input,

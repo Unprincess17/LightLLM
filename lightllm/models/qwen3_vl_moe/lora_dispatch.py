@@ -1193,116 +1193,125 @@ class Qwen3VLMoELoRADispatcher:
         if req_bins is None:
             return self._get_output_buffer(input_tensor, pool), 0, 0
 
-        original_device = input_tensor.device
-        original_dtype = input_tensor.dtype
+        proj_lower = projection.lower()
+        nvtx_root = f"MoE_CPUStrictMoELoRA/{proj_lower}/L{int(layer_id)}/kern_{cpu_kernel_mode}"
+        with NvtxAnnotate(nvtx_root):
+            original_device = input_tensor.device
+            original_dtype = input_tensor.dtype
 
-        compute_input = input_tensor
-        if compute_input.device.type != "cpu":
-            compute_input = compute_input.to(device="cpu", non_blocking=True)
-        if compute_input.dtype != torch.bfloat16:
-            compute_input = compute_input.to(dtype=torch.bfloat16)
+            with NvtxAnnotate(f"{nvtx_root}/HostTensorPrep"):
+                compute_input = input_tensor
+                if compute_input.device.type != "cpu":
+                    compute_input = compute_input.to(device="cpu", non_blocking=True)
+                if compute_input.dtype != torch.bfloat16:
+                    compute_input = compute_input.to(dtype=torch.bfloat16)
 
-        batch_size = compute_input.shape[0]
-        output_dim = pool.value_buffer.shape[2]
-        output = torch.zeros(batch_size, output_dim, dtype=torch.bfloat16, device="cpu")
+            batch_size = compute_input.shape[0]
+            output_dim = pool.value_buffer.shape[2]
+            output = torch.zeros(batch_size, output_dim, dtype=torch.bfloat16, device="cpu")
 
-        if len(req_bins) > batch_size:
-            req_bins = req_bins[:batch_size]
+            if len(req_bins) > batch_size:
+                req_bins = req_bins[:batch_size]
 
-        if adapter_group_plan is not None:
-            adapter_groups = adapter_group_plan
-        else:
-            adapter_to_indices: Dict[int, List[int]] = {}
-            for i, bin_idx in enumerate(req_bins):
-                idx = int(bin_idx.item())
-                adapter_to_indices.setdefault(idx, []).append(i)
-            adapter_groups = tuple((adapter_idx, tuple(indices)) for adapter_idx, indices in adapter_to_indices.items())
-
-        if cpu_kernel_mode == "naive":
-            gate_kernel = _naive_moe_lora_gate
-            proj_lower = projection.lower()
-            if proj_lower in ("gate", "up", "down"):
-                stage2_kernel = _naive_moe_lora_stage2
+            if adapter_group_plan is not None:
+                adapter_groups = adapter_group_plan
             else:
-                raise ValueError(
-                    f"Unsupported MoE projection '{projection}', expected gate|up|down"
-                )
-        else:
-            gate_kernel = moe_batch_lora_gate_avx
-            stage2_kernel = self._select_moe_stage2_kernel(projection)
-        kernel_calls = 0
-        kernel_tokens = 0
+                adapter_to_indices: Dict[int, List[int]] = {}
+                for i, bin_idx in enumerate(req_bins):
+                    idx = int(bin_idx.item())
+                    adapter_to_indices.setdefault(idx, []).append(i)
+                adapter_groups = tuple((adapter_idx, tuple(indices)) for adapter_idx, indices in adapter_to_indices.items())
 
-        for adapter_idx, req_indices_tuple in adapter_groups:
-            if adapter_idx < 0:
-                continue
-            req_indices = list(req_indices_tuple)
-            if len(req_indices) == 0:
-                continue
-
-            hot_weights = None
-            hot_handle = None
-            hot_status = "disabled"
-            if temporal_prefetch_context is not None:
-                hot_weights, hot_handle, hot_status = self._maybe_acquire_prefetched_projection(
-                    projection=projection,
-                    adapter_idx=int(adapter_idx),
-                    temporal_prefetch_context=temporal_prefetch_context,
-                )
-
-            try:
-                if hot_weights is not None:
-                    A = hot_weights.a_buffer[: hot_weights.rank]
-                    B = hot_weights.b_buffer[: hot_weights.rank]
-                    a_scaling = float(hot_weights.scaling)
-                    self._last_colora_stats["prefetch_ready_hits"] += 1
+            if cpu_kernel_mode == "naive":
+                gate_kernel = _naive_moe_lora_gate
+                if proj_lower in ("gate", "up", "down"):
+                    stage2_kernel = _naive_moe_lora_stage2
                 else:
-                    if hot_status == "filling":
-                        self._last_colora_stats["prefetch_not_ready"] += 1
-                    a_start = int(pool.a_start[adapter_idx].item())
-                    a_len = int(pool.a_len[adapter_idx].item())
-                    a_scaling = float(pool.a_scaling[adapter_idx].item())
-                    if hasattr(pool, "a_rank") and len(pool.a_rank) > adapter_idx:
-                        a_rank = int(pool.a_rank[adapter_idx].item())
-                    else:
-                        a_rank = int(a_len)
+                    raise ValueError(
+                        f"Unsupported MoE projection '{projection}', expected gate|up|down"
+                    )
+            else:
+                gate_kernel = moe_batch_lora_gate_avx
+                stage2_kernel = self._select_moe_stage2_kernel(projection)
+            kernel_calls = 0
+            kernel_tokens = 0
 
-                    loc = a_start + layer_id
-                    if loc >= a_start + a_len:
-                        continue
+            for adapter_idx, req_indices_tuple in adapter_groups:
+                if adapter_idx < 0:
+                    continue
+                req_indices = list(req_indices_tuple)
+                if len(req_indices) == 0:
+                    continue
 
-                    A = pool.key_buffer[loc, :a_rank]
-                    B = pool.value_buffer[loc, :a_rank]
+                hot_weights = None
+                hot_handle = None
+                hot_status = "disabled"
+                if temporal_prefetch_context is not None:
+                    hot_weights, hot_handle, hot_status = self._maybe_acquire_prefetched_projection(
+                        projection=projection,
+                        adapter_idx=int(adapter_idx),
+                        temporal_prefetch_context=temporal_prefetch_context,
+                    )
 
-                if A.device.type != "cpu" or A.dtype != torch.bfloat16:
-                    A = A.to(device="cpu", dtype=torch.bfloat16)
-                if B.device.type != "cpu" or B.dtype != torch.bfloat16:
-                    B = B.to(device="cpu", dtype=torch.bfloat16)
-                if not A.is_contiguous():
-                    A = A.contiguous()
-                if not B.is_contiguous():
-                    B = B.contiguous()
+                adapter_nvtx = f"{nvtx_root}/Adapter_bin{int(adapter_idx)}/n{len(req_indices)}"
+                with NvtxAnnotate(adapter_nvtx):
+                    try:
+                        if hot_weights is not None:
+                            A = hot_weights.a_buffer[: hot_weights.rank]
+                            B = hot_weights.b_buffer[: hot_weights.rank]
+                            a_scaling = float(hot_weights.scaling)
+                            self._last_colora_stats["prefetch_ready_hits"] += 1
+                        else:
+                            if hot_status == "filling":
+                                self._last_colora_stats["prefetch_not_ready"] += 1
+                            a_start = int(pool.a_start[adapter_idx].item())
+                            a_len = int(pool.a_len[adapter_idx].item())
+                            a_scaling = float(pool.a_scaling[adapter_idx].item())
+                            if hasattr(pool, "a_rank") and len(pool.a_rank) > adapter_idx:
+                                a_rank = int(pool.a_rank[adapter_idx].item())
+                            else:
+                                a_rank = int(a_len)
 
-                batch_input = compute_input[req_indices]
-                if not batch_input.is_contiguous():
-                    batch_input = batch_input.contiguous()
+                            loc = a_start + layer_id
+                            if loc >= a_start + a_len:
+                                continue
 
-                # Stage-1: x @ A^T
-                intermediate = gate_kernel(batch_input, A, 1.0)
-                # Stage-2: intermediate @ B, projection-specific kernel.
-                batch_output = stage2_kernel(intermediate, B, scaling=a_scaling)
-                output[req_indices] = batch_output
+                            A = pool.key_buffer[loc, :a_rank]
+                            B = pool.value_buffer[loc, :a_rank]
 
-                kernel_calls += 2
-                kernel_tokens += int(len(req_indices))
-            finally:
-                if hot_handle is not None:
-                    hot_handle.release()
+                        with NvtxAnnotate(f"{adapter_nvtx}/WeightHostPrep"):
+                            if A.device.type != "cpu" or A.dtype != torch.bfloat16:
+                                A = A.to(device="cpu", dtype=torch.bfloat16)
+                            if B.device.type != "cpu" or B.dtype != torch.bfloat16:
+                                B = B.to(device="cpu", dtype=torch.bfloat16)
+                            if not A.is_contiguous():
+                                A = A.contiguous()
+                            if not B.is_contiguous():
+                                B = B.contiguous()
 
-        if return_to_original_device and (original_device.type != "cpu" or original_dtype != torch.bfloat16):
-            output = output.to(device=original_device, dtype=original_dtype, non_blocking=True)
+                            batch_input = compute_input[req_indices]
+                            if not batch_input.is_contiguous():
+                                batch_input = batch_input.contiguous()
 
-        return output, kernel_calls, kernel_tokens
+                        # Stage-1: x @ A^T (naive matmul or AVX gate path)
+                        with NvtxAnnotate(f"{adapter_nvtx}/Stage1_{cpu_kernel_mode}_gate"):
+                            intermediate = gate_kernel(batch_input, A, 1.0)
+                        # Stage-2: intermediate @ B, projection-specific kernel.
+                        with NvtxAnnotate(f"{adapter_nvtx}/Stage2_{cpu_kernel_mode}_{proj_lower}"):
+                            batch_output = stage2_kernel(intermediate, B, scaling=a_scaling)
+                        output[req_indices] = batch_output
+
+                        kernel_calls += 2
+                        kernel_tokens += int(len(req_indices))
+                    finally:
+                        if hot_handle is not None:
+                            hot_handle.release()
+
+            with NvtxAnnotate(f"{nvtx_root}/ReturnToOriginalDevice"):
+                if return_to_original_device and (original_device.type != "cpu" or original_dtype != torch.bfloat16):
+                    output = output.to(device=original_device, dtype=original_dtype, non_blocking=True)
+
+            return output, kernel_calls, kernel_tokens
 
     def _reset_colora_stats(self) -> None:
         manager = getattr(self, "expert_cache_manager", None)

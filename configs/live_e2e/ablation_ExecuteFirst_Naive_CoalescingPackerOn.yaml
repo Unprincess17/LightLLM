@@ -1,23 +1,23 @@
-run_id: ablation_ExecuteFirst_BatchWait_NaiveCPUKernel_01
+# Ablation: execution-first overlap with naive MoE CPU kernels + coalescing packer on.
+run_id: ablation_ExecuteFirst_Naive_CoalescingPackerOn_01
 description: >
-  Execution-first ablation under batch-wait/no-overlap with synchronous CPU fallback
-  and no speculative dispatch. Single-run manifest for cpu_first policy.
+  Demonstrates cpu_kernel_mode + coalescing_packer wiring for live E2E (naive + packer on).
 
 benchmark_script: test/lora/benchmark_lora.sh
 
 runs:
-  - run_label: colora_execution_first_naive_no_overlap
+  - run_label: colora_exec_first_naive_packer_on
     suite_kind: paper
-    mode_label: execution_first_naive_no_overlap
+    mode_label: execution_first_naive_packer
     compute_device: "vl_storage:gpu,vl_compute:gpu,attn_storage:gpu,attn_compute:gpu,moe_storage:cpu,moe_compute:hybrid"
     miss_handling_mode: cpu_first
-    overlap_policy: no_overlap
-    async_fallback: false
-    cpu_workers: 1
+    overlap_policy: request_skip
+    async_fallback: true
+    cpu_workers: 2
     cpu_queue_depth: 8
     cpu_batch_timeout_us: 500
     cpu_kernel_mode: naive
-    coalescing_packer: false
+    coalescing_packer: true
     warmup_requests: 4
     measurement_requests: 32
     nsys_enabled: false

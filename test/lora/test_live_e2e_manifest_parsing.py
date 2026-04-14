@@ -29,7 +29,7 @@ runs:
     mode_label: execution_first
     compute_device: "vl_storage:gpu,vl_compute:gpu,attn_storage:gpu,attn_compute:gpu,moe_storage:cpu,moe_compute:hybrid"
     miss_handling_mode: execution_first
-    overlap_policy: calibrated
+    overlap_policy: request_skip
     cpu_workers: 2
     cpu_queue_depth: 8
     nsys_enabled: false
@@ -78,14 +78,14 @@ runs:
     mode_label: execution_first
     compute_device: "vl_storage:gpu,vl_compute:gpu,attn_storage:gpu,attn_compute:gpu,moe_storage:cpu,moe_compute:hybrid"
     miss_handling_mode: execution_first
-    overlap_policy: calibrated
+    overlap_policy: request_skip
     nsys_enabled: false
   - run_label: colora_load_then_run
     suite_kind: paper
     mode_label: load_then_run
     compute_device: "vl_storage:gpu,vl_compute:gpu,attn_storage:gpu,attn_compute:gpu,moe_storage:cpu,moe_compute:hybrid"
     miss_handling_mode: load_then_run
-    overlap_policy: calibrated
+    overlap_policy: request_skip
     nsys_enabled: false
 """
         manifest_path = _write_temp_manifest(tmp_path, content)
@@ -121,7 +121,7 @@ def test_build_benchmark_command_colora():
         mode_label="execution_first",
         compute_device="vl_storage:gpu,vl_compute:gpu,attn_storage:gpu,attn_compute:gpu,moe_storage:cpu,moe_compute:hybrid",
         miss_handling_mode="execution_first",
-        overlap_policy="calibrated",
+        overlap_policy="request_skip",
         cpu_workers=2,
         cpu_queue_depth=8,
         async_fallback=True,
@@ -178,16 +178,25 @@ def test_example_paper_suite_manifest_parses_and_builds_commands():
     # Baseline command has all-gpu
     assert "all:gpu" in cmds[0]
 
-    # execution_first has correct policy
-    assert "execution_first" in cmds[1]
+    # cpu_first (execution-first) has correct policy; speculative_dispatch omitted => server default false
+    assert "--colora_miss_policy cpu_first" in cmds[1]
     assert "--colora_request_skip 1" in cmds[1]
     assert "cpu_workers 2" in cmds[1]
-    assert "--colora_speculative_dispatch" in cmds[1]
+    assert "MOE_COALESCING_PACKER=1" in cmds[1]
+    assert "COLORA_CPU_KERNEL_MODE=avx" in cmds[1]
+    assert "--colora_speculative_dispatch" not in cmds[1]
+    assert "--no_colora_speculative_dispatch" not in cmds[1]
 
     # load_then_run has correct policy
     assert "load_then_run" in cmds[2]
     assert "--colora_request_skip 1" in cmds[2]
-    assert "--no_colora_speculative_dispatch" in cmds[2]
+    assert "MOE_COALESCING_PACKER=1" in cmds[2]
+    assert "COLORA_CPU_KERNEL_MODE=avx" in cmds[2]
+    assert "--colora_speculative_dispatch" not in cmds[2]
+    assert "--no_colora_speculative_dispatch" not in cmds[2]
+
+    assert "MOE_COALESCING_PACKER=1" in cmds[0]
+    assert "COLORA_CPU_KERNEL_MODE=avx" in cmds[0]
 
 
 def test_cli_help_includes_manifest_and_summarize_only_flags():

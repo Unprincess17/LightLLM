@@ -87,7 +87,7 @@ WARMUP_ADAPTER_TRACE_PATH=""
 MEASURE_ADAPTER_TRACE_PATH=""
 WARMUP_NUM_REQUESTS=""
 MEASURE_NUM_REQUESTS=""
-PHASE_GAP_S="0"
+PHASE_GAP_S="10"
 ADAPTER_EXPERT_PROFILE=0
 ADAPTER_EXPERT_LOG_PATH="/tmp/moe_adapter_expert_profile.log"
 PRINT_PER_REQUEST=0
@@ -156,6 +156,45 @@ terminate_server_tree() {
 
     pkill -KILL -P "$pid" 2>/dev/null || true
     kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+}
+
+# SIGKILL immediately after measurement can corrupt Nsight .qdstrm; try SIGTERM first.
+# Gunicorn respawns workers on worker SIGKILL; kill gunicorn masters early in the SIGKILL phase.
+finish_profiling_children() {
+    local max_wait_s="${1:-90}"
+    local _pat="lightllm.server|lightllm::|gunicorn|python.*api_server|multiprocessing.resource_tracker|multiprocessing.spawn|multiprocessing.forkserver"
+    pkill -TERM -f "lightllm.server|lightllm::|gunicorn|python.*api_server" 2>/dev/null || true
+    pkill -TERM -f "multiprocessing.resource_tracker|multiprocessing.spawn|multiprocessing.forkserver" 2>/dev/null || true
+    local w=0
+    while (( w < max_wait_s )); do
+        if ! pgrep -f "$_pat" >/dev/null; then
+            return 0
+        fi
+        sleep 1
+        w=$((w + 1))
+    done
+    echo "[Cleanup] Some processes still alive after ${max_wait_s}s; sending SIGKILL..."
+    pkill -KILL -f "gunicorn" 2>/dev/null || true
+    sleep 2
+    local r _p
+    for r in $(seq 1 20); do
+        while read -r _p; do
+            [[ -z "$_p" || "$_p" == "$$" ]] && continue
+            kill -KILL "$_p" 2>/dev/null || true
+        done < <(pgrep -f "$_pat" 2>/dev/null || true)
+        pkill -KILL -f "gunicorn" 2>/dev/null || true
+        if ! pgrep -f "$_pat" >/dev/null; then
+            return 0
+        fi
+        sleep 1
+    done
+    pkill -KILL -f "lightllm.server|lightllm::|gunicorn|python.*api_server" 2>/dev/null || true
+    pkill -KILL -f "multiprocessing.resource_tracker|multiprocessing.spawn|multiprocessing.forkserver" 2>/dev/null || true
+    sleep 1
+    if pgrep -f "$_pat" >/dev/null; then
+        echo "[Cleanup] WARNING: processes may still be alive; run: pgrep -af 'lightllm|gunicorn'"
+        pgrep -af "lightllm|gunicorn" 2>/dev/null || true
+    fi
 }
 
 build_phase_args() {
@@ -356,9 +395,7 @@ cleanup() {
     #     SERVER_PID=""
     # fi
 
-    # Force kill all remaining processes
-    pkill -9 -f "lightllm.server|lightllm::|gunicorn|python.*api_server" 2>/dev/null || true
-    pkill -9 -f "multiprocessing.resource_tracker|multiprocessing.spawn|multiprocessing.forkserver" 2>/dev/null || true
+    finish_profiling_children 30
 
     # Fast shared memory cleanup with 5s timeout
     echo "[Cleanup] Removing shared memory segments..."
@@ -371,9 +408,11 @@ trap cleanup EXIT
 
 # Step 0: clean up old processes if any
 echo "cleanup processes"
-pgrep -f "lightllm.server|lightllm::|gunicorn|multiprocessing.resource_tracker|multiprocessing.spawn" && echo "Killing old processes..." && \
-pkill -9 -f "lightllm.server|lightllm::|gunicorn" && \
-pkill -9 -f "multiprocessing.resource_tracker|multiprocessing.spawn"
+if pgrep -f "lightllm.server|lightllm::|gunicorn|multiprocessing.resource_tracker|multiprocessing.spawn" >/dev/null; then
+    echo "Killing old processes..."
+    pkill -9 -f "lightllm.server|lightllm::|gunicorn" 2>/dev/null || true
+    pkill -9 -f "multiprocessing.resource_tracker|multiprocessing.spawn" 2>/dev/null || true
+fi
 
 echo > $ADAPTER_EXPERT_LOG_PATH
 
@@ -664,21 +703,26 @@ fi
 SERVER_PID=""
 echo "[5/5] Server log saved to: $SERVER_LOG_PATH"
 
-# Extra thorough cleanup to ensure all processes are dead
-echo "[Cleanup] Killing all remaining lightllm and worker processes..."
-pkill -9 -f "lightllm.server|lightllm::|gunicorn|python.*api_server" 2>/dev/null || true
-pkill -9 -f "multiprocessing.resource_tracker|multiprocessing.spawn|multiprocessing.forkserver" 2>/dev/null || true
+echo "[Cleanup] Stopping remaining benchmark processes (graceful first, for valid nsys traces)..."
+finish_profiling_children 90
 
-# Wait for processes to exit and CUDA context to be released
+# Wait for CUDA context teardown
 sleep 5
 
-# Ensure no leftover processes are running
-while pgrep -f "lightllm.server|python.*api_server" >/dev/null; do
+# Bounded wait — avoids infinite hang if pgrep matches an unrelated long-lived process
+_SPIN=0
+while pgrep -f "lightllm.server|python.*api_server" >/dev/null && (( _SPIN < 45 )); do
     echo "Waiting for processes to exit..."
     sleep 2
+    _SPIN=$((_SPIN + 1))
 done
+if pgrep -f "lightllm.server|python.*api_server" >/dev/null; then
+    echo "[Cleanup] WARNING: pgrep still matches after ${_SPIN} waits; try: pgrep -af 'lightllm|api_server'"
+    finish_profiling_children 15
+fi
 
 echo "[5/5] Benchmark complete."
+echo "[Cleanup] If nsys is still running, it is usually waiting on traced children; try: nsys profile --wait=primary ... (faster shutdown, may drop orphan trace) or: pgrep -af lightllm"
 
 # Disable EXIT trap since we already did full cleanup
 trap - EXIT

@@ -1,3 +1,4 @@
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -19,9 +20,19 @@ def build_benchmark_command(run: LiveE2ERun, benchmark_script: str) -> str:
         parts.append(f"COLORA_CPU_KERNEL_MODE={str(run.cpu_kernel_mode).strip().lower()}")
     parts.append(benchmark_script)
     parts.append(f"--compute_device {run.compute_device}")
+    if run.adapter_ids is not None:
+        parts.append(f"--adapter_ids {run.adapter_ids}")
+    if run.lora_dirs is not None:
+        parts.append(f"--lora_dirs {run.lora_dirs}")
+    if run.server_host is not None:
+        parts.append(f"--server_host {run.server_host}")
+    if run.server_port is not None:
+        parts.append(f"--server_port {run.server_port}")
 
     if run.miss_handling_mode is not None:
         parts.append(f"--colora_miss_policy {run.miss_handling_mode}")
+    if run.overlap_mode is not None:
+        parts.append(f"--colora_overlap_mode {run.overlap_mode}")
     if run.overlap_policy is not None:
         # benchmark_lora.sh does not accept --colora_overlap_mode.
         # Translate overlap policy into currently-supported control flags.
@@ -29,6 +40,7 @@ def build_benchmark_command(run: LiveE2ERun, benchmark_script: str) -> str:
         if str(run.overlap_policy).strip().lower() == "no_overlap":
             parts.append("--colora_request_skip 0")
         else:
+            # Any non-no_overlap value (e.g. request_skip, skip_reinsert_stability)
             parts.append("--colora_request_skip 1")
     if run.async_fallback is not None:
         parts.append(f"--colora_async_fallback {1 if run.async_fallback else 0}")
@@ -38,27 +50,89 @@ def build_benchmark_command(run: LiveE2ERun, benchmark_script: str) -> str:
         parts.append(f"--colora_cpu_queue_depth {run.cpu_queue_depth}")
     if run.cpu_batch_timeout_us is not None:
         parts.append(f"--colora_cpu_batch_timeout_us {run.cpu_batch_timeout_us}")
+    if run.max_continuations is not None:
+        parts.append(f"--colora_max_continuations {run.max_continuations}")
+    if run.temporal_prefetch is not None:
+        if run.temporal_prefetch:
+            parts.append("--colora_temporal_prefetch")
+        else:
+            parts.append("--no_colora_temporal_prefetch")
+    if run.temporal_prefetch_layer_whitelist is not None:
+        parts.append(f"--colora_temporal_prefetch_layer_whitelist {run.temporal_prefetch_layer_whitelist}")
+    if run.temporal_hot_cache_slots is not None:
+        parts.append(f"--colora_temporal_hot_cache_slots {run.temporal_hot_cache_slots}")
+    if run.cache_budget_mb is not None:
+        parts.append(f"--colora_cache_budget_mb {run.cache_budget_mb}")
+    if run.promote_min_hits is not None:
+        parts.append(f"--colora_promote_min_hits {run.promote_min_hits}")
+    if run.promote_window is not None:
+        parts.append(f"--colora_promote_window {run.promote_window}")
+    if run.max_promote_per_step is not None:
+        parts.append(f"--colora_max_promote_per_step {run.max_promote_per_step}")
+    if run.decay is not None:
+        parts.append(f"--colora_decay {run.decay}")
+    if run.deferred_promotion_delta_steps is not None:
+        parts.append(f"--colora_deferred_promotion_delta_steps {run.deferred_promotion_delta_steps}")
+    if run.promotion_ema_alpha is not None:
+        parts.append(f"--colora_promotion_ema_alpha {run.promotion_ema_alpha}")
     if run.speculative_dispatch is not None:
         if run.speculative_dispatch:
             parts.append("--colora_speculative_dispatch")
         else:
             parts.append("--no_colora_speculative_dispatch")
+    if run.spec_layer_whitelist is not None:
+        parts.append(f"--colora_spec_layer_whitelist {run.spec_layer_whitelist}")
     if run.warmup_requests is not None:
         parts.append(f"--warmup_num_requests {run.warmup_requests}")
     if run.measurement_requests is not None:
         parts.append(f"--measure_num_requests {run.measurement_requests}")
+    if run.warmup_adapter_trace_path is not None:
+        parts.append(f"--warmup_adapter_trace_path {run.warmup_adapter_trace_path}")
+    if run.measurement_adapter_trace_path is not None:
+        parts.append(f"--measure_adapter_trace_path {run.measurement_adapter_trace_path}")
 
     # The per-request log path will be determined at runtime in the run directory
     return " ".join(parts)
 
 
 def build_nsys_command(base_cmd: str, output_path: Path, run: LiveE2ERun) -> str:
-    """Wrap the benchmark command with nsys profile."""
+    """Wrap the benchmark command with nsys profile.
+
+    nsys expects an *executable* after its own flags. A line like
+    ``VAR=1 ./script.sh`` is wrong: ``VAR=1`` is treated as the app name and
+    fails with "Executable not found". We therefore run the full shell line via
+    ``bash -c <quoted>``.
+
+    Do **not** insert a standalone ``--`` before ``bash``: this nsys CLI treats
+    ``--`` as an ambiguous option prefix (not POSIX end-of-options) and errors.
+
+    Default trace is ``cuda,nvtx`` (no ``osrt``): with multi-process Python + CUDA,
+    ``osrt`` often produces very large streams and Nsight importers can fail with
+    "Wrong event order". Override with ``run.nsys_trace`` (e.g. ``cuda,nvtx,osrt``)
+    when you need libc waits.
+
+    Mirrors common manual usage::
+      nsys profile --trace=cuda,nvtx --output=... bash -c '...'
+    """
     prefix = run.nsys_output_prefix or f"{run.run_label}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    nsys_cmd = (
-        f"nsys profile --stats=true --output {output_path / prefix} {base_cmd}"
-    )
-    return nsys_cmd
+    out_file = output_path / prefix
+    trace = run.nsys_trace or "cuda,nvtx"
+    parts = [
+        "nsys",
+        "profile",
+        "--stats=false",
+        f"--trace={trace}",
+        f"--output={shlex.quote(str(out_file))}",
+    ]
+    if run.nsys_force_overwrite:
+        parts.append("--force-overwrite=true")
+    delay = run.nsys_delay_seconds
+    if delay is not None:
+        parts.append(f"--delay={int(delay)}")
+    parts.append("bash")
+    parts.append("-c")
+    parts.append(shlex.quote(base_cmd))
+    return " ".join(parts)
 
 
 def get_run_output_dir(manifest: LiveE2EManifest, run: LiveE2ERun) -> Path:
