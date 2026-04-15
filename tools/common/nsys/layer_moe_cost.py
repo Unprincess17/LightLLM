@@ -7,8 +7,10 @@ import subprocess
 
 import pandas as pd
 
-# NVTX names like MoE_CoalescedAct_LoRA_GPU/L0/E106/Gate — family is prefix before /Lx/Ey/Role
+# Legacy NVTX names like MoE_CoalescedAct_LoRA_GPU/L0/E106/Gate.
 _MOE_DGU_EVENT_RE = re.compile(r"^(.+)/L(\d+)/E\d+/(Down|Gate|Up)$")
+# Newer top-level markers in nsys trees: MoE_GateLoRA / MoE_UpLoRA / MoE_DownLoRA.
+_MOE_DGU_SIMPLE_RE = re.compile(r"^MoE_(Down|Gate|Up)LoRA$", re.IGNORECASE)
 
 # Defaults when invoked with no CLI args (same workflow as before argv support).
 DEFAULT_CSV_FILE = (
@@ -42,10 +44,15 @@ def get_descendants(df, root_range_id, parent_id_col="ParentId", range_id_col="R
     return df.iloc[0:0].copy()
 
 
-def parse_moe_dgu_event(event: str) -> tuple[str, str, int] | None:
-    """If event matches MoE_* / L<layer>/ E<expert> / {Down,Gate,Up}, return (family, role, layer_from_path)."""
+def parse_moe_dgu_event(event: str) -> tuple[str, str, int | None] | None:
+    """Return (family, role, layer_from_path) for known MoE Down/Gate/Up event formats."""
     if not isinstance(event, str):
         return None
+    m_simple = _MOE_DGU_SIMPLE_RE.match(event)
+    if m_simple:
+        role_raw = m_simple.group(1).lower()
+        role = {"down": "Down", "gate": "Gate", "up": "Up"}[role_raw]
+        return "MoE_LoRA", role, None
     m = _MOE_DGU_EVENT_RE.match(event)
     if not m:
         return None
@@ -62,6 +69,16 @@ def parse_layer_idx(layer_name):
         return int(parts[1])
     except ValueError:
         return pd.NA
+
+
+def parse_moe_lora_role(event: str) -> str | None:
+    """Parse MoE_{Gate,Up,Down}LoRA event to role name."""
+    if not isinstance(event, str):
+        return None
+    m = re.match(r"^MoE_(Gate|Up|Down)LoRA$", event)
+    if not m:
+        return None
+    return m.group(1)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -179,6 +196,7 @@ def run(
 
     layer_rows = decode_desc_all[decode_desc_all[name_col].str.match(r"^Layer \d+$", na=False)].copy()
     layer_map = dict(zip(layer_rows[range_id_col], layer_rows[name_col]))
+    name_lookup = dict(zip(decode_desc_all[range_id_col], decode_desc_all[name_col]))
     parent_lookup = dict(zip(decode_desc_all[range_id_col], decode_desc_all[parent_id_col]))
 
     def find_parent_layer(range_id):
@@ -194,6 +212,21 @@ def run(
 
     decode_desc_all["layer"] = decode_desc_all[range_id_col].apply(find_parent_layer)
     decode_desc_all["layer_idx"] = decode_desc_all["layer"].apply(parse_layer_idx)
+
+    def find_parent_moe_lora_role(range_id):
+        cur = range_id
+        while cur in parent_lookup:
+            parent = parent_lookup[cur]
+            if pd.isna(parent):
+                return None
+            parent_name = name_lookup.get(parent)
+            role = parse_moe_lora_role(parent_name)
+            if role is not None:
+                return role
+            cur = parent
+        return None
+
+    decode_desc_all["moe_lora_role"] = decode_desc_all[range_id_col].apply(find_parent_moe_lora_role)
 
     expert_mask = decode_desc_all[name_col].str.match(r"^MoE_Expert_\d+$", na=False)
     experts = decode_desc_all[expert_mask].copy()
@@ -285,7 +318,7 @@ def run(
         n_mismatch = 0
         for _, r in coarse_by_layer_event.loc[dgu_mask].iterrows():
             p = parse_moe_dgu_event(r["event"])
-            if p and pd.notna(r["layer_idx"]) and int(r["layer_idx"]) != p[2]:
+            if p and p[2] is not None and pd.notna(r["layer_idx"]) and int(r["layer_idx"]) != p[2]:
                 n_mismatch += 1
         if n_mismatch:
             print(
@@ -330,6 +363,37 @@ def run(
         if dgu_mask.any()
         else pd.DataFrame(columns=["layer", "layer_idx", "role", *_dgu_val_cols])
     )
+    # Averages Down/Gate/Up across all layers and families — one global row per role.
+    dgu_global_by_role_only = (
+        _build_dgu_frame(["role"])
+        if dgu_mask.any()
+        else pd.DataFrame(columns=["role", *_dgu_val_cols])
+    )
+
+    def _build_timing_frame(data: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
+        if data.empty:
+            return pd.DataFrame(columns=[*group_cols, "count", "total_ms", "avg_ms", "min_ms", "max_ms"])
+        return (
+            data.groupby(group_cols, dropna=False, as_index=False)
+            .agg(
+                count=(dur_col, "size"),
+                total_ms=(dur_col, "sum"),
+                avg_ms=(dur_col, "mean"),
+                min_ms=(dur_col, "min"),
+                max_ms=(dur_col, "max"),
+            )
+            .sort_values("total_ms", ascending=False)
+        )
+
+    # Deep COLoRA breakdown under MoE_{Gate,Up,Down}LoRA.
+    colora_events = decode_desc_all[
+        decode_desc_all[name_col].str.startswith("COLoRA_", na=False)
+        & decode_desc_all["moe_lora_role"].notna()
+    ].copy()
+    colora_events = colora_events.rename(columns={name_col: "event", "moe_lora_role": "role"})
+    colora_global_by_event = _build_timing_frame(colora_events, ["event"])
+    colora_global_by_role_event = _build_timing_frame(colora_events, ["role", "event"])
+    colora_by_layer_role_event = _build_timing_frame(colora_events, ["layer", "layer_idx", "role", "event"])
 
     base_dir = csv_path.parent
     by_expert.to_csv(base_dir / "expert_avg_by_id.csv", index=False)
@@ -340,6 +404,10 @@ def run(
     dgu_by_layer_family.to_csv(base_dir / "layer_moe_dgu_by_layer_family.csv", index=False)
     dgu_global_by_family.to_csv(base_dir / "layer_moe_dgu_global_by_family.csv", index=False)
     dgu_by_layer_role_only.to_csv(base_dir / "layer_moe_dgu_by_layer_role_only.csv", index=False)
+    dgu_global_by_role_only.to_csv(base_dir / "layer_moe_dgu_global_by_role_only.csv", index=False)
+    colora_global_by_event.to_csv(base_dir / "layer_colora_global_by_event.csv", index=False)
+    colora_global_by_role_event.to_csv(base_dir / "layer_colora_global_by_role_event.csv", index=False)
+    colora_by_layer_role_event.to_csv(base_dir / "layer_colora_by_layer_role_event.csv", index=False)
 
     print("\nSaved:")
     print(f"  {base_dir / 'expert_avg_by_id.csv'}")
@@ -350,6 +418,10 @@ def run(
     print(f"  {base_dir / 'layer_moe_dgu_by_layer_family.csv'}")
     print(f"  {base_dir / 'layer_moe_dgu_global_by_family.csv'}")
     print(f"  {base_dir / 'layer_moe_dgu_by_layer_role_only.csv'}")
+    print(f"  {base_dir / 'layer_moe_dgu_global_by_role_only.csv'}")
+    print(f"  {base_dir / 'layer_colora_global_by_event.csv'}")
+    print(f"  {base_dir / 'layer_colora_global_by_role_event.csv'}")
+    print(f"  {base_dir / 'layer_colora_by_layer_role_event.csv'}")
 
 
 def main(argv: list[str] | None = None) -> int:

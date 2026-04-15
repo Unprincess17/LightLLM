@@ -210,16 +210,25 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
         req_bins: Optional[torch.Tensor],
         expert_id: int,
         pack_meta: Optional[Dict[str, torch.Tensor]],
+        hybrid_prepare_ctx_cache: Optional[Dict[str, Any]] = None,
         reuse_packed_input: bool = False,
         phase_name: str = "",
         study2_prefix: Optional[str] = None,
     ) -> torch.Tensor:
         """Run LoRA with packed activations when metadata is available."""
         if pack_meta is None:
-            return dispatch_fn(input_tensor, layer_id, req_bins, expert_id=expert_id)
+            packed_input = input_tensor
+            packed_bins = req_bins
+        elif reuse_packed_input:
+            packed_input = pack_meta["packed_activations"]
+            packed_bins = pack_meta["packed_bins"]
+        else:
+            with NvtxAnnotate(f"MoE_CoalescedAct_GatherInput/L{layer_id}/E{expert_id}/{phase_name or 'LoRA'}"):
+                packed_input = input_tensor.index_select(0, pack_meta["token_positions"]).contiguous()
+            packed_bins = pack_meta["packed_bins"]
 
         use_cpu_compute = self._should_use_moe_cpu_compute()
-        if use_cpu_compute:
+        if use_cpu_compute and pack_meta is not None:
             return self._dispatch_lora_with_coalesced_cpu_roundtrip(
                 dispatch_fn=dispatch_fn,
                 input_tensor=input_tensor,
@@ -231,19 +240,45 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
                 study2_prefix=study2_prefix,
             )
 
-        if reuse_packed_input:
-            packed_input = pack_meta["packed_activations"]
-        else:
-            with NvtxAnnotate(f"MoE_CoalescedAct_GatherInput/L{layer_id}/E{expert_id}/{phase_name or 'LoRA'}"):
-                packed_input = input_tensor.index_select(0, pack_meta["token_positions"]).contiguous()
+        dispatch_kwargs: Dict[str, Any] = {"expert_id": expert_id}
+        dispatcher = self.lora_dispatcher_
+        if (
+            hybrid_prepare_ctx_cache is not None
+            and dispatcher is not None
+            and callable(getattr(dispatcher, "build_moe_hybrid_shared_prepare_context", None))
+            and packed_bins is not None
+        ):
+            shared_ctx_key = f"{int(layer_id)}:{int(expert_id)}:{int(packed_bins.shape[0])}:{packed_bins.data_ptr()}"
+            shared_prepare_ctx = hybrid_prepare_ctx_cache.get(shared_ctx_key)
+            if shared_prepare_ctx is None:
+                shared_prepare_ctx = dispatcher.build_moe_hybrid_shared_prepare_context(
+                    batch_size=int(packed_input.shape[0]),
+                    bins=packed_bins,
+                    expert_id=expert_id,
+                )
+                hybrid_prepare_ctx_cache[shared_ctx_key] = shared_prepare_ctx
+            if shared_prepare_ctx is not None:
+                dispatch_kwargs["hybrid_prepare_ctx"] = shared_prepare_ctx
+
         lora_nvtx = f"MoE_CoalescedAct_LoRA_GPU/L{layer_id}/E{expert_id}/{phase_name or 'LoRA'}"
         with NvtxAnnotate(lora_nvtx):
-            packed_out = dispatch_fn(
-                packed_input,
-                layer_id,
-                pack_meta["packed_bins"],
-                expert_id=expert_id,
-            )
+            try:
+                packed_out = dispatch_fn(
+                    packed_input,
+                    layer_id,
+                    packed_bins,
+                    **dispatch_kwargs,
+                )
+            except TypeError:
+                # Older dispatchers may not support hybrid_prepare_ctx kwarg.
+                packed_out = dispatch_fn(
+                    packed_input,
+                    layer_id,
+                    packed_bins,
+                    expert_id=expert_id,
+                )
+        if pack_meta is None:
+            return packed_out
         with NvtxAnnotate(f"MoE_CoalescedAct_ScatterOutput/L{layer_id}/E{expert_id}/{phase_name or 'LoRA'}"):
             return self._scatter_lora_from_packed(
                 packed_output=packed_out,
@@ -1034,6 +1069,9 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
             with torch.cuda.stream(transfer_stream):
                 next_weights = prefetch_weights(first_expert_idx)
 
+        # Layer-call cache to reuse shared hybrid-prepare metadata across Gate/Up/Down.
+        layer_hybrid_prepare_ctx_cache: Dict[str, Any] = {}
+
         # 4.4 Pipelined Expert Loop
         for i, (local_expert_idx, batch_indices, k_indices) in enumerate(active_experts_data):
             with NvtxAnnotate(f"MoE_Expert_{local_expert_idx}"):
@@ -1083,6 +1121,18 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
                                 activations=expert_input,
                                 req_bins=expert_req_bins,
                             )
+                    if pack_meta is None:
+                        bins_for_shared_ctx = expert_req_bins
+                    else:
+                        bins_for_shared_ctx = pack_meta["packed_bins"]
+                    shared_ctx_key = (
+                        f"{int(layer_weight.layer_num_)}:{int(local_expert_idx)}:"
+                        f"{-1 if bins_for_shared_ctx is None else int(bins_for_shared_ctx.shape[0])}:"
+                        f"{0 if bins_for_shared_ctx is None else int(bins_for_shared_ctx.data_ptr())}"
+                    )
+                    expert_hybrid_prepare_ctx_cache: Dict[str, Any] = {}
+                    if shared_ctx_key in layer_hybrid_prepare_ctx_cache:
+                        expert_hybrid_prepare_ctx_cache[shared_ctx_key] = layer_hybrid_prepare_ctx_cache[shared_ctx_key]
 
                     # 4.4.1 Synchronize: ensure current expert's weights have arrived
                     with NvtxAnnotate("MoE_WaitTransfer"):
@@ -1130,6 +1180,7 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
                                 req_bins=expert_req_bins,
                                 expert_id=local_expert_idx,
                                 pack_meta=pack_meta,
+                                hybrid_prepare_ctx_cache=expert_hybrid_prepare_ctx_cache,
                                 reuse_packed_input=True,
                                 phase_name="Gate",
                                 study2_prefix=study2_prefix,
@@ -1143,6 +1194,7 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
                                 req_bins=expert_req_bins,
                                 expert_id=local_expert_idx,
                                 pack_meta=pack_meta,
+                                hybrid_prepare_ctx_cache=expert_hybrid_prepare_ctx_cache,
                                 reuse_packed_input=True,
                                 phase_name="Up",
                                 study2_prefix=study2_prefix,
@@ -1172,10 +1224,13 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
                             req_bins=expert_req_bins,
                             expert_id=local_expert_idx,
                             pack_meta=pack_meta,
+                            hybrid_prepare_ctx_cache=expert_hybrid_prepare_ctx_cache,
                             phase_name="Down",
                             study2_prefix=study2_prefix,
                         )
                         self._merge_colora_stats(colora_stats)
+                    if shared_ctx_key in expert_hybrid_prepare_ctx_cache:
+                        layer_hybrid_prepare_ctx_cache[shared_ctx_key] = expert_hybrid_prepare_ctx_cache[shared_ctx_key]
                     down_out += down_lora
 
                     # 4.4.8 Weighted Aggregation (Corrected)

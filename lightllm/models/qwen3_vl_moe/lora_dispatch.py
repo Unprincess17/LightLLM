@@ -202,6 +202,17 @@ class PrefetchedProjectionWeights:
 
 
 @dataclass
+class MoEHybridSharedPrepareContext:
+    """Projection-invariant hybrid-prepare metadata reused by Gate/Up/Down."""
+
+    batch_size: int
+    key_expert: int
+    valid_pos: torch.Tensor
+    valid_bins: torch.Tensor
+    adapter_ids_cpu: List[int]
+
+
+@dataclass
 class _TemporalProjectionBuffers:
     a_buffer: torch.Tensor
     b_buffer: torch.Tensor
@@ -1969,6 +1980,34 @@ class Qwen3VLMoELoRADispatcher:
             except Exception as e:
                 logger.debug("[COLoRA] Failed to update gauge %s: %s", gauge_name, e)
 
+    def build_moe_hybrid_shared_prepare_context(
+        self,
+        batch_size: int,
+        bins: torch.Tensor,
+        expert_id: Optional[int],
+    ) -> Optional[MoEHybridSharedPrepareContext]:
+        """Build projection-invariant token/bin metadata once per expert call."""
+        if bins is None:
+            return None
+        local_bins = bins
+        if len(local_bins) > int(batch_size):
+            local_bins = local_bins[: int(batch_size)]
+        valid_mask = local_bins >= 0
+        if not torch.any(valid_mask):
+            return None
+        valid_pos = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1)
+        valid_bins = local_bins.index_select(0, valid_pos).long()
+        # Convert once, then reuse across Gate/Up/Down.
+        adapter_ids_cpu = torch.unique(valid_bins).detach().to(device="cpu", dtype=torch.long).tolist()
+        key_expert = int(expert_id) if expert_id is not None else 0
+        return MoEHybridSharedPrepareContext(
+            batch_size=int(batch_size),
+            key_expert=key_expert,
+            valid_pos=valid_pos,
+            valid_bins=valid_bins,
+            adapter_ids_cpu=adapter_ids_cpu,
+        )
+
     def _batch_apply_moe_lora_hybrid(
         self,
         input_tensor: torch.Tensor,
@@ -1978,6 +2017,7 @@ class Qwen3VLMoELoRADispatcher:
         bins: torch.Tensor,
         projection: str,
         expert_id: Optional[int],
+        hybrid_prepare_ctx: Optional[MoEHybridSharedPrepareContext] = None,
     ) -> torch.Tensor:
         """COLoRA hybrid path: GPU cache hit + CPU miss fallback + async promotion."""
         output = self._get_output_buffer(input_tensor, pool)
@@ -2008,27 +2048,33 @@ class Qwen3VLMoELoRADispatcher:
             )
             return miss_out
 
+        key_expert = int(expert_id) if expert_id is not None else 0
+        shared_prepare_ctx = hybrid_prepare_ctx
         with NvtxAnnotate("COLoRA_Hybrid_Prepare"):
             with NvtxAnnotate("COLoRA_ApplyCompletedPromotions"):
                 manager.apply_completed_promotions()
 
             with NvtxAnnotate("COLoRA_BuildValidTokenView"):
-                batch_size = input_tensor.shape[0]
-                if len(bins) > batch_size:
-                    bins = bins[:batch_size]
-                valid_mask = bins >= 0
-                if not torch.any(valid_mask):
+                if (
+                    shared_prepare_ctx is None
+                    or int(shared_prepare_ctx.batch_size) != int(input_tensor.shape[0])
+                    or int(shared_prepare_ctx.key_expert) != key_expert
+                ):
+                    shared_prepare_ctx = self.build_moe_hybrid_shared_prepare_context(
+                        batch_size=int(input_tensor.shape[0]),
+                        bins=bins,
+                        expert_id=expert_id,
+                    )
+                if shared_prepare_ctx is None:
                     self._last_colora_stats["promotion_queue_depth"] = manager.get_promotion_queue_depth()
                     self._last_colora_stats["cache_hit_rate"] = manager.get_hit_rate()
                     return output
 
-                valid_pos = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1)
-                valid_bins = bins.index_select(0, valid_pos).long()
+                valid_pos = shared_prepare_ctx.valid_pos
+                valid_bins = shared_prepare_ctx.valid_bins
 
             with NvtxAnnotate("COLoRA_BuildCacheKeys"):
-                # NOTE: torch.unique(...).cpu().tolist() can trigger host sync on CUDA.
-                unique_adapters = torch.unique(valid_bins).cpu().tolist()
-                key_expert = int(expert_id) if expert_id is not None else 0
+                unique_adapters = shared_prepare_ctx.adapter_ids_cpu
                 keys = [
                     ExpertCacheKey(
                         projection=projection,
@@ -2070,9 +2116,15 @@ class Qwen3VLMoELoRADispatcher:
 
         with NvtxAnnotate("COLoRA_BuildHitMissMasks"):
             hit_adapters = {key.adapter_idx for key in ready_slots.keys()}
-            hit_mask = torch.zeros_like(valid_bins, dtype=torch.bool)
-            for adapter_idx in hit_adapters:
-                hit_mask |= valid_bins == int(adapter_idx)
+            if hit_adapters:
+                adapter_tensor = torch.tensor(
+                    sorted(int(adapter_idx) for adapter_idx in hit_adapters),
+                    dtype=valid_bins.dtype,
+                    device=valid_bins.device,
+                )
+                hit_mask = torch.isin(valid_bins, adapter_tensor)
+            else:
+                hit_mask = torch.zeros_like(valid_bins, dtype=torch.bool)
             miss_mask = ~hit_mask
 
         gpu_compute_time = 0.0
@@ -2090,8 +2142,9 @@ class Qwen3VLMoELoRADispatcher:
 
         with NvtxAnnotate("COLoRA_MissPath_CheckAndPrepare"):
             if torch.any(miss_mask):
-                miss_pos = valid_pos.index_select(0, torch.nonzero(miss_mask, as_tuple=False).squeeze(-1))
-                miss_bins = valid_bins.index_select(0, torch.nonzero(miss_mask, as_tuple=False).squeeze(-1))
+                miss_rows = torch.nonzero(miss_mask, as_tuple=False).squeeze(-1)
+                miss_pos = valid_pos.index_select(0, miss_rows)
+                miss_bins = valid_bins.index_select(0, miss_rows)
                 miss_input = input_tensor.index_select(0, miss_pos).contiguous()
                 if miss_input.device.type == "cuda":
                     d2h_bytes += float(miss_input.numel() * miss_input.element_size())
@@ -2128,21 +2181,15 @@ class Qwen3VLMoELoRADispatcher:
         with NvtxAnnotate("COLoRA_HitPath_Prepare"):
             if torch.any(hit_mask):
                 with NvtxAnnotate("COLoRA_HitIndicesAndGroups"):
-                    hit_pos = valid_pos.index_select(0, torch.nonzero(hit_mask, as_tuple=False).squeeze(-1))
-                    hit_bins = valid_bins.index_select(0, torch.nonzero(hit_mask, as_tuple=False).squeeze(-1))
+                    hit_rows = torch.nonzero(hit_mask, as_tuple=False).squeeze(-1)
+                    hit_pos = valid_pos.index_select(0, hit_rows)
+                    hit_bins = valid_bins.index_select(0, hit_rows)
                     hit_unique_adapters, hit_inverse = torch.unique(hit_bins, return_inverse=True)
 
                 with NvtxAnnotate("COLoRA_ResolveSlotIds"):
-                    slot_ids = []
-                    # NOTE: cpu().tolist() may synchronize with CUDA work.
-                    for adapter_idx in hit_unique_adapters.cpu().tolist():
-                        key = ExpertCacheKey(
-                            projection=projection,
-                            adapter_idx=int(adapter_idx),
-                            layer_id=int(layer_id),
-                            expert_id=key_expert,
-                        )
-                        slot_ids.append(int(ready_slots.get(key, -1)))
+                    slot_by_adapter = {int(key.adapter_idx): int(slot_id) for key, slot_id in ready_slots.items()}
+                    hit_unique_cpu = hit_unique_adapters.detach().to(device="cpu", dtype=torch.long).tolist()
+                    slot_ids = [int(slot_by_adapter.get(int(adapter_idx), -1)) for adapter_idx in hit_unique_cpu]
 
                 cache_a, cache_b = manager.get_projection_buffers(projection)
                 if (
@@ -2180,7 +2227,8 @@ class Qwen3VLMoELoRADispatcher:
                             hit_output = self._get_output_buffer(hit_input, pool)
                             temp_a_start = torch.arange(active_count, device=input_tensor.device, dtype=torch.int32)
                             temp_a_len = torch.ones(active_count, device=input_tensor.device, dtype=torch.int32)
-                            temp_scaling = pool.a_scaling[hit_unique_adapters.long().cpu()].to(input_tensor.device)
+                            scaling_idx_cpu = hit_unique_adapters.detach().to(device="cpu", dtype=torch.long)
+                            temp_scaling = pool.a_scaling.index_select(0, scaling_idx_cpu).to(input_tensor.device)
 
                         with NvtxAnnotate("COLoRA_GPU_Hit_BGMV"):
                             batch_lora_get_mlp(
@@ -2627,7 +2675,8 @@ class Qwen3VLMoELoRADispatcher:
         input_tensor: torch.Tensor,
         layer_id: int,
         req_bins: Optional[torch.Tensor] = None,
-        expert_id: Optional[int] = None
+        expert_id: Optional[int] = None,
+        hybrid_prepare_ctx: Optional[MoEHybridSharedPrepareContext] = None,
     ) -> torch.Tensor:
         """Apply gate_proj LoRA to batch with different adapters.
 
@@ -2664,6 +2713,7 @@ class Qwen3VLMoELoRADispatcher:
                 bins=bins,
                 projection="gate",
                 expert_id=expert_id,
+                hybrid_prepare_ctx=hybrid_prepare_ctx,
             )
 
         # Use CPU compute if configured
@@ -2733,7 +2783,8 @@ class Qwen3VLMoELoRADispatcher:
         input_tensor: torch.Tensor,
         layer_id: int,
         req_bins: Optional[torch.Tensor] = None,
-        expert_id: Optional[int] = None
+        expert_id: Optional[int] = None,
+        hybrid_prepare_ctx: Optional[MoEHybridSharedPrepareContext] = None,
     ) -> torch.Tensor:
         """Apply up_proj LoRA to batch with different adapters.
 
@@ -2767,6 +2818,7 @@ class Qwen3VLMoELoRADispatcher:
                 bins=bins,
                 projection="up",
                 expert_id=expert_id,
+                hybrid_prepare_ctx=hybrid_prepare_ctx,
             )
 
         # Use CPU compute if configured
@@ -2829,7 +2881,8 @@ class Qwen3VLMoELoRADispatcher:
         input_tensor: torch.Tensor,
         layer_id: int,
         req_bins: Optional[torch.Tensor] = None,
-        expert_id: Optional[int] = None
+        expert_id: Optional[int] = None,
+        hybrid_prepare_ctx: Optional[MoEHybridSharedPrepareContext] = None,
     ) -> torch.Tensor:
         """Apply down_proj LoRA. Input: Intermediate, Output: Hidden.
 
@@ -2863,6 +2916,7 @@ class Qwen3VLMoELoRADispatcher:
                 bins=bins,
                 projection="down",
                 expert_id=expert_id,
+                hybrid_prepare_ctx=hybrid_prepare_ctx,
             )
 
         output = self._get_output_buffer(input_tensor, pool)

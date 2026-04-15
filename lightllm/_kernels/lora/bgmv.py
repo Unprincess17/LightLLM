@@ -11,6 +11,7 @@ Note: A and B matrices are stored in SEPARATE buffers (not interleaved).
 - A matrices: stored in a_buffer (key_buffer in the memory pool)
 - B matrices: stored in b_buffer (value_buffer in the memory pool)
 """
+import os
 import torch
 import triton
 import triton.language as tl
@@ -18,6 +19,7 @@ from lightllm.utils.log_utils import init_logger
 from lightllm.utils.nvtx_utils import NvtxAnnotate
 
 logger = init_logger(__name__)
+_BGMV_DEBUG_BOUNDS = os.environ.get("LIGHTLLM_BGMV_DEBUG_BOUNDS", "0") == "1"
 
 @triton.jit
 def bgmv_kernel(
@@ -179,9 +181,10 @@ def dispatch_bgmv(
 
     assert a_len.shape[0] != 0, f"a_len tensor is empty, cannot proceed with dispatch_bgmv"
 
-    # Debug: Check that slot location is within pool bounds
-    max_slot = (a_start + layer_id).max().item()
-    assert max_slot < pool_size, f"Slot location out of bounds: max slot {max_slot} >= pool size {pool_size}"
+    if _BGMV_DEBUG_BOUNDS:
+        # Debug-only bounds check; disabled by default to avoid forcing host sync.
+        max_slot = (a_start + layer_id).max().item()
+        assert max_slot < pool_size, f"Slot location out of bounds: max slot {max_slot} >= pool size {pool_size}"
 
     # Helper to pick block size
     def get_block_n(dim):
