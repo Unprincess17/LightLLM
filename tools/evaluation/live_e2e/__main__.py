@@ -23,6 +23,15 @@ def main():
         action="store_true",
         help="Only run summarization from existing results, do not re-execute runs",
     )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help=(
+            "Re-run every manifest entry even when its output dir already has "
+            "run_result.json with valid=true. Default is to skip those runs so "
+            "you can resume after partial failures (e.g. bad nsys captures)."
+        ),
+    )
     args = parser.parse_args()
 
     if not args.manifest.exists():
@@ -50,7 +59,7 @@ def main():
         sys.exit(0)
     else:
         # Run all the evaluation
-        results = run_manifest(args.manifest)
+        results = run_manifest(args.manifest, overwrite=args.overwrite)
         manifest = load_manifest(args.manifest)
         summaries_dir = get_summaries_dir(manifest)
         # After running, automatically do the summarization
@@ -60,9 +69,13 @@ def main():
             results_json_path=results_json_path,
             output_root=summaries_dir,
         )
+        skipped = sum(1 for r in results if r.get("skipped"))
+        executed = len(results) - skipped
         print(f"\nEvaluation and summarization complete:")
-        print(f"  Total runs executed: {len(results)}")
-        print(f"  Valid runs executed: {sum(1 for r in results if r['valid'])}")
+        print(f"  Runs in manifest: {len(results)}")
+        print(f"  Benchmarks executed this invocation: {executed}")
+        print(f"  Skipped (reused prior valid): {skipped}")
+        print(f"  Valid results (including reused): {sum(1 for r in results if r['valid'])}")
         print(f"  Summary: {summaries_dir / 'live_e2e_summary.json'}")
         print(f"  Paper comparison CSV: {summaries_dir / 'live_e2e_comparison.csv'}")
         # Exit with non-zero if no valid paper runs

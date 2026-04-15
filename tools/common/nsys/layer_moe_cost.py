@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import re
 from pathlib import Path
 import subprocess
-import sys
 
 import pandas as pd
+
+# NVTX names like MoE_CoalescedAct_LoRA_GPU/L0/E106/Gate — family is prefix before /Lx/Ey/Role
+_MOE_DGU_EVENT_RE = re.compile(r"^(.+)/L(\d+)/E\d+/(Down|Gate|Up)$")
 
 # Defaults when invoked with no CLI args (same workflow as before argv support).
 DEFAULT_CSV_FILE = (
@@ -37,6 +40,16 @@ def get_descendants(df, root_range_id, parent_id_col="ParentId", range_id_col="R
     if descendants:
         return pd.concat(descendants, ignore_index=True)
     return df.iloc[0:0].copy()
+
+
+def parse_moe_dgu_event(event: str) -> tuple[str, str, int] | None:
+    """If event matches MoE_* / L<layer>/ E<expert> / {Down,Gate,Up}, return (family, role, layer_from_path)."""
+    if not isinstance(event, str):
+        return None
+    m = _MOE_DGU_EVENT_RE.match(event)
+    if not m:
+        return None
+    return m.group(1), m.group(3), int(m.group(2))
 
 
 def parse_layer_idx(layer_name):
@@ -208,7 +221,7 @@ def run(
             min_ms=(dur_col, "min"),
             max_ms=(dur_col, "max"),
         )
-        .sort_values(["avg_ms", "expert_id"], ascending=[False, True])
+        .sort_values(["total_ms", "expert_id"], ascending=[False, True])
     )
 
     by_layer = (
@@ -218,7 +231,7 @@ def run(
             total_ms=(dur_col, "sum"),
             avg_ms=(dur_col, "mean"),
         )
-        .sort_values("avg_ms", ascending=False)
+        .sort_values("total_ms", ascending=False)
     )
 
     detail = experts[
@@ -266,12 +279,67 @@ def run(
         .sort_values(["layer_idx", "layer"], na_position="last")
     )
 
+    dgu_parsed = coarse_by_layer_event["event"].apply(parse_moe_dgu_event)
+    dgu_mask = dgu_parsed.notna()
+    if dgu_mask.any():
+        n_mismatch = 0
+        for _, r in coarse_by_layer_event.loc[dgu_mask].iterrows():
+            p = parse_moe_dgu_event(r["event"])
+            if p and pd.notna(r["layer_idx"]) and int(r["layer_idx"]) != p[2]:
+                n_mismatch += 1
+        if n_mismatch:
+            print(
+                f"Warning: {n_mismatch} D/G/U event rows have L* in name != layer_idx; "
+                "using row layer_idx for grouping."
+            )
+
+    def _build_dgu_frame(group_cols: list[str]) -> pd.DataFrame:
+        sub = coarse_by_layer_event.loc[dgu_mask].copy()
+        sub["family"] = dgu_parsed.loc[dgu_mask].apply(lambda t: t[0])
+        sub["role"] = dgu_parsed.loc[dgu_mask].apply(lambda t: t[1])
+        out = (
+            sub.groupby(group_cols, dropna=False, as_index=False)
+            .agg(
+                count=("count", "sum"),
+                total_ms=("total_ms", "sum"),
+                min_ms=("min_ms", "min"),
+                max_ms=("max_ms", "max"),
+            )
+            .assign(avg_ms=lambda df: df["total_ms"] / df["count"])
+        )
+        value_cols = ["count", "total_ms", "avg_ms", "min_ms", "max_ms"]
+        out = out[[*group_cols, *value_cols]]
+        sort_cols = ["total_ms"] + [c for c in group_cols if c != "total_ms"]
+        ascending = [False] + [True] * (len(sort_cols) - 1)
+        return out.sort_values(sort_cols, ascending=ascending)
+
+    _dgu_val_cols = ["count", "total_ms", "avg_ms", "min_ms", "max_ms"]
+    dgu_by_layer_family = (
+        _build_dgu_frame(["layer", "layer_idx", "family", "role"])
+        if dgu_mask.any()
+        else pd.DataFrame(columns=["layer", "layer_idx", "family", "role", *_dgu_val_cols])
+    )
+    dgu_global_by_family = (
+        _build_dgu_frame(["family", "role"])
+        if dgu_mask.any()
+        else pd.DataFrame(columns=["family", "role", *_dgu_val_cols])
+    )
+    # Sums Down/Gate/Up across NVTX families (e.g. GatherInput + LoRA_GPU) for one layer — combined stage time.
+    dgu_by_layer_role_only = (
+        _build_dgu_frame(["layer", "layer_idx", "role"])
+        if dgu_mask.any()
+        else pd.DataFrame(columns=["layer", "layer_idx", "role", *_dgu_val_cols])
+    )
+
     base_dir = csv_path.parent
     by_expert.to_csv(base_dir / "expert_avg_by_id.csv", index=False)
     by_layer.to_csv(base_dir / "expert_avg_by_layer.csv", index=False)
     detail.to_csv(base_dir / "expert_detail_rows.csv", index=False)
     coarse_by_layer_event.to_csv(base_dir / "layer_coarse_summary.csv", index=False)
     coarse_wide_total_ms.to_csv(base_dir / "layer_coarse_summary_wide_total_ms.csv", index=False)
+    dgu_by_layer_family.to_csv(base_dir / "layer_moe_dgu_by_layer_family.csv", index=False)
+    dgu_global_by_family.to_csv(base_dir / "layer_moe_dgu_global_by_family.csv", index=False)
+    dgu_by_layer_role_only.to_csv(base_dir / "layer_moe_dgu_by_layer_role_only.csv", index=False)
 
     print("\nSaved:")
     print(f"  {base_dir / 'expert_avg_by_id.csv'}")
@@ -279,6 +347,9 @@ def run(
     print(f"  {base_dir / 'expert_detail_rows.csv'}")
     print(f"  {base_dir / 'layer_coarse_summary.csv'}")
     print(f"  {base_dir / 'layer_coarse_summary_wide_total_ms.csv'}")
+    print(f"  {base_dir / 'layer_moe_dgu_by_layer_family.csv'}")
+    print(f"  {base_dir / 'layer_moe_dgu_global_by_family.csv'}")
+    print(f"  {base_dir / 'layer_moe_dgu_by_layer_role_only.csv'}")
 
 
 def main(argv: list[str] | None = None) -> int:

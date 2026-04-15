@@ -31,10 +31,13 @@
 #   --colora_max_promote_per_step N    COLoRA max promotions per step
 #   --colora_decay F                   COLoRA utility decay
 #   --colora_miss_policy STR           COLoRA miss policy (cpu_first|load_then_run)
+#   --colora_overlap_mode STR          COLoRA overlap scheduling (full|no_overlap)
 #   --colora_async_fallback 0|1        Enable async CPU fallback in hybrid mode
 #   --colora_cpu_workers N             Async CPU fallback worker threads
 #   --colora_cpu_queue_depth N         Async CPU fallback queue depth
 #   --colora_cpu_batch_timeout_us N    Queue wait budget before sync degrade
+#   --colora_temporal_prefetch         Enable COLoRA temporal weight prefetch
+#   --no_colora_temporal_prefetch      Disable temporal prefetch (default off)
 #   --colora_speculative_dispatch      Enable COLoRA speculative dispatch MVP
 #   --no_colora_speculative_dispatch   Disable COLoRA speculative dispatch MVP
 #   --colora_spec_layer_whitelist CSV  Comma-separated speculative layer whitelist
@@ -82,6 +85,7 @@ Options:
   --colora_max_promote_per_step N
   --colora_decay F
   --colora_miss_policy STR
+  --colora_overlap_mode full|no_overlap
   --colora_async_fallback 0|1
   --colora_cpu_workers N
   --colora_cpu_queue_depth N
@@ -175,6 +179,7 @@ COLORA_SPECULATIVE_DISPATCH=0
 COLORA_SPEC_LAYER_WHITELIST=""
 COLORA_REQUEST_SKIP="1"
 COLORA_MAX_CONTINUATIONS="8"
+COLORA_OVERLAP_MODE="full"
 
 # Environment variables
 LOADWORKER=8
@@ -313,6 +318,10 @@ while [[ $# -gt 0 ]]; do
             COLORA_MISS_POLICY="$2"
             shift 2
             ;;
+        --colora_overlap_mode)
+            COLORA_OVERLAP_MODE="$2"
+            shift 2
+            ;;
         --colora_async_fallback)
             COLORA_ASYNC_FALLBACK="$2"
             shift 2
@@ -331,6 +340,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --colora_temporal_prefetch)
             COLORA_TEMPORAL_PREFETCH=1
+            shift
+            ;;
+        --no_colora_temporal_prefetch)
+            COLORA_TEMPORAL_PREFETCH=0
             shift
             ;;
         --colora_temporal_prefetch_layer_whitelist)
@@ -494,6 +507,7 @@ CMD="$CMD --colora_cache_budget_mb $COLORA_CACHE_BUDGET_MB \
     --colora_deferred_promotion_delta_steps $COLORA_DEFERRED_PROMOTION_DELTA_STEPS \
     --colora_promotion_ema_alpha $COLORA_PROMOTION_EMA_ALPHA \
     --colora_miss_policy $COLORA_MISS_POLICY \
+    --colora_overlap_mode $COLORA_OVERLAP_MODE \
     --colora_async_fallback $COLORA_ASYNC_FALLBACK \
     --colora_cpu_workers $COLORA_CPU_WORKERS \
     --colora_cpu_queue_depth $COLORA_CPU_QUEUE_DEPTH \

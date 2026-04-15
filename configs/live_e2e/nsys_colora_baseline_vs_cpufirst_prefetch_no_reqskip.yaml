@@ -1,0 +1,49 @@
+run_id: nsys_colora_baseline_vs_cpufirst_prefetch_no_reqskip_01
+description: >
+  Nsys A/B profile comparing baseline load-then-run vs cpu-first+async+temporal-prefetch
+  under reqskip-0 / overlap_mode=full with AVX kernel, workers=2, and no coalescing packer.
+
+benchmark_script: test/lora/benchmark_lora.sh
+
+runs:
+  - run_label: colora__miss-load_then_run__reqskip-0__ovmode-full__asynccpu-0__workers-2__kernel-avx__packer-0__tprefetch-0__moe-hybrid
+    suite_kind: paper
+    mode_label: baseline
+    compute_device: "vl_storage:gpu,vl_compute:gpu,attn_storage:gpu,attn_compute:gpu,moe_storage:cpu,moe_compute:hybrid"
+    miss_handling_mode: load_then_run
+    overlap_policy: no_overlap
+    overlap_mode: full
+    async_fallback: false
+    cpu_workers: 2
+    cpu_queue_depth: 8
+    cpu_batch_timeout_us: 500
+    cpu_kernel_mode: avx
+    coalescing_packer: false
+    temporal_prefetch: false
+    warmup_requests: 4
+    measurement_requests: 32
+    nsys_enabled: true
+    nsys_output_prefix: baseline_load_then_run_no_reqskip
+    nsys_delay_seconds: 110
+    output_root: artifacts/evaluation/live_e2e
+
+  - run_label: colora__miss-cpu_first__reqskip-0__ovmode-full__asynccpu-1__workers-2__kernel-avx__packer-0__tprefetch-1__moe-hybrid
+    suite_kind: paper
+    mode_label: execution_first
+    compute_device: "vl_storage:gpu,vl_compute:gpu,attn_storage:gpu,attn_compute:gpu,moe_storage:cpu,moe_compute:hybrid"
+    miss_handling_mode: cpu_first
+    overlap_policy: no_overlap
+    overlap_mode: full
+    async_fallback: true
+    cpu_workers: 2
+    cpu_queue_depth: 8
+    cpu_batch_timeout_us: 500
+    cpu_kernel_mode: avx
+    coalescing_packer: false
+    temporal_prefetch: true
+    warmup_requests: 4
+    measurement_requests: 32
+    nsys_enabled: true
+    nsys_output_prefix: cpu_first_async_prefetch_no_reqskip
+    nsys_delay_seconds: 110
+    output_root: artifacts/evaluation/live_e2e

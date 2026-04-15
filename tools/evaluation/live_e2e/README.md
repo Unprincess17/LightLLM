@@ -45,6 +45,15 @@ nsys_output_prefix: smoke_profile
 python -m tools.evaluation.live_e2e --manifest configs/live_e2e/paper_suite_example.yaml --summarize-only
 ```
 
+### Resume after partial failure (skip valid runs)
+
+By default, re-running the same manifest **does not** re-execute a run whose output directory already contains `run_result.json` with `"valid": true`. Invalid or missing results are always re-run. Use **`--overwrite`** to execute every run regardless (for example after changing the manifest or when you want fresh benchmarks).
+
+```bash
+python -m tools.evaluation.live_e2e --manifest configs/live_e2e/your_suite.yaml
+python -m tools.evaluation.live_e2e --manifest configs/live_e2e/your_suite.yaml --overwrite
+```
+
 ## Real Trace Replay (Alibaba)
 
 Live e2e now supports adapter-trace replay from Alibaba-derived JSONL files.

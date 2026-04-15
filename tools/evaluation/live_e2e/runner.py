@@ -5,6 +5,7 @@ from pathlib import Path
 from datetime import datetime
 import json
 import threading
+from typing import Any, Dict, List, Optional
 
 from tools.case_study.common import ensure_dir, write_json
 from tools.evaluation.live_e2e.manifest import LiveE2EManifest, LiveE2ERun
@@ -34,8 +35,7 @@ def build_benchmark_command(run: LiveE2ERun, benchmark_script: str) -> str:
     if run.overlap_mode is not None:
         parts.append(f"--colora_overlap_mode {run.overlap_mode}")
     if run.overlap_policy is not None:
-        # benchmark_lora.sh does not accept --colora_overlap_mode.
-        # Translate overlap policy into currently-supported control flags.
+        # Translate overlap policy into request-skip control flags.
         # no_overlap => disable request-level skip-and-reinsert.
         if str(run.overlap_policy).strip().lower() == "no_overlap":
             parts.append("--colora_request_skip 0")
@@ -148,6 +148,17 @@ def get_run_output_dir(manifest: LiveE2EManifest, run: LiveE2ERun) -> Path:
 def get_summaries_dir(manifest: LiveE2EManifest) -> Path:
     """Get the summaries directory for an evaluation."""
     return manifest.runs[0].output_root / manifest.run_id / "summaries"
+
+
+def read_existing_run_result(output_dir: Path) -> Optional[Dict[str, Any]]:
+    """Load ``run_result.json`` if present and parseable; otherwise None."""
+    path = output_dir / "run_result.json"
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
 
 
 def _stream_pipe(pipe, log_file, output_stream):
@@ -279,15 +290,39 @@ def run_single(manifest: LiveE2EManifest, run: LiveE2ERun, capture_stdout: bool 
     return result
 
 
-def run_manifest(manifest_path: Path) -> list[dict]:
-    """Run all runs defined in a manifest."""
+def run_manifest(manifest_path: Path, *, overwrite: bool = False) -> List[Dict[str, Any]]:
+    """Run all runs defined in a manifest.
+
+    By default (``overwrite=False``), a run is **not** re-executed if its output
+    directory already contains ``run_result.json`` with ``"valid": true``. This
+    supports resuming after flaky nsys or partial failures. Pass
+    ``overwrite=True`` to always execute every run regardless of prior results.
+    """
     manifest = load_manifest(manifest_path)
     print(f"Loaded manifest run_id={manifest.run_id}, {len(manifest.runs)} runs")
+    if overwrite:
+        print("Overwrite: re-running all runs (ignoring existing valid run_result.json).")
+    else:
+        print("Resume: runs with existing valid run_result.json will be skipped (use --overwrite to re-run).")
 
-    results = []
+    results: List[Dict[str, Any]] = []
     for run in manifest.runs:
+        output_dir = get_run_output_dir(manifest, run)
+        if not overwrite:
+            prev = read_existing_run_result(output_dir)
+            if prev is not None and prev.get("valid") is True:
+                merged = {**prev, "skipped": True}
+                results.append(merged)
+                print(f"\n=== Skipping {run.run_label} ===")
+                print(f"Existing run_result.json has valid=true. Use --overwrite to re-run.")
+                print(f"Output directory: {output_dir}")
+                continue
+
         result = run_single(manifest, run)
         results.append(result)
+
+    skipped_valid = sum(1 for r in results if r.get("skipped"))
+    executed = len(results) - skipped_valid
 
     # Write overall results summary
     summaries_dir = get_summaries_dir(manifest)
@@ -298,11 +333,17 @@ def run_manifest(manifest_path: Path) -> list[dict]:
         "description": manifest.description,
         "total_runs": len(results),
         "valid_runs": sum(1 for r in results if r["valid"]),
+        "executed_runs": executed,
+        "skipped_valid_runs": skipped_valid,
+        "overwrite": overwrite,
         "results": results,
     })
 
     print(f"\n=== All runs complete ===")
-    print(f"Total: {len(results)}, Valid: {sum(1 for r in results if r['valid'])}")
+    print(
+        f"Total: {len(results)}, Valid: {sum(1 for r in results if r['valid'])}, "
+        f"Executed: {executed}, Skipped (prior valid): {skipped_valid}"
+    )
     print(f"Results in: {summaries_dir}")
 
     return results

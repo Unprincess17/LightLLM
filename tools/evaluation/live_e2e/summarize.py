@@ -119,7 +119,7 @@ def collect_and_summarize_manifest(
             summary = {
                 "run_label": result["run_label"],
                 "suite_kind": result["suite_kind"],
-                "mode_label": result["mode_label"],
+                "mode_label": result.get("mode_label", ""),
                 "valid": False,
                 "reason": result.get("failure_reason", "benchmark run failed"),
                 "request_count": 0,

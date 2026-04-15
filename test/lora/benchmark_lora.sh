@@ -50,6 +50,7 @@ Server pass-through options:
   --colora_deferred_promotion_delta_steps N
   --colora_promotion_ema_alpha F
   --colora_miss_policy STR
+  --colora_overlap_mode full|no_overlap
   --colora_async_fallback 0|1
   --colora_cpu_workers N
   --colora_cpu_queue_depth N
@@ -61,6 +62,8 @@ Server pass-through options:
   --colora_spec_layer_whitelist CSV
   --server_log_path PATH
   --server_stdout_log PATH
+  --server_host HOST          Bind / health-check host (default: localhost)
+  --server_port PORT          Bind port for server and client URL (default: 8040)
 USAGE
 }
 
@@ -78,7 +81,6 @@ IGNORE_EOS=1
 SERVER_SCRIPT="$TEST_SCRIPT_DIR/start_server.sh"
 SERVER_HOST="localhost"
 SERVER_PORT=8040
-SERVER_URL="http://$SERVER_HOST:$SERVER_PORT"
 ADAPTER_IDS="lora_dummy_0,lora_dummy_1,lora_dummy_2,lora_dummy_3,lora_dummy_4,lora_dummy_5,lora_dummy_6,lora_dummy_7,lora_dummy_8,lora_dummy_9"
 ADAPTER_IDS_SET="0"
 POISSON_LAMBDA=3.0
@@ -114,6 +116,7 @@ COLORA_DECAY=""
 COLORA_DEFERRED_PROMOTION_DELTA_STEPS=""
 COLORA_PROMOTION_EMA_ALPHA=""
 COLORA_MISS_POLICY=""
+COLORA_OVERLAP_MODE=""
 COLORA_ASYNC_FALLBACK=""
 COLORA_CPU_WORKERS="8"
 COLORA_CPU_QUEUE_DEPTH="512"
@@ -208,6 +211,7 @@ build_phase_args() {
     local prompt_namespace="$8"
 
     out_arr=(
+        --url "$SERVER_URL"
         --max_tokens "$MAX_TOKENS"
         --adapter_ids "$ADAPTER_IDS"
         --poisson_lambda "$POISSON_LAMBDA"
@@ -309,11 +313,13 @@ while [[ $# -gt 0 ]]; do
         --colora_deferred_promotion_delta_steps) COLORA_DEFERRED_PROMOTION_DELTA_STEPS="$2"; shift 2 ;;
         --colora_promotion_ema_alpha) COLORA_PROMOTION_EMA_ALPHA="$2"; shift 2 ;;
         --colora_miss_policy) COLORA_MISS_POLICY="$2"; shift 2 ;;
+        --colora_overlap_mode) COLORA_OVERLAP_MODE="$2"; shift 2 ;;
         --colora_async_fallback) COLORA_ASYNC_FALLBACK="$2"; shift 2 ;;
         --colora_cpu_workers) COLORA_CPU_WORKERS="$2"; shift 2 ;;
         --colora_cpu_queue_depth) COLORA_CPU_QUEUE_DEPTH="$2"; shift 2 ;;
         --colora_cpu_batch_timeout_us) COLORA_CPU_BATCH_TIMEOUT_US="$2"; shift 2 ;;
         --colora_temporal_prefetch) COLORA_TEMPORAL_PREFETCH="1"; shift ;;
+        --no_colora_temporal_prefetch) COLORA_TEMPORAL_PREFETCH="0"; shift ;;
         --colora_temporal_prefetch_layer_whitelist) COLORA_TEMPORAL_PREFETCH_LAYER_WHITELIST="$2"; shift 2 ;;
         --colora_temporal_hot_cache_slots) COLORA_TEMPORAL_HOT_CACHE_SLOTS="$2"; shift 2 ;;
         --colora_speculative_dispatch) COLORA_SPECULATIVE_DISPATCH="1"; shift ;;
@@ -323,6 +329,8 @@ while [[ $# -gt 0 ]]; do
 		--colora_max_continuations) COLORA_MAX_CONTINUATIONS="$2"; shift 2 ;;
         --server_log_path) SERVER_LOG_PATH="$2"; shift 2 ;;
         --server_stdout_log) SERVER_STDOUT_LOG="$2"; shift 2 ;;
+        --server_host) SERVER_HOST="$2"; shift 2 ;;
+        --server_port) SERVER_PORT="$2"; shift 2 ;;
         --print_per_request) PRINT_PER_REQUEST=1; shift ;;
         --no_print_per_request) PRINT_PER_REQUEST=0; shift ;;
         --top_k_slowest) TOP_K_SLOWEST="$2"; shift 2 ;;
@@ -332,6 +340,8 @@ while [[ $# -gt 0 ]]; do
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
+
+SERVER_URL="http://$SERVER_HOST:$SERVER_PORT"
 
 if [[ -z "$SERVER_LOG_PATH" ]]; then
     SERVER_LOG_PATH="/tmp/${OUTPUT_PREFIX}_server.log"
@@ -575,6 +585,9 @@ if [[ -n "$COLORA_PROMOTION_EMA_ALPHA" ]]; then
 fi
 if [[ -n "$COLORA_MISS_POLICY" ]]; then
     SERVER_ARGS+=(--colora_miss_policy "$COLORA_MISS_POLICY")
+fi
+if [[ -n "$COLORA_OVERLAP_MODE" ]]; then
+    SERVER_ARGS+=(--colora_overlap_mode "$COLORA_OVERLAP_MODE")
 fi
 if [[ -n "$COLORA_ASYNC_FALLBACK" ]]; then
     SERVER_ARGS+=(--colora_async_fallback "$COLORA_ASYNC_FALLBACK")
