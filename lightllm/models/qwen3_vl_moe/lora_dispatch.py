@@ -58,33 +58,82 @@ except ImportError:
     BGMV_AVAILABLE = False
     # Fallback: naive per-request computation
 
-# Try to import AVX-512 CPU kernel for CPU offload mode
+# AVX CPU kernels: import symbols only — JIT compile is deferred (see _touch_*_avx_flags)
+# so importing this module does not block on torch cpp_extension file locks.
+AVX_AVAILABLE = None  # resolved on first _touch_lora_avx_flags(); bool if tests pre-set
+MOE_AVX_AVAILABLE = None  # resolved on first _touch_moe_avx_flags(); bool if tests pre-set
+_lora_cpu_kernel_import_ok = False
+_moe_cpu_kernel_import_ok = False
+_lora_avx_flags_touched = False
+_moe_avx_flags_touched = False
+
 try:
     from lightllm._kernels.lora.lora_cpu_kernel import (
         batch_lora_avx,
         lora_down_avx,
         lora_up_avx,
-        is_available as _avx_is_available,
+        ensure_kernel_loaded as _ensure_lora_cpu_kernel_loaded,
+        is_available as _lora_cpu_is_available,
     )
-    AVX_AVAILABLE = _avx_is_available()
-    if AVX_AVAILABLE:
-        logger.info("AVX-512 BF16 CPU kernel available")
-except ImportError:
-    AVX_AVAILABLE = False
 
-# Try to import MoE-specific AVX-512 kernel for strict MoE CPU paths.
+    _lora_cpu_kernel_import_ok = True
+except ImportError:
+    pass
+
 try:
     from lightllm._kernels.lora.moe_lora_cpu_kernel import (
         moe_batch_lora_gate_avx,
         moe_batch_lora_up_avx,
         moe_batch_lora_down_avx,
-        is_available as _moe_avx_is_available,
+        ensure_kernel_loaded as _ensure_moe_cpu_kernel_loaded,
+        is_available as _moe_cpu_is_available,
     )
-    MOE_AVX_AVAILABLE = bool(_moe_avx_is_available())
-    if MOE_AVX_AVAILABLE:
-        logger.info("MoE-specific AVX-512 BF16 CPU kernel available")
+
+    _moe_cpu_kernel_import_ok = True
 except Exception:
-    MOE_AVX_AVAILABLE = False
+    pass
+
+
+def _touch_lora_avx_flags() -> None:
+    """Resolve AVX_AVAILABLE once; honors pre-set bool (e.g. tests) without probing."""
+    global AVX_AVAILABLE, _lora_avx_flags_touched
+
+    if _lora_avx_flags_touched:
+        return
+    _lora_avx_flags_touched = True
+    if AVX_AVAILABLE is not None:
+        return
+    if not _lora_cpu_kernel_import_ok:
+        AVX_AVAILABLE = False
+        return
+    try:
+        _ensure_lora_cpu_kernel_loaded()
+        AVX_AVAILABLE = bool(_lora_cpu_is_available())
+        if AVX_AVAILABLE:
+            logger.info("AVX-512 BF16 CPU kernel available")
+    except Exception:
+        AVX_AVAILABLE = False
+
+
+def _touch_moe_avx_flags() -> None:
+    """Resolve MOE_AVX_AVAILABLE once; honors pre-set bool (e.g. tests) without probing."""
+    global MOE_AVX_AVAILABLE, _moe_avx_flags_touched
+
+    if _moe_avx_flags_touched:
+        return
+    _moe_avx_flags_touched = True
+    if MOE_AVX_AVAILABLE is not None:
+        return
+    if not _moe_cpu_kernel_import_ok:
+        MOE_AVX_AVAILABLE = False
+        return
+    try:
+        _ensure_moe_cpu_kernel_loaded()
+        MOE_AVX_AVAILABLE = bool(_moe_cpu_is_available())
+        if MOE_AVX_AVAILABLE:
+            logger.info("MoE-specific AVX-512 BF16 CPU kernel available")
+    except Exception:
+        MOE_AVX_AVAILABLE = False
 
 
 def _colora_resolved_cpu_kernel_mode() -> str:
@@ -110,6 +159,7 @@ def _naive_moe_lora_stage2(
 
 def is_moe_cpu_kernel_available() -> bool:
     """Expose MoE kernel readiness for backend startup checks."""
+    _touch_moe_avx_flags()
     return bool(MOE_AVX_AVAILABLE)
 
 
@@ -834,6 +884,7 @@ class Qwen3VLMoELoRADispatcher:
         return self.lora_compute_config.should_compute_hybrid("moe")
 
     def _require_moe_cpu_kernel(self, mode: str) -> None:
+        _touch_moe_avx_flags()
         if not MOE_AVX_AVAILABLE:
             raise RuntimeError(
                 f"MoE-specific CPU kernel is required for strict {mode} MoE path "
@@ -3074,6 +3125,7 @@ class Qwen3VLMoELoRADispatcher:
         This is slower but correctness-preserving.
         Uses AVX-512 BF16 kernel when available on CPU.
         """
+        _touch_lora_avx_flags()
         # Ensure req_bins is available
         if req_bins is None:
             req_bins = self.req_bins

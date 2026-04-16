@@ -16,6 +16,7 @@ Created for LightLLM project
 """
 
 import os
+import threading
 import torch
 from torch.utils.cpp_extension import load
 
@@ -31,22 +32,42 @@ _extra_cflags = [
     '-DNDEBUG',  # Disable assertions for performance
 ]
 
-# Load the compiled kernel
-_moe_lora_cpu_kernel = load(
-    name='moe_lora_cpu_kernel',
-    sources=[
-        os.path.join(os.path.dirname(__file__), 'moe_lora_cpu_kernel.cpp')
-    ],
-    extra_cflags=_extra_cflags,
-    verbose=False,
-)
+_moe_lora_cpu_kernel = None
+_load_failed = False
+_load_lock = threading.Lock()
+
+
+def ensure_kernel_loaded() -> None:
+    """JIT-compile the extension on first use (import stays non-blocking)."""
+    global _moe_lora_cpu_kernel, _load_failed  # noqa: PLW0603
+
+    if _moe_lora_cpu_kernel is not None or _load_failed:
+        return
+    with _load_lock:
+        if _moe_lora_cpu_kernel is not None or _load_failed:
+            return
+        try:
+            _moe_lora_cpu_kernel = load(
+                name="moe_lora_cpu_kernel",
+                sources=[os.path.join(os.path.dirname(__file__), "moe_lora_cpu_kernel.cpp")],
+                extra_cflags=_extra_cflags,
+                verbose=False,
+            )
+        except Exception:
+            _moe_lora_cpu_kernel = None
+            _load_failed = True
+
 
 def is_available():
     """Check if the MoE LoRA AVX-512 kernel is available on this system."""
+    ensure_kernel_loaded()
+    if _moe_lora_cpu_kernel is None:
+        return False
     try:
         return bool(_moe_lora_cpu_kernel.is_available())
-    except:
+    except Exception:
         return False
+
 
 def moe_batch_lora_avx(
     x: torch.Tensor,
@@ -69,6 +90,9 @@ def moe_batch_lora_avx(
     Returns:
         LoRA output [N, H]
     """
+    ensure_kernel_loaded()
+    if _moe_lora_cpu_kernel is None:
+        raise RuntimeError("moe_lora_cpu_kernel extension failed to load")
     output = torch.zeros_like(x)
     _moe_lora_cpu_kernel.moe_batch_lora_avx(
         x, A, B, output,
@@ -92,6 +116,9 @@ def moe_batch_lora_gate_avx(
     Returns:
         LoRA output [N, R]
     """
+    ensure_kernel_loaded()
+    if _moe_lora_cpu_kernel is None:
+        raise RuntimeError("moe_lora_cpu_kernel extension failed to load")
     output = torch.zeros(x.shape[0], A.shape[0], dtype=x.dtype, device=x.device)
     _moe_lora_cpu_kernel.moe_batch_lora_gate_avx(
         x, A, output,
@@ -115,6 +142,9 @@ def moe_batch_lora_up_avx(
     Returns:
         LoRA output [N, H]
     """
+    ensure_kernel_loaded()
+    if _moe_lora_cpu_kernel is None:
+        raise RuntimeError("moe_lora_cpu_kernel extension failed to load")
     output = torch.zeros(x.shape[0], B.shape[1], dtype=x.dtype, device=x.device)
     _moe_lora_cpu_kernel.moe_batch_lora_up_avx(
         x, B, output,
@@ -138,6 +168,9 @@ def moe_batch_lora_down_avx(
     Returns:
         LoRA output [N, H]
     """
+    ensure_kernel_loaded()
+    if _moe_lora_cpu_kernel is None:
+        raise RuntimeError("moe_lora_cpu_kernel extension failed to load")
     output = torch.zeros(x.shape[0], B.shape[1], dtype=x.dtype, device=x.device)
     _moe_lora_cpu_kernel.moe_batch_lora_down_avx(
         x, B, output,

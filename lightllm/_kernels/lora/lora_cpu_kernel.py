@@ -1,6 +1,7 @@
 # PyTorch binding for AVX-512 BF16 LoRA Kernel
 # This module provides JIT compilation and Python interface for the C++ AVX-512 kernels
 
+import threading
 import torch
 import os
 from torch.utils.cpp_extension import load_inline
@@ -71,21 +72,35 @@ try:
 except Exception:
     _extra_cflags.append('-D_GLIBCXX_USE_CXX11_ABI=0')
 
-# Try to load the extension
-try:
-    _lora_cpu_kernel = load_inline(
-        name="lora_cpu_kernel",
-        cpp_sources=[cpp_source],
-        extra_cflags=_extra_cflags,
-        functions=['lora_down_bindings', 'lora_up_bindings', 'batch_lora_bindings'],
-        verbose=True
-    )
-    _KERNEL_LOADED = True
-except Exception as e:
-    print(f"[LoRA CPU Kernel] Warning: Failed to load AVX-512 kernel: {e}")
-    print("[LoRA CPU Kernel] Falling back to PyTorch implementation")
-    _lora_cpu_kernel = None
-    _KERNEL_LOADED = False
+_lora_cpu_kernel = None
+_KERNEL_LOADED = False
+_load_failed = False
+_load_lock = threading.Lock()
+
+
+def ensure_kernel_loaded() -> None:
+    """JIT-compile the extension on first use (import stays non-blocking)."""
+    global _lora_cpu_kernel, _KERNEL_LOADED, _load_failed
+    if _KERNEL_LOADED or _load_failed:
+        return
+    with _load_lock:
+        if _KERNEL_LOADED or _load_failed:
+            return
+        try:
+            _lora_cpu_kernel = load_inline(
+                name="lora_cpu_kernel",
+                cpp_sources=[cpp_source],
+                extra_cflags=_extra_cflags,
+                functions=["lora_down_bindings", "lora_up_bindings", "batch_lora_bindings"],
+                verbose=True,
+            )
+            _KERNEL_LOADED = True
+        except Exception as e:
+            print(f"[LoRA CPU Kernel] Warning: Failed to load AVX-512 kernel: {e}")
+            print("[LoRA CPU Kernel] Falling back to PyTorch implementation")
+            _lora_cpu_kernel = None
+            _load_failed = True
+            _KERNEL_LOADED = False
 
 @NvtxAnnotate("batch_lora_avx")
 def batch_lora_avx(
@@ -107,6 +122,7 @@ def batch_lora_avx(
     Returns:
         Output tensor [batch, hidden_out] (bfloat16, CPU)
     """
+    ensure_kernel_loaded()
     if not _KERNEL_LOADED:
         raise RuntimeError("AVX-512 kernel not loaded")
 
@@ -165,6 +181,7 @@ def lora_down_avx(
     Returns:
         Output tensor [batch, rank] (bfloat16, CPU)
     """
+    ensure_kernel_loaded()
     if not _KERNEL_LOADED:
         raise RuntimeError("AVX-512 kernel not loaded")
 
@@ -202,6 +219,7 @@ def lora_up_avx(
     Returns:
         Output tensor [batch, hidden] (bfloat16, CPU)
     """
+    ensure_kernel_loaded()
     if not _KERNEL_LOADED:
         raise RuntimeError("AVX-512 kernel not loaded")
 
