@@ -39,9 +39,9 @@ class MoEExpertCacheConfig:
     # Eviction (evict_one): score = F*freq + R*recency + S*size; lowest score is evicted first.
     # Frequency is log1p(access_count) normalized to [0, 1] using eviction_frequency_cap.
     eviction_frequency_cap: int = 1_000_000
-    eviction_weight_frequency: float = 1.0
-    eviction_weight_recency: float = 1.0
-    eviction_weight_size: float = 1.0
+    eviction_weight_frequency: float = 0.45
+    eviction_weight_recency: float = 0.10
+    eviction_weight_size: float = 0.45
 
 
 def _eviction_frequency_bounded(access_count: int, cap: int) -> float:
