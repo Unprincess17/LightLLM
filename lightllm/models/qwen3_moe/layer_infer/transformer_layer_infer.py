@@ -922,47 +922,52 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
         # ----------------------------------------------------------------
 
         # 1. Router computation
-        router_logits = layer_weight.moe_gate.mm(hidden_states)
+        with NvtxAnnotate("MoE_SlowPath_RouterComputation"):
+            router_logits = layer_weight.moe_gate.mm(hidden_states)
 
         # 2. Explicit routing
-        topk_weights, topk_ids = select_experts(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-            correction_bias=getattr(layer_weight.experts, "e_score_correction_bias", None),
-            top_k=self.num_experts_per_tok,
-            renormalize=self.norm_topk_prob,
-            use_grouped_topk=False,
-            topk_group=None,
-            num_expert_group=None,
-            scoring_func=getattr(layer_weight.experts, "scoring_func", "softmax"),
-        )
+        with NvtxAnnotate("MoE_SlowPath_TopKRouting"):
+            topk_weights, topk_ids = select_experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                correction_bias=getattr(layer_weight.experts, "e_score_correction_bias", None),
+                top_k=self.num_experts_per_tok,
+                renormalize=self.norm_topk_prob,
+                use_grouped_topk=False,
+                topk_group=None,
+                num_expert_group=None,
+                scoring_func=getattr(layer_weight.experts, "scoring_func", "softmax"),
+            )
 
         if hasattr(layer_weight.experts, "routed_scaling_factor"):
-            # topk_weights = topk_weights * layer_weight.experts.routed_scaling_factor
-            topk_weights.mul_(layer_weight.experts.routed_scaling_factor)
+            with NvtxAnnotate("MoE_SlowPath_RoutedScaling"):
+                # topk_weights = topk_weights * layer_weight.experts.routed_scaling_factor
+                topk_weights.mul_(layer_weight.experts.routed_scaling_factor)
 
-        self._log_adapter_expert_distribution(
-            topk_ids=topk_ids,
-            req_bins=self.req_bins_,
-            num_experts=layer_weight.experts.n_routed_experts,
-            num_tokens=num_tokens,
-            infer_state=infer_state,
-        )
-        self._log_router_trace(
-            topk_ids=topk_ids,
-            topk_weights=topk_weights,
-            num_tokens=num_tokens,
-            infer_state=infer_state,
-        )
+        with NvtxAnnotate("MoE_SlowPath_RouterLogging"):
+            self._log_adapter_expert_distribution(
+                topk_ids=topk_ids,
+                req_bins=self.req_bins_,
+                num_experts=layer_weight.experts.n_routed_experts,
+                num_tokens=num_tokens,
+                infer_state=infer_state,
+            )
+            self._log_router_trace(
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+                num_tokens=num_tokens,
+                infer_state=infer_state,
+            )
 
-        return self._moe_ffn_pipelined_per_expert_from_topk(
-            hidden_states,
-            topk_weights,
-            topk_ids,
-            infer_state,
-            layer_weight,
-            colora_stats,
-        )
+        with NvtxAnnotate("MoE_SlowPath_DispatchToPipeline"):
+            return self._moe_ffn_pipelined_per_expert_from_topk(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                infer_state,
+                layer_weight,
+                colora_stats,
+            )
 
     def _moe_ffn_pipelined_per_expert_from_topk(
         self,
@@ -974,35 +979,36 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
         colora_stats: Dict[str, Any],
     ) -> torch.Tensor:
         """Shared MoE slow path: cluster tokens by expert, HtoD prefetch + compute stream pipeline, COLoRA LoRA."""
-        num_tokens, hidden_dim = hidden_states.shape
-        assert topk_ids.shape[0] == num_tokens and topk_weights.shape[0] == num_tokens
+        with NvtxAnnotate("MoE_PipelinePrelude"):
+            num_tokens, hidden_dim = hidden_states.shape
+            assert topk_ids.shape[0] == num_tokens and topk_weights.shape[0] == num_tokens
 
-        # 3. Check weights availability
-        experts = layer_weight.experts
-        # 必须确保使用了 keep_expert_lists=True
-        assert hasattr(experts, "experts_gate_projs") and experts.experts_gate_projs[0] is not None, (
-            "Per-Expert Baseline requires 'keep_expert_lists=True' in FusedMoeWeightTP."
-        )
+            # 3. Check weights availability
+            experts = layer_weight.experts
+            # 必须确保使用了 keep_expert_lists=True
+            assert hasattr(experts, "experts_gate_projs") and experts.experts_gate_projs[0] is not None, (
+                "Per-Expert Baseline requires 'keep_expert_lists=True' in FusedMoeWeightTP."
+            )
 
-        final_output = torch.zeros_like(hidden_states)
-        total_experts = experts.n_routed_experts
+            final_output = torch.zeros_like(hidden_states)
+            total_experts = experts.n_routed_experts
 
-        # EP mode: get local expert info
-        is_ep, local_expert_ids, local_to_global, global_to_local = self._get_local_expert_info(layer_weight)
+            # EP mode: get local expert info
+            is_ep, local_expert_ids, local_to_global, global_to_local = self._get_local_expert_info(layer_weight)
 
-        # 4. Expert Loop with Compute-Transfer Pipelining
-        # In TP mode: iterate over all experts
-        # In EP mode: iterate only over local experts
-        expert_iter_range = local_expert_ids if is_ep else range(total_experts)
+            # 4. Expert Loop with Compute-Transfer Pipelining
+            # In TP mode: iterate over all experts
+            # In EP mode: iterate only over local experts
+            expert_iter_range = local_expert_ids if is_ep else range(total_experts)
 
-        # Log token distribution per expert before entering the loop
-        if logger.isEnabledFor(logging.DEBUG):
-            token_counts = {}
-            for global_eid in (local_to_global.values() if is_ep else range(total_experts)):
-                count = int((topk_ids == global_eid).sum())
-                if count > 0:
-                    token_counts[global_eid] = count
-            logger.debug(f"[MoE] Layer {self.layer_num_}: {num_tokens} tokens -> {token_counts}")
+            # Log token distribution per expert before entering the loop
+            if logger.isEnabledFor(logging.DEBUG):
+                token_counts = {}
+                for global_eid in (local_to_global.values() if is_ep else range(total_experts)):
+                    count = int((topk_ids == global_eid).sum())
+                    if count > 0:
+                        token_counts[global_eid] = count
+                logger.debug(f"[MoE] Layer {self.layer_num_}: {num_tokens} tokens -> {token_counts}")
 
         with NvtxAnnotate("MoE_ActiveExpertExtraction_Optimized"):
             # 1. 扁平化 topk_ids [num_tokens * top_k]

@@ -2103,6 +2103,16 @@ class Qwen3VLMoELoRADispatcher:
             if promoted_now:
                 ready_slots.update(promoted_now)
                 miss_keys = [key for key in miss_keys if key not in promoted_now]
+            if miss_keys:
+                promotion_t0 = time.perf_counter()
+                promotion_result = manager.promote_blocking(miss_keys)
+                blocking_promotion_time += max(time.perf_counter() - promotion_t0, 0.0)
+                blocking_promotion_bytes += float(promotion_result.transferred_bytes)
+                blocking_promotion_count += int(promotion_result.promoted_count)
+                ready_slots.update(promotion_result.ready_slots)
+                miss_keys = [key for key in miss_keys if key not in promotion_result.ready_slots]
+                if miss_keys:
+                    raise RuntimeError(f"COLoRA load_then_run left unresolved misses: {miss_keys!r}")
         if miss_keys and miss_policy == MISS_POLICY_NO_CPU_PATH:
             promotion_t0 = time.perf_counter()
             promotion_result = manager.promote_blocking(miss_keys)
@@ -2251,9 +2261,9 @@ class Qwen3VLMoELoRADispatcher:
                         gpu_compute_time += time.perf_counter() - t0
                 else:
                     # Kernel unavailable or GPU cache not ready: degrade to CPU path.
-                    if miss_policy == MISS_POLICY_NO_CPU_PATH:
+                    if miss_policy in (MISS_POLICY_NO_CPU_PATH, MISS_POLICY_LOAD_THEN_RUN):
                         raise RuntimeError(
-                            "COLoRA no_cpu_path requires GPU cached execution on the promoted hot path; CPU fallback is not allowed."
+                            f"COLoRA {miss_policy} requires GPU cached execution on the promoted hot path; CPU fallback is not allowed."
                         )
                     hit_mask = torch.zeros_like(valid_bins, dtype=torch.bool)
                     miss_mask = torch.ones_like(valid_bins, dtype=torch.bool)
@@ -2272,8 +2282,8 @@ class Qwen3VLMoELoRADispatcher:
         with NvtxAnnotate("COLoRA_MissPath_ExecuteAndCommit"):
             if torch.any(miss_mask):
                 assert miss_pos is not None and miss_bins is not None
-                if miss_policy == MISS_POLICY_NO_CPU_PATH:
-                    raise RuntimeError("COLoRA no_cpu_path cannot execute remaining misses on the CPU path.")
+                if miss_policy in (MISS_POLICY_NO_CPU_PATH, MISS_POLICY_LOAD_THEN_RUN):
+                    raise RuntimeError(f"COLoRA {miss_policy} cannot execute remaining misses on the CPU path.")
                 if miss_future is not None:
                     with NvtxAnnotate("COLoRA_CPU_Miss_Path_AsyncJoin"):
                         miss_output, queue_wait, cpu_t, kernel_calls, kernel_tokens = miss_future.result()
