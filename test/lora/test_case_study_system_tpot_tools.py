@@ -1,5 +1,6 @@
 import csv
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -7,6 +8,7 @@ import pytest
 
 
 _ROOT = Path(__file__).resolve().parents[2]
+_CALIBRATION_V2_PATH = _ROOT / "artifacts/case_study/router_lora_case_v1/calibration/system_baseline_calib_v2.json"
 
 
 def _load_module(rel_path: str, module_name: str):
@@ -24,6 +26,12 @@ system_tpot_mod = _load_module("tools/case_study/analyze_system_tpot.py", "case_
 def _read_csv_rows(path: Path):
     with path.open("r", encoding="utf-8", newline="") as handle:
         return list(csv.DictReader(handle))
+
+
+def _write_jsonl(path: Path, rows):
+    with path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row) + "\n")
 
 
 def test_write_condition_merged_csv_preserves_unselected_conditions(tmp_path: Path):
@@ -135,3 +143,80 @@ def test_validate_execution_first_calibration_rejects_missing_cold_path_profile(
             calibration={"overlap_windows_ms": {"1": {"early": {"p50_ms": 0.1, "mean_ms": 0.1, "p90_ms": 0.1}, "late": {"p50_ms": 0.1, "mean_ms": 0.1, "p90_ms": 0.1}}}},
             load_profile="stressed",
         )
+
+
+@pytest.mark.parametrize("load_profile", ["idle", "stressed"])
+def test_validate_execution_first_calibration_artifact_has_required_cold_path_curves(load_profile: str):
+    calibration = json.loads(_CALIBRATION_V2_PATH.read_text(encoding="utf-8"))
+    system_tpot_mod.validate_execution_first_calibration(
+        calibration=calibration,
+        load_profile=load_profile,
+        tool_name="pytest",
+    )
+
+
+def test_build_replay_policy_state_uses_decode_iteration_distance_for_execution_first(tmp_path: Path):
+    joined_indep_path = tmp_path / "joined_trace_indep.jsonl"
+    joined_corr_path = tmp_path / "joined_trace_corr.jsonl"
+
+    base_rows = [
+        {
+            "arrival_idx": 0,
+            "req_idx": 0,
+            "adapter_id": "lora_0",
+            "event_idx": 0,
+            "layer_id": 0,
+            "token_pos": 0,
+            "phase": "decode",
+            "expert_id": 1,
+        },
+        {
+            "arrival_idx": 0,
+            "req_idx": 0,
+            "adapter_id": "lora_0",
+            "event_idx": 0,
+            "layer_id": 1,
+            "token_pos": 0,
+            "phase": "decode",
+            "expert_id": 2,
+        },
+        {
+            "arrival_idx": 0,
+            "req_idx": 0,
+            "adapter_id": "lora_0",
+            "event_idx": 0,
+            "layer_id": 0,
+            "token_pos": 1,
+            "phase": "decode",
+            "expert_id": 1,
+        },
+        {
+            "arrival_idx": 0,
+            "req_idx": 0,
+            "adapter_id": "lora_0",
+            "event_idx": 0,
+            "layer_id": 1,
+            "token_pos": 1,
+            "phase": "decode",
+            "expert_id": 2,
+        },
+    ]
+    indep_rows = [{**row, "mapping_mode": "indep"} for row in base_rows]
+    corr_rows = [{**row, "mapping_mode": "corr"} for row in base_rows]
+    _write_jsonl(joined_indep_path, indep_rows)
+    _write_jsonl(joined_corr_path, corr_rows)
+
+    stream = system_tpot_mod.build_system_streams(
+        joined_indep_path=joined_indep_path,
+        joined_corr_path=joined_corr_path,
+        total_events=len(base_rows),
+        progress_every=0,
+    )
+    policy_state = system_tpot_mod.build_replay_policy_state(
+        stream=stream,
+        access_buffer=stream.condition_buffers["expert_only"],
+        enable_temporal_prefetch=False,
+    )
+
+    assert stream.decode_step_ids.tolist() == [0, 0, 1, 1]
+    assert policy_state.next_decode_reuse_distance.tolist() == [1, 1, -1, -1]

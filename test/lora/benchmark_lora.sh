@@ -37,27 +37,40 @@ Server pass-through options:
   --max_req_total_len N
   --mem_fraction F
   --batch_max_tokens N
+  --trust_remote_code | --no_trust_remote_code
+  --disable_cudagraph | --no_disable_cudagraph
+  --enable_multimodal | --no_enable_multimodal
+  --lora_max_size N
+  --mock_prefill_logits | --no_mock_prefill_logits
   --colora_cache_budget_mb MB
   --colora_promote_min_hits N
   --colora_promote_window N
   --colora_max_promote_per_step N
   --colora_decay F
+  --colora_deferred_promotion_delta_steps N
+  --colora_promotion_ema_alpha F
   --colora_miss_policy STR
+  --colora_overlap_mode full|no_overlap
   --colora_async_fallback 0|1
   --colora_cpu_workers N
   --colora_cpu_queue_depth N
   --colora_cpu_batch_timeout_us N
+  --colora_temporal_prefetch | --no_colora_temporal_prefetch
+  --colora_temporal_prefetch_layer_whitelist CSV
+  --colora_temporal_hot_cache_slots N
   --colora_speculative_dispatch | --no_colora_speculative_dispatch
   --colora_spec_layer_whitelist CSV
   --server_log_path PATH
   --server_stdout_log PATH
+  --server_host HOST          Bind / health-check host (default: localhost)
+  --server_port PORT          Bind port for server and client URL (default: 8040)
 USAGE
 }
 
 
 # Default values
 SETUP_DELAY=10
-MAX_WAIT=1200
+MAX_WAIT=2000
 OUTPUT_PREFIX="moe_offload_profile"
 TEST_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEST_SCRIPT="$TEST_SCRIPT_DIR/test_moe_lora_api.py"
@@ -68,7 +81,6 @@ IGNORE_EOS=1
 SERVER_SCRIPT="$TEST_SCRIPT_DIR/start_server.sh"
 SERVER_HOST="localhost"
 SERVER_PORT=8040
-SERVER_URL="http://$SERVER_HOST:$SERVER_PORT"
 ADAPTER_IDS="lora_dummy_0,lora_dummy_1,lora_dummy_2,lora_dummy_3,lora_dummy_4,lora_dummy_5,lora_dummy_6,lora_dummy_7,lora_dummy_8,lora_dummy_9"
 ADAPTER_IDS_SET="0"
 POISSON_LAMBDA=3.0
@@ -77,7 +89,7 @@ WARMUP_ADAPTER_TRACE_PATH=""
 MEASURE_ADAPTER_TRACE_PATH=""
 WARMUP_NUM_REQUESTS=""
 MEASURE_NUM_REQUESTS=""
-PHASE_GAP_S="0"
+PHASE_GAP_S="10"
 ADAPTER_EXPERT_PROFILE=0
 ADAPTER_EXPERT_LOG_PATH="/tmp/moe_adapter_expert_profile.log"
 PRINT_PER_REQUEST=0
@@ -91,6 +103,11 @@ FORCE_SLOW_LORA_PATH="1"
 MAX_REQ_TOTAL_LEN=""
 MEM_FRACTION=""
 BATCH_MAX_TOKENS=""
+TRUST_REMOTE_CODE=""
+DISABLE_CUDAGRAPH=""
+ENABLE_MULTIMODAL=""
+LORA_MAX_SIZE=""
+MOCK_PREFILL_LOGITS=""
 COLORA_CACHE_BUDGET_MB=""
 COLORA_PROMOTE_MIN_HITS="1"
 COLORA_PROMOTE_WINDOW="512"
@@ -99,6 +116,7 @@ COLORA_DECAY=""
 COLORA_DEFERRED_PROMOTION_DELTA_STEPS=""
 COLORA_PROMOTION_EMA_ALPHA=""
 COLORA_MISS_POLICY=""
+COLORA_OVERLAP_MODE=""
 COLORA_ASYNC_FALLBACK=""
 COLORA_CPU_WORKERS="8"
 COLORA_CPU_QUEUE_DEPTH="512"
@@ -126,7 +144,8 @@ terminate_server_tree() {
 
     echo "[Cleanup] Stopping server tree rooted at PID $pid..."
 
-    kill -INT "$pid" 2>/dev/null || true
+    # Prefer signaling the whole process group to stop launcher + workers together.
+    kill -INT -- "-$pid" 2>/dev/null || kill -INT "$pid" 2>/dev/null || true
     for _ in $(seq 1 20); do
         if ! kill -0 "$pid" 2>/dev/null; then
             return 0
@@ -135,11 +154,50 @@ terminate_server_tree() {
     done
 
     pkill -TERM -P "$pid" 2>/dev/null || true
-    kill -TERM "$pid" 2>/dev/null || true
+    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
     sleep 2
 
     pkill -KILL -P "$pid" 2>/dev/null || true
-    kill -KILL "$pid" 2>/dev/null || true
+    kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+}
+
+# SIGKILL immediately after measurement can corrupt Nsight .qdstrm; try SIGTERM first.
+# Gunicorn respawns workers on worker SIGKILL; kill gunicorn masters early in the SIGKILL phase.
+finish_profiling_children() {
+    local max_wait_s="${1:-90}"
+    local _pat="lightllm.server|lightllm::|gunicorn|python.*api_server|multiprocessing.resource_tracker|multiprocessing.spawn|multiprocessing.forkserver"
+    pkill -TERM -f "lightllm.server|lightllm::|gunicorn|python.*api_server" 2>/dev/null || true
+    pkill -TERM -f "multiprocessing.resource_tracker|multiprocessing.spawn|multiprocessing.forkserver" 2>/dev/null || true
+    local w=0
+    while (( w < max_wait_s )); do
+        if ! pgrep -f "$_pat" >/dev/null; then
+            return 0
+        fi
+        sleep 1
+        w=$((w + 1))
+    done
+    echo "[Cleanup] Some processes still alive after ${max_wait_s}s; sending SIGKILL..."
+    pkill -KILL -f "gunicorn" 2>/dev/null || true
+    sleep 2
+    local r _p
+    for r in $(seq 1 20); do
+        while read -r _p; do
+            [[ -z "$_p" || "$_p" == "$$" ]] && continue
+            kill -KILL "$_p" 2>/dev/null || true
+        done < <(pgrep -f "$_pat" 2>/dev/null || true)
+        pkill -KILL -f "gunicorn" 2>/dev/null || true
+        if ! pgrep -f "$_pat" >/dev/null; then
+            return 0
+        fi
+        sleep 1
+    done
+    pkill -KILL -f "lightllm.server|lightllm::|gunicorn|python.*api_server" 2>/dev/null || true
+    pkill -KILL -f "multiprocessing.resource_tracker|multiprocessing.spawn|multiprocessing.forkserver" 2>/dev/null || true
+    sleep 1
+    if pgrep -f "$_pat" >/dev/null; then
+        echo "[Cleanup] WARNING: processes may still be alive; run: pgrep -af 'lightllm|gunicorn'"
+        pgrep -af "lightllm|gunicorn" 2>/dev/null || true
+    fi
 }
 
 build_phase_args() {
@@ -153,6 +211,7 @@ build_phase_args() {
     local prompt_namespace="$8"
 
     out_arr=(
+        --url "$SERVER_URL"
         --max_tokens "$MAX_TOKENS"
         --adapter_ids "$ADAPTER_IDS"
         --poisson_lambda "$POISSON_LAMBDA"
@@ -187,6 +246,14 @@ run_client_phase() {
     shift
 
     echo "===== ${phase_name} =====" | tee -a benchmark_lora.log
+
+    # Print exact client command
+    printf "Running client command: python %q" "$TEST_SCRIPT"
+    for arg in "$@"; do
+        printf " %q" "$arg"
+    done
+    printf "\n" | tee -a benchmark_lora.log
+
     python "$TEST_SCRIPT" "$@" 2>&1 | tee -a benchmark_lora.log
 }
 
@@ -229,6 +296,15 @@ while [[ $# -gt 0 ]]; do
         --max_req_total_len) MAX_REQ_TOTAL_LEN="$2"; shift 2 ;;
         --mem_fraction) MEM_FRACTION="$2"; shift 2 ;;
         --batch_max_tokens) BATCH_MAX_TOKENS="$2"; shift 2 ;;
+        --trust_remote_code) TRUST_REMOTE_CODE="1"; shift ;;
+        --no_trust_remote_code) TRUST_REMOTE_CODE="0"; shift ;;
+        --disable_cudagraph) DISABLE_CUDAGRAPH="1"; shift ;;
+        --no_disable_cudagraph) DISABLE_CUDAGRAPH="0"; shift ;;
+        --enable_multimodal) ENABLE_MULTIMODAL="1"; shift ;;
+        --no_enable_multimodal) ENABLE_MULTIMODAL="0"; shift ;;
+        --lora_max_size) LORA_MAX_SIZE="$2"; shift 2 ;;
+        --mock_prefill_logits) MOCK_PREFILL_LOGITS="1"; shift ;;
+        --no_mock_prefill_logits) MOCK_PREFILL_LOGITS="0"; shift ;;
         --colora_cache_budget_mb) COLORA_CACHE_BUDGET_MB="$2"; shift 2 ;;
         --colora_promote_min_hits) COLORA_PROMOTE_MIN_HITS="$2"; shift 2 ;;
         --colora_promote_window) COLORA_PROMOTE_WINDOW="$2"; shift 2 ;;
@@ -237,11 +313,13 @@ while [[ $# -gt 0 ]]; do
         --colora_deferred_promotion_delta_steps) COLORA_DEFERRED_PROMOTION_DELTA_STEPS="$2"; shift 2 ;;
         --colora_promotion_ema_alpha) COLORA_PROMOTION_EMA_ALPHA="$2"; shift 2 ;;
         --colora_miss_policy) COLORA_MISS_POLICY="$2"; shift 2 ;;
+        --colora_overlap_mode) COLORA_OVERLAP_MODE="$2"; shift 2 ;;
         --colora_async_fallback) COLORA_ASYNC_FALLBACK="$2"; shift 2 ;;
         --colora_cpu_workers) COLORA_CPU_WORKERS="$2"; shift 2 ;;
         --colora_cpu_queue_depth) COLORA_CPU_QUEUE_DEPTH="$2"; shift 2 ;;
         --colora_cpu_batch_timeout_us) COLORA_CPU_BATCH_TIMEOUT_US="$2"; shift 2 ;;
         --colora_temporal_prefetch) COLORA_TEMPORAL_PREFETCH="1"; shift ;;
+        --no_colora_temporal_prefetch) COLORA_TEMPORAL_PREFETCH="0"; shift ;;
         --colora_temporal_prefetch_layer_whitelist) COLORA_TEMPORAL_PREFETCH_LAYER_WHITELIST="$2"; shift 2 ;;
         --colora_temporal_hot_cache_slots) COLORA_TEMPORAL_HOT_CACHE_SLOTS="$2"; shift 2 ;;
         --colora_speculative_dispatch) COLORA_SPECULATIVE_DISPATCH="1"; shift ;;
@@ -251,6 +329,8 @@ while [[ $# -gt 0 ]]; do
 		--colora_max_continuations) COLORA_MAX_CONTINUATIONS="$2"; shift 2 ;;
         --server_log_path) SERVER_LOG_PATH="$2"; shift 2 ;;
         --server_stdout_log) SERVER_STDOUT_LOG="$2"; shift 2 ;;
+        --server_host) SERVER_HOST="$2"; shift 2 ;;
+        --server_port) SERVER_PORT="$2"; shift 2 ;;
         --print_per_request) PRINT_PER_REQUEST=1; shift ;;
         --no_print_per_request) PRINT_PER_REQUEST=0; shift ;;
         --top_k_slowest) TOP_K_SLOWEST="$2"; shift 2 ;;
@@ -260,6 +340,8 @@ while [[ $# -gt 0 ]]; do
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
+
+SERVER_URL="http://$SERVER_HOST:$SERVER_PORT"
 
 if [[ -z "$SERVER_LOG_PATH" ]]; then
     SERVER_LOG_PATH="/tmp/${OUTPUT_PREFIX}_server.log"
@@ -312,20 +394,18 @@ cleanup() {
     echo "[Cleanup] Tearing down benchmark processes..."
     trap - INT TERM EXIT # Disable traps to avoid recursion
 
-    if [[ -n "$SERVER_PID" ]]; then
-        # Fast kill - skip the 20-second wait in terminate_server_tree
-        kill -INT "$SERVER_PID" 2>/dev/null || true
-        sleep 2
-        # Hard kill immediately if still running
-        pkill -KILL -P "$SERVER_PID" 2>/dev/null || true
-        kill -KILL "$SERVER_PID" 2>/dev/null || true
-        wait "$SERVER_PID" 2>/dev/null || true
-        SERVER_PID=""
-    fi
+    # if [[ -n "$SERVER_PID" ]]; then
+    #     # Fast kill - skip the 20-second wait in terminate_server_tree
+    #     kill -INT "$SERVER_PID" 2>/dev/null || true
+    #     sleep 2
+    #     # Hard kill immediately if still running
+    #     pkill -KILL -P "$SERVER_PID" 2>/dev/null || true
+    #     kill -KILL "$SERVER_PID" 2>/dev/null || true
+    #     wait "$SERVER_PID" 2>/dev/null || true
+    #     SERVER_PID=""
+    # fi
 
-    # Force kill all remaining processes
-    pkill -9 -f "lightllm.server|lightllm::|gunicorn|python.*api_server" 2>/dev/null || true
-    pkill -9 -f "multiprocessing.resource_tracker|multiprocessing.spawn|multiprocessing.forkserver" 2>/dev/null || true
+    finish_profiling_children 30
 
     # Fast shared memory cleanup with 5s timeout
     echo "[Cleanup] Removing shared memory segments..."
@@ -338,9 +418,11 @@ trap cleanup EXIT
 
 # Step 0: clean up old processes if any
 echo "cleanup processes"
-pgrep -f "lightllm.server|lightllm::|gunicorn|multiprocessing.resource_tracker|multiprocessing.spawn" && echo "Killing old processes..." && \
-pkill -9 -f "lightllm.server|lightllm::|gunicorn" && \
-pkill -9 -f "multiprocessing.resource_tracker|multiprocessing.spawn"
+if pgrep -f "lightllm.server|lightllm::|gunicorn|multiprocessing.resource_tracker|multiprocessing.spawn" >/dev/null; then
+    echo "Killing old processes..."
+    pkill -9 -f "lightllm.server|lightllm::|gunicorn" 2>/dev/null || true
+    pkill -9 -f "multiprocessing.resource_tracker|multiprocessing.spawn" 2>/dev/null || true
+fi
 
 echo > $ADAPTER_EXPERT_LOG_PATH
 
@@ -350,6 +432,7 @@ echo "=============================================="
 echo "Starting MoE Profiling"
 echo "=============================================="
 echo "Adapter IDs: $ADAPTER_IDS"
+echo "Number of adapters: $(echo "$ADAPTER_IDS" | tr ',' '\n' | wc -l)"
 echo "Poisson lambda: $POISSON_LAMBDA"
 echo "Poisson seed: $POISSON_SEED"
 echo "Max tokens (fallback): $MAX_TOKENS"
@@ -456,6 +539,29 @@ fi
 if [[ -n "$BATCH_MAX_TOKENS" ]]; then
     SERVER_ARGS+=(--batch_max_tokens "$BATCH_MAX_TOKENS")
 fi
+if [[ "$TRUST_REMOTE_CODE" == "1" ]]; then
+    SERVER_ARGS+=(--trust_remote_code)
+elif [[ "$TRUST_REMOTE_CODE" == "0" ]]; then
+    SERVER_ARGS+=(--no_trust_remote_code)
+fi
+if [[ "$DISABLE_CUDAGRAPH" == "1" ]]; then
+    SERVER_ARGS+=(--disable_cudagraph)
+elif [[ "$DISABLE_CUDAGRAPH" == "0" ]]; then
+    SERVER_ARGS+=(--no_disable_cudagraph)
+fi
+if [[ "$ENABLE_MULTIMODAL" == "1" ]]; then
+    SERVER_ARGS+=(--enable_multimodal)
+elif [[ "$ENABLE_MULTIMODAL" == "0" ]]; then
+    SERVER_ARGS+=(--no_enable_multimodal)
+fi
+if [[ -n "$LORA_MAX_SIZE" ]]; then
+    SERVER_ARGS+=(--lora_max_size "$LORA_MAX_SIZE")
+fi
+if [[ "$MOCK_PREFILL_LOGITS" == "1" ]]; then
+    SERVER_ARGS+=(--mock_prefill_logits)
+elif [[ "$MOCK_PREFILL_LOGITS" == "0" ]]; then
+    SERVER_ARGS+=(--no_mock_prefill_logits)
+fi
 if [[ -n "$COLORA_CACHE_BUDGET_MB" ]]; then
     SERVER_ARGS+=(--colora_cache_budget_mb "$COLORA_CACHE_BUDGET_MB")
 fi
@@ -479,6 +585,9 @@ if [[ -n "$COLORA_PROMOTION_EMA_ALPHA" ]]; then
 fi
 if [[ -n "$COLORA_MISS_POLICY" ]]; then
     SERVER_ARGS+=(--colora_miss_policy "$COLORA_MISS_POLICY")
+fi
+if [[ -n "$COLORA_OVERLAP_MODE" ]]; then
+    SERVER_ARGS+=(--colora_overlap_mode "$COLORA_OVERLAP_MODE")
 fi
 if [[ -n "$COLORA_ASYNC_FALLBACK" ]]; then
     SERVER_ARGS+=(--colora_async_fallback "$COLORA_ASYNC_FALLBACK")
@@ -515,14 +624,16 @@ if [[ -n "$COLORA_MAX_CONTINUATIONS" ]]; then
 fi
 # Redirect server output
 if [[ -n "$SERVER_STDOUT_LOG" ]]; then
-    # User specified explicit output location for stdout/stderr
-    bash "$SERVER_SCRIPT" "${SERVER_ARGS[@]}" 2>&1 | tee -a "$SERVER_STDOUT_LOG" &
+    # User specified explicit output location for stdout/stderr.
+    # Use process substitution so $! is the server launcher PID (not tee PID).
+    bash "$SERVER_SCRIPT" "${SERVER_ARGS[@]}" > >(tee -a "$SERVER_STDOUT_LOG") 2>&1 &
 elif [[ -z "$SERVER_LOG_PATH" || "$SERVER_LOG_PATH" == "/dev/null" ]]; then
     # Output only to stdout/stderr
     bash "$SERVER_SCRIPT" "${SERVER_ARGS[@]}" &
 else
-    # Default: output to both server log file AND stdout (so you see it in real time)
-    bash "$SERVER_SCRIPT" "${SERVER_ARGS[@]}" 2>&1 | tee "$SERVER_LOG_PATH" &
+    # Default: output to both server log file AND stdout.
+    # Use process substitution so shutdown targets the real server launcher tree.
+    bash "$SERVER_SCRIPT" "${SERVER_ARGS[@]}" > >(tee "$SERVER_LOG_PATH") 2>&1 &
 fi
 SERVER_PID=$!
 echo "Server PID: $SERVER_PID"
@@ -534,18 +645,38 @@ start_time=$SECONDS
 echo "[2/5] Waiting for server to be healthy..."
 
 while (( SECONDS - start_time < MAX_WAIT )); do
-    if nc -vz "$SERVER_HOST" "$SERVER_PORT" 2>/dev/null; then
+    # First check if process is still alive
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
         echo ""
-        echo "Server is UP (port $SERVER_PORT open)"
-        break
+        echo "ERROR: Server process exited early (PID $SERVER_PID)."
+        echo "Check server log at: $SERVER_LOG_PATH"
+        exit 1
+    fi
+
+    # First check port open
+    if nc -vz "$SERVER_HOST" "$SERVER_PORT" 2>/dev/null; then
+        # Port is open, try health checks
+        # Try /healthz first
+        if curl -sf "http://$SERVER_HOST:$SERVER_PORT/healthz" >/dev/null 2>&1; then
+            echo ""
+            echo "Server is HEALTHY (healthz check passed)"
+            break
+        fi
+        # Fallback to /health
+        if curl -sf "http://$SERVER_HOST:$SERVER_PORT/health" >/dev/null 2>&1; then
+            echo ""
+            echo "Server is HEALTHY (health check passed)"
+            break
+        fi
     fi
     echo -n "."
     sleep 5
 done
 
-# Check if server is ready (break sets server_ready=true)
+# Check if we timed out
 if [[ $(($SECONDS - start_time)) -ge $MAX_WAIT ]]; then
-    echo "ERROR: Server failed to start within ${MAX_WAIT}s."
+    echo "ERROR: Server failed to become healthy within ${MAX_WAIT}s."
+    echo "Check server log at: $SERVER_LOG_PATH"
     exit 1
 fi
 
@@ -585,21 +716,26 @@ fi
 SERVER_PID=""
 echo "[5/5] Server log saved to: $SERVER_LOG_PATH"
 
-# Extra thorough cleanup to ensure all processes are dead
-echo "[Cleanup] Killing all remaining lightllm and worker processes..."
-pkill -9 -f "lightllm.server|lightllm::|gunicorn|python.*api_server" 2>/dev/null || true
-pkill -9 -f "multiprocessing.resource_tracker|multiprocessing.spawn|multiprocessing.forkserver" 2>/dev/null || true
+echo "[Cleanup] Stopping remaining benchmark processes (graceful first, for valid nsys traces)..."
+finish_profiling_children 90
 
-# Wait for processes to exit and CUDA context to be released
+# Wait for CUDA context teardown
 sleep 5
 
-# Ensure no leftover processes are running
-while pgrep -f "lightllm.server|python.*api_server" >/dev/null; do
+# Bounded wait — avoids infinite hang if pgrep matches an unrelated long-lived process
+_SPIN=0
+while pgrep -f "lightllm.server|python.*api_server" >/dev/null && (( _SPIN < 45 )); do
     echo "Waiting for processes to exit..."
     sleep 2
+    _SPIN=$((_SPIN + 1))
 done
+if pgrep -f "lightllm.server|python.*api_server" >/dev/null; then
+    echo "[Cleanup] WARNING: pgrep still matches after ${_SPIN} waits; try: pgrep -af 'lightllm|api_server'"
+    finish_profiling_children 15
+fi
 
 echo "[5/5] Benchmark complete."
+echo "[Cleanup] If nsys is still running, it is usually waiting on traced children; try: nsys profile --wait=primary ... (faster shutdown, may drop orphan trace) or: pgrep -af lightllm"
 
 # Disable EXIT trap since we already did full cleanup
 trap - EXIT

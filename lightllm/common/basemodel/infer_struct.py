@@ -24,6 +24,7 @@ class InferStateInfo:
         self.b_req_idx: torch.Tensor = None
         self.b_adapter_bin: torch.Tensor = None
         self.b_trace_req_id: torch.Tensor = None
+        self.b_mtp_index: torch.Tensor = None
         self.decode_step_id: Optional[int] = None
         self.b_start_loc: torch.Tensor = None
         self.b_ready_cache_len: torch.Tensor = None  # only for prefill prompt cache used.
@@ -134,23 +135,27 @@ class InferStateInfo:
         if keep_indices.dim() != 1:
             keep_indices = keep_indices.view(-1)
 
-        self.b_req_idx = self.b_req_idx.index_select(0, keep_indices)
+        def _sel(tensor):
+            idx = keep_indices if tensor.device == keep_indices.device else keep_indices.to(device=tensor.device)
+            return tensor.index_select(0, idx)
+
+        self.b_req_idx = _sel(self.b_req_idx)
         if self.b_adapter_bin is not None:
-            self.b_adapter_bin = self.b_adapter_bin.index_select(0, keep_indices)
+            self.b_adapter_bin = _sel(self.b_adapter_bin)
         if self.b_trace_req_id is not None:
-            self.b_trace_req_id = self.b_trace_req_id.index_select(0, keep_indices)
+            self.b_trace_req_id = _sel(self.b_trace_req_id)
         if self.b_mtp_index is not None:
-            self.b_mtp_index = self.b_mtp_index.index_select(0, keep_indices)
+            self.b_mtp_index = _sel(self.b_mtp_index)
         if self.b_seq_len is not None:
-            self.b_seq_len = self.b_seq_len.index_select(0, keep_indices)
+            self.b_seq_len = _sel(self.b_seq_len)
         if self.mem_index is not None:
-            self.mem_index = self.mem_index.index_select(0, keep_indices)
+            self.mem_index = _sel(self.mem_index)
         if self.b_shared_seq_len is not None:
-            self.b_shared_seq_len = self.b_shared_seq_len.index_select(0, keep_indices)
+            self.b_shared_seq_len = _sel(self.b_shared_seq_len)
         if self.b_mark_shared_group is not None:
-            self.b_mark_shared_group = self.b_mark_shared_group.index_select(0, keep_indices)
+            self.b_mark_shared_group = _sel(self.b_mark_shared_group)
         if self.active_request_positions is not None:
-            self.active_request_positions = self.active_request_positions.index_select(0, keep_indices)
+            self.active_request_positions = _sel(self.active_request_positions)
 
         if self.multimodal_params is not None:
             keep_list = keep_indices.detach().cpu().tolist()

@@ -11,6 +11,10 @@ from tqdm import tqdm
 
 from lightllm.common.basemodel.layer_weights.hf_load_utils import load_hf_weights
 from lightllm.common.basemodel.infer_struct import InferStateInfo
+from lightllm.common.basemodel.decode_batch_empty import (
+    should_break_layer_loop,
+    should_emit_empty_logits,
+)
 from lightllm.common.kv_cache_mem_manager import MemoryManager
 from lightllm.common.kv_cache_mem_manager.mem_utils import select_mem_manager_class
 from lightllm.common.req_manager import ReqManager
@@ -618,10 +622,10 @@ class TpPartBaseModel:
             layer = self.layers_infer[i]
             layer_method = (layer.token_forward, layer.tpsp_token_forward)[run_mode_index]
             input_embs: torch.Tensor = layer_method(input_embs, infer_state, self.trans_layers_weight[i])
-            if infer_state.batch_size == 0:
+            if should_break_layer_loop(infer_state, input_embs):
                 break
 
-        if infer_state.batch_size == 0:
+        if should_emit_empty_logits(infer_state, input_embs):
             logits = torch.empty(
                 (0, self.pre_post_weight.lm_head_weight_.shape[0]),
                 dtype=torch.float32,
@@ -669,10 +673,10 @@ class TpPartBaseModel:
             layer = self.layers_infer[i]
             layer_method = (layer.token_forward, layer.tpsp_token_forward)[run_mode_index]
             input_embs: torch.Tensor = layer_method(input_embs, infer_state, self.trans_layers_weight[i])
-            if infer_state.batch_size == 0:
+            if should_break_layer_loop(infer_state, input_embs):
                 break
 
-        if infer_state.batch_size == 0:
+        if should_emit_empty_logits(infer_state, input_embs):
             logits = torch.empty(
                 (0, self.pre_post_weight.lm_head_weight_.shape[0]),
                 dtype=torch.float32,

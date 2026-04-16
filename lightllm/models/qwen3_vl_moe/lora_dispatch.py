@@ -87,6 +87,27 @@ except Exception:
     MOE_AVX_AVAILABLE = False
 
 
+def _colora_resolved_cpu_kernel_mode() -> str:
+    """Return ``naive`` or ``avx`` (default) from ``COLORA_CPU_KERNEL_MODE``."""
+    raw = os.environ.get("COLORA_CPU_KERNEL_MODE", "").strip().lower()
+    if raw == "naive":
+        return "naive"
+    return "avx"
+
+
+def _naive_moe_lora_gate(
+    batch_input: torch.Tensor, A: torch.Tensor, scaling: float
+) -> torch.Tensor:
+    _ = scaling
+    return torch.matmul(batch_input, A.transpose(0, 1))
+
+
+def _naive_moe_lora_stage2(
+    intermediate: torch.Tensor, B: torch.Tensor, scaling: float
+) -> torch.Tensor:
+    return torch.matmul(intermediate, B) * scaling
+
+
 def is_moe_cpu_kernel_available() -> bool:
     """Expose MoE kernel readiness for backend startup checks."""
     return bool(MOE_AVX_AVAILABLE)
@@ -178,6 +199,17 @@ class PrefetchedProjectionWeights:
     b_buffer: torch.Tensor
     rank: int
     scaling: float
+
+
+@dataclass
+class MoEHybridSharedPrepareContext:
+    """Projection-invariant hybrid-prepare metadata reused by Gate/Up/Down."""
+
+    batch_size: int
+    key_expert: int
+    valid_pos: torch.Tensor
+    valid_bins: torch.Tensor
+    adapter_ids_cpu: List[int]
 
 
 @dataclass
@@ -1162,113 +1194,135 @@ class Qwen3VLMoELoRADispatcher:
         return_to_original_device: bool = True,
         temporal_prefetch_context: Optional[Tuple[int, int, int]] = None,
     ) -> Tuple[torch.Tensor, int, int]:
-        """Strict MoE CPU fallback: force MoE-specific AVX kernel path."""
-        self._require_moe_cpu_kernel(mode=projection)
+        """Strict MoE CPU fallback: AVX MoE kernels or PyTorch reference (``naive``)."""
+        cpu_kernel_mode = _colora_resolved_cpu_kernel_mode()
+        if cpu_kernel_mode != "naive":
+            self._require_moe_cpu_kernel(mode=projection)
 
         if req_bins is None:
             req_bins = self.req_bins
         if req_bins is None:
             return self._get_output_buffer(input_tensor, pool), 0, 0
 
-        original_device = input_tensor.device
-        original_dtype = input_tensor.dtype
+        proj_lower = projection.lower()
+        nvtx_root = f"MoE_CPUStrictMoELoRA/{proj_lower}/L{int(layer_id)}/kern_{cpu_kernel_mode}"
+        with NvtxAnnotate(nvtx_root):
+            original_device = input_tensor.device
+            original_dtype = input_tensor.dtype
 
-        compute_input = input_tensor
-        if compute_input.device.type != "cpu":
-            compute_input = compute_input.to(device="cpu", non_blocking=True)
-        if compute_input.dtype != torch.bfloat16:
-            compute_input = compute_input.to(dtype=torch.bfloat16)
+            with NvtxAnnotate(f"{nvtx_root}/HostTensorPrep"):
+                compute_input = input_tensor
+                if compute_input.device.type != "cpu":
+                    compute_input = compute_input.to(device="cpu", non_blocking=True)
+                if compute_input.dtype != torch.bfloat16:
+                    compute_input = compute_input.to(dtype=torch.bfloat16)
 
-        batch_size = compute_input.shape[0]
-        output_dim = pool.value_buffer.shape[2]
-        output = torch.zeros(batch_size, output_dim, dtype=torch.bfloat16, device="cpu")
+            batch_size = compute_input.shape[0]
+            output_dim = pool.value_buffer.shape[2]
+            output = torch.zeros(batch_size, output_dim, dtype=torch.bfloat16, device="cpu")
 
-        if len(req_bins) > batch_size:
-            req_bins = req_bins[:batch_size]
+            if len(req_bins) > batch_size:
+                req_bins = req_bins[:batch_size]
 
-        if adapter_group_plan is not None:
-            adapter_groups = adapter_group_plan
-        else:
-            adapter_to_indices: Dict[int, List[int]] = {}
-            for i, bin_idx in enumerate(req_bins):
-                idx = int(bin_idx.item())
-                adapter_to_indices.setdefault(idx, []).append(i)
-            adapter_groups = tuple((adapter_idx, tuple(indices)) for adapter_idx, indices in adapter_to_indices.items())
+            if adapter_group_plan is not None:
+                adapter_groups = adapter_group_plan
+            else:
+                adapter_to_indices: Dict[int, List[int]] = {}
+                for i, bin_idx in enumerate(req_bins):
+                    idx = int(bin_idx.item())
+                    adapter_to_indices.setdefault(idx, []).append(i)
+                adapter_groups = tuple((adapter_idx, tuple(indices)) for adapter_idx, indices in adapter_to_indices.items())
 
-        stage2_kernel = self._select_moe_stage2_kernel(projection)
-        kernel_calls = 0
-        kernel_tokens = 0
-
-        for adapter_idx, req_indices_tuple in adapter_groups:
-            if adapter_idx < 0:
-                continue
-            req_indices = list(req_indices_tuple)
-            if len(req_indices) == 0:
-                continue
-
-            hot_weights = None
-            hot_handle = None
-            hot_status = "disabled"
-            if temporal_prefetch_context is not None:
-                hot_weights, hot_handle, hot_status = self._maybe_acquire_prefetched_projection(
-                    projection=projection,
-                    adapter_idx=int(adapter_idx),
-                    temporal_prefetch_context=temporal_prefetch_context,
-                )
-
-            try:
-                if hot_weights is not None:
-                    A = hot_weights.a_buffer[: hot_weights.rank]
-                    B = hot_weights.b_buffer[: hot_weights.rank]
-                    a_scaling = float(hot_weights.scaling)
-                    self._last_colora_stats["prefetch_ready_hits"] += 1
+            if cpu_kernel_mode == "naive":
+                gate_kernel = _naive_moe_lora_gate
+                if proj_lower in ("gate", "up", "down"):
+                    stage2_kernel = _naive_moe_lora_stage2
                 else:
-                    if hot_status == "filling":
-                        self._last_colora_stats["prefetch_not_ready"] += 1
-                    a_start = int(pool.a_start[adapter_idx].item())
-                    a_len = int(pool.a_len[adapter_idx].item())
-                    a_scaling = float(pool.a_scaling[adapter_idx].item())
-                    if hasattr(pool, "a_rank") and len(pool.a_rank) > adapter_idx:
-                        a_rank = int(pool.a_rank[adapter_idx].item())
-                    else:
-                        a_rank = int(a_len)
+                    raise ValueError(
+                        f"Unsupported MoE projection '{projection}', expected gate|up|down"
+                    )
+            else:
+                gate_kernel = moe_batch_lora_gate_avx
+                stage2_kernel = self._select_moe_stage2_kernel(projection)
+            kernel_calls = 0
+            kernel_tokens = 0
 
-                    loc = a_start + layer_id
-                    if loc >= a_start + a_len:
-                        continue
+            for adapter_idx, req_indices_tuple in adapter_groups:
+                if adapter_idx < 0:
+                    continue
+                req_indices = list(req_indices_tuple)
+                if len(req_indices) == 0:
+                    continue
 
-                    A = pool.key_buffer[loc, :a_rank]
-                    B = pool.value_buffer[loc, :a_rank]
+                hot_weights = None
+                hot_handle = None
+                hot_status = "disabled"
+                if temporal_prefetch_context is not None:
+                    hot_weights, hot_handle, hot_status = self._maybe_acquire_prefetched_projection(
+                        projection=projection,
+                        adapter_idx=int(adapter_idx),
+                        temporal_prefetch_context=temporal_prefetch_context,
+                    )
 
-                if A.device.type != "cpu" or A.dtype != torch.bfloat16:
-                    A = A.to(device="cpu", dtype=torch.bfloat16)
-                if B.device.type != "cpu" or B.dtype != torch.bfloat16:
-                    B = B.to(device="cpu", dtype=torch.bfloat16)
-                if not A.is_contiguous():
-                    A = A.contiguous()
-                if not B.is_contiguous():
-                    B = B.contiguous()
+                adapter_nvtx = f"{nvtx_root}/Adapter_bin{int(adapter_idx)}/n{len(req_indices)}"
+                with NvtxAnnotate(adapter_nvtx):
+                    try:
+                        if hot_weights is not None:
+                            A = hot_weights.a_buffer[: hot_weights.rank]
+                            B = hot_weights.b_buffer[: hot_weights.rank]
+                            a_scaling = float(hot_weights.scaling)
+                            self._last_colora_stats["prefetch_ready_hits"] += 1
+                        else:
+                            if hot_status == "filling":
+                                self._last_colora_stats["prefetch_not_ready"] += 1
+                            a_start = int(pool.a_start[adapter_idx].item())
+                            a_len = int(pool.a_len[adapter_idx].item())
+                            a_scaling = float(pool.a_scaling[adapter_idx].item())
+                            if hasattr(pool, "a_rank") and len(pool.a_rank) > adapter_idx:
+                                a_rank = int(pool.a_rank[adapter_idx].item())
+                            else:
+                                a_rank = int(a_len)
 
-                batch_input = compute_input[req_indices]
-                if not batch_input.is_contiguous():
-                    batch_input = batch_input.contiguous()
+                            loc = a_start + layer_id
+                            if loc >= a_start + a_len:
+                                continue
 
-                # Stage-1: x @ A^T
-                intermediate = moe_batch_lora_gate_avx(batch_input, A, scaling=1.0)
-                # Stage-2: intermediate @ B, projection-specific kernel.
-                batch_output = stage2_kernel(intermediate, B, scaling=a_scaling)
-                output[req_indices] = batch_output
+                            A = pool.key_buffer[loc, :a_rank]
+                            B = pool.value_buffer[loc, :a_rank]
 
-                kernel_calls += 2
-                kernel_tokens += int(len(req_indices))
-            finally:
-                if hot_handle is not None:
-                    hot_handle.release()
+                        with NvtxAnnotate(f"{adapter_nvtx}/WeightHostPrep"):
+                            if A.device.type != "cpu" or A.dtype != torch.bfloat16:
+                                A = A.to(device="cpu", dtype=torch.bfloat16)
+                            if B.device.type != "cpu" or B.dtype != torch.bfloat16:
+                                B = B.to(device="cpu", dtype=torch.bfloat16)
+                            if not A.is_contiguous():
+                                A = A.contiguous()
+                            if not B.is_contiguous():
+                                B = B.contiguous()
 
-        if return_to_original_device and (original_device.type != "cpu" or original_dtype != torch.bfloat16):
-            output = output.to(device=original_device, dtype=original_dtype, non_blocking=True)
+                            batch_input = compute_input[req_indices]
+                            if not batch_input.is_contiguous():
+                                batch_input = batch_input.contiguous()
 
-        return output, kernel_calls, kernel_tokens
+                        # Stage-1: x @ A^T (naive matmul or AVX gate path)
+                        with NvtxAnnotate(f"{adapter_nvtx}/Stage1_{cpu_kernel_mode}_gate"):
+                            intermediate = gate_kernel(batch_input, A, 1.0)
+                        # Stage-2: intermediate @ B, projection-specific kernel.
+                        with NvtxAnnotate(f"{adapter_nvtx}/Stage2_{cpu_kernel_mode}_{proj_lower}"):
+                            batch_output = stage2_kernel(intermediate, B, scaling=a_scaling)
+                        output[req_indices] = batch_output
+
+                        kernel_calls += 2
+                        kernel_tokens += int(len(req_indices))
+                    finally:
+                        if hot_handle is not None:
+                            hot_handle.release()
+
+            with NvtxAnnotate(f"{nvtx_root}/ReturnToOriginalDevice"):
+                if return_to_original_device and (original_device.type != "cpu" or original_dtype != torch.bfloat16):
+                    output = output.to(device=original_device, dtype=original_dtype, non_blocking=True)
+
+            return output, kernel_calls, kernel_tokens
 
     def _reset_colora_stats(self) -> None:
         manager = getattr(self, "expert_cache_manager", None)
@@ -1926,6 +1980,34 @@ class Qwen3VLMoELoRADispatcher:
             except Exception as e:
                 logger.debug("[COLoRA] Failed to update gauge %s: %s", gauge_name, e)
 
+    def build_moe_hybrid_shared_prepare_context(
+        self,
+        batch_size: int,
+        bins: torch.Tensor,
+        expert_id: Optional[int],
+    ) -> Optional[MoEHybridSharedPrepareContext]:
+        """Build projection-invariant token/bin metadata once per expert call."""
+        if bins is None:
+            return None
+        local_bins = bins
+        if len(local_bins) > int(batch_size):
+            local_bins = local_bins[: int(batch_size)]
+        valid_mask = local_bins >= 0
+        if not torch.any(valid_mask):
+            return None
+        valid_pos = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1)
+        valid_bins = local_bins.index_select(0, valid_pos).long()
+        # Convert once, then reuse across Gate/Up/Down.
+        adapter_ids_cpu = torch.unique(valid_bins).detach().to(device="cpu", dtype=torch.long).tolist()
+        key_expert = int(expert_id) if expert_id is not None else 0
+        return MoEHybridSharedPrepareContext(
+            batch_size=int(batch_size),
+            key_expert=key_expert,
+            valid_pos=valid_pos,
+            valid_bins=valid_bins,
+            adapter_ids_cpu=adapter_ids_cpu,
+        )
+
     def _batch_apply_moe_lora_hybrid(
         self,
         input_tensor: torch.Tensor,
@@ -1935,6 +2017,7 @@ class Qwen3VLMoELoRADispatcher:
         bins: torch.Tensor,
         projection: str,
         expert_id: Optional[int],
+        hybrid_prepare_ctx: Optional[MoEHybridSharedPrepareContext] = None,
     ) -> torch.Tensor:
         """COLoRA hybrid path: GPU cache hit + CPU miss fallback + async promotion."""
         output = self._get_output_buffer(input_tensor, pool)
@@ -1965,39 +2048,52 @@ class Qwen3VLMoELoRADispatcher:
             )
             return miss_out
 
-        manager.apply_completed_promotions()
-
-        batch_size = input_tensor.shape[0]
-        if len(bins) > batch_size:
-            bins = bins[:batch_size]
-        valid_mask = bins >= 0
-        if not torch.any(valid_mask):
-            self._last_colora_stats["promotion_queue_depth"] = manager.get_promotion_queue_depth()
-            self._last_colora_stats["cache_hit_rate"] = manager.get_hit_rate()
-            return output
-
-        valid_pos = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1)
-        valid_bins = bins.index_select(0, valid_pos).long()
-        unique_adapters = torch.unique(valid_bins).cpu().tolist()
         key_expert = int(expert_id) if expert_id is not None else 0
-        keys = [
-            ExpertCacheKey(
-                projection=projection,
-                adapter_idx=int(adapter_idx),
-                layer_id=int(layer_id),
-                expert_id=key_expert,
-            )
-            for adapter_idx in unique_adapters
-        ]
+        shared_prepare_ctx = hybrid_prepare_ctx
+        with NvtxAnnotate("COLoRA_Hybrid_Prepare"):
+            with NvtxAnnotate("COLoRA_ApplyCompletedPromotions"):
+                manager.apply_completed_promotions()
 
-        if decode_context is None:
-            manager.record_access(keys)
-        miss_policy = str(getattr(getattr(manager, "config", None), "miss_policy", MISS_POLICY_CPU_FIRST))
-        ready_slots = manager.lookup_many(keys)
-        miss_keys = [key for key in keys if key not in ready_slots]
-        allow_inline_promotion_schedule = decode_context is None
-        if allow_inline_promotion_schedule and miss_policy in (MISS_POLICY_CPU_FIRST, MISS_POLICY_LOAD_THEN_RUN):
-            manager.schedule_promotion(miss_keys)
+            with NvtxAnnotate("COLoRA_BuildValidTokenView"):
+                if (
+                    shared_prepare_ctx is None
+                    or int(shared_prepare_ctx.batch_size) != int(input_tensor.shape[0])
+                    or int(shared_prepare_ctx.key_expert) != key_expert
+                ):
+                    shared_prepare_ctx = self.build_moe_hybrid_shared_prepare_context(
+                        batch_size=int(input_tensor.shape[0]),
+                        bins=bins,
+                        expert_id=expert_id,
+                    )
+                if shared_prepare_ctx is None:
+                    self._last_colora_stats["promotion_queue_depth"] = manager.get_promotion_queue_depth()
+                    self._last_colora_stats["cache_hit_rate"] = manager.get_hit_rate()
+                    return output
+
+                valid_pos = shared_prepare_ctx.valid_pos
+                valid_bins = shared_prepare_ctx.valid_bins
+
+            with NvtxAnnotate("COLoRA_BuildCacheKeys"):
+                unique_adapters = shared_prepare_ctx.adapter_ids_cpu
+                keys = [
+                    ExpertCacheKey(
+                        projection=projection,
+                        adapter_idx=int(adapter_idx),
+                        layer_id=int(layer_id),
+                        expert_id=key_expert,
+                    )
+                    for adapter_idx in unique_adapters
+                ]
+
+        with NvtxAnnotate("COLoRA_CacheLookupAndPolicy"):
+            if decode_context is None:
+                manager.record_access(keys)
+            miss_policy = str(getattr(getattr(manager, "config", None), "miss_policy", MISS_POLICY_CPU_FIRST))
+            ready_slots = manager.lookup_many(keys)
+            miss_keys = [key for key in keys if key not in ready_slots]
+            allow_inline_promotion_schedule = decode_context is None
+            if allow_inline_promotion_schedule and miss_policy in (MISS_POLICY_CPU_FIRST, MISS_POLICY_LOAD_THEN_RUN):
+                manager.schedule_promotion(miss_keys)
         blocking_promotion_time = 0.0
         blocking_promotion_bytes = 0.0
         blocking_promotion_count = 0
@@ -2007,6 +2103,16 @@ class Qwen3VLMoELoRADispatcher:
             if promoted_now:
                 ready_slots.update(promoted_now)
                 miss_keys = [key for key in miss_keys if key not in promoted_now]
+            if miss_keys:
+                promotion_t0 = time.perf_counter()
+                promotion_result = manager.promote_blocking(miss_keys)
+                blocking_promotion_time += max(time.perf_counter() - promotion_t0, 0.0)
+                blocking_promotion_bytes += float(promotion_result.transferred_bytes)
+                blocking_promotion_count += int(promotion_result.promoted_count)
+                ready_slots.update(promotion_result.ready_slots)
+                miss_keys = [key for key in miss_keys if key not in promotion_result.ready_slots]
+                if miss_keys:
+                    raise RuntimeError(f"COLoRA load_then_run left unresolved misses: {miss_keys!r}")
         if miss_keys and miss_policy == MISS_POLICY_NO_CPU_PATH:
             promotion_t0 = time.perf_counter()
             promotion_result = manager.promote_blocking(miss_keys)
@@ -2018,11 +2124,18 @@ class Qwen3VLMoELoRADispatcher:
             if miss_keys:
                 raise RuntimeError(f"COLoRA no_cpu_path left unresolved misses: {miss_keys!r}")
 
-        hit_adapters = {key.adapter_idx for key in ready_slots.keys()}
-        hit_mask = torch.zeros_like(valid_bins, dtype=torch.bool)
-        for adapter_idx in hit_adapters:
-            hit_mask |= valid_bins == int(adapter_idx)
-        miss_mask = ~hit_mask
+        with NvtxAnnotate("COLoRA_BuildHitMissMasks"):
+            hit_adapters = {key.adapter_idx for key in ready_slots.keys()}
+            if hit_adapters:
+                adapter_tensor = torch.tensor(
+                    sorted(int(adapter_idx) for adapter_idx in hit_adapters),
+                    dtype=valid_bins.dtype,
+                    device=valid_bins.device,
+                )
+                hit_mask = torch.isin(valid_bins, adapter_tensor)
+            else:
+                hit_mask = torch.zeros_like(valid_bins, dtype=torch.bool)
+            miss_mask = ~hit_mask
 
         gpu_compute_time = 0.0
         cpu_compute_time = 0.0
@@ -2037,160 +2150,182 @@ class Qwen3VLMoELoRADispatcher:
         miss_pos = None
         miss_bins = None
 
-        if torch.any(miss_mask):
-            miss_pos = valid_pos.index_select(0, torch.nonzero(miss_mask, as_tuple=False).squeeze(-1))
-            miss_bins = valid_bins.index_select(0, torch.nonzero(miss_mask, as_tuple=False).squeeze(-1))
-            miss_input = input_tensor.index_select(0, miss_pos).contiguous()
-            if miss_input.device.type == "cuda":
-                d2h_bytes += float(miss_input.numel() * miss_input.element_size())
-            h2d_bytes += float(miss_input.shape[0] * pool.value_buffer.shape[2] * miss_input.element_size())
+        with NvtxAnnotate("COLoRA_MissPath_CheckAndPrepare"):
+            if torch.any(miss_mask):
+                miss_rows = torch.nonzero(miss_mask, as_tuple=False).squeeze(-1)
+                miss_pos = valid_pos.index_select(0, miss_rows)
+                miss_bins = valid_bins.index_select(0, miss_rows)
+                miss_input = input_tensor.index_select(0, miss_pos).contiguous()
+                if miss_input.device.type == "cuda":
+                    d2h_bytes += float(miss_input.numel() * miss_input.element_size())
+                h2d_bytes += float(miss_input.shape[0] * pool.value_buffer.shape[2] * miss_input.element_size())
 
-            if self._should_use_async_cpu_fallback(bool(torch.any(hit_mask))):
-                if self._reserve_async_queue_slot():
-                    async_overlap_used = True
-                    enqueue_ts = time.perf_counter()
-                    miss_plan = self._build_cpu_group_plan(miss_bins)
+                if self._should_use_async_cpu_fallback(bool(torch.any(hit_mask))):
+                    if self._reserve_async_queue_slot():
+                        async_overlap_used = True
+                        enqueue_ts = time.perf_counter()
+                        miss_plan = self._build_cpu_group_plan(miss_bins)
 
-                    def _miss_worker():
-                        try:
-                            start_ts = time.perf_counter()
-                            queue_wait = max(start_ts - enqueue_ts, 0.0)
-                            t0 = time.perf_counter()
-                            miss_out, kernel_calls, kernel_tokens = self._strict_moe_cpu_batch_lora(
-                                miss_input,
-                                buffer_layer_id,
-                                pool,
-                                miss_bins,
-                                projection=projection,
-                                adapter_group_plan=miss_plan,
-                                temporal_prefetch_context=decode_context,
+                        def _miss_worker():
+                            try:
+                                start_ts = time.perf_counter()
+                                queue_wait = max(start_ts - enqueue_ts, 0.0)
+                                t0 = time.perf_counter()
+                                miss_out, kernel_calls, kernel_tokens = self._strict_moe_cpu_batch_lora(
+                                    miss_input,
+                                    buffer_layer_id,
+                                    pool,
+                                    miss_bins,
+                                    projection=projection,
+                                    adapter_group_plan=miss_plan,
+                                    temporal_prefetch_context=decode_context,
+                                )
+                                return miss_out, queue_wait, time.perf_counter() - t0, kernel_calls, kernel_tokens
+                            finally:
+                                self._release_async_queue_slot()
+
+                        miss_future = self._get_or_create_cpu_executor().submit(_miss_worker)
+                    else:
+                        fallback_degrade_count += 1
+
+        with NvtxAnnotate("COLoRA_HitPath_Prepare"):
+            if torch.any(hit_mask):
+                with NvtxAnnotate("COLoRA_HitIndicesAndGroups"):
+                    hit_rows = torch.nonzero(hit_mask, as_tuple=False).squeeze(-1)
+                    hit_pos = valid_pos.index_select(0, hit_rows)
+                    hit_bins = valid_bins.index_select(0, hit_rows)
+                    hit_unique_adapters, hit_inverse = torch.unique(hit_bins, return_inverse=True)
+
+                with NvtxAnnotate("COLoRA_ResolveSlotIds"):
+                    slot_by_adapter = {int(key.adapter_idx): int(slot_id) for key, slot_id in ready_slots.items()}
+                    hit_unique_cpu = hit_unique_adapters.detach().to(device="cpu", dtype=torch.long).tolist()
+                    slot_ids = [int(slot_by_adapter.get(int(adapter_idx), -1)) for adapter_idx in hit_unique_cpu]
+
+                cache_a, cache_b = manager.get_projection_buffers(projection)
+                if (
+                    BGMV_AVAILABLE
+                    and input_tensor.device.type == "cuda"
+                    and cache_a is not None
+                    and cache_b is not None
+                    and all(slot_id >= 0 for slot_id in slot_ids)
+                ):
+                    with NvtxAnnotate("COLoRA_GPU_Hit_Path"):
+                        t0 = time.perf_counter()
+
+                        with NvtxAnnotate("COLoRA_GPU_Hit_InputGather"):
+                            hit_input = input_tensor.index_select(0, hit_pos).contiguous()
+
+                        with NvtxAnnotate("COLoRA_GPU_Hit_ScratchpadEnsure"):
+                            active_count = hit_unique_adapters.size(0)
+                            self._ensure_compact_scratchpad(pool, input_tensor.device, int(active_count))
+                            assert self.gpu_scratchpad_a is not None and self.gpu_scratchpad_b is not None
+
+                        with NvtxAnnotate("COLoRA_GPU_Hit_CacheGather"):
+                            slot_tensor = torch.tensor(slot_ids, dtype=torch.long, device=cache_a.device)
+                            gathered_a = cache_a.index_select(0, slot_tensor)
+                            gathered_b = cache_b.index_select(0, slot_tensor)
+
+                        with NvtxAnnotate("COLoRA_GPU_Hit_CopyToScratchpad"):
+                            self.gpu_scratchpad_a[:active_count].copy_(
+                                gathered_a.to(input_tensor.device), non_blocking=True
                             )
-                            return miss_out, queue_wait, time.perf_counter() - t0, kernel_calls, kernel_tokens
-                        finally:
-                            self._release_async_queue_slot()
+                            self.gpu_scratchpad_b[:active_count].copy_(
+                                gathered_b.to(input_tensor.device), non_blocking=True
+                            )
 
-                    miss_future = self._get_or_create_cpu_executor().submit(_miss_worker)
+                        with NvtxAnnotate("COLoRA_GPU_Hit_KernelSetup"):
+                            hit_output = self._get_output_buffer(hit_input, pool)
+                            temp_a_start = torch.arange(active_count, device=input_tensor.device, dtype=torch.int32)
+                            temp_a_len = torch.ones(active_count, device=input_tensor.device, dtype=torch.int32)
+                            scaling_idx_cpu = hit_unique_adapters.detach().to(device="cpu", dtype=torch.long)
+                            temp_scaling = pool.a_scaling.index_select(0, scaling_idx_cpu).to(input_tensor.device)
+
+                        with NvtxAnnotate("COLoRA_GPU_Hit_BGMV"):
+                            batch_lora_get_mlp(
+                                hit_output,
+                                hit_input,
+                                self.gpu_scratchpad_a,
+                                self.gpu_scratchpad_b,
+                                temp_a_start,
+                                temp_a_len,
+                                temp_scaling,
+                                hit_inverse,
+                                a_hidden_dim=hit_input.shape[1],
+                                b_hidden_dim=hit_output.shape[1],
+                                layer_id=0,
+                            )
+
+                        with NvtxAnnotate("COLoRA_GPU_Hit_Writeback"):
+                            output.index_copy_(0, hit_pos, hit_output)
+
+                        gpu_compute_time += time.perf_counter() - t0
                 else:
-                    fallback_degrade_count += 1
+                    # Kernel unavailable or GPU cache not ready: degrade to CPU path.
+                    if miss_policy in (MISS_POLICY_NO_CPU_PATH, MISS_POLICY_LOAD_THEN_RUN):
+                        raise RuntimeError(
+                            f"COLoRA {miss_policy} requires GPU cached execution on the promoted hot path; CPU fallback is not allowed."
+                        )
+                    hit_mask = torch.zeros_like(valid_bins, dtype=torch.bool)
+                    miss_mask = torch.ones_like(valid_bins, dtype=torch.bool)
+                    if miss_pos is None:
+                        miss_pos = valid_pos
+                        miss_bins = valid_bins
+                    if miss_future is not None:
+                        cancelled = miss_future.cancel()
+                        if cancelled:
+                            # Task never ran, so worker-side finally won't release queue slot.
+                            self._release_async_queue_slot()
+                        miss_future = None
+                        async_overlap_used = False
+                        fallback_degrade_count += 1
 
-        if torch.any(hit_mask):
-            hit_pos = valid_pos.index_select(0, torch.nonzero(hit_mask, as_tuple=False).squeeze(-1))
-            hit_bins = valid_bins.index_select(0, torch.nonzero(hit_mask, as_tuple=False).squeeze(-1))
-            hit_unique_adapters, hit_inverse = torch.unique(hit_bins, return_inverse=True)
-
-            slot_ids = []
-            for adapter_idx in hit_unique_adapters.cpu().tolist():
-                key = ExpertCacheKey(
-                    projection=projection,
-                    adapter_idx=int(adapter_idx),
-                    layer_id=int(layer_id),
-                    expert_id=key_expert,
-                )
-                slot_ids.append(int(ready_slots.get(key, -1)))
-
-            cache_a, cache_b = manager.get_projection_buffers(projection)
-            if (
-                BGMV_AVAILABLE
-                and input_tensor.device.type == "cuda"
-                and cache_a is not None
-                and cache_b is not None
-                and all(slot_id >= 0 for slot_id in slot_ids)
-            ):
-                with NvtxAnnotate("COLoRA_GPU_Hit_Path"):
-                    t0 = time.perf_counter()
-                    hit_input = input_tensor.index_select(0, hit_pos).contiguous()
-                    active_count = hit_unique_adapters.size(0)
-                    self._ensure_compact_scratchpad(pool, input_tensor.device, int(active_count))
-
-                    assert self.gpu_scratchpad_a is not None and self.gpu_scratchpad_b is not None
-                    slot_tensor = torch.tensor(slot_ids, dtype=torch.long, device=cache_a.device)
-                    gathered_a = cache_a.index_select(0, slot_tensor)
-                    gathered_b = cache_b.index_select(0, slot_tensor)
-                    self.gpu_scratchpad_a[:active_count].copy_(gathered_a.to(input_tensor.device), non_blocking=True)
-                    self.gpu_scratchpad_b[:active_count].copy_(gathered_b.to(input_tensor.device), non_blocking=True)
-
-                    hit_output = self._get_output_buffer(hit_input, pool)
-                    temp_a_start = torch.arange(active_count, device=input_tensor.device, dtype=torch.int32)
-                    temp_a_len = torch.ones(active_count, device=input_tensor.device, dtype=torch.int32)
-                    temp_scaling = pool.a_scaling[hit_unique_adapters.long().cpu()].to(input_tensor.device)
-
-                    batch_lora_get_mlp(
-                        hit_output,
-                        hit_input,
-                        self.gpu_scratchpad_a,
-                        self.gpu_scratchpad_b,
-                        temp_a_start,
-                        temp_a_len,
-                        temp_scaling,
-                        hit_inverse,
-                        a_hidden_dim=hit_input.shape[1],
-                        b_hidden_dim=hit_output.shape[1],
-                        layer_id=0,
-                    )
-                    output.index_copy_(0, hit_pos, hit_output)
-                    gpu_compute_time += time.perf_counter() - t0
-            else:
-                # Kernel unavailable or GPU cache not ready: degrade to CPU path.
-                if miss_policy == MISS_POLICY_NO_CPU_PATH:
-                    raise RuntimeError(
-                        "COLoRA no_cpu_path requires GPU cached execution on the promoted hot path; CPU fallback is not allowed."
-                    )
-                hit_mask = torch.zeros_like(valid_bins, dtype=torch.bool)
-                miss_mask = torch.ones_like(valid_bins, dtype=torch.bool)
-                if miss_pos is None:
-                    miss_pos = valid_pos
-                    miss_bins = valid_bins
+        with NvtxAnnotate("COLoRA_MissPath_ExecuteAndCommit"):
+            if torch.any(miss_mask):
+                assert miss_pos is not None and miss_bins is not None
+                if miss_policy in (MISS_POLICY_NO_CPU_PATH, MISS_POLICY_LOAD_THEN_RUN):
+                    raise RuntimeError(f"COLoRA {miss_policy} cannot execute remaining misses on the CPU path.")
                 if miss_future is not None:
-                    cancelled = miss_future.cancel()
-                    if cancelled:
-                        # Task never ran, so worker-side finally won't release queue slot.
-                        self._release_async_queue_slot()
-                    miss_future = None
-                    async_overlap_used = False
-                    fallback_degrade_count += 1
+                    with NvtxAnnotate("COLoRA_CPU_Miss_Path_AsyncJoin"):
+                        miss_output, queue_wait, cpu_t, kernel_calls, kernel_tokens = miss_future.result()
+                else:
+                    with NvtxAnnotate("COLoRA_CPU_Miss_Path"):
+                        t0 = time.perf_counter()
+                        miss_input = input_tensor.index_select(0, miss_pos).contiguous()
+                        miss_plan = self._build_cpu_group_plan(miss_bins)
+                        miss_output, kernel_calls, kernel_tokens = self._strict_moe_cpu_batch_lora(
+                            miss_input,
+                            buffer_layer_id,
+                            pool,
+                            miss_bins,
+                            projection=projection,
+                            adapter_group_plan=miss_plan,
+                            temporal_prefetch_context=decode_context,
+                        )
+                        queue_wait = 0.0
+                        cpu_t = time.perf_counter() - t0
+                with NvtxAnnotate("COLoRA_MissPath_Writeback"):
+                    output.index_copy_(0, miss_pos, miss_output)
+                with NvtxAnnotate("COLoRA_MissPath_StatsAccumulate"):
+                    cpu_compute_time += cpu_t
+                    cpu_queue_wait_time += queue_wait
+                    moe_kernel_calls += int(kernel_calls)
+                    moe_kernel_tokens += int(kernel_tokens)
+                if miss_policy == MISS_POLICY_NO_DEFERRED_SYNC and miss_keys:
+                    with NvtxAnnotate("COLoRA_MissPath_BlockingPromotionSync"):
+                        promotion_t0 = time.perf_counter()
+                        promotion_result = manager.promote_blocking(miss_keys)
+                        blocking_promotion_time += max(time.perf_counter() - promotion_t0, 0.0)
+                        blocking_promotion_bytes += float(promotion_result.transferred_bytes)
+                        blocking_promotion_count += int(promotion_result.promoted_count)
 
-        if torch.any(miss_mask):
-            assert miss_pos is not None and miss_bins is not None
-            if miss_policy == MISS_POLICY_NO_CPU_PATH:
-                raise RuntimeError("COLoRA no_cpu_path cannot execute remaining misses on the CPU path.")
-            if miss_future is not None:
-                with NvtxAnnotate("COLoRA_CPU_Miss_Path_AsyncJoin"):
-                    miss_output, queue_wait, cpu_t, kernel_calls, kernel_tokens = miss_future.result()
-            else:
-                with NvtxAnnotate("COLoRA_CPU_Miss_Path"):
-                    t0 = time.perf_counter()
-                    miss_input = input_tensor.index_select(0, miss_pos).contiguous()
-                    miss_plan = self._build_cpu_group_plan(miss_bins)
-                    miss_output, kernel_calls, kernel_tokens = self._strict_moe_cpu_batch_lora(
-                        miss_input,
-                        buffer_layer_id,
-                        pool,
-                        miss_bins,
-                        projection=projection,
-                        adapter_group_plan=miss_plan,
-                        temporal_prefetch_context=decode_context,
-                    )
-                    queue_wait = 0.0
-                    cpu_t = time.perf_counter() - t0
-            output.index_copy_(0, miss_pos, miss_output)
-            cpu_compute_time += cpu_t
-            cpu_queue_wait_time += queue_wait
-            moe_kernel_calls += int(kernel_calls)
-            moe_kernel_tokens += int(kernel_tokens)
-            if miss_policy == MISS_POLICY_NO_DEFERRED_SYNC and miss_keys:
-                promotion_t0 = time.perf_counter()
-                promotion_result = manager.promote_blocking(miss_keys)
-                blocking_promotion_time += max(time.perf_counter() - promotion_t0, 0.0)
-                blocking_promotion_bytes += float(promotion_result.transferred_bytes)
-                blocking_promotion_count += int(promotion_result.promoted_count)
-
-        overlap_ratio = 0.0
-        if async_overlap_used and cpu_compute_time > 0.0 and gpu_compute_time > 0.0:
-            overlap = min(cpu_compute_time, gpu_compute_time)
-            overlap_ratio = overlap / max(cpu_compute_time + gpu_compute_time, 1e-9)
-        drop_breakdown = {}
-        if hasattr(manager, "get_promotion_drop_breakdown"):
-            drop_breakdown = manager.get_promotion_drop_breakdown()
+        with NvtxAnnotate("COLoRA_PostCompute_StatsFinalize"):
+            overlap_ratio = 0.0
+            if async_overlap_used and cpu_compute_time > 0.0 and gpu_compute_time > 0.0:
+                overlap = min(cpu_compute_time, gpu_compute_time)
+                overlap_ratio = overlap / max(cpu_compute_time + gpu_compute_time, 1e-9)
+            drop_breakdown = {}
+            if hasattr(manager, "get_promotion_drop_breakdown"):
+                drop_breakdown = manager.get_promotion_drop_breakdown()
 
         self._last_colora_stats = {
             "colora_hit_tokens": int(hit_mask.sum().item()),
@@ -2550,7 +2685,8 @@ class Qwen3VLMoELoRADispatcher:
         input_tensor: torch.Tensor,
         layer_id: int,
         req_bins: Optional[torch.Tensor] = None,
-        expert_id: Optional[int] = None
+        expert_id: Optional[int] = None,
+        hybrid_prepare_ctx: Optional[MoEHybridSharedPrepareContext] = None,
     ) -> torch.Tensor:
         """Apply gate_proj LoRA to batch with different adapters.
 
@@ -2587,6 +2723,7 @@ class Qwen3VLMoELoRADispatcher:
                 bins=bins,
                 projection="gate",
                 expert_id=expert_id,
+                hybrid_prepare_ctx=hybrid_prepare_ctx,
             )
 
         # Use CPU compute if configured
@@ -2656,7 +2793,8 @@ class Qwen3VLMoELoRADispatcher:
         input_tensor: torch.Tensor,
         layer_id: int,
         req_bins: Optional[torch.Tensor] = None,
-        expert_id: Optional[int] = None
+        expert_id: Optional[int] = None,
+        hybrid_prepare_ctx: Optional[MoEHybridSharedPrepareContext] = None,
     ) -> torch.Tensor:
         """Apply up_proj LoRA to batch with different adapters.
 
@@ -2690,6 +2828,7 @@ class Qwen3VLMoELoRADispatcher:
                 bins=bins,
                 projection="up",
                 expert_id=expert_id,
+                hybrid_prepare_ctx=hybrid_prepare_ctx,
             )
 
         # Use CPU compute if configured
@@ -2752,7 +2891,8 @@ class Qwen3VLMoELoRADispatcher:
         input_tensor: torch.Tensor,
         layer_id: int,
         req_bins: Optional[torch.Tensor] = None,
-        expert_id: Optional[int] = None
+        expert_id: Optional[int] = None,
+        hybrid_prepare_ctx: Optional[MoEHybridSharedPrepareContext] = None,
     ) -> torch.Tensor:
         """Apply down_proj LoRA. Input: Intermediate, Output: Hidden.
 
@@ -2786,6 +2926,7 @@ class Qwen3VLMoELoRADispatcher:
                 bins=bins,
                 projection="down",
                 expert_id=expert_id,
+                hybrid_prepare_ctx=hybrid_prepare_ctx,
             )
 
         output = self._get_output_buffer(input_tensor, pool)

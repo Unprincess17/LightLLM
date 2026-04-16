@@ -783,6 +783,70 @@ def test_qwen3_vl_moe_wrapper_eagerly_retires_unbound_jobs_after_actual_routing(
             os.environ["MOE_MODE"] = prev_mode
 
 
+def test_qwen3_vl_moe_request_skip_decode_path_exposes_select_experts_helper(monkeypatch):
+    assert hasattr(layer_infer_mod, "select_experts")
+
+    layer = object.__new__(layer_infer_mod.Qwen3VLMOETransformerLayerInfer)
+    layer.embed_dim_ = 4
+    layer.layer_num_ = 7
+    layer.num_experts_per_tok = 1
+    layer.norm_topk_prob = False
+    layer.req_bins_ = None
+    layer.lora_dispatcher_ = type("Dispatcher", (), {"expert_cache_manager": None})()
+    layer._spec_bound_job_keys_current_call = set()
+    layer._should_enable_request_skip = lambda infer_state: True
+    layer._maybe_submit_decode_temporal_prefetch = lambda infer_state: None
+    layer._maybe_submit_decode_spec_gate_up = lambda hidden_states, infer_state: None
+    layer._eager_retire_remaining_decode_spec_jobs = lambda infer_state: None
+    layer._finalize_decode_temporal_prefetch_step_nonblocking = lambda infer_state: None
+    layer._finalize_decode_spec_step_nonblocking = lambda infer_state: None
+    layer._log_adapter_expert_distribution = lambda **kwargs: None
+    layer._log_router_trace = lambda **kwargs: None
+    layer._get_local_expert_info = lambda _layer_weight: (True, [], {}, {})
+
+    def _fake_select_experts(**kwargs):
+        num_tokens = int(kwargs["hidden_states"].shape[0])
+        topk_weights = torch.ones((num_tokens, 1), dtype=torch.float32)
+        topk_ids = torch.zeros((num_tokens, 1), dtype=torch.int64)
+        return topk_weights, topk_ids
+
+    monkeypatch.setattr(layer_infer_mod, "select_experts", _fake_select_experts)
+
+    class _Gate:
+        def mm(self, hidden_states):
+            return torch.zeros((hidden_states.shape[0], 1), dtype=torch.float32)
+
+    experts = type(
+        "Experts",
+        (),
+        {
+            "n_routed_experts": 1,
+            "e_score_correction_bias": None,
+            "scoring_func": "softmax",
+        },
+    )()
+    layer_weight = type("LayerWeight", (), {"moe_gate": _Gate(), "experts": experts, "layer_num_": 7})()
+    infer_state = type(
+        "InferState",
+        (),
+        {
+            "is_prefill": False,
+            "decode_step_id": 42,
+            "b_req_idx": torch.tensor([1000, 1001], dtype=torch.int64),
+            "b_adapter_bin": torch.tensor([3, 4], dtype=torch.int32),
+        },
+    )()
+
+    output = layer_infer_mod.Qwen3VLMOETransformerLayerInfer._moe_ffn(
+        layer,
+        torch.ones((2, 4), dtype=torch.float32),
+        infer_state,
+        layer_weight,
+    )
+
+    assert torch.equal(output, torch.zeros((2, 4), dtype=torch.float32))
+
+
 def _make_spec_bind_layer(dispatcher):
     layer = object.__new__(layer_infer_mod.Qwen3VLMOETransformerLayerInfer)
     layer.layer_num_ = 7

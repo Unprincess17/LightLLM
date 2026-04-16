@@ -1,3 +1,4 @@
+import math
 import time
 import threading
 from collections import deque
@@ -35,6 +36,24 @@ class MoEExpertCacheConfig:
     queue_high_watermark: Optional[int] = None
     # Cooldown in schedule steps before same key can be queued again.
     promote_cooldown_steps: int = 4
+    # Eviction (evict_one): score = F*freq + R*recency + S*size; lowest score is evicted first.
+    # Frequency is log1p(access_count) normalized to [0, 1] using eviction_frequency_cap.
+    eviction_frequency_cap: int = 1_000_000
+    eviction_weight_frequency: float = 0.45
+    eviction_weight_recency: float = 0.10
+    eviction_weight_size: float = 0.45
+
+
+def _eviction_frequency_bounded(access_count: int, cap: int) -> float:
+    """Map access_count to [0, 1] sublinearly (bounded), for stable eviction weighting."""
+    cap = max(int(cap), 1)
+    ac = max(min(int(access_count), cap), 0)
+    return math.log1p(ac) / math.log1p(cap)
+
+
+def _eviction_recency_bounded(age_sec: float) -> float:
+    """Recent access -> near 1; stale -> near 0. Always in (0, 1]."""
+    return 1.0 / (1.0 + max(float(age_sec), 0.0))
 
 
 @dataclass
@@ -337,11 +356,16 @@ class MoEExpertCacheManager:
         return queued
 
     def evict_one(self, projection: str) -> Optional[int]:
-        """Evict one READY slot using LFU+LRU composite score."""
+        """Evict one READY slot: lowest combined score is least critical and goes first.
+
+        Uses bounded frequency (normalized log1p(access_count)) and bounded recency
+        (1/(1+age)); optional static weights match Chameleon-style F/R/S tuning.
+        """
         state = self._states.get(projection)
         if state is None:
             return None
 
+        cfg = self.config
         candidate_key = None
         candidate_score = None
         now_ts = time.time()
@@ -350,9 +374,18 @@ class MoEExpertCacheManager:
             if entry.state != ExpertCacheSlotState.READY or entry.slot_id < 0:
                 continue
 
-            age = max(now_ts - entry.last_access, 0.0)
-            # Lower score means lower utility and older usage -> evict first.
-            score = entry.utility + 0.05 * entry.access_count - 0.001 * age
+            age_sec = max(now_ts - entry.last_access, 0.0)
+            freq_b = _eviction_frequency_bounded(entry.access_count, cfg.eviction_frequency_cap)
+            rec_b = _eviction_recency_bounded(age_sec)
+            # TODO(multi-slot): one expert--LoRA may occupy rank contiguous slot_ids; set
+            # size_term to that slot count (and/or bytes). Currently one key maps to one
+            # physical slot row; size is a placeholder constant.
+            size_term = 1.0
+            score = (
+                float(cfg.eviction_weight_frequency) * freq_b
+                + float(cfg.eviction_weight_recency) * rec_b
+                + float(cfg.eviction_weight_size) * size_term
+            )
             if candidate_score is None or score < candidate_score:
                 candidate_key = key
                 candidate_score = score

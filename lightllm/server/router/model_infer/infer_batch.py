@@ -26,7 +26,8 @@ class ColoraContinuation:
     """Continuation state for a request paused mid-decode by COLoRA."""
     resume_layer: int          # Which layer to resume from (L+1)
     saved_hidden: torch.Tensor # Hidden states after completing layer L on CPU
-    mem_index: torch.Tensor    # Cached mem_index for the KV slots (reuse existing allocation)
+    # One decode-row KV slot (shape [1]), same as one element of ModelInput.mem_indexes / infer_state.mem_index.
+    mem_index: torch.Tensor
     seq_len: int               # Current sequence length
     completed: bool = False    # Whether CPU completion is done
 

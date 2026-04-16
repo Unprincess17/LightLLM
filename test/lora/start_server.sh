@@ -31,10 +31,13 @@
 #   --colora_max_promote_per_step N    COLoRA max promotions per step
 #   --colora_decay F                   COLoRA utility decay
 #   --colora_miss_policy STR           COLoRA miss policy (cpu_first|load_then_run)
+#   --colora_overlap_mode STR          COLoRA overlap scheduling (full|no_overlap)
 #   --colora_async_fallback 0|1        Enable async CPU fallback in hybrid mode
 #   --colora_cpu_workers N             Async CPU fallback worker threads
 #   --colora_cpu_queue_depth N         Async CPU fallback queue depth
 #   --colora_cpu_batch_timeout_us N    Queue wait budget before sync degrade
+#   --colora_temporal_prefetch         Enable COLoRA temporal weight prefetch
+#   --no_colora_temporal_prefetch      Disable temporal prefetch (default off)
 #   --colora_speculative_dispatch      Enable COLoRA speculative dispatch MVP
 #   --no_colora_speculative_dispatch   Disable COLoRA speculative dispatch MVP
 #   --colora_spec_layer_whitelist CSV  Comma-separated speculative layer whitelist
@@ -64,6 +67,11 @@ Options:
   --tp TP
   --host HOST
   --enable_multimodal
+  --no_enable_multimodal
+  --trust_remote_code
+  --no_trust_remote_code
+  --disable_cudagraph
+  --no_disable_cudagraph
   --lora_max_size SIZE
   --compute_device STR
   --force_slow_lora_path
@@ -77,6 +85,7 @@ Options:
   --colora_max_promote_per_step N
   --colora_decay F
   --colora_miss_policy STR
+  --colora_overlap_mode full|no_overlap
   --colora_async_fallback 0|1
   --colora_cpu_workers N
   --colora_cpu_queue_depth N
@@ -121,6 +130,8 @@ TP=2
 HOST="0.0.0.0"
 ENABLE_MULTIMODAL=true
 LORA_MAX_SIZE=1024
+TRUST_REMOTE_CODE=true
+DISABLE_CUDAGRAPH=true
 
 <<EOF
 # This two baselines are not implemented yet.
@@ -143,7 +154,7 @@ EOF
 # COMPUTE_DEVICE="vl_storage:gpu,vl_compute:gpu,attn_storage:gpu,attn_compute:gpu,moe_storage:cpu,moe_compute:cpu"
 
 ### COLoRA default: GPU hit + CPU miss for MoE LoRA ###
-COMPUTE_DEVICE="vl_storage:gpu,vl_compute:gpu,attn_storage:gpu,attn_compute:gpu,moe_storage:cpu,moe_compute:hybrid"
+COMPUTE_DEVICE="vl_storage:cpu,vl_compute:gpu,attn_storage:gpu,attn_compute:gpu,moe_storage:cpu,moe_compute:hybrid"
 
 FORCE_SLOW_LORA_PATH=true
 MAX_REQ_TOTAL_LEN=8192
@@ -168,13 +179,13 @@ COLORA_SPECULATIVE_DISPATCH=0
 COLORA_SPEC_LAYER_WHITELIST=""
 COLORA_REQUEST_SKIP="1"
 COLORA_MAX_CONTINUATIONS="8"
+COLORA_OVERLAP_MODE="full"
 
 # Environment variables
 LOADWORKER=8
 LIGHTLLM_LOGGING="${LIGHTLLM_LOGGING:-DEBUG}"
 MOE_MODE="TP"
 MOCK_PREFILL_LOGITS="TRUE"
-#MOCK_PREFILL_LOGITS="FALSE"
 MOE_ADAPTER_EXPERT_PROFILING=0
 MOE_ADAPTER_EXPERT_LOG_PATH="/tmp/moe_adapter_expert_profile.log"
 MOE_ROUTER_TRACE=0
@@ -219,6 +230,10 @@ while [[ $# -gt 0 ]]; do
             ENABLE_MULTIMODAL=true
             shift
             ;;
+        --no_enable_multimodal)
+            ENABLE_MULTIMODAL=false
+            shift
+            ;;
         --lora_max_size)
             LORA_MAX_SIZE="$2"
             shift 2
@@ -246,6 +261,30 @@ while [[ $# -gt 0 ]]; do
         --batch_max_tokens)
             BATCH_MAX_TOKENS="$2"
             shift 2
+            ;;
+        --trust_remote_code)
+            TRUST_REMOTE_CODE=true
+            shift
+            ;;
+        --no_trust_remote_code)
+            TRUST_REMOTE_CODE=false
+            shift
+            ;;
+        --disable_cudagraph)
+            DISABLE_CUDAGRAPH=true
+            shift
+            ;;
+        --no_disable_cudagraph)
+            DISABLE_CUDAGRAPH=false
+            shift
+            ;;
+        --mock_prefill_logits)
+            MOCK_PREFILL_LOGITS="TRUE"
+            shift
+            ;;
+        --no_mock_prefill_logits)
+            MOCK_PREFILL_LOGITS="FALSE"
+            shift
             ;;
         --colora_cache_budget_mb)
             COLORA_CACHE_BUDGET_MB="$2"
@@ -279,6 +318,10 @@ while [[ $# -gt 0 ]]; do
             COLORA_MISS_POLICY="$2"
             shift 2
             ;;
+        --colora_overlap_mode)
+            COLORA_OVERLAP_MODE="$2"
+            shift 2
+            ;;
         --colora_async_fallback)
             COLORA_ASYNC_FALLBACK="$2"
             shift 2
@@ -297,6 +340,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --colora_temporal_prefetch)
             COLORA_TEMPORAL_PREFETCH=1
+            shift
+            ;;
+        --no_colora_temporal_prefetch)
+            COLORA_TEMPORAL_PREFETCH=0
             shift
             ;;
         --colora_temporal_prefetch_layer_whitelist)
@@ -395,6 +442,7 @@ echo "=============================================="
 echo "LightLLM LoRA Server"
 echo "=============================================="
 echo "Base Model: $MODEL_DIR"
+echo "Final server command: $CMD"
 if [[ "$USE_LORA" == "true" && -n "$LORA_DIR" ]]; then
     echo "LoRA Adapter(s): $LORA_DIR"
 else
@@ -420,9 +468,15 @@ CMD="python -m lightllm.server.api_server \
     --tp $TP \
     --batch_max_tokens $BATCH_MAX_TOKENS \
     --max_req_total_len $MAX_REQ_TOTAL_LEN \
-    --trust_remote_code \
-    --mem_fraction $MEM_FRACTION \
-    --disable_cudagraph"
+    --mem_fraction $MEM_FRACTION"
+
+if [[ "$TRUST_REMOTE_CODE" == "true" ]]; then
+    CMD="$CMD --trust_remote_code"
+fi
+
+if [[ "$DISABLE_CUDAGRAPH" == "true" ]]; then
+    CMD="$CMD --disable_cudagraph"
+fi
 
 if [[ "$USE_LORA" == "true" && -n "$LORA_DIR" ]]; then
     CMD="$CMD --lora_dir $LORA_DIR --lora_max_size $LORA_MAX_SIZE"
@@ -453,6 +507,7 @@ CMD="$CMD --colora_cache_budget_mb $COLORA_CACHE_BUDGET_MB \
     --colora_deferred_promotion_delta_steps $COLORA_DEFERRED_PROMOTION_DELTA_STEPS \
     --colora_promotion_ema_alpha $COLORA_PROMOTION_EMA_ALPHA \
     --colora_miss_policy $COLORA_MISS_POLICY \
+    --colora_overlap_mode $COLORA_OVERLAP_MODE \
     --colora_async_fallback $COLORA_ASYNC_FALLBACK \
     --colora_cpu_workers $COLORA_CPU_WORKERS \
     --colora_cpu_queue_depth $COLORA_CPU_QUEUE_DEPTH \
@@ -531,6 +586,12 @@ echo "  COLORA_SPEC_LAYER_WHITELIST=$COLORA_SPEC_LAYER_WHITELIST"
 echo "  COLORA_REQUEST_SKIP=$COLORA_REQUEST_SKIP"
 echo "  COLORA_MAX_CONTINUATIONS=$COLORA_MAX_CONTINUATIONS"
 echo ""
+
+if [[ "$MOCK_PREFILL_LOGITS" == "TRUE" ]]; then
+    echo "WARNING: MOCK_PREFILL_LOGITS=TRUE skips real prefill forward and can invalidate decode/kernel behavior."
+    echo "         Use --no_mock_prefill_logits for real-model correctness and CUDA stability checks."
+    echo ""
+fi
 
 
 eval "exec $CMD"

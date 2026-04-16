@@ -144,38 +144,44 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
         - adapter_offsets: prefix-sum offsets into packed activations
         - token_positions: positions in original activations for each packed row
         """
-        if req_bins is None or activations.numel() == 0:
-            return None
+        nvtx_coalesce = f"MoE_CoalesceLoraActivations/L{int(self.layer_num_)}"
+        with NvtxAnnotate(nvtx_coalesce):
+            if req_bins is None or activations.numel() == 0:
+                return None
 
-        bins = req_bins.to(device=activations.device, dtype=torch.long)
-        valid_mask = bins >= 0
-        if not torch.any(valid_mask):
-            return None
+            with NvtxAnnotate(f"{nvtx_coalesce}/BinCastValidMask"):
+                bins = req_bins.to(device=activations.device, dtype=torch.long)
+                valid_mask = bins >= 0
+                if not torch.any(valid_mask):
+                    return None
 
-        token_positions = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1)
-        valid_bins = bins.index_select(0, token_positions)
+                token_positions = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1)
+                valid_bins = bins.index_select(0, token_positions)
 
-        # Group rows by adapter to maximize contiguous D2H/H2D transfer efficiency.
-        if valid_bins.numel() > 1:
-            sorted_bins, sort_idx = torch.sort(valid_bins)
-            token_positions = token_positions.index_select(0, sort_idx)
-        else:
-            sorted_bins = valid_bins
+            # Group rows by adapter to maximize contiguous D2H/H2D transfer efficiency.
+            if valid_bins.numel() > 1:
+                with NvtxAnnotate(f"{nvtx_coalesce}/SortByAdapterBin"):
+                    sorted_bins, sort_idx = torch.sort(valid_bins)
+                    token_positions = token_positions.index_select(0, sort_idx)
+            else:
+                sorted_bins = valid_bins
 
-        packed_activations = activations.index_select(0, token_positions).contiguous()
+            with NvtxAnnotate(f"{nvtx_coalesce}/GatherContiguous"):
+                packed_activations = activations.index_select(0, token_positions).contiguous()
 
-        adapter_ids, adapter_counts = torch.unique_consecutive(sorted_bins, return_counts=True)
-        adapter_offsets = torch.empty(adapter_counts.numel() + 1, dtype=torch.int32, device=activations.device)
-        adapter_offsets[0] = 0
-        adapter_offsets[1:] = torch.cumsum(adapter_counts.to(torch.int32), dim=0)
+            with NvtxAnnotate(f"{nvtx_coalesce}/AdapterOffsetsCSR"):
+                adapter_ids, adapter_counts = torch.unique_consecutive(sorted_bins, return_counts=True)
+                adapter_offsets = torch.empty(adapter_counts.numel() + 1, dtype=torch.int32, device=activations.device)
+                adapter_offsets[0] = 0
+                adapter_offsets[1:] = torch.cumsum(adapter_counts.to(torch.int32), dim=0)
 
-        return {
-            "packed_activations": packed_activations,
-            "packed_bins": sorted_bins.contiguous(),
-            "token_positions": token_positions,
-            "adapter_ids": adapter_ids,
-            "adapter_offsets": adapter_offsets,
-        }
+            return {
+                "packed_activations": packed_activations,
+                "packed_bins": sorted_bins.contiguous(),
+                "token_positions": token_positions,
+                "adapter_ids": adapter_ids,
+                "adapter_offsets": adapter_offsets,
+            }
 
     def _scatter_lora_from_packed(
         self,
@@ -184,13 +190,16 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
         total_tokens: int,
     ) -> torch.Tensor:
         """Scatter packed LoRA output back to the original expert token order."""
-        full_output = torch.zeros(
-            (total_tokens, packed_output.shape[1]),
-            dtype=packed_output.dtype,
-            device=packed_output.device,
-        )
+        nvtx_scatter = f"MoE_CoalescedAct_Scatter/L{int(self.layer_num_)}"
+        with NvtxAnnotate(f"{nvtx_scatter}/AllocZeroBuffer"):
+            full_output = torch.zeros(
+                (total_tokens, packed_output.shape[1]),
+                dtype=packed_output.dtype,
+                device=packed_output.device,
+            )
         if packed_output.numel() > 0:
-            full_output.index_copy_(0, token_positions, packed_output)
+            with NvtxAnnotate(f"{nvtx_scatter}/IndexCopyRows"):
+                full_output.index_copy_(0, token_positions, packed_output)
         return full_output
 
     def _dispatch_lora_with_optional_coalescing(
@@ -201,16 +210,25 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
         req_bins: Optional[torch.Tensor],
         expert_id: int,
         pack_meta: Optional[Dict[str, torch.Tensor]],
+        hybrid_prepare_ctx_cache: Optional[Dict[str, Any]] = None,
         reuse_packed_input: bool = False,
         phase_name: str = "",
         study2_prefix: Optional[str] = None,
     ) -> torch.Tensor:
         """Run LoRA with packed activations when metadata is available."""
         if pack_meta is None:
-            return dispatch_fn(input_tensor, layer_id, req_bins, expert_id=expert_id)
+            packed_input = input_tensor
+            packed_bins = req_bins
+        elif reuse_packed_input:
+            packed_input = pack_meta["packed_activations"]
+            packed_bins = pack_meta["packed_bins"]
+        else:
+            with NvtxAnnotate(f"MoE_CoalescedAct_GatherInput/L{layer_id}/E{expert_id}/{phase_name or 'LoRA'}"):
+                packed_input = input_tensor.index_select(0, pack_meta["token_positions"]).contiguous()
+            packed_bins = pack_meta["packed_bins"]
 
         use_cpu_compute = self._should_use_moe_cpu_compute()
-        if use_cpu_compute:
+        if use_cpu_compute and pack_meta is not None:
             return self._dispatch_lora_with_coalesced_cpu_roundtrip(
                 dispatch_fn=dispatch_fn,
                 input_tensor=input_tensor,
@@ -222,21 +240,51 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
                 study2_prefix=study2_prefix,
             )
 
-        if reuse_packed_input:
-            packed_input = pack_meta["packed_activations"]
-        else:
-            packed_input = input_tensor.index_select(0, pack_meta["token_positions"]).contiguous()
-        packed_out = dispatch_fn(
-            packed_input,
-            layer_id,
-            pack_meta["packed_bins"],
-            expert_id=expert_id,
-        )
-        return self._scatter_lora_from_packed(
-            packed_output=packed_out,
-            token_positions=pack_meta["token_positions"],
-            total_tokens=input_tensor.shape[0],
-        )
+        dispatch_kwargs: Dict[str, Any] = {"expert_id": expert_id}
+        dispatcher = self.lora_dispatcher_
+        if (
+            hybrid_prepare_ctx_cache is not None
+            and dispatcher is not None
+            and callable(getattr(dispatcher, "build_moe_hybrid_shared_prepare_context", None))
+            and packed_bins is not None
+        ):
+            shared_ctx_key = f"{int(layer_id)}:{int(expert_id)}:{int(packed_bins.shape[0])}:{packed_bins.data_ptr()}"
+            shared_prepare_ctx = hybrid_prepare_ctx_cache.get(shared_ctx_key)
+            if shared_prepare_ctx is None:
+                shared_prepare_ctx = dispatcher.build_moe_hybrid_shared_prepare_context(
+                    batch_size=int(packed_input.shape[0]),
+                    bins=packed_bins,
+                    expert_id=expert_id,
+                )
+                hybrid_prepare_ctx_cache[shared_ctx_key] = shared_prepare_ctx
+            if shared_prepare_ctx is not None:
+                dispatch_kwargs["hybrid_prepare_ctx"] = shared_prepare_ctx
+
+        lora_nvtx = f"MoE_CoalescedAct_LoRA_GPU/L{layer_id}/E{expert_id}/{phase_name or 'LoRA'}"
+        with NvtxAnnotate(lora_nvtx):
+            try:
+                packed_out = dispatch_fn(
+                    packed_input,
+                    layer_id,
+                    packed_bins,
+                    **dispatch_kwargs,
+                )
+            except TypeError:
+                # Older dispatchers may not support hybrid_prepare_ctx kwarg.
+                packed_out = dispatch_fn(
+                    packed_input,
+                    layer_id,
+                    packed_bins,
+                    expert_id=expert_id,
+                )
+        if pack_meta is None:
+            return packed_out
+        with NvtxAnnotate(f"MoE_CoalescedAct_ScatterOutput/L{layer_id}/E{expert_id}/{phase_name or 'LoRA'}"):
+            return self._scatter_lora_from_packed(
+                packed_output=packed_out,
+                token_positions=pack_meta["token_positions"],
+                total_tokens=input_tensor.shape[0],
+            )
 
     def _should_use_moe_cpu_compute(self) -> bool:
         """Best-effort detection for MoE CPU-compute mode across dispatcher variants."""
@@ -273,22 +321,6 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
             "colora_miss_tokens": 0,
             "promotion_queue_depth": 0,
             "cache_hit_rate": 0.0,
-            "cache_capacity_slots": 0,
-            "cache_resident_slots": 0,
-            "cache_free_slots": 0,
-            "cache_evictions_total": 0,
-            "gate_capacity_slots": 0,
-            "gate_resident_slots": 0,
-            "gate_free_slots": 0,
-            "gate_evictions_total": 0,
-            "up_capacity_slots": 0,
-            "up_resident_slots": 0,
-            "up_free_slots": 0,
-            "up_evictions_total": 0,
-            "down_capacity_slots": 0,
-            "down_resident_slots": 0,
-            "down_free_slots": 0,
-            "down_evictions_total": 0,
             "cpu_compute_time": 0.0,
             "gpu_compute_time": 0.0,
             "cpu_queue_wait_time": 0.0,
@@ -369,22 +401,6 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
             agg_stats["overlap_ratio_count"] += 1
         agg_stats["promotion_queue_depth"] = int(stats.get("promotion_queue_depth", agg_stats["promotion_queue_depth"]))
         agg_stats["cache_hit_rate"] = float(stats.get("cache_hit_rate", agg_stats["cache_hit_rate"]))
-        agg_stats["cache_capacity_slots"] = int(stats.get("cache_capacity_slots", agg_stats["cache_capacity_slots"]))
-        agg_stats["cache_resident_slots"] = int(stats.get("cache_resident_slots", agg_stats["cache_resident_slots"]))
-        agg_stats["cache_free_slots"] = int(stats.get("cache_free_slots", agg_stats["cache_free_slots"]))
-        agg_stats["cache_evictions_total"] = int(stats.get("cache_evictions_total", agg_stats["cache_evictions_total"]))
-        agg_stats["gate_capacity_slots"] = int(stats.get("gate_capacity_slots", agg_stats["gate_capacity_slots"]))
-        agg_stats["gate_resident_slots"] = int(stats.get("gate_resident_slots", agg_stats["gate_resident_slots"]))
-        agg_stats["gate_free_slots"] = int(stats.get("gate_free_slots", agg_stats["gate_free_slots"]))
-        agg_stats["gate_evictions_total"] = int(stats.get("gate_evictions_total", agg_stats["gate_evictions_total"]))
-        agg_stats["up_capacity_slots"] = int(stats.get("up_capacity_slots", agg_stats["up_capacity_slots"]))
-        agg_stats["up_resident_slots"] = int(stats.get("up_resident_slots", agg_stats["up_resident_slots"]))
-        agg_stats["up_free_slots"] = int(stats.get("up_free_slots", agg_stats["up_free_slots"]))
-        agg_stats["up_evictions_total"] = int(stats.get("up_evictions_total", agg_stats["up_evictions_total"]))
-        agg_stats["down_capacity_slots"] = int(stats.get("down_capacity_slots", agg_stats["down_capacity_slots"]))
-        agg_stats["down_resident_slots"] = int(stats.get("down_resident_slots", agg_stats["down_resident_slots"]))
-        agg_stats["down_free_slots"] = int(stats.get("down_free_slots", agg_stats["down_free_slots"]))
-        agg_stats["down_evictions_total"] = int(stats.get("down_evictions_total", agg_stats["down_evictions_total"]))
 
     def _get_study2_profile_prefix(self, expert_id: int, step_idx: int, token_count: int) -> Optional[str]:
         """Build Study2 NVTX prefix for real-model profiling when enabled via env."""
@@ -418,57 +434,62 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
         study2_prefix: Optional[str],
     ) -> torch.Tensor:
         """Coalesced D2H->CPU compute->H2D path using packed activation order."""
+        phase_suffix = phase_name if phase_name else "LoRA"
+
+        def _nvtx(name: str) -> str:
+            if study2_prefix is not None:
+                return f"{study2_prefix}/{name}"
+            return name
+
         if reuse_packed_input:
             packed_input_gpu = pack_meta["packed_activations"]
         else:
-            packed_input_gpu = input_tensor.index_select(0, pack_meta["token_positions"]).contiguous()
+            with NvtxAnnotate(
+                _nvtx(f"MoE_CoalescedAct_GatherInput/L{layer_id}/E{expert_id}/{phase_suffix}")
+            ):
+                packed_input_gpu = input_tensor.index_select(0, pack_meta["token_positions"]).contiguous()
 
         if "packed_bins_cpu" not in pack_meta:
-            pack_meta["packed_bins_cpu"] = pack_meta["packed_bins"].to(device="cpu", non_blocking=False)
+            with NvtxAnnotate(_nvtx(f"MoE_CoalescedAct_BinsToCPU/L{layer_id}/E{expert_id}/{phase_suffix}")):
+                pack_meta["packed_bins_cpu"] = pack_meta["packed_bins"].to(device="cpu", non_blocking=False)
         packed_bins_cpu = pack_meta["packed_bins_cpu"]
 
         if packed_input_gpu.device.type != "cuda":
-            packed_out = dispatch_fn(
-                packed_input_gpu,
-                layer_id,
-                packed_bins_cpu.to(device=packed_input_gpu.device),
-                expert_id=expert_id,
-            )
-            return self._scatter_lora_from_packed(
-                packed_output=packed_out,
-                token_positions=pack_meta["token_positions"],
-                total_tokens=input_tensor.shape[0],
-            )
+            with NvtxAnnotate(
+                _nvtx(f"MoE_CoalescedAct_LoRA_CPU/L{layer_id}/E{expert_id}/{phase_suffix}")
+            ):
+                packed_out = dispatch_fn(
+                    packed_input_gpu,
+                    layer_id,
+                    packed_bins_cpu.to(device=packed_input_gpu.device),
+                    expert_id=expert_id,
+                )
+            with NvtxAnnotate(_nvtx(f"MoE_CoalescedAct_ScatterOutput/L{layer_id}/E{expert_id}/{phase_suffix}")):
+                return self._scatter_lora_from_packed(
+                    packed_output=packed_out,
+                    token_positions=pack_meta["token_positions"],
+                    total_tokens=input_tensor.shape[0],
+                )
 
-        phase_suffix = phase_name if phase_name else "LoRA"
-        to_cpu_label = (
-            f"{study2_prefix}/Transfer_ToCPU/{phase_suffix}"
-            if study2_prefix is not None
-            else "MoE_COLoRA_D2H_Activation"
-        )
-        cpu_compute_label = (
-            f"{study2_prefix}/CPU_AVX_Compute/{phase_suffix}"
-            if study2_prefix is not None
-            else "MoE_COLoRA_CPU_AVX_Compute"
-        )
-        to_gpu_label = (
-            f"{study2_prefix}/Transfer_ToGPU/{phase_suffix}"
-            if study2_prefix is not None
-            else "MoE_COLoRA_H2D_Activation"
-        )
+        d2h_nvtx = _nvtx(f"MoE_CoalescedAct_D2H_PackedActivations/L{layer_id}/E{expert_id}/{phase_suffix}")
+        cpu_nvtx = _nvtx(f"MoE_CoalescedAct_LoRA_CPU/L{layer_id}/E{expert_id}/{phase_suffix}")
+        h2d_nvtx = _nvtx(f"MoE_CoalescedAct_H2D_PackedLoRAOut/L{layer_id}/E{expert_id}/{phase_suffix}")
 
-        with NvtxAnnotate(to_cpu_label):
-            packed_input_cpu = torch.empty(
-                packed_input_gpu.shape,
-                dtype=packed_input_gpu.dtype,
-                device="cpu",
-                pin_memory=True,
-            )
-            packed_input_cpu.copy_(packed_input_gpu, non_blocking=True)
+        with NvtxAnnotate(d2h_nvtx):
+            with NvtxAnnotate(f"{d2h_nvtx}/AllocPinnedHost"):
+                packed_input_cpu = torch.empty(
+                    packed_input_gpu.shape,
+                    dtype=packed_input_gpu.dtype,
+                    device="cpu",
+                    pin_memory=True,
+                )
+            with NvtxAnnotate(f"{d2h_nvtx}/CopyAsync"):
+                packed_input_cpu.copy_(packed_input_gpu, non_blocking=True)
             # CPU kernel consumes host data directly; ensure D2H completion first.
-            torch.cuda.current_stream().synchronize()
+            with NvtxAnnotate(f"{d2h_nvtx}/StreamSync"):
+                torch.cuda.current_stream().synchronize()
 
-        with NvtxAnnotate(cpu_compute_label):
+        with NvtxAnnotate(cpu_nvtx):
             packed_out_cpu = dispatch_fn(
                 packed_input_cpu,
                 layer_id,
@@ -477,35 +498,39 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
             )
 
         if packed_out_cpu.device.type != "cpu":
+            with NvtxAnnotate(_nvtx(f"MoE_CoalescedAct_ScatterOutput/L{layer_id}/E{expert_id}/{phase_suffix}")):
+                return self._scatter_lora_from_packed(
+                    packed_output=packed_out_cpu,
+                    token_positions=pack_meta["token_positions"],
+                    total_tokens=input_tensor.shape[0],
+                )
+
+        with NvtxAnnotate(h2d_nvtx):
+            # Keep H2D contiguous and pinned to maximize PCIe bandwidth.
+            packed_out_cpu = packed_out_cpu.contiguous()
+            with NvtxAnnotate(f"{h2d_nvtx}/PinStaging"):
+                packed_out_cpu_pinned = torch.empty(
+                    packed_out_cpu.shape,
+                    dtype=packed_out_cpu.dtype,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                packed_out_cpu_pinned.copy_(packed_out_cpu, non_blocking=False)
+
+            with NvtxAnnotate(f"{h2d_nvtx}/ToDevice"):
+                packed_out_gpu = torch.empty(
+                    packed_out_cpu_pinned.shape,
+                    dtype=packed_out_cpu_pinned.dtype,
+                    device=input_tensor.device,
+                )
+                packed_out_gpu.copy_(packed_out_cpu_pinned, non_blocking=True)
+
+        with NvtxAnnotate(_nvtx(f"MoE_CoalescedAct_ScatterOutput/L{layer_id}/E{expert_id}/{phase_suffix}")):
             return self._scatter_lora_from_packed(
-                packed_output=packed_out_cpu,
+                packed_output=packed_out_gpu,
                 token_positions=pack_meta["token_positions"],
                 total_tokens=input_tensor.shape[0],
             )
-
-        with NvtxAnnotate(to_gpu_label):
-            # Keep H2D contiguous and pinned to maximize PCIe bandwidth.
-            packed_out_cpu = packed_out_cpu.contiguous()
-            packed_out_cpu_pinned = torch.empty(
-                packed_out_cpu.shape,
-                dtype=packed_out_cpu.dtype,
-                device="cpu",
-                pin_memory=True,
-            )
-            packed_out_cpu_pinned.copy_(packed_out_cpu, non_blocking=False)
-
-            packed_out_gpu = torch.empty(
-                packed_out_cpu_pinned.shape,
-                dtype=packed_out_cpu_pinned.dtype,
-                device=input_tensor.device,
-            )
-            packed_out_gpu.copy_(packed_out_cpu_pinned, non_blocking=True)
-
-        return self._scatter_lora_from_packed(
-            packed_output=packed_out_gpu,
-            token_positions=pack_meta["token_positions"],
-            total_tokens=input_tensor.shape[0],
-        )
 
     def _bind_func(self):
         super()._bind_func()
@@ -897,64 +922,93 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
         # ----------------------------------------------------------------
 
         # 1. Router computation
-        router_logits = layer_weight.moe_gate.mm(hidden_states)
+        with NvtxAnnotate("MoE_SlowPath_RouterComputation"):
+            router_logits = layer_weight.moe_gate.mm(hidden_states)
 
         # 2. Explicit routing
-        topk_weights, topk_ids = select_experts(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-            correction_bias=getattr(layer_weight.experts, "e_score_correction_bias", None),
-            top_k=self.num_experts_per_tok,
-            renormalize=self.norm_topk_prob,
-            use_grouped_topk=False,
-            topk_group=None,
-            num_expert_group=None,
-            scoring_func=getattr(layer_weight.experts, "scoring_func", "softmax"),
-        )
+        with NvtxAnnotate("MoE_SlowPath_TopKRouting"):
+            topk_weights, topk_ids = select_experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                correction_bias=getattr(layer_weight.experts, "e_score_correction_bias", None),
+                top_k=self.num_experts_per_tok,
+                renormalize=self.norm_topk_prob,
+                use_grouped_topk=False,
+                topk_group=None,
+                num_expert_group=None,
+                scoring_func=getattr(layer_weight.experts, "scoring_func", "softmax"),
+            )
 
         if hasattr(layer_weight.experts, "routed_scaling_factor"):
-            # topk_weights = topk_weights * layer_weight.experts.routed_scaling_factor
-            topk_weights.mul_(layer_weight.experts.routed_scaling_factor)
+            with NvtxAnnotate("MoE_SlowPath_RoutedScaling"):
+                # topk_weights = topk_weights * layer_weight.experts.routed_scaling_factor
+                topk_weights.mul_(layer_weight.experts.routed_scaling_factor)
 
-        self._log_adapter_expert_distribution(
-            topk_ids=topk_ids,
-            req_bins=self.req_bins_,
-            num_experts=layer_weight.experts.n_routed_experts,
-            num_tokens=num_tokens,
-            infer_state=infer_state,
-        )
-        self._log_router_trace(
-            topk_ids=topk_ids,
-            topk_weights=topk_weights,
-            num_tokens=num_tokens,
-            infer_state=infer_state,
-        )
+        with NvtxAnnotate("MoE_SlowPath_RouterLogging"):
+            self._log_adapter_expert_distribution(
+                topk_ids=topk_ids,
+                req_bins=self.req_bins_,
+                num_experts=layer_weight.experts.n_routed_experts,
+                num_tokens=num_tokens,
+                infer_state=infer_state,
+            )
+            self._log_router_trace(
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+                num_tokens=num_tokens,
+                infer_state=infer_state,
+            )
 
-        # 3. Check weights availability
-        experts = layer_weight.experts
-        # 必须确保使用了 keep_expert_lists=True
-        assert hasattr(experts, "experts_gate_projs") and experts.experts_gate_projs[0] is not None, \
-            "Per-Expert Baseline requires 'keep_expert_lists=True' in FusedMoeWeightTP."
+        with NvtxAnnotate("MoE_SlowPath_DispatchToPipeline"):
+            return self._moe_ffn_pipelined_per_expert_from_topk(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                infer_state,
+                layer_weight,
+                colora_stats,
+            )
 
-        final_output = torch.zeros_like(hidden_states)
-        total_experts = experts.n_routed_experts
+    def _moe_ffn_pipelined_per_expert_from_topk(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        infer_state: LlamaInferStateInfo,
+        layer_weight: Qwen3MOETransformerLayerWeight,
+        colora_stats: Dict[str, Any],
+    ) -> torch.Tensor:
+        """Shared MoE slow path: cluster tokens by expert, HtoD prefetch + compute stream pipeline, COLoRA LoRA."""
+        with NvtxAnnotate("MoE_PipelinePrelude"):
+            num_tokens, hidden_dim = hidden_states.shape
+            assert topk_ids.shape[0] == num_tokens and topk_weights.shape[0] == num_tokens
 
-        # EP mode: get local expert info
-        is_ep, local_expert_ids, local_to_global, global_to_local = self._get_local_expert_info(layer_weight)
+            # 3. Check weights availability
+            experts = layer_weight.experts
+            # 必须确保使用了 keep_expert_lists=True
+            assert hasattr(experts, "experts_gate_projs") and experts.experts_gate_projs[0] is not None, (
+                "Per-Expert Baseline requires 'keep_expert_lists=True' in FusedMoeWeightTP."
+            )
 
-        # 4. Expert Loop with Compute-Transfer Pipelining
-        # In TP mode: iterate over all experts
-        # In EP mode: iterate only over local experts
-        expert_iter_range = local_expert_ids if is_ep else range(total_experts)
+            final_output = torch.zeros_like(hidden_states)
+            total_experts = experts.n_routed_experts
 
-        # Log token distribution per expert before entering the loop
-        if logger.isEnabledFor(logging.DEBUG):
-            token_counts = {}
-            for global_eid in (local_to_global.values() if is_ep else range(total_experts)):
-                count = int((topk_ids == global_eid).sum())
-                if count > 0:
-                    token_counts[global_eid] = count
-            logger.debug(f"[MoE] Layer {self.layer_num_}: {num_tokens} tokens -> {token_counts}")
+            # EP mode: get local expert info
+            is_ep, local_expert_ids, local_to_global, global_to_local = self._get_local_expert_info(layer_weight)
+
+            # 4. Expert Loop with Compute-Transfer Pipelining
+            # In TP mode: iterate over all experts
+            # In EP mode: iterate only over local experts
+            expert_iter_range = local_expert_ids if is_ep else range(total_experts)
+
+            # Log token distribution per expert before entering the loop
+            if logger.isEnabledFor(logging.DEBUG):
+                token_counts = {}
+                for global_eid in (local_to_global.values() if is_ep else range(total_experts)):
+                    count = int((topk_ids == global_eid).sum())
+                    if count > 0:
+                        token_counts[global_eid] = count
+                logger.debug(f"[MoE] Layer {self.layer_num_}: {num_tokens} tokens -> {token_counts}")
 
         with NvtxAnnotate("MoE_ActiveExpertExtraction_Optimized"):
             # 1. 扁平化 topk_ids [num_tokens * top_k]
@@ -969,8 +1023,10 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
                 layer_id = layer_weight.layer_num_
                 active_experts = [i for i, count in enumerate(expert_counts) if count > 0]
                 with open("/tmp/moe_profiling.log", "a") as f:
-                    f.write(f"Layer {layer_id}: activated_experts={active_experts}, "
-                            f"expert_counts={expert_counts}, total_tokens={sum(expert_counts)}\n")
+                    f.write(
+                        f"Layer {layer_id}: activated_experts={active_experts}, "
+                        f"expert_counts={expert_counts}, total_tokens={sum(expert_counts)}\n"
+                    )
 
             # 3. 纯 GPU 排序，瞬间将 Token 按 Expert 聚类
             sorted_token_indices = torch.argsort(flat_topk_ids)
@@ -978,7 +1034,7 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
             # 4. 在 CPU 端瞬间计算出全局内存块的偏移量
             global_offsets = [0] * (total_experts + 1)
             for i in range(total_experts):
-                global_offsets[i+1] = global_offsets[i] + expert_counts[i]
+                global_offsets[i + 1] = global_offsets[i] + expert_counts[i]
 
             active_experts_data = []
             for local_expert_idx in expert_iter_range:
@@ -993,7 +1049,7 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
                     token_idx = sorted_token_indices[start_idx:end_idx]
                     batch_indices = token_idx // self.num_experts_per_tok
                     k_indices = token_idx % self.num_experts_per_tok
-                    
+
                     active_experts_data.append((local_expert_idx, batch_indices, k_indices))
 
         # Early exit if no active experts
@@ -1018,6 +1074,9 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
             first_expert_idx, _, _ = active_experts_data[0]
             with torch.cuda.stream(transfer_stream):
                 next_weights = prefetch_weights(first_expert_idx)
+
+        # Layer-call cache to reuse shared hybrid-prepare metadata across Gate/Up/Down.
+        layer_hybrid_prepare_ctx_cache: Dict[str, Any] = {}
 
         # 4.4 Pipelined Expert Loop
         for i, (local_expert_idx, batch_indices, k_indices) in enumerate(active_experts_data):
@@ -1055,12 +1114,31 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
                     enable_coalescing = os.environ.get("MOE_COALESCING_PACKER", "1") == "1"
                     pack_meta = None
                     if enable_coalescing:
-                        pack_label = f"{study2_prefix}/Gather" if study2_prefix is not None else "MoE_COLoRA_CoalescePack"
+                        pack_label = (
+                            f"{study2_prefix}/CoalescedPacker"
+                            if study2_prefix is not None
+                            else (
+                                f"MoE_CoalescedPacker_CallSite/L{int(layer_weight.layer_num_)}"
+                                f"/E{int(local_expert_idx)}"
+                            )
+                        )
                         with NvtxAnnotate(pack_label):
                             pack_meta = self._coalesce_lora_activations(
                                 activations=expert_input,
                                 req_bins=expert_req_bins,
                             )
+                    if pack_meta is None:
+                        bins_for_shared_ctx = expert_req_bins
+                    else:
+                        bins_for_shared_ctx = pack_meta["packed_bins"]
+                    shared_ctx_key = (
+                        f"{int(layer_weight.layer_num_)}:{int(local_expert_idx)}:"
+                        f"{-1 if bins_for_shared_ctx is None else int(bins_for_shared_ctx.shape[0])}:"
+                        f"{0 if bins_for_shared_ctx is None else int(bins_for_shared_ctx.data_ptr())}"
+                    )
+                    expert_hybrid_prepare_ctx_cache: Dict[str, Any] = {}
+                    if shared_ctx_key in layer_hybrid_prepare_ctx_cache:
+                        expert_hybrid_prepare_ctx_cache[shared_ctx_key] = layer_hybrid_prepare_ctx_cache[shared_ctx_key]
 
                     # 4.4.1 Synchronize: ensure current expert's weights have arrived
                     with NvtxAnnotate("MoE_WaitTransfer"):
@@ -1108,6 +1186,7 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
                                 req_bins=expert_req_bins,
                                 expert_id=local_expert_idx,
                                 pack_meta=pack_meta,
+                                hybrid_prepare_ctx_cache=expert_hybrid_prepare_ctx_cache,
                                 reuse_packed_input=True,
                                 phase_name="Gate",
                                 study2_prefix=study2_prefix,
@@ -1121,6 +1200,7 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
                                 req_bins=expert_req_bins,
                                 expert_id=local_expert_idx,
                                 pack_meta=pack_meta,
+                                hybrid_prepare_ctx_cache=expert_hybrid_prepare_ctx_cache,
                                 reuse_packed_input=True,
                                 phase_name="Up",
                                 study2_prefix=study2_prefix,
@@ -1150,10 +1230,13 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
                             req_bins=expert_req_bins,
                             expert_id=local_expert_idx,
                             pack_meta=pack_meta,
+                            hybrid_prepare_ctx_cache=expert_hybrid_prepare_ctx_cache,
                             phase_name="Down",
                             study2_prefix=study2_prefix,
                         )
                         self._merge_colora_stats(colora_stats)
+                    if shared_ctx_key in expert_hybrid_prepare_ctx_cache:
+                        layer_hybrid_prepare_ctx_cache[shared_ctx_key] = expert_hybrid_prepare_ctx_cache[shared_ctx_key]
                     down_out += down_lora
 
                     # 4.4.8 Weighted Aggregation (Corrected)
@@ -1183,14 +1266,8 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
                 overlap_ratio_avg = colora_stats["overlap_ratio_sum"] / float(colora_stats["overlap_ratio_count"])
             logger.debug(
                 "[COLoRA] layer=%s hit_tokens=%s miss_tokens=%s queue_depth=%s hit_rate=%.4f "
-                "cache_capacity_slots=%s cache_resident_slots=%s cache_free_slots=%s cache_evictions_total=%s "
-                "gate_capacity_slots=%s gate_resident_slots=%s gate_free_slots=%s gate_evictions_total=%s "
-                "up_capacity_slots=%s up_resident_slots=%s up_free_slots=%s up_evictions_total=%s "
-                "down_capacity_slots=%s down_resident_slots=%s down_free_slots=%s down_evictions_total=%s "
                 "cpu_compute_time=%.6f gpu_compute_time=%.6f cpu_queue_wait=%.6f "
-                "d2h_bytes=%.0f h2d_bytes=%.0f weight_h2d_bytes=%.0f weight_h2d_time=%.6f "
-                "overlap_ratio=%.4f fallback_degrade_count=%s blocking_promotion_count=%s "
-                "miss_policy=%s overlap_mode=%s cpu_queue_depth=%s "
+                "d2h_bytes=%.0f h2d_bytes=%.0f overlap_ratio=%.4f fallback_degrade_count=%s cpu_queue_depth=%s "
                 "promotion_drop_total=%s promotion_drop_queue=%s promotion_drop_cooldown=%s "
                 "promotion_admitted=%s promotion_reject_delta=%s promotion_reject_no_ema=%s tracker_queue_drop=%s "
                 "prefetch_submitted=%s prefetch_ready_hits=%s prefetch_not_ready=%s prefetch_stale=%s "
@@ -1202,34 +1279,13 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
                 colora_stats["colora_miss_tokens"],
                 colora_stats["promotion_queue_depth"],
                 colora_stats["cache_hit_rate"],
-                colora_stats["cache_capacity_slots"],
-                colora_stats["cache_resident_slots"],
-                colora_stats["cache_free_slots"],
-                colora_stats["cache_evictions_total"],
-                colora_stats["gate_capacity_slots"],
-                colora_stats["gate_resident_slots"],
-                colora_stats["gate_free_slots"],
-                colora_stats["gate_evictions_total"],
-                colora_stats["up_capacity_slots"],
-                colora_stats["up_resident_slots"],
-                colora_stats["up_free_slots"],
-                colora_stats["up_evictions_total"],
-                colora_stats["down_capacity_slots"],
-                colora_stats["down_resident_slots"],
-                colora_stats["down_free_slots"],
-                colora_stats["down_evictions_total"],
                 colora_stats["cpu_compute_time"],
                 colora_stats["gpu_compute_time"],
                 colora_stats["cpu_queue_wait_time"],
                 colora_stats["d2h_bytes"],
                 colora_stats["h2d_bytes"],
-                colora_stats["weight_h2d_bytes"],
-                colora_stats["weight_h2d_time"],
                 overlap_ratio_avg,
                 colora_stats["fallback_degrade_count"],
-                colora_stats["blocking_promotion_count"],
-                colora_stats["miss_policy"],
-                colora_stats["overlap_mode"],
                 colora_stats["cpu_queue_depth"],
                 colora_stats["promotion_drop_total"],
                 colora_stats["promotion_drop_queue_high_watermark"],

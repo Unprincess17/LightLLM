@@ -409,11 +409,24 @@ git commit -m "test: align system TPOT tooling with COLoRA audit matrix"
 Use this minimum matrix:
 ```markdown
 Conditions: expert_only, joint_indep, joint_corr
-Miss handling modes: load_then_run, execution_first
-Optional diagnostic modes: no_cpu_path, no_deferred_sync
+Primary comparison modes: load_then_run, execution_first
+Ablation mode: no_deferred_sync
+Optional diagnostic mode: no_cpu_path only if the audit needs CPU-path isolation
 Overlap policy: calibrated
 At least one practical cache budget and one larger budget
 Outputs: tpot_quantiles.csv, token_tpot.csv, background_policy_summary.csv
+Per-mode output dirs:
+- artifacts/case_study/<RUN_ID>/replay/system_tpot_execution_first
+- artifacts/case_study/<RUN_ID>/replay/system_tpot_load_then_run
+- artifacts/case_study/<RUN_ID>/replay/system_tpot_no_deferred_sync
+
+Why these three runs:
+- load_then_run is the blocking baseline the paper claims COLoRA improves on.
+- execution_first is the full COLoRA path whose tail behavior should beat the baseline.
+- no_deferred_sync is the ablation that isolates whether deferred synchronization / promotion adds value beyond execution-first dispatch itself.
+
+Figure assembly rule:
+- tools/case_study/assemble_motivation_figures.py reads one system-TPOT directory at a time via --system_tpot_dir; it does not merge multiple miss_handling_mode runs automatically.
 ```
 
 - [ ] **Step 2: Run the focused unit-test gate before E2E**
@@ -437,9 +450,10 @@ python tools/case_study/analyze_system_tpot.py \
   --calibration_path <ABSOLUTE_CALIBRATION_JSON> \
   --miss_handling_mode execution_first \
   --overlap_policy calibrated \
+  --output_dir artifacts/case_study/<RUN_ID>/replay/system_tpot_execution_first \
   --conditions expert_only,joint_indep,joint_corr
 ```
-Expected: writes `tpot_quantiles.csv`, `token_tpot.csv`, `layer_barrier_breakdown.csv`, `background_policy_summary.csv` to the selected system-TPOT output directory.
+Expected: writes `tpot_quantiles.csv`, `token_tpot.csv`, `layer_barrier_breakdown.csv`, `background_policy_summary.csv`, and `system_tpot_manifest.json` to `replay/system_tpot_execution_first`.
 
 - [ ] **Step 4: Re-run the baseline comparison mode**
 
@@ -449,26 +463,49 @@ python tools/case_study/analyze_system_tpot.py \
   --calibration_path <ABSOLUTE_CALIBRATION_JSON> \
   --miss_handling_mode load_then_run \
   --overlap_policy calibrated \
+  --output_dir artifacts/case_study/<RUN_ID>/replay/system_tpot_load_then_run \
   --conditions expert_only,joint_indep,joint_corr
 ```
-Expected: merged CSV outputs preserve all selected conditions and expose the baseline vs execution-first deltas.
+Expected: writes the baseline artifacts to `replay/system_tpot_load_then_run` without overwriting the execution-first outputs.
 
-- [ ] **Step 5: If the audit flagged diagnostic modes as important, run them once each**
-
-Run:
-```bash
-python tools/case_study/analyze_system_tpot.py --calibration_path <ABSOLUTE_CALIBRATION_JSON> --miss_handling_mode no_cpu_path --conditions joint_indep,joint_corr
-python tools/case_study/analyze_system_tpot.py --calibration_path <ABSOLUTE_CALIBRATION_JSON> --miss_handling_mode no_deferred_sync --conditions joint_indep,joint_corr
-```
-Expected: diagnostic-only outputs used to justify what execution-first specifically buys.
-
-- [ ] **Step 6: Assemble the motivation figures from the audited outputs**
+- [ ] **Step 5: Run the deferred-sync ablation once in its own directory**
 
 Run:
 ```bash
-python tools/case_study/assemble_motivation_figures.py --run_id <RUN_ID>
+python tools/case_study/analyze_system_tpot.py \
+  --calibration_path <ABSOLUTE_CALIBRATION_JSON> \
+  --miss_handling_mode no_deferred_sync \
+  --overlap_policy calibrated \
+  --output_dir artifacts/case_study/<RUN_ID>/replay/system_tpot_no_deferred_sync \
+  --conditions expert_only,joint_indep,joint_corr
 ```
-Expected: motivation panel PDFs are regenerated without missing-input errors.
+Expected: writes the ablation artifacts to `replay/system_tpot_no_deferred_sync`; because this is a fresh output directory, include `expert_only` as well so the initial manifest exists.
+
+- [ ] **Step 6: Assemble the motivation figures from a chosen mode-specific output**
+
+Run:
+```bash
+python tools/case_study/assemble_motivation_figures.py \
+  --run_id <RUN_ID> \
+  --system_tpot_dir artifacts/case_study/<RUN_ID>/replay/system_tpot_execution_first \
+  --figures_dir artifacts/case_study/<RUN_ID>/figures/motivation_execution_first \
+  --output_stem motivation_execution_first
+```
+Optional comparison renders:
+```bash
+python tools/case_study/assemble_motivation_figures.py \
+  --run_id <RUN_ID> \
+  --system_tpot_dir artifacts/case_study/<RUN_ID>/replay/system_tpot_load_then_run \
+  --figures_dir artifacts/case_study/<RUN_ID>/figures/motivation_load_then_run \
+  --output_stem motivation_load_then_run
+
+python tools/case_study/assemble_motivation_figures.py \
+  --run_id <RUN_ID> \
+  --system_tpot_dir artifacts/case_study/<RUN_ID>/replay/system_tpot_no_deferred_sync \
+  --figures_dir artifacts/case_study/<RUN_ID>/figures/motivation_no_deferred_sync \
+  --output_stem motivation_no_deferred_sync
+```
+Expected: each invocation regenerates motivation panels from exactly one miss-handling mode without missing-input or overwrite errors.
 
 - [ ] **Step 7: Update the audit matrix with measured evidence**
 
@@ -476,6 +513,7 @@ Append short evidence notes like:
 ```markdown
 - Verified by `background_policy_summary.csv`: prefetch false positives remain bounded.
 - Verified by `tpot_quantiles.csv`: execution_first improves tail under joint-object conditions.
+- Verified by `tpot_quantiles.csv`: no_deferred_sync quantifies how much of the gain survives when deferred synchronization is disabled.
 - Still unverified: speculative dispatch contribution remains unisolated.
 ```
 

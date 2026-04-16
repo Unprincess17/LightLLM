@@ -1,4 +1,5 @@
 import os
+import json
 import numpy as np
 import torch
 import time
@@ -45,12 +46,33 @@ from lightllm.models.deepseek_mtp.model import Deepseek3MTPModel
 from lightllm.server.router.model_infer.mode_backend.generic_post_process import sample
 from lightllm.common.basemodel.triton_kernel.gather_token_id import scatter_token
 from lightllm.server.pd_io_struct import NIXLChunckedTransTaskRet
-from lightllm.server.metrics.manager import MetricClient
 from .multi_level_kv_cache import MultiLevelKvCacheModule
 from lightllm.server.embed_cache.embed_cache_client import CpuEmbedCacheClient
 
 import sys
 print(f"DEBUG: Loading base_backend from {__file__}", file=sys.stderr)
+
+
+def _agent_cuda_debug(location: str, message: str, data: dict, hypothesis_id: str) -> None:
+    try:
+        with open("/home/shufan/LightLLM-integrate-to-SLoRA/.cursor/debug-93213c.log", "a", encoding="utf-8") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "sessionId": "93213c",
+                        "runId": "pre-fix",
+                        "hypothesisId": hypothesis_id,
+                        "location": location,
+                        "message": message,
+                        "data": data,
+                        "timestamp": int(time.time() * 1000),
+                    }
+                )
+                + "\n"
+            )
+    except Exception:
+        pass
+
 class ModeBackend:
     def __init__(self) -> None:
         self.shm_req_manager = ShmReqManager()
@@ -81,7 +103,6 @@ class ModeBackend:
         self._enable_radix_tree_timer_merge: bool = enable_radix_tree_timer_merge()
         self._radix_tree_merge_update_delta: int = get_radix_tree_merge_update_delta()
         self._decode_step_id: int = 0
-        self.colora_metric_client: Optional[MetricClient] = None
         pass
 
     def _alloc_decode_step_id(self) -> int:
@@ -426,14 +447,40 @@ class ModeBackend:
         return
 
     def _try_read_new_reqs_normal(self):
+        try:
+            torch.cuda.synchronize()
+        except Exception as e:
+            _agent_cuda_debug(
+                "base_backend.py:_try_read_new_reqs_normal",
+                "cuda sync failed before node_broadcast_tensor fill",
+                {"error": str(e)},
+                "HC1",
+            )
+            raise
         if self.is_master_in_node:
             if self.shm_reqs_io_buffer.is_ready():
                 self.node_broadcast_tensor.fill_(1)
             else:
                 self.node_broadcast_tensor.fill_(0)
+            _agent_cuda_debug(
+                "base_backend.py:_try_read_new_reqs_normal",
+                "prepared node_broadcast_tensor",
+                {"value": int(self.node_broadcast_tensor.item()), "is_master_in_node": bool(self.is_master_in_node)},
+                "HC2",
+            )
 
         src_rank_id = self.args.node_rank * self.node_world_size
         dist.broadcast(self.node_broadcast_tensor, src=src_rank_id, group=self.node_nccl_group, async_op=False)
+        try:
+            torch.cuda.synchronize()
+        except Exception as e:
+            _agent_cuda_debug(
+                "base_backend.py:_try_read_new_reqs_normal",
+                "cuda sync failed after node_broadcast_tensor broadcast",
+                {"error": str(e), "src_rank_id": int(src_rank_id)},
+                "HC3",
+            )
+            raise
         new_buffer_is_ready = self.node_broadcast_tensor.detach().item()
         if new_buffer_is_ready:
             self._read_reqs_buffer_and_init_reqs()
@@ -838,6 +885,32 @@ class ModeBackend:
         b_prefill_has_output_cpu: torch.Tensor = None,
         mask_func: Optional[Callable] = None,
     ):
+        if logits.shape[0] != len(run_reqs):
+            # #region agent log
+            with open("/home/shufan/LightLLM-integrate-to-SLoRA/.cursor/debug-93213c.log", "a", encoding="utf-8") as _f:
+                _f.write(
+                    json.dumps(
+                        {
+                            "sessionId": "93213c",
+                            "runId": "pre-fix",
+                            "hypothesisId": "H7",
+                            "location": "base_backend.py:_sample_and_scatter_token",
+                            "message": "logits/run_reqs mismatch before sampling",
+                            "data": {
+                                "is_prefill": bool(is_prefill),
+                                "logits_rows": int(logits.shape[0]),
+                                "run_reqs_len": int(len(run_reqs)),
+                                "b_req_idx_len": int(b_req_idx.shape[0]) if b_req_idx is not None else -1,
+                                "req_idxs": [int(getattr(r, "req_idx", -1)) for r in run_reqs[:8]],
+                                "has_continuation": [bool(getattr(r, "colora_continuation", None) is not None) for r in run_reqs[:8]],
+                                "is_paused": [bool(getattr(r, "colora_paused", False)) for r in run_reqs[:8]],
+                            },
+                            "timestamp": int(time.time() * 1000),
+                        }
+                    )
+                    + "\n"
+                )
+            # #endregion
 
         if mask_func is not None:
             assert len(run_reqs) == logits.shape[0]
@@ -866,44 +939,6 @@ class ModeBackend:
             next_token_ids, next_token_logprobs
         )
         return next_token_ids, next_token_ids_cpu, next_token_logprobs_cpu
-
-    def _select_active_decode_outputs(
-        self,
-        model_output: ModelOutput,
-        b_req_idx: torch.Tensor,
-        b_mtp_index: torch.Tensor,
-        run_reqs: List[InferReq],
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[InferReq]]:
-        logits = model_output.logits
-        active_positions = getattr(model_output, "active_request_positions", None)
-
-        if active_positions is None:
-            usable = min(int(logits.shape[0]), len(run_reqs), int(b_req_idx.shape[0]))
-            if usable <= 0:
-                empty_logits = logits[:0]
-                empty_req_idx = b_req_idx[:0]
-                empty_mtp_index = b_mtp_index[:0]
-                return empty_logits, empty_req_idx, empty_mtp_index, []
-            orig_positions = torch.arange(usable, dtype=torch.long, device=b_req_idx.device)
-            row_positions = torch.arange(usable, dtype=torch.long, device=logits.device)
-        else:
-            active_positions = active_positions.to(device=b_req_idx.device, dtype=torch.long)
-            real_mask = active_positions < len(run_reqs)
-            if real_mask.numel() == 0 or not bool(torch.any(real_mask)):
-                empty_logits = logits[:0]
-                empty_req_idx = b_req_idx[:0]
-                empty_mtp_index = b_mtp_index[:0]
-                return empty_logits, empty_req_idx, empty_mtp_index, []
-            row_positions = torch.nonzero(real_mask, as_tuple=False).squeeze(-1).to(device=logits.device, dtype=torch.long)
-            orig_positions = active_positions.index_select(
-                0, row_positions.to(device=active_positions.device, dtype=torch.long)
-            )
-
-        selected_logits = logits.index_select(0, row_positions)
-        selected_b_req_idx = b_req_idx.index_select(0, orig_positions)
-        selected_b_mtp_index = b_mtp_index.index_select(0, orig_positions)
-        selected_run_reqs = [run_reqs[idx] for idx in orig_positions.detach().cpu().tolist()]
-        return selected_logits, selected_b_req_idx, selected_b_mtp_index, selected_run_reqs
 
     def _dp_all_gather_prefill_and_decode_req_num(
         self, prefill_reqs: List[InferReq], decode_reqs: List[InferReq]
@@ -1096,12 +1131,6 @@ class ModeBackend:
                 effective_lora_compute_config is not None
                 and effective_lora_compute_config.should_compute_hybrid("moe")
             )
-            colora_miss_policy = str(getattr(self.args, "colora_miss_policy", "cpu_first"))
-            colora_overlap_mode = str(getattr(self.args, "colora_overlap_mode", "full"))
-            if (colora_miss_policy in ("no_cpu_path", "no_deferred_sync") or colora_overlap_mode == "no_overlap") and not use_colora_hybrid:
-                raise RuntimeError(
-                    "COLoRA baseline modes require moe_compute=hybrid so the GPU expert cache and CPU miss path are both available."
-                )
             if (
                 use_colora_hybrid
                 and effective_lora_compute_config is not None
@@ -1161,7 +1190,7 @@ class ModeBackend:
                     max_promote_per_step=getattr(self.args, "colora_max_promote_per_step", 8),
                     decay=getattr(self.args, "colora_decay", 0.9),
                     deferred_promotion_delta_steps=getattr(self.args, "colora_deferred_promotion_delta_steps", 4),
-                    miss_policy=colora_miss_policy,
+                    miss_policy=getattr(self.args, "colora_miss_policy", "cpu_first"),
                     queue_high_watermark=getattr(self.args, "colora_promote_window", 128),
                     promote_cooldown_steps=4,
                 )
@@ -1169,11 +1198,6 @@ class ModeBackend:
                 self.moe_expert_cache_manager.register_projection_pool("gate", self.lora_mem_pool.moe_gate_pool)
                 self.moe_expert_cache_manager.register_projection_pool("up", self.lora_mem_pool.moe_up_pool)
                 self.moe_expert_cache_manager.register_projection_pool("down", self.lora_mem_pool.moe_down_pool)
-                cache_stats = self.moe_expert_cache_manager.get_cache_observability_stats()
-                if colora_miss_policy in ("no_cpu_path", "no_deferred_sync") and int(cache_stats["total"]["capacity_slots"]) <= 0:
-                    raise RuntimeError(
-                        f"COLoRA miss policy {colora_miss_policy!r} requires a non-empty GPU expert cache, but no cache slots were allocated."
-                    )
                 self.logger.info(
                     "[COLoRA] Expert cache initialized: budget_mb=%s, promote_min_hits=%s, "
                     "window=%s, max_promote_per_step=%s, decay=%.4f, deferred_delta=%s, miss_policy=%s, queue_hwm=%s",
@@ -1254,20 +1278,6 @@ class ModeBackend:
             async_fallback_enabled = bool(int(async_fallback_raw))
         except (TypeError, ValueError):
             async_fallback_enabled = bool(async_fallback_raw)
-        request_skip_enabled = bool(getattr(self.args, "colora_request_skip", True))
-        overlap_mode = str(getattr(self.args, "colora_overlap_mode", "full"))
-        if overlap_mode == "no_overlap":
-            if async_fallback_enabled:
-                self.logger.info("[COLoRA] overlap_mode=no_overlap forcing colora_async_fallback=0")
-            if request_skip_enabled:
-                self.logger.info("[COLoRA] overlap_mode=no_overlap forcing colora_request_skip=0")
-            async_fallback_enabled = False
-            request_skip_enabled = False
-        if self.colora_metric_client is None and self.args.metric_port is not None and get_global_rank() == 0:
-            try:
-                self.colora_metric_client = MetricClient(self.args.metric_port)
-            except Exception as e:
-                self.logger.warning(f"[COLoRA] Failed to connect metric client for cache gauges: {e}")
         for layer_id in range(num_layers):
             dispatcher_kwargs = dict(
                 num_layers=1,  # Single layer dispatcher
@@ -1282,12 +1292,10 @@ class ModeBackend:
                     getattr(self.args, "colora_deferred_promotion_delta_steps", 4)
                 ),
                 colora_promotion_ema_alpha=float(getattr(self.args, "colora_promotion_ema_alpha", 0.5)),
-                colora_overlap_mode=overlap_mode,
                 colora_temporal_prefetch=bool(getattr(self.args, "colora_temporal_prefetch", False)),
                 colora_temporal_hot_cache_slots=int(getattr(self.args, "colora_temporal_hot_cache_slots", 64)),
-                colora_request_skip=request_skip_enabled,
+                colora_request_skip=bool(getattr(self.args, "colora_request_skip", True)),
                 colora_max_continuations=int(getattr(self.args, "colora_max_continuations", 8)),
-                metric_client=self.colora_metric_client,
             )
             try:
                 dispatcher = self._create_lora_dispatcher_fn(**dispatcher_kwargs)
@@ -1338,7 +1346,7 @@ class ModeBackend:
             if adapter_id > 0:
                 active_adapter_ids.add(adapter_id)
 
-        self.logger.info(
+        self.logger.debug(
             f"[LoRA Backend] Preparing batch: batch_size={len(batch.reqs)}, active_adapters={sorted(active_adapter_ids)}"
         )
 

@@ -100,7 +100,19 @@ def apply_deepstack_features(
 ):
     """
     apply deepstack features for all images in qwen3-vl/qwen3-vl-moe
+    Deepstack embeddings are only applied during prefill phase when processing image tokens
     """
+    # Return early if not in prefill phase
+    if not infer_state.is_prefill:
+        return
+
+    # Return early if deepstack is not enabled or required attributes are missing
+    if (infer_state.cpu_embed_cache_tensor is None
+        or infer_state.img_start_token_ids is None
+        or infer_state.img_token_lens is None
+        or infer_state.img_start_locs_in_cache is None
+        or infer_state.input_ids is None):
+        return
 
     deepstack_num_layers = infer_state.cpu_embed_cache_tensor.shape[1] - 1
 
