@@ -75,7 +75,7 @@
 %%
 %% The "title" command has an optional parameter,
 %% allowing the author to define a "short title" to be used in page headers.
-\title{CoLoRA: Execution-First Cold-Miss Recovery for Multi-LoRA MoE Decode Serving}
+\title{CoLoRA: Execution-First Miss Recovery for Multi-LoRA MoE Decode Serving}
 
 
 \author{Anonymous Submission}
@@ -94,7 +94,7 @@
 \begin{abstract}
 Large-scale LLM serving is increasingly shaped by the convergence of sparse Mixture-of-Experts (MoE) base models and LoRA-based multi-tenant adaptation. In multi-LoRA MoE serving, tenant-specific LoRA modules are attached to sparsely activated expert layers, creating a regime where the effective unit of caching is a joint expert--LoRA object. Our trace-driven analysis shows this shift weakens hot-set concentration, reducing cache hit rates by up to 56\% compared to LoRA serving in dense models, and pushing performance degradation into the tail latency.
 
-We present CoLoRA, a serving runtime that treats GPU-cold misses as an execution-first recovery problem rather than a promotion-first caching problem. CoLoRA adopts a residency-aware hot/cold dual-path design: GPU-resident objects execute on the hot path, while GPU-cold objects trigger a CPU cold path that computes only the LoRA residual from host-resident weights and merges it back for the current token. CoLoRA further incorporates deferred promotion and temporal prefetching to improve future reuse and partially overlap cold-path latency. By decoupling cold-object execution from GPU residency management, CoLoRA prevents pipeline stalls during cache misses while preserving GPU compute saturation for hot tenants. Under high memory pressure, CoLoRA reduces P99 and P50 Time-Between-Tokens (TBT) latencies by XX\% and XX\%, respectively, over state-of-the-art baselines such as S-LoRA, while maintaining comparable throughput.
+We present CoLoRA, a serving runtime that treats GPU memory misses as an execution-first recovery problem rather than a promotion-first caching problem. CoLoRA adopts a residency-aware hot/cold dual-path design: GPU-resident objects execute on the hot path, while GPU-cold objects trigger a CPU cold path that computes only the LoRA residual from host-resident weights and merges it back for the current token. CoLoRA further incorporates deferred promotion and temporal prefetching to improve future reuse and partially overlap cold-path latency. By decoupling cold-object execution from GPU residency management, CoLoRA prevents pipeline stalls during cache misses while preserving GPU compute saturation for hot tenants. Under high memory pressure, CoLoRA reduces P99 and P50 Time-Between-Tokens (TBT) latencies by XX\% and XX\%, respectively, over state-of-the-art baselines such as S-LoRA, while maintaining comparable throughput.
 \end{abstract}
 
 %%
