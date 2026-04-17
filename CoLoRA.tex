@@ -402,339 +402,52 @@ CoLoRA leverages this regularity using a lightweight temporal predictor that ide
 
 Because temporal prefetching is auxiliary to the main execution-first design, incorrect predictions consume only bounded background bandwidth and do not affect correctness or foreground progress. Taken together, deferred promotion and temporal prefetching preserve CoLoRA's uniform design philosophy: misses are served immediately through execution-first recovery, while locality-driven background mechanisms optimize how similar accesses are handled later.
 
-% \section{Implementation}
-% \label{sec:implementation}
+\section{Implementation}
+\label{sec:implementation}
 % TODO:WIP
+Note:
+
+GPU LoRA Cache Management: 
+
+1. Adopt S-LoRA cache memory management. Each expert--lora takes number=rank cache slot
+
+2. Adopt Chameleon's Cost-Aware Eviction Policy. We adopt Chameleon's static configuration and (F,R,S)=(0.45, 0.1, 0.45)
 
 \section{Evaluation}
 \label{sec:evaluation}
 
-% Suggested artifact order:
-% Table 1: Experimental setup and default parameters.
-% Figure 1: Synthetic locality breakdown and cache scaling.
-% Figure 2: Synthetic latency percentiles under controlled miss pressure.
-% Figure 3: Live-server end-to-end latency/throughput under Alibaba+ShareGPT replay.
-% Figure 4: Robustness vs. cache budget and tenant scale.
-% Figure 5: Miss-recovery/overlap breakdown.
-% Figure 6: Component ablations.
+\subsection{Experiment Setup}
+\label{setup}
+Note:
 
-This section evaluates CoLoRA from two complementary angles. 
-We first use synthetic workloads to isolate the decode-time cold-miss regime introduced by expert--LoRA joint objects and to stress the system under controlled cache budgets, popularity skew, and request rates. We then move to a live-server evaluation driven by Alibaba traces and ShareGPT v3 prompts to validate end-to-end behavior under realistic multi-tenant serving conditions. Unless otherwise noted, we focus on decode-time behavior because CoLoRA targets cold-miss recovery on the token-generation critical path.
+1. models: qwen3 vl moe 30B-A3B. Mixstral 8*7B. Consider about 235B model, if can rent 8*A100 asap.
 
-\subsection{Evaluation Questions}
-\label{sec:eval_questions}
+2. Baselines: 
 
-We answer the following questions:
+- S-LoRA, load-then-run
 
-\begin{enumerate}
-    \item \textbf{Q1: Locality regime.}
-    Does modeling accesses at expert--LoRA joint-object granularity materially weaken hot-set concentration and reduce the effectiveness of cache scaling?
+- Toppings, exec-first, no deferred promotion
 
-    \item \textbf{Q2: Miss-handling effectiveness.}
-    Under controlled cold-miss pressure, does execution-first recovery reduce tail-latency inflation compared with promotion-first load-then-run recovery?
+- Extend the SOTAs to use expert--lora level cache unit
 
-    \item \textbf{Q3: End-to-end serving gains.}
-    Under realistic replay with Alibaba traces and ShareGPT v3 prompts, does CoLoRA improve tail TPOT and SLO attainment while preserving average latency
-    and throughput?
+3. Traces: 
 
-    \item \textbf{Q4: Component contributions.}
-    How much do the CPU cold path, deferred promotion, and temporal predispatch each contribute to the final gains?
-\end{enumerate}
+- Scaled production workload. Sampled from Alibaba trace. Overall XX loras.
 
-\subsection{Experimental Setup}
-\label{sec:eval_setup}
+- Synthetic workload. Poisson distribution. Distinct id~\cite{li2025toppings}
 
-\paragraph{Prototype and Hardware.}
-We implement CoLoRA in our multi-LoRA MoE serving prototype and evaluate it on
-a server equipped with \textit{[CPU model]}, \textit{[GPU model]}, and
-\textit{[host memory size]}.  Unless otherwise specified, all results are
-measured on a single-node deployment.  We report additional multi-GPU results
-only if they are needed to demonstrate scalability beyond the main claim.
+4. Datasets:
 
-\paragraph{Model and Adaptation Setup.}
-We evaluate on \textit{[base MoE model name]} with LoRA attached to
-\textit{[targeted expert FFN layers / expert projections]}.
-We use \textit{[LoRA rank(s)]}, \textit{[number of experts]}, and
-\textit{[precision / quantization setting]}.
-The effective cache object is an expert--LoRA joint object.
-We explicitly report its size so that cache budgets can be interpreted in both
-``number of objects'' and ``GPU memory footprint''.
+LMSYS-CHAT-1M and QMSum. Don't use sharegpt-v3, which is old.
 
-\paragraph{Baselines.}
-We compare against the following systems:
+\subsection{LLM Inference Server Performance}
+\subsection{Microbenchmark Evaluations / Ablation Study}
+\subsection{Sensitivity Analysis}
 
-\begin{itemize}
-    \item \textbf{Promotion-First}: the same serving stack, but with
-    conventional load-then-run recovery, i.e., a cold object is first promoted
-    to GPU memory and only then executed.
 
-    \item \textbf{CoLoRA}: the full system with hot/cold dual-path execution,
-    bounded CPU cold-path execution, deferred promotion, and temporal
-    predispatch.
-
-    \item \textbf{CoLoRA w/o Deferred Promotion}: disables asynchronous
-    promotion to isolate the benefit of future-reuse optimization.
-
-    \item \textbf{CoLoRA w/o Temporal Predispatch}: disables short-horizon
-    predispatch to isolate the benefit of overlap-oriented background
-    optimization.
-
-    \item \textbf{CoLoRA w/o Cold-Path Optimizations}: disables one or more
-    implementation optimizations in the CPU cold path (e.g., activation
-    coalescing, pinned staging, or AVX kernels) to measure how much engineering
-    is required to make execution-first practical.
-\end{itemize}
-
-% Optional synthetic-only upper bound.
-% \begin{itemize}
-%     \item \textbf{Expert-Only Oracle}: a synthetic-only reference that ignores
-%     adapter identity and serves as a best-case cache-locality upper bound.
-% \end{itemize}
-
-\paragraph{Metrics.}
-Our primary metric is \textbf{time per output token (TPOT)}, reported at
-P50/P95/P99/P99.9.
-We also report \textbf{throughput}, \textbf{SLO attainment},
-\textbf{end-to-end request latency}, and \textbf{GPU/CPU miss-handling
-statistics}, including cold-path invocation rate, promotion traffic, and GPU
-residency hit rate.
-Because CoLoRA changes execution scheduling rather than model semantics, we
-add a small correctness check by comparing outputs or logits against the
-promotion-first baseline on a held-out request set.
-
-\paragraph{Workloads.}
-We organize the evaluation around two main workload scenarios:
-
-\begin{itemize}
-    \item \textbf{Synthetic:} controlled workloads used to diagnose locality
-    fragmentation and stress miss handling.
-
-    \item \textbf{Live server:} realistic replay using Alibaba traces for
-    arrivals/tenant activity and ShareGPT v3 for prompt and response behavior.
-\end{itemize}
-
-\subsection{Scenario I: Synthetic Stress Tests}
-\label{sec:eval_synthetic}
-
-This scenario is diagnosis-first.
-Its goal is not realism by itself, but to expose \emph{why} cold misses become
-unavoidable and \emph{when} execution-first recovery helps most.
-
-\subsubsection{Synthetic Workload Generator}
-\label{sec:eval_synth_gen}
-
-We generate synthetic decode workloads with controllable parameters:
-request rate $\lambda$, active-tenant count $N$, adapter popularity skew
-$\alpha$, GPU cache budget $B$, and expert-route continuity $\rho$.
-To isolate the locality effect of the access unit, we evaluate three access
-models:
-
-\begin{itemize}
-    \item \textbf{C0 (Expert-Only):} accesses are keyed only by the routed
-    expert.
-    \item \textbf{C1 (Joint-Independent):} accesses are keyed by expert--LoRA
-    joint objects, with independent expert and adapter assignment.
-    \item \textbf{C2 (Joint-Correlated):} accesses are keyed by expert--LoRA
-    joint objects, with structured expert/adapter affinity.
-\end{itemize}
-
-For synthetic latency stress tests, we either fix prompt/output lengths or draw
-them from narrow distributions so that the observed differences primarily reflect
-cache locality and miss-handling behavior rather than unrelated prompt-length
-variance.
-
-\subsubsection{Locality Breakdown and Cache Scaling}
-\label{sec:eval_synth_locality}
-
-We begin by quantifying how the access distribution changes when the serving
-system reasons at expert--LoRA joint-object granularity.
-Figure~\ref{fig:synthetic_locality} should contain two panels:
-(i) cumulative access fraction versus object rank, and
-(ii) P99 TPOT versus cache budget.
-
-% Main message:
-% Joint-object modeling flattens the access distribution and makes cache scaling
-% much less effective than in expert-only reasoning.
-
-\paragraph{What to show.}
-We recommend reporting:
-(i) hot-set concentration curves for C0/C1/C2,
-(ii) cache budget versus P99 TPOT,
-and (iii) the cache-capacity gap needed to recover the same tail target under
-expert-only versus joint-object access patterns.
-
-\paragraph{What this subsection should conclude.}
-The conclusion should be that the core issue is not merely ``insufficient GPU
-capacity,'' but that at expert--LoRA granularity the remaining misses are hard
-to eliminate by cache scaling alone.
-
-\subsubsection{Tail Latency Under Controlled Miss Pressure}
-\label{sec:eval_synth_tail}
-
-We next evaluate whether CoLoRA reduces tail inflation once cold misses are
-present.
-Figure~\ref{fig:synthetic_tail} should compare TPOT percentiles under
-increasing miss pressure by varying one stress knob at a time:
-cache budget, request rate, or active-tenant count.
-
-\paragraph{What to compare.}
-The key comparison here is \textbf{Promotion-First} versus \textbf{CoLoRA},
-with P50/P95/P99/P99.9 TPOT reported together.
-If space allows, also add SLO attainment under a decode-latency target.
-
-\paragraph{What this subsection should conclude.}
-The conclusion should be that CoLoRA does not necessarily change the median
-dramatically, but it suppresses the \emph{tail amplification} caused by
-promotion-first recovery on unavoidable cold misses.
-
-\subsubsection{Sensitivity Analysis}
-\label{sec:eval_synth_sensitivity}
-
-To show robustness, we vary the main synthetic knobs one at a time:
-
-\begin{itemize}
-    \item GPU cache budget;
-    \item request rate;
-    \item active-tenant count;
-    \item popularity skew;
-    \item expert-route continuity;
-    \item CPU cold-path worker count / queue depth.
-\end{itemize}
-
-This subsection can be short if the curves are monotonic.
-Its purpose is to show that CoLoRA's gains persist across a broad miss-pressure
-regime rather than only at a single operating point.
-
-\subsection{Scenario II: Live-Server Evaluation with Alibaba Trace + ShareGPT v3}
-\label{sec:eval_live}
-
-This scenario is realism-first.
-Its goal is to validate that the synthetic conclusions survive in an end-to-end
-online serving environment with realistic arrival patterns and prompt behavior.
-
-\subsubsection{Replay Methodology}
-\label{sec:eval_live_replay}
-
-We deploy the full system as a live server and replay a multi-tenant workload.
-Alibaba traces provide request arrivals and tenant activity patterns, while
-ShareGPT v3 provides realistic prompts and response-length behavior.
-Each incoming request is assigned a tenant/adaptation identity according to the
-trace and is executed end-to-end by the online serving system.
-
-\paragraph{Recommended presentation.}
-Be explicit that this is a \emph{server replay}, not an offline simulator.
-The value of this section is that it captures queueing, overlap, resource
-contention, and scheduler interactions that synthetic experiments intentionally
-abstract away.
-
-\subsubsection{End-to-End Latency and Throughput}
-\label{sec:eval_live_e2e}
-
-Figure~\ref{fig:live_e2e} should report end-to-end latency and throughput under
-increasing offered load.
-We suggest one latency figure with P50/P95/P99 TPOT and one throughput/SLO
-figure.
-
-\paragraph{What to compare.}
-Compare \textbf{Promotion-First}, \textbf{CoLoRA}, and the main ablated variants.
-If TTFT is included, keep it secondary; the main claim is decode-tail behavior,
-so TPOT should remain the primary axis.
-
-\paragraph{What this subsection should conclude.}
-The conclusion should be that CoLoRA preserves the GPU as the fast path for hot
-objects while preventing cold misses from turning into severe tail events in the
-online system.
-
-\subsubsection{Robustness Under Cache Pressure and Tenant Scale}
-\label{sec:eval_live_robustness}
-
-We then vary the practical deployment knobs that determine how often cold misses
-occur in production:
-
-\begin{itemize}
-    \item GPU cache budget;
-    \item number of active tenants / adapters;
-    \item offered load;
-    \item optional expert fan-out or route diversity if your implementation
-    exposes it cleanly.
-\end{itemize}
-
-Figure~\ref{fig:live_robustness} should show that CoLoRA degrades more
-gracefully than promotion-first recovery as cache pressure increases.
-
-\subsubsection{Operational Breakdown of Miss Recovery}
-\label{sec:eval_live_breakdown}
-
-This subsection explains \emph{why} the live-server gains appear.
-Figure~\ref{fig:live_breakdown} can include one or more of the following:
-
-\begin{itemize}
-    \item a TPOT breakdown into hot-path execution, cold-path execution,
-    transfer, and promotion overhead;
-    \item a timeline showing overlap among GPU base compute, GPU hot-path LoRA
-    compute, and CPU cold-path LoRA compute;
-    \item cold-path invocation rate versus promotion traffic;
-    \item GPU residency hit rate and promoted-object reuse.
-\end{itemize}
-
-This figure is especially important for defending the central claim that the
-benefit comes from changing the default miss-recovery action from
-promotion-first to execution-first, not merely from adding another cache level.
-
-\subsection{Ablation Studies}
-\label{sec:eval_ablation}
-
-After the two main scenarios, we isolate the contribution of each major design
-component.
-
-\subsubsection{Execution-First vs.\ Promotion-First}
-\label{sec:eval_ablation_execfirst}
-
-This is the core ablation.
-Keep the cache budget, workload, and object granularity fixed, and compare only
-the miss-recovery policy.
-This subsection should make the paper's main takeaway visually obvious.
-
-\subsubsection{CPU Cold-Path Practicality}
-\label{sec:eval_ablation_coldpath}
-
-We disable one optimization at a time in the cold path, such as activation
-coalescing, pinned staging buffers, or AVX kernels.
-The goal is to show that the CPU path is not useful merely because it exists,
-but because it is engineered to be predictable and overlap-friendly.
-
-\subsubsection{Deferred Promotion}
-\label{sec:eval_ablation_promotion}
-
-We compare full CoLoRA against CoLoRA w/o deferred promotion.
-This ablation should answer a narrow question:
-does background promotion improve future reuse enough to matter without
-reintroducing blocking behavior on the current token's critical path?
-
-\subsubsection{Temporal Predispatch}
-\label{sec:eval_ablation_predispatch}
-
-We compare full CoLoRA against CoLoRA w/o temporal predispatch.
-Keep this subsection modest in emphasis.
-Its purpose is to show that predispatch is a useful auxiliary optimization,
-not the main source of the system's benefit.
-
-\subsection{Summary of Findings}
-\label{sec:eval_summary}
-
-We summarize the evaluation with three takeaways.
-First, once the access unit becomes the expert--LoRA joint object, cache
-locality degrades structurally and cold misses remain common under realistic
-GPU budgets.
-Second, under this regime, promotion-first recovery mainly hurts the latency
-tail because the current token must pay for synchronous weight restoration.
-Third, CoLoRA's execution-first hot/cold dual-path design reduces that tail
-inflation while preserving efficient GPU execution for hot objects and
-base-model compute.
-
-% Optional ending sentence with placeholders:
-% Compared with Promotion-First, CoLoRA reduces P99 TPOT by \textbf{[TBD]\%}
-% and improves SLO attainment by \textbf{[TBD] points} under realistic replay.
+% 1. overall performance on 2*RTX 6000 + 2*A100
+% 2. 
+% 3. ablations
 
 
 
