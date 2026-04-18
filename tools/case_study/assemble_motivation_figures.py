@@ -54,17 +54,17 @@ CONDITION_MARKERS = {
     'joint_indep': 's',  # Square (C1)
     'joint_corr': '^'   # Triangle Up (C2)
 }
-PRACTICAL_CACHE_LIMIT = 1024
-PRACTICAL_CACHE_LABEL = "Cache Limit\n(1K objs)"
+PRACTICAL_CACHE_LIMIT = 2048
+PRACTICAL_CACHE_LABEL = "Cache Limit\n(2K objs)  "
 METAL_FLOOR_MS = 1.2
 FLOOR_TOLERANCE_MS = 0.01
 DEFAULT_TAIL_BUDGET = 2048
 DEFAULT_SYSTEM_TPOT_STAGE = "replay/system_tpot_stressed"
-MAX_TAIL_PERCENTILE = 0.999
-MAX_TAIL_PERCENTILE_LABEL = "P99.9"
-TAIL_CURVE_PERCENTILES = (0.50, 0.75, 0.90, 0.95, 0.97, 0.98, 0.99, MAX_TAIL_PERCENTILE)
-TAIL_CURVE_TICK_PERCENTILES = (0.50, 0.90, 0.95, 0.99, MAX_TAIL_PERCENTILE)
-TAIL_CURVE_TICK_LABELS = ("P50", "P90", "P95", "P99", MAX_TAIL_PERCENTILE_LABEL)
+MAX_TAIL_PERCENTILE = 0.99
+MAX_TAIL_PERCENTILE_LABEL = "P99"
+TAIL_CURVE_PERCENTILES = (0.50, 0.75, 0.90, 0.95, 0.97, 0.98, MAX_TAIL_PERCENTILE)
+TAIL_CURVE_TICK_PERCENTILES = (0.50, 0.90, 0.95, MAX_TAIL_PERCENTILE)
+TAIL_CURVE_TICK_LABELS = ("P50", "P90", "P95", MAX_TAIL_PERCENTILE_LABEL)
 HEADLINE_PERCENTILES = (0.95, 0.99)
 CAPACITY_TICK_BUDGETS = (128, 512, 2048, 8192, 32768, 65536)
 CAPACITY_TICK_LABELS = ("128", "512", "2K", "8K", "32K", "65K")
@@ -72,7 +72,7 @@ CAPACITY_TICK_LABELS = ("128", "512", "2K", "8K", "32K", "65K")
 TAIL_CURVE_AXIS_BASE = math.log10(1.0 / (1.0 - TAIL_CURVE_TICK_PERCENTILES[0]))
 SINGLE_COLUMN_WIDTH_IN = 3.35
 STANDALONE_PANEL_SIZE = (SINGLE_COLUMN_WIDTH_IN, 2.5)
-COMBINED_VERTICAL_SIZE = (SINGLE_COLUMN_WIDTH_IN, 6.55)
+COMBINED_VERTICAL_SIZE = (SINGLE_COLUMN_WIDTH_IN, 7)
 
 
 def parse_args() -> argparse.Namespace:
@@ -193,20 +193,52 @@ def quantile_from_sorted(values: Sequence[float], quantile: float) -> float:
     return float(values[lower] * (1.0 - weight) + values[upper] * weight)
 
 
-def load_token_tpot_budget_slice(path: Path, budget: int) -> dict[str, List[float]]:
-    series = {condition: [] for condition in CONDITION_ORDER}
-    with path.open("r", encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle)
-        for row in reader:
-            if int(row["cache_budget"]) != int(budget):
-                continue
-            condition = str(row["condition"])
-            if condition in series:
-                series[condition].append(float(row["tpot_ms"]))
-    for condition, values in series.items():
-        if not values:
-            raise ValueError(f"token_tpot.csv does not contain cache_budget={budget} for condition={condition}")
-        values.sort()
+def quantile_column_name(percentile: float) -> str:
+    quantile_columns = {
+        0.50: "p50",
+        0.75: "p75",
+        0.90: "p90",
+        0.95: "p95",
+        0.97: "p97",
+        0.98: "p98",
+        0.99: "p99",
+    }
+    try:
+        return quantile_columns[float(percentile)]
+    except KeyError as exc:
+        raise KeyError(f"unsupported tail percentile {percentile}") from exc
+
+
+def infer_p75_latency(row: Mapping[str, str]) -> float:
+    p50 = float(row["p50"])
+    p90 = float(row["p90"])
+    if abs(p90 - p50) < 1e-12:
+        return p50
+    alpha = (0.75 - 0.50) / (0.90 - 0.50)
+    return float(math.exp((1.0 - alpha) * math.log(max(p50, 1e-12)) + alpha * math.log(max(p90, 1e-12))))
+
+
+def quantile_value_from_row(row: Mapping[str, str], percentile: float) -> float:
+    column = quantile_column_name(percentile)
+    raw_value = row.get(column)
+    if raw_value is not None and str(raw_value).strip() != "":
+        return float(raw_value)
+    if abs(float(percentile) - 0.75) < 1e-12:
+        return infer_p75_latency(row)
+    raise KeyError(f"quantile column {column} is missing from tpot_quantiles.csv")
+
+
+def load_tail_quantile_budget_slice(
+    quantile_rows: Sequence[Mapping[str, str]],
+    budget: int,
+) -> dict[str, np.ndarray]:
+    series: dict[str, np.ndarray] = {}
+    for condition in CONDITION_ORDER:
+        row = single_row(quantile_rows, condition=condition, cache_budget=str(int(budget)))
+        series[condition] = np.asarray(
+            [quantile_value_from_row(row, percentile) for percentile in TAIL_CURVE_PERCENTILES],
+            dtype=float,
+        )
     return series
 
 
@@ -214,10 +246,6 @@ def tail_percentile_axis(percentile: float) -> float:
     if not 0.0 < percentile < 1.0:
         raise ValueError(f"percentile must be between 0 and 1, got {percentile}")
     return math.log10(1.0 / (1.0 - percentile)) - TAIL_CURVE_AXIS_BASE
-
-
-def tail_curve_latencies(values: Sequence[float], percentiles: Sequence[float]) -> np.ndarray:
-    return np.asarray([quantile_from_sorted(values, percentile) for percentile in percentiles], dtype=float)
 
 
 def percentile_index(percentiles: Sequence[float], target: float) -> int:
@@ -276,7 +304,7 @@ def plot_root_cause(ax: plt.Axes, popularity_rows: Sequence[Mapping[str, str]], 
         PRACTICAL_CACHE_LABEL,
         xy=(PRACTICAL_CACHE_LIMIT, 0.985),
         xycoords=ax.get_xaxis_transform(),
-        xytext=(-5, -1),
+        xytext=(-7.8, -0.3),
         textcoords="offset points",
         ha="right",
         va="top",
@@ -286,9 +314,9 @@ def plot_root_cause(ax: plt.Axes, popularity_rows: Sequence[Mapping[str, str]], 
     )
 
     label_offsets = {
-        "expert_only": (6, 8),
+        "expert_only": (6, -2),
         "joint_indep": (6, -2),
-        "joint_corr": (6, 8),
+        "joint_corr": (6, 2),
     }
     for condition in CONDITION_ORDER:
         coverage = limit_coverages[condition]
@@ -318,7 +346,7 @@ def plot_root_cause(ax: plt.Axes, popularity_rows: Sequence[Mapping[str, str]], 
     ax.set_xscale("log")
     ax.set_xlim(left=1)
     ax.set_ylim(0.0, 1.0)
-    ax.set_xlabel("Expert-LoRA Rank")
+    ax.set_xlabel("Popularity Rank (sorted by access frequency)", x=0.43)
     ax.set_ylabel("Cumulative Access Fraction")
     ax.yaxis.set_major_formatter(PercentFormatter(xmax=1.0))
     if show_legend:
@@ -332,7 +360,7 @@ def plot_root_cause(ax: plt.Axes, popularity_rows: Sequence[Mapping[str, str]], 
             edgecolor="#D7DCE0",
             borderpad=0.25,
             labelspacing=0.25,
-            handlelength=0.8,
+            handlelength=1.3,
             handletextpad=0.4,
         )
 
@@ -379,34 +407,54 @@ def plot_capacity_illusion(ax: plt.Axes, quantile_rows: Sequence[Mapping[str, st
     ax.text(
         150, 
         1.25,
-        "C0 P99 Target",
+        "C0 target",
         fontsize=10
     )
     ax.axvline(floor_b0, color="#AEB6BF", linewidth=0.95, linestyle=":", alpha=0.6)
     ax.axvline(floor_b2, color="#AEB6BF", linewidth=0.95, linestyle=":", alpha=0.6)
     # Keep the gap annotation above the descending curves so it reads as a bracket, not another data series.
-    ax.annotate(
-        "",
-        xy=(floor_b2, gap_arrow_y),
-        xytext=(floor_b0, gap_arrow_y),
-        arrowprops={"arrowstyle": "<->", "color": "#3A3F44", "lw": 1.35, "shrinkA": 0, "shrinkB": 0},
-    )
+    # ax.annotate(
+    #     "",
+    #     xy=(floor_b2, gap_arrow_y),
+    #     xytext=(floor_b0, gap_arrow_y),
+    #     arrowprops={"arrowstyle": "<->", "color": "#3A3F44", "lw": 1.35, "shrinkA": 0, "shrinkB": 0},
+    # )
     ax.set_xscale("log", base=2)
     ax.set_xlim(128, 65536)
     ax.set_ylim(1.0, max(7.35, gap_arrow_y + 0.55))
     ax.set_xticks(CAPACITY_TICK_BUDGETS)
     ax.set_xticklabels(CAPACITY_TICK_LABELS)
     ax.tick_params(axis="x", which="minor", length=0)
-    ax.text(
-        gap_label_x,
-        gap_arrow_y + 0.07,
-        gap_label,
-        fontsize=10,
-        fontweight="semibold",
-        ha="center",
-        va="bottom",
-        color="#3A3F44",
+    # ax.text(
+    #     gap_label_x,
+    #     gap_arrow_y + 0.07,
+    #     gap_label,
+    #     fontsize=10,
+    #     fontweight="semibold",
+    #     ha="center",
+    #     va="bottom",
+    #     color="#3A3F44",
+    # )
+    summary_label = "C1/C2 remain far above\ntarget even at 65K objects"
+    c2_65k = next(
+        (row for row in condition_rows(quantile_rows, "joint_corr") if int(row["cache_budget"]) == 65536),
+        None,
     )
+    if c2_65k is not None:
+        c2_y_65k = float(c2_65k["p99"])
+        ax.annotate(
+            summary_label,
+            xy=(65536, c2_y_65k),
+            xytext=(-2, -4),
+            textcoords="offset points",
+            ha="right",
+            va="top",
+            fontsize=8.8,
+            color="#3A3F44",
+            fontweight="semibold",
+            bbox={"facecolor": "white", "edgecolor": "none", "pad": 0.22, "alpha": 0.9},
+        )
+
     ax.set_xlabel("Cache Budget (#objects)")
     ax.set_ylabel("P99 TPOT (ms)")
     # ax.legend(
@@ -420,13 +468,18 @@ def plot_capacity_illusion(ax: plt.Axes, quantile_rows: Sequence[Mapping[str, st
     # )
 
 
-def plot_tail_blowout(ax: plt.Axes, token_tpot_by_condition: Mapping[str, Sequence[float]], _budget: int, show_legend: bool = False) -> None:
+def plot_tail_blowout(
+    ax: plt.Axes,
+    tail_quantiles_by_condition: Mapping[str, Sequence[float]],
+    _budget: int,
+    show_legend: bool = False,
+) -> None:
     curve_x = np.asarray([tail_percentile_axis(percentile) for percentile in TAIL_CURVE_PERCENTILES], dtype=float)
     tick_x = [tail_percentile_axis(percentile) for percentile in TAIL_CURVE_TICK_PERCENTILES]
     tail_values: dict[str, np.ndarray] = {}
 
     for condition in CONDITION_ORDER:
-        latencies = tail_curve_latencies(token_tpot_by_condition[condition], TAIL_CURVE_PERCENTILES)
+        latencies = np.asarray(tail_quantiles_by_condition[condition], dtype=float)
         tail_values[condition] = latencies
         ax.plot(
             curve_x,
@@ -470,17 +523,17 @@ def plot_tail_blowout(ax: plt.Axes, token_tpot_by_condition: Mapping[str, Sequen
     ax.set_xlabel("Token Percentile")
     ax.set_ylabel("TPOT (ms)")
     ax.annotate(
-        f"Joint LoRAs: P95={headline_p95:.2f} ms, P99={headline_y:.2f} ms\n{p99_slowdown:.1f}x vs C0 at P99",
-        xy=(headline_x + 0.02, headline_target_y),
-        xytext=(curve_x[1] + 0.06, max_latency - 1.55),
+        f"P99 ≈ {headline_y:.2f} ms\n≈ {p99_slowdown:.1f}x C0",
+        xy=(headline_x - 0.02, headline_target_y+0.1),
+        xytext=(curve_x[2] -0.02, max_latency-0.5),
         arrowprops={"arrowstyle": "->", "color": "#8A5A44", "lw": 1.15},
         fontsize=10,
         bbox={"facecolor": "white", "edgecolor": "#D7DCE0", "boxstyle": "round,pad=0.22"},
     )
     ax.annotate(
-        f"C0 P50 ≈ {c0_p50:.2f} ms",
-        xy=(flat_tip_x, c0_p50),
-        xytext=(flat_tip_x + 0.24, c0_p50 + 0.5),
+        f"C0 baseline ≈ {c0_p50:.2f} ms",
+        xy=(flat_tip_x, c0_p50+0.1),
+        xytext=(flat_tip_x + 0.34, c0_p50 + 0.5),
         arrowprops={"arrowstyle": "->", "color": CONDITION_COLORS["expert_only"], "lw": 1.1},
         fontsize=10,
         bbox={"facecolor": "white", "edgecolor": "#D7DCE0", "boxstyle": "round,pad=0.22"},
@@ -525,7 +578,6 @@ def resolve_paths(
         "figures_dir": resolved_figures_dir,
         "popularity_path": run_root / "replay" / "locality" / "popularity_rank.csv",
         "quantiles_path": resolved_system_tpot_dir / "tpot_quantiles.csv",
-        "token_tpot_path": resolved_system_tpot_dir / "token_tpot.csv",
     }
 
 
@@ -543,13 +595,12 @@ def main() -> None:
         [
             paths["popularity_path"],
             paths["quantiles_path"],
-            paths["token_tpot_path"],
         ]
     )
 
     popularity_rows = read_csv_rows(paths["popularity_path"])
     quantile_rows = read_csv_rows(paths["quantiles_path"])
-    token_tpot_by_condition = load_token_tpot_budget_slice(paths["token_tpot_path"], args.tail_budget)
+    tail_quantiles_by_condition = load_tail_quantile_budget_slice(quantile_rows, args.tail_budget)
 
     output_stem = args.output_stem
     figures_dir = paths["figures_dir"]
@@ -566,25 +617,25 @@ def main() -> None:
     build_standalone_panel(plot_root_cause, panel_a_png, popularity_rows)
     build_standalone_panel(plot_capacity_illusion, panel_b_pdf, quantile_rows)
     build_standalone_panel(plot_capacity_illusion, panel_b_png, quantile_rows)
-    build_standalone_panel(plot_tail_blowout, panel_c_pdf, token_tpot_by_condition, args.tail_budget)
-    build_standalone_panel(plot_tail_blowout, panel_c_png, token_tpot_by_condition, args.tail_budget)
+    build_standalone_panel(plot_tail_blowout, panel_c_pdf, tail_quantiles_by_condition, args.tail_budget)
+    build_standalone_panel(plot_tail_blowout, panel_c_png, tail_quantiles_by_condition, args.tail_budget)
 
     fig, axes = plt.subplots(3, 1, figsize=COMBINED_VERTICAL_SIZE, constrained_layout=True)
-    plot_root_cause(axes[0], popularity_rows, show_legend=False)
+    plot_root_cause(axes[0], popularity_rows, show_legend=True)
     plot_capacity_illusion(axes[1], quantile_rows)
-    plot_tail_blowout(axes[2], token_tpot_by_condition, args.tail_budget)
-    fig.legend(handles=condition_legend_handles(CONDITION_LABELS), loc='lower center', ncol=3, frameon=True,
-               framealpha=0.85, fontsize=8.5, facecolor="white",
-               edgecolor="#D7DCE0", borderpad=0.25)
+    plot_tail_blowout(axes[2], tail_quantiles_by_condition, args.tail_budget)
+    # fig.legend(handles=condition_legend_handles(CONDITION_LABELS), loc='lower center', ncol=3, frameon=True,
+            #    framealpha=0.85, fontsize=8.5, facecolor="white",
+            #    edgecolor="#D7DCE0", borderpad=0.25)
     save_figure(fig, combined_pdf)
 
     fig, axes = plt.subplots(3, 1, figsize=COMBINED_VERTICAL_SIZE, constrained_layout=True)
-    plot_root_cause(axes[0], popularity_rows, show_legend=False)
+    plot_root_cause(axes[0], popularity_rows, show_legend=True)
     plot_capacity_illusion(axes[1], quantile_rows)
-    plot_tail_blowout(axes[2], token_tpot_by_condition, args.tail_budget)
-    fig.legend(handles=condition_legend_handles(CONDITION_LABELS), loc='lower center', ncol=3, frameon=True,
-               framealpha=0.85, fontsize=8.5, facecolor="white",
-               edgecolor="#D7DCE0", borderpad=0.25)
+    plot_tail_blowout(axes[2], tail_quantiles_by_condition, args.tail_budget)
+    # fig.legend(handles=condition_legend_handles(CONDITION_LABELS), loc='lower center', ncol=3, frameon=True,
+            #    framealpha=0.85, fontsize=8.5, facecolor="white",
+            #    edgecolor="#D7DCE0", borderpad=0.25)
     save_figure(fig, combined_png)
 
     floor_b0 = condition_floor_budget(quantile_rows, "expert_only")
@@ -594,7 +645,7 @@ def main() -> None:
     c2_practical = topk_coverage(popularity_rows, "joint_corr", PRACTICAL_CACHE_LIMIT)
     tail_summary = {
         condition: {
-            percentile: quantile_from_sorted(token_tpot_by_condition[condition], percentile)
+            percentile: float(tail_quantiles_by_condition[condition][percentile_index(TAIL_CURVE_PERCENTILES, percentile)])
             for percentile in (*HEADLINE_PERCENTILES, MAX_TAIL_PERCENTILE)
         }
         for condition in CONDITION_ORDER
@@ -625,12 +676,13 @@ def main() -> None:
         f"C1={tail_summary['joint_indep'][0.99]:.3f} ms, "
         f"C2={tail_summary['joint_corr'][0.99]:.3f} ms"
     )
-    print(
-        f"Panel C budget={args.tail_budget} {MAX_TAIL_PERCENTILE_LABEL} TPOT: "
-        f"C0={tail_summary['expert_only'][MAX_TAIL_PERCENTILE]:.3f} ms, "
-        f"C1={tail_summary['joint_indep'][MAX_TAIL_PERCENTILE]:.3f} ms, "
-        f"C2={tail_summary['joint_corr'][MAX_TAIL_PERCENTILE]:.3f} ms"
-    )
+    if MAX_TAIL_PERCENTILE not in HEADLINE_PERCENTILES:
+        print(
+            f"Panel C budget={args.tail_budget} {MAX_TAIL_PERCENTILE_LABEL} TPOT: "
+            f"C0={tail_summary['expert_only'][MAX_TAIL_PERCENTILE]:.3f} ms, "
+            f"C1={tail_summary['joint_indep'][MAX_TAIL_PERCENTILE]:.3f} ms, "
+            f"C2={tail_summary['joint_corr'][MAX_TAIL_PERCENTILE]:.3f} ms"
+        )
 
 
 if __name__ == "__main__":
