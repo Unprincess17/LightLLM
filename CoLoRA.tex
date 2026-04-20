@@ -271,9 +271,35 @@ Moving from coarse-grained to joint-object modeling severely fragments decode lo
 Because locality is fundamentally weakened, simply increasing GPU cache capacity does not resolve the problem. Figure~\ref{fig:motivation-breakdown}(b) shows that, although the expert-only layout reaches its target P99 TPOT with only 2K cached objects, the joint-object layouts remain substantially above the same target across the entire cache sweep and still fail to recover it even at 65K cached objects. This means the issue is not merely insufficient cache capacity: once object granularity destroys locality, scaling cache size yields limited benefit. In practice, systems must therefore operate under constrained budgets where cold misses remain unavoidable.
 
 \paragraph{Tail latency explodes under misses.}
-The most severe consequence of this locality fragmentation manifests in request latency. Figure \ref{fig:motivation-breakdown}(c) evaluates Time Per Output Token (TPOT) under a practical GPU cache budget. While the median TPOT remains near-optimal at approximately 1.2 ms, the degradation is heavily concentrated in the tail. P99 latency increases by roughly 5.6x. Because decode operations repeat routing and parameter-access decisions token by token, cold misses stall the synchronous execution path, disproportionately penalizing tail requests that happen to traverse un-cached expert–adapter intersections.
+The most severe consequence of this locality fragmentation manifests in request latency. Figure \ref{fig:motivation-breakdown}(c) evaluates Time Per Output Token (TPOT) under a practical GPU cache budget. While the median TPOT remains near-optimal at approximately 1.2 ms, the degradation is heavily concentrated in the tail. P99 latency increases by roughly 5.6x. Because decode operations repeat routing and parameter-access decisions token by token, cold misses stall the synchronous execution path, disproportionately penalizing tail requests that happen to traverse un-cached expert--LoRA intersections.
 
 Taken together, these results show that the key problem in multi-LoRA MoE decode is no longer only cache efficiency in the traditional sense. Once expert--LoRA joint objects become the effective unit of access, the remaining performance loss is increasingly determined by how unavoidable cold misses are handled on the decode critical path.
+
+\subsubsection{Why execution-first is feasible on decode}
+\label{subsec:feasibility}
+The results above show that, once expert--LoRA joint objects become the effective unit of access, cold misses remain persistent under practical GPU cache budgets. At that point, the central systems question is no longer only how to enlarge the hot set, but how to serve a miss on the latency-critical decode path. In decode, this question is particularly important because execution proceeds token by token, batching opportunities are limited, and any synchronous miss-handling step is exposed directly in per-token latency.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figures/miss_cost_compare.pdf}
+  \caption{
+    \textbf{Promotion-first vs. execution-first synchronous miss cost.}
+    Promotion-first recovery restores the full expert--LoRA object before execution can resume, making weight migration part of the current token's foreground miss cost.
+    Execution-first recovery instead exchanges activation/residual-sized state, computes only the missing LoRA contribution on the CPU, and merges the result back into the decode stream.
+    The key distinction is therefore what data must be moved synchronously on the decode critical path, rather than a claim that CPU execution is universally faster.
+  }
+  \label{fig:miss-cost-compare}
+\end{figure}
+
+A key observation is that a decode-time cold miss introduces an asymmetry between restoring residency and serving the current token, as shown in figure~\ref{fig:miss-cost-compare}. 
+Under a conventional promotion-first policy, the system must first move the missing expert--LoRA object into GPU memory and only then resume execution. However, for the current token, what is immediately needed is not full residency restoration as a goal in itself, but completion of the missing expert--LoRA contribution for the routed expert. This distinction matters because expert-layer LoRA objects are relatively large, whereas the per-token activation state involved in the current decode step is comparatively small. As a result, the synchronous cost of promotion-first recovery is dominated by moving a large weight object onto the device before useful work can continue.
+
+This asymmetry suggests that feasibility should be judged not by asking whether CPU execution is universally faster than GPU execution, but by asking what portion of miss-recovery latency must appear on the current token's critical path. If the system can complete the missing LoRA contribution by exchanging activation-sized state while leaving the base expert computation on the GPU, then a cold miss no longer has to be treated as an unconditional residency-restoration barrier. Instead, it can be handled as a bounded execution event whose visible cost depends on how much of that work can be overlapped with other ready GPU computation.
+
+This perspective is especially relevant in multi-tenant MoE decode, where mixed hit/miss batches are common and misses are not perfectly synchronized across requests. In such settings, forcing every cold object through immediate promotion risks turning a per-request miss into a group-wide stall. By contrast, an execution-first design has the potential to isolate the miss to the faulting request while allowing other ready requests to continue making progress on the GPU. The goal, therefore, is not to replace GPU execution for the common case, but to provide a miss-recovery path whose exposed latency is better matched to the decode-time cost structure of joint expert--LoRA accesses.
+
+This argument does not imply that execution-first recovery is always preferable. When adapter diversity is low, the effective working set fits comfortably in GPU memory, or near-term reuse is strong enough to amortize immediate promotion, a load-then-run policy becomes more competitive. CoLoRA therefore targets the regime identified by Figure~\cite{TODO}: cache-pressured multi-LoRA MoE decode, where joint-object locality is structurally fragmented, cold misses remain unavoidable, and miss recovery should be optimized for exposed latency rather than immediate residency restoration.
+
 
 \subsection{Challenges}
 \label{subsec:challenges}
@@ -303,24 +329,18 @@ Changing the miss-recovery abstraction is not sufficient by itself. If cold-path
 
 The system must therefore make cold-path recovery efficient enough to operate at small, irregular decode batch sizes, and organize execution to preserve opportunities for overlap between cold-miss handling and GPU hot-path or base-model computation whenever dependencies allow. The challenge is not only to provide an alternative recovery path, but to ensure that this path reduces exposed miss latency instead of becoming a new bottleneck.
 
-\begin{figure*}[t]
-  \centering
-  \includegraphics[width=\textwidth]{figures/architecture.pdf}
-  \caption{
-  Overview of CoLoRA's hot/cold dual-path serving design for expert--LoRA computation in decode.
-  Routed expert--LoRA accesses first check GPU residency.
-  Cache-hit objects are served on the GPU hot path.
-  Cold misses are redirected to a CPU cold path, which completes the current LoRA computation via host-memory streaming, decoupled from the layer-wise synchronization of other active requests.
-  Promotion is deferred to future reuse, and a temporal predictor prefetches top-1 experts to mask host-memory latency across sequential tokens.
-  }
-  \label{fig:CoLoRA_overview}
-\end{figure*}
-
 \section{Design}
 \label{sec:design}
 
 \subsection{Hot/Cold Execution-First Architecture}
 \label{subsec:dual-path-handling}
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\linewidth]{figures/architecture.pdf}
+    \caption{\textbf{CoLoRA's execution-first hot/cold dual-path architecture for decode-time expert--LoRA serving.} Routed expert--LoRA accesses check GPU residency; hits remain on the GPU hot path, while miss requests peel off to a CPU cold path that computes only the LoRA residual and later reinserts the result. Deferred promotion is decoupled from foreground miss recovery and serves future reuse only.}
+  \label{fig:CoLoRA_overview}
+\end{figure}
 
 CoLoRA is motivated by a simple observation: under multi-tenant expert--LoRA serving, cold misses cannot be treated as rare exceptions. Once the unit of management becomes the expert--LoRA joint object, the effective working set expands and fragments, and misses remain common under realistic GPU memory budgets. In decode, where execution proceeds token by token and batching opportunities are limited, each such miss can directly surface as a stall on the current token's critical path.
 
@@ -404,6 +424,7 @@ CoLoRA leverages this regularity using a lightweight temporal predictor that ide
 % TODO: 是否需要说明 prefetch 的对象很小 ~几百KB level，所以足以放在 LLC 上而不影响别的计算？
 
 Because temporal prefetching is auxiliary to the main execution first design, incorrect predictions consume only the bounded background bandwidth and do not affect correctness or foreground progress. Taken together, deferred promotion and temporal prefetching preserve CoLoRA's uniform design philosophy: misses are served immediately through execution first recovery, while locality-driven background mechanisms optimize how similar accesses are handled later.
+
 
 \section{Implementation}
 \label{sec:implementation}
