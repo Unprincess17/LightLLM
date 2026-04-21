@@ -487,6 +487,17 @@ LMSYS-CHAT-1M and QMSum. Don't use sharegpt-v3, which is old.
 \subsection{LLM Inference Server Performance}
 \subsection{Microbenchmark Evaluations / Ablation Study}
 \subsection{Sensitivity Analysis}
+Note:
+
+sweep evaluation for the boundary~\ref{subsec:feasibility}, to make the "where CoLoRA helps / where it doesn't" story much more credible
+
+- active LoRAs: 1, 2, 4, 8, 16, 64
+
+- popularity skew
+
+- cold-path CPU cores / concurrency
+
+- repeated same-object burstiness
 
 
 % 1. overall performance on 2*RTX 6000 + 2*A100
