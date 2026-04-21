@@ -369,22 +369,26 @@ This design is particularly well suited to decode-time serving, where per-adapte
 \label{subsec:analytical-formulation}
 
 \paragraph{Latency decomposition.}
-Execution-first miss handling replaces synchronous weight promotion with a sequence that moves activations to the host, computes the missing LoRA contribution there, and returns the result to the device. The latency of a cold-path invocation can be decomposed as
+To formalize the feasibility argument above, we model execution-first recovery in terms of the latency components that can become visible on the current token's decode path. The relevant question is not whether host execution is universally faster than GPU execution in isolation, but whether miss handling can be converted from a weight-restoration bottleneck into a bounded side path whose exposed latency can be reduced through overlap.
+
+Under execution-first handling, a cold miss is served by exporting the token's activation state to the host, computing only the missing LoRA contribution there, and returning the result to the device for reintegration. The service time of such a cold-path invocation can be decomposed as
 \begin{equation}
 T_{\text{cold}} = T_{\text{pack}} + T_{\text{D2H}} + T_{\text{cpu}} + T_{\text{H2D}} + T_{\text{merge}},
 \end{equation}
-where $T_{\text{pack}}$ is activation packing and layout preparation, $T_{\text{D2H}}$ and $T_{\text{H2D}}$ are device-to-host and host-to-device transfers, $T_{\text{cpu}}$ is host-side computation, and $T_{\text{merge}}$ is the cost of reintegrating the returned result into the device-side execution stream.
+where $T_{\text{pack}}$ is activation packing and layout preparation, $T_{\text{D2H}}$ and $T_{\text{H2D}}$ are device-to-host and host-to-device transfers, $T_{\text{cpu}}$ is host-side computation of the missing LoRA contribution, and $T_{\text{merge}}$ is the cost of reintegrating the returned result into the device-side decode stream.
 
-This decomposition matters because, in decode, the transferred activation payload is typically much smaller than the missing expert--LoRA weights themselves. Execution-first recovery therefore avoids placing full weight movement on the current token's critical path. The relevant systems question is not whether the CPU path is universally faster in absolute time, but whether enough of its latency can be overlapped with ongoing GPU work on other requests.
+This decomposition makes explicit the asymmetry highlighted in Section~\ref{subsec:feasibility}. The synchronous payload on the cold path is activation- or residual-sized state, rather than the full expert--LoRA object. As a result, execution-first avoids placing full weight restoration on the current token's foreground path. Accordingly, $T_{\text{cold}}$ should be interpreted as the service time of the cold path, while the latency exposed to decode is only the non-overlapped portion of that service time.
 
 \paragraph{Critical-path comparison with promotion-first.}
 For comparison, a promotion-first recovery path incurs
 \begin{equation}
 T_{\text{promote}} = T_{\text{admit}} + T_{\text{H2D-weights}} + T_{\text{gpu}},
 \end{equation}
-where $T_{\text{admit}}$ captures admission and scheduling overhead for the restored object, $T_{\text{H2D-weights}}$ is the host-to-device transfer of weights, and $T_{\text{gpu}}$ is the subsequent GPU execution. In expert--LoRA serving, weight transfer and preparation are often the dominant terms. More importantly, promotion-first keeps those costs on the synchronous recovery path of the current token.
+where $T_{\text{admit}}$ captures admission and scheduling overhead for the restored object, $T_{\text{H2D-weights}}$ is the host-to-device transfer of weights, and $T_{\text{gpu}}$ is the subsequent GPU execution. In expert--LoRA serving, the dominant synchronous cost is often not the computation itself, but the need to move and admit a relatively large weight object before the faulting token can resume.
 
-The key distinction is therefore not only total recovery latency, but where that latency appears. Under promotion-first handling, execution cannot resume until residency has been restored, so recovery remains on the token's critical path. Execution-first changes this placement: it shifts miss recovery onto a side path whose exposed cost can be reduced whenever the GPU hot path still has other ready work to process. Realizing this benefit in practice, however, requires a cold path whose overheads are bounded and whose service time remains stable. We therefore next describe how CoLoRA realizes the CPU cold path as a practical execution substrate for decode-time miss handling.
+The key distinction is therefore not only total miss-recovery time, but where that time appears. Promotion-first treats miss handling as immediate residency restoration, so weight transfer and object admission remain prerequisites for progress on the faulting request. Execution-first instead shifts recovery onto a side path whose synchronous payload is smaller and whose exposed latency can be reduced whenever the GPU hot path still has other ready requests to execute.
+
+In this sense, the comparison is fundamentally about decode-time cost structure rather than raw device preference. Promotion-first pays a weight-restoration cost before useful work on the miss can complete, whereas execution-first pays an activation-exchange plus host-execution cost whose visible impact depends on overlap. Realizing this advantage in practice, however, requires a cold path with bounded overheads and stable service time. We therefore next describe how CoLoRA realizes the CPU cold path as a practical substrate for decode-time miss handling.
 
 \subsubsection{CPU Cold Path Realization}
 \label{subsec:cpu-cold-path}
