@@ -412,20 +412,21 @@ With the cold path realized as a bounded execution substrate, the remaining chal
 \subsection{Decoupled Miss-Recovery Scheduler}
 \label{subsec:scheduler}
 
-The execution-first architecture depends on a runtime scheduler that explicitly decouples cold-miss handling from the main GPU execution stream. This scheduler is the mechanism that converts execution-first recovery into system-level latency isolation: the faulting request pays the miss cost, but unrelated ready requests continue to make forward progress.
+The execution-first architecture relies on a runtime scheduler that explicitly decouples cold-miss handling from the main GPU execution stream. This scheduler bridges heterogeneous miss recovery with the dynamic admission model of continuous batching: rather than treating batch membership as fixed per decode step, it allows temporary, miss-induced evictions. The faulting request absorbs the cold-path cost, while unrelated ready requests continue making forward progress on the GPU.
 
 \paragraph{Scheduler state model.}
-Conceptually, each request alternates among three states: it is either ready to execute on the GPU hot path, being processed on the CPU cold path after a miss, or waiting to be reinserted once a cold-path result has returned. The runtime maintains corresponding queues for GPU-ready work, CPU cold-path jobs, and completed results awaiting reintegration.
+Each request cycles through three states: \textit{GPU-Ready} (queued for hot-path execution), \textit{Cold-Path} (offloaded to the CPU after a miss), or \textit{Awaiting Reinsertion} (completed on the host, pending GPU-side merge). The scheduler maintains lock-free queues for each state and tracks a per-request layer counter to enforce strict intra-request ordering across decoupled execution phases. This phase-tracking mechanism allows cross-request divergence without breaking the decode pipeline.
 
 \paragraph{Miss handling workflow.}
-When a miss occurs at layer $L$, the scheduler removes the affected request from the GPU-ready set, materializes its activations into a staging buffer, and submits a cold-path job to the CPU side. Crucially, the GPU does not wait for this job to complete. It immediately continues issuing kernels for the remaining ready requests. When the cold-path job finishes, its result is transferred back to device memory and the request is reintroduced into GPU execution at the appropriate continuation point.
+When a miss is detected at layer $L$, the scheduler atomically removes the request from the GPU-Ready queue, copies the required activations into a pinned staging buffer, and enqueues a cold-path job. The GPU dispatch loop continues issuing kernels for remaining ready requests without synchronization. Crucially, the skipped request's KV cache pointers and attention masks remain intact on the device; only the LoRA residual is deferred. Upon CPU completion, a host-side callback triggers an asynchronous D2H transfer of the computed residual. Once the transfer lands in device memory, the request is placed in the Awaiting Reinsertion queue. The scheduler's splice logic merges the residual into the GPU-side activation state at layer $L$ and returns the request to the GPU-Ready queue. Reinsertion uses per-layer CUDA events to guarantee that the merged state is visible before the request participates in subsequent attention computations, avoiding global barriers.
 
-This organization yields decoupled miss recovery: GPU progress is no longer tied to immediate weight promotion for every cold object. More precisely, the request that incurs the miss still waits for its own cold-path result before it can advance, but other ready requests do not synchronize on that recovery. CoLoRA therefore does not eliminate cold-miss latency; it isolates that latency to the faulting request and prevents a single miss from becoming a group-wide stall.
+This organization yields decoupled miss recovery: GPU progress is no longer blocked by synchronous weight promotion. CoLoRA does not eliminate the per-request cost of handling a cold miss, but it transforms that cost from a large, batch-stalling PCIe migration into a bounded, CPU-side computation whose critical-path impact is minimized through asynchronous execution and overlap. Consequently, cold misses no longer inflate system-wide tail latency; their cost is isolated to the faulting request while the GPU continues serving ready work.
 
 \paragraph{Bounded cold-path concurrency.}
-To keep the cold path from becoming an uncontrolled source of backlog, CoLoRA imposes an explicit bound on cold-path concurrency. Only a limited number of cold jobs may be in flight at once, and excess misses are queued rather than launched immediately. This keeps host-side resource usage predictable and avoids replacing one form of global instability with another. Within this bounded regime, the scheduler preserves per-request layer ordering, allows cross-request phase decoupling, and maintains GPU forward progress whenever ready work exists.
+To prevent the cold path from becoming a source of host-side queueing instability, CoLoRA caps the number of concurrent cold-path jobs to $K$ (tuned to host core count and PCIe copy-engine capacity). The scheduler enforces this bound via an atomic counter that blocks new cold-path submissions until a running job completes; excess misses are queued rather than dispatched. Within this bounded regime, the scheduler guarantees three invariants: (1) per-request layer ordering is strictly preserved, (2) cross-request execution phases may diverge, enabling overlap between cold-path computation and hot-path GPU work, and (3) GPU forward progress is maintained whenever the GPU-Ready queue is non-empty.
 
-Decoupled scheduling addresses the current access, but not how future accesses should be handled. To improve future efficiency without reintroducing promotion-first semantics, CoLoRA adds auxiliary mechanisms that act on locality rather than demand. The key constraint is that these mechanisms remain strictly background optimizations: they may improve residency and access efficiency when beneficial, but they must never become prerequisites for immediate progress.
+Decoupled scheduling addresses the current access but does not proactively improve future residency. To that end, CoLoRA layers locality-driven background optimizations (deferred promotion and temporal prefetching) that operate strictly off the critical path. These mechanisms improve hot-set concentration when beneficial but are never prerequisites for immediate forward progress.
+
 
 \subsection{Locality-Driven Background Optimizations}
 \label{subsec:locality-background}
@@ -490,7 +491,15 @@ Note:
 LMSYS-CHAT-1M and QMSum. Don't use sharegpt-v3, which is old.
 
 \subsection{LLM Inference Server Performance}
+Note:
+
+- compare CoLoRA against a ``skip-reinsert only'' variant (no deferred promotion/prefetch) to quantify the marginal gain of background optimizations under sustained cache pressure.~\ref{subsec:scheduler}
+
 \subsection{Microbenchmark Evaluations / Ablation Study}
+Note:
+
+- Measuring reinsertion latency (callback + D2H + state merge) and show it remains $<5\%$ of per-token decode time under typical cache pressure.~\ref{subsec:scheduler}
+
 \subsection{Sensitivity Analysis}
 Note:
 
@@ -503,6 +512,8 @@ sweep evaluation for the boundary~\ref{subsec:feasibility}, to make the "where C
 - cold-path CPU cores / concurrency
 
 - repeated same-object burstiness
+
+Sweep $K \in \{1,2,4,8,16\}$ and show throughput/latency trade-offs. Demonstrate that throughput degrades gracefully (not catastrophically) as miss rate increases.~\ref{subsec:scheduler}
 
 
 % 1. overall performance on 2*RTX 6000 + 2*A100
