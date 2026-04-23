@@ -1224,33 +1224,152 @@ class ModeBackend:
         # Load adapters into memory pool
         from lightllm.server.lora import LoRATargetType
 
+        # Startup profiling for adapter preload bottlenecks.
+        preload_prev_t = time.perf_counter()
+        can_rank0_broadcast = (
+            self.node_world_size > 1
+            and dist.is_available()
+            and dist.is_initialized()
+        )
+        node_src_rank = self.args.node_rank * self.node_world_size
         for adapter_id, adapter_dir in lora_adapter_dirs.items():
             try:
-                # Load adapter using the model's LoRA loading function
-                adapter = self._load_lora_adapter_fn(
-                    adapter_dir=adapter_dir,
-                    network_config=self.model.config,
-                    data_type=self.model.data_type,
-                    device="cuda",
-                    swap=False
-                )
+                preload_start_t = time.perf_counter()
+                gap_ms = (preload_start_t - preload_prev_t) * 1000.0
+                broadcast_ms = 0.0
+                load_mode = "local_all_ranks"
+                load_obj_ms = 0.0
+                get_weights_ms = 0.0
 
-                # Convert adapter weights to memory pool format
-                # Format: {layer_id: {target_type: {module_name: {"A": tensor, "B": tensor}}}}
-                rank = adapter.max_rank  # Use actual LoRA rank
-                scaling = adapter.lora_alpha / adapter.max_rank  # Proper scaling calculation
+                # Load adapter using the model's LoRA loading function.
+                # In TP mode, try rank0-only disk load + broadcast to reduce duplicated slow I/O.
+                if can_rank0_broadcast:
+                    load_mode = "rank0_broadcast"
+                    try:
+                        payload = None
+                        if self.rank_in_node == 0:
+                            load_obj_t0 = time.perf_counter()
+                            adapter = self._load_lora_adapter_fn(
+                                adapter_dir=adapter_dir,
+                                network_config=self.model.config,
+                                data_type=self.model.data_type,
+                                device="cpu",
+                                swap=False
+                            )
+                            load_obj_t1 = time.perf_counter()
+                            load_obj_ms = (load_obj_t1 - load_obj_t0) * 1000.0
 
-                # Direct assignment - format already matches LoRAMemPool expectation
-                layer_weights = adapter.get_all_weights()
+                            rank = adapter.max_rank
+                            scaling = adapter.lora_alpha / adapter.max_rank
+                            get_weights_t0 = time.perf_counter()
+                            layer_weights = adapter.get_all_weights()
+                            get_weights_t1 = time.perf_counter()
+                            get_weights_ms = (get_weights_t1 - get_weights_t0) * 1000.0
+                            payload = {
+                                "ok": True,
+                                "rank": rank,
+                                "scaling": scaling,
+                                "layer_weights": layer_weights,
+                            }
+
+                        bcast_t0 = time.perf_counter()
+                        object_list = [payload]
+                        dist.broadcast_object_list(
+                            object_list,
+                            src=node_src_rank,
+                            group=self.node_nccl_group,
+                            device=torch.device("cuda", self.current_device_id),
+                        )
+                        bcast_t1 = time.perf_counter()
+                        broadcast_ms = (bcast_t1 - bcast_t0) * 1000.0
+
+                        received = object_list[0]
+                        if not isinstance(received, dict) or not received.get("ok", False):
+                            raise RuntimeError(
+                                f"Invalid broadcast payload for adapter {adapter_id} at {adapter_dir}"
+                            )
+
+                        rank = received["rank"]
+                        scaling = received["scaling"]
+                        layer_weights = received["layer_weights"]
+                    except Exception as broadcast_err:
+                        # Guarded fallback to current behavior if broadcast fails.
+                        self.logger.warning(
+                            "[LoRA Backend][StartupTiming] rank0 broadcast failed for adapter %s (%s): %s; "
+                            "falling back to per-rank local load",
+                            adapter_id,
+                            adapter_dir,
+                            broadcast_err,
+                        )
+                        load_mode = "fallback_local"
+                        load_obj_t0 = time.perf_counter()
+                        adapter = self._load_lora_adapter_fn(
+                            adapter_dir=adapter_dir,
+                            network_config=self.model.config,
+                            data_type=self.model.data_type,
+                            device="cuda",
+                            swap=False
+                        )
+                        load_obj_t1 = time.perf_counter()
+                        load_obj_ms = (load_obj_t1 - load_obj_t0) * 1000.0
+
+                        rank = adapter.max_rank
+                        scaling = adapter.lora_alpha / adapter.max_rank
+                        get_weights_t0 = time.perf_counter()
+                        layer_weights = adapter.get_all_weights()
+                        get_weights_t1 = time.perf_counter()
+                        get_weights_ms = (get_weights_t1 - get_weights_t0) * 1000.0
+                else:
+                    load_obj_t0 = time.perf_counter()
+                    adapter = self._load_lora_adapter_fn(
+                        adapter_dir=adapter_dir,
+                        network_config=self.model.config,
+                        data_type=self.model.data_type,
+                        device="cuda",
+                        swap=False
+                    )
+                    load_obj_t1 = time.perf_counter()
+                    load_obj_ms = (load_obj_t1 - load_obj_t0) * 1000.0
+
+                    rank = adapter.max_rank
+                    scaling = adapter.lora_alpha / adapter.max_rank
+                    get_weights_t0 = time.perf_counter()
+                    layer_weights = adapter.get_all_weights()
+                    get_weights_t1 = time.perf_counter()
+                    get_weights_ms = (get_weights_t1 - get_weights_t0) * 1000.0
 
                 # Load into memory pool
+                pool_load_t0 = time.perf_counter()
                 self.lora_mem_pool.load_adapter(
                     adapter_dir=adapter_dir,
                     rank=rank,
                     scaling=scaling,
                     layer_weights=layer_weights
                 )
+                pool_load_t1 = time.perf_counter()
+
+                total_ms = (pool_load_t1 - preload_start_t) * 1000.0
+                pool_load_ms = (pool_load_t1 - pool_load_t0) * 1000.0
+
+                self.logger.info(
+                    "[LoRA Backend][StartupTiming] pid=%s rank=%s rank_in_node=%s adapter_id=%s "
+                    "gap_before_ms=%.2f load_obj_ms=%.2f get_weights_ms=%.2f pool_load_ms=%.2f bcast_ms=%.2f "
+                    "total_ms=%.2f mode=%s adapter_dir=%s",
+                    os.getpid(),
+                    self.global_rank,
+                    self.rank_in_node,
+                    adapter_id,
+                    gap_ms,
+                    load_obj_ms,
+                    get_weights_ms,
+                    pool_load_ms,
+                    broadcast_ms,
+                    total_ms,
+                    load_mode,
+                    adapter_dir,
+                )
                 self.logger.info(f"[LoRA Backend] Loaded adapter {adapter_id} from {adapter_dir}")
+                preload_prev_t = pool_load_t1
 
             except Exception as e:
                 self.logger.error(f"[LoRA Backend] Failed to load adapter {adapter_id} from {adapter_dir}: {e}")
@@ -1296,6 +1415,7 @@ class ModeBackend:
                 colora_temporal_hot_cache_slots=int(getattr(self.args, "colora_temporal_hot_cache_slots", 64)),
                 colora_request_skip=bool(getattr(self.args, "colora_request_skip", True)),
                 colora_max_continuations=int(getattr(self.args, "colora_max_continuations", 8)),
+                colora_hit_indexing=str(getattr(self.args, "colora_hit_indexing", "gpu")),
             )
             try:
                 dispatcher = self._create_lora_dispatcher_fn(**dispatcher_kwargs)
