@@ -9,8 +9,9 @@ import pandas as pd
 
 # Legacy NVTX names like MoE_CoalescedAct_LoRA_GPU/L0/E106/Gate.
 _MOE_DGU_EVENT_RE = re.compile(r"^(.+)/L(\d+)/E\d+/(Down|Gate|Up)$")
-# Newer top-level markers in nsys trees: MoE_GateLoRA / MoE_UpLoRA / MoE_DownLoRA.
-_MOE_DGU_SIMPLE_RE = re.compile(r"^MoE_(Down|Gate|Up)LoRA$", re.IGNORECASE)
+# Newer top-level markers in nsys trees: MoE_GateLoRA / MoE_UpLoRA / MoE_DownLoRA,
+# plus hybrid overlap wrappers: MoE_*LoRA_PreAsync / MoE_*LoRA_JoinHybrid.
+_MOE_DGU_SIMPLE_RE = re.compile(r"^MoE_(Down|Gate|Up)LoRA(?:_PreAsync|_JoinHybrid)?$", re.IGNORECASE)
 
 # Defaults when invoked with no CLI args (same workflow as before argv support).
 DEFAULT_CSV_FILE = (
@@ -45,7 +46,11 @@ def get_descendants(df, root_range_id, parent_id_col="ParentId", range_id_col="R
 
 
 def parse_moe_dgu_event(event: str) -> tuple[str, str, int | None] | None:
-    """Return (family, role, layer_from_path) for known MoE Down/Gate/Up event formats."""
+    """Return (family, role, layer_from_path) for known MoE Down/Gate/Up event formats.
+
+    Includes simple markers ``MoE_{Gate,Up,Down}LoRA`` and hybrid NVTX names with
+    ``_PreAsync`` / ``_JoinHybrid`` suffixes (same as COLoRA parent attribution).
+    """
     if not isinstance(event, str):
         return None
     m_simple = _MOE_DGU_SIMPLE_RE.match(event)
@@ -71,11 +76,19 @@ def parse_layer_idx(layer_name):
         return pd.NA
 
 
+_MOE_LORA_ROLE_RE = re.compile(r"^MoE_(Gate|Up|Down)LoRA(?:_PreAsync|_JoinHybrid)?$")
+
+
 def parse_moe_lora_role(event: str) -> str | None:
-    """Parse MoE_{Gate,Up,Down}LoRA event to role name."""
+    """Parse MoE Gate/Up/Down LoRA NVTX name to role label for COLoRA attribution.
+
+    Matches the base markers ``MoE_GateLoRA``, ``MoE_UpLoRA``, ``MoE_DownLoRA`` and
+    hybrid overlap wrappers from ``transformer_layer_infer.py``:
+    ``MoE_*LoRA_PreAsync`` and ``MoE_*LoRA_JoinHybrid``.
+    """
     if not isinstance(event, str):
         return None
-    m = re.match(r"^MoE_(Gate|Up|Down)LoRA$", event)
+    m = _MOE_LORA_ROLE_RE.match(event)
     if not m:
         return None
     return m.group(1)
@@ -147,9 +160,20 @@ def run(
             text=True,
         )
         lines = result.stdout.splitlines()
-        if len(lines) <= 2:
-            raise RuntimeError("Generated CSV output is unexpectedly short")
-        csv_path.write_text("\n".join(lines[2:]) + "\n")
+        # nsys stats prints a variable-length preamble before the CSV body (e.g.
+        # "It is assumed file was previously exported...", "Processing [...]").
+        # Skip until the real CSV header line starting with "Start (ms),End (ms),".
+        header_idx = next(
+            (i for i, ln in enumerate(lines) if ln.startswith("Start (ms),End (ms),")),
+            -1,
+        )
+        if header_idx < 0:
+            raise RuntimeError(
+                "Could not find CSV header in nsys stats output; "
+                "expected a line starting with 'Start (ms),End (ms),'.\n"
+                f"First lines were:\n{chr(10).join(lines[:10])}"
+            )
+        csv_path.write_text("\n".join(lines[header_idx:]) + "\n")
 
     df = pd.read_csv(csv_path)
     df.columns = df.columns.str.strip()
