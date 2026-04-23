@@ -75,10 +75,12 @@
   year={2024}
 }
 
-@inproceedings{todo:slora,
-  title={{S-LoRA}: Serving Thousands of Concurrent {LoRA} Adapters},
-  author={Sheng, Ying and Cao, Shiyi and Li, Dacheng and Hooper, Coleman and Lee, Nicholas and Yang, Shuhong and Chou, Christopher and Zhu, Banghua and Zheng, Lianmin and Keutzer, Kurt and others},
-  booktitle={Proceedings of Machine Learning and Systems (MLSys)},
+@article{sheng2024slora,
+  title={Slora: Scalable serving of thousands of lora adapters},
+  author={Sheng, Ying and Cao, Shiyi and Li, Dacheng and Hooper, Coleman and Lee, Nicholas and Yang, Shuo and Chou, Christopher and Zhu, Banghua and Zheng, Lianmin and Keutzer, Kurt and others},
+  journal={Proceedings of Machine Learning and Systems},
+  volume={6},
+  pages={296--311},
   year={2024}
 }
 
@@ -97,10 +99,10 @@
   year={2017}
 }
 
-@article{todo:large-moe-models,
-  title={DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model},
-  author={DeepSeek-AI},
-  journal={arXiv preprint arXiv:2405.04434},
+@article{zhu2024deepseek,
+  title={Deepseek-coder-v2: Breaking the barrier of closed-source models in code intelligence},
+  author={Zhu, Qihao and Guo, Daya and Shao, Zhihong and Yang, Dejian and Wang, Peiyi and Xu, Runxin and Wu, Y and Li, Yukun and Gao, Huazuo and Ma, Shirong and others},
+  journal={arXiv preprint arXiv:2406.11931},
   year={2024}
 }
 
@@ -117,5 +119,152 @@
   author={Li, Suyi and Lu, Hanfeng and Wu, Tianyuan and Yu, Minchen and Weng, Qizhen and Chen, Xusheng and Shan, Yizhou and Yuan, Binhang and Wang, Wei},
   booktitle={2025 USENIX Annual Technical Conference (USENIX ATC 25)},
   pages={613--629},
+  year={2025}
+}
+
+@article{hu2022lora,
+  title={Lora: Low-rank adaptation of large language models.},
+  author={Hu, Edward J and Shen, Yelong and Wallis, Phillip and Allen-Zhu, Zeyuan and Li, Yuanzhi and Wang, Shean and Wang, Liang and Chen, Weizhu and others},
+  journal={Iclr},
+  volume={1},
+  number={2},
+  pages={3},
+  year={2022}
+}
+
+@article{chen2024punica,
+  title={Punica: Multi-tenant lora serving},
+  author={Chen, Lequn and Ye, Zihao and Wu, Yongji and Zhuo, Danyang and Ceze, Luis and Krishnamurthy, Arvind},
+  journal={Proceedings of Machine Learning and Systems},
+  volume={6},
+  pages={1--13},
+  year={2024}
+}
+
+@inproceedings{wu2024dlora,
+  title={$\{$dLoRA$\}$: Dynamically orchestrating requests and adapters for $\{$LoRA$\}$$\{$LLM$\}$ serving},
+  author={Wu, Bingyang and Zhu, Ruidong and Zhang, Zili and Sun, Peng and Liu, Xuanzhe and Jin, Xin},
+  booktitle={18th USENIX Symposium on Operating Systems Design and Implementation (OSDI 24)},
+  pages={911--927},
+  year={2024}
+}
+
+@article{bruel2024compress,
+  title={Compress then serve: Serving thousands of lora adapters with little overhead},
+  author={Br{\"u}el-Gabrielsson, Rickard and Zhu, Jiacheng and Bhardwaj, Onkar and Choshen, Leshem and Greenewald, Kristjan and Yurochkin, Mikhail and Solomon, Justin},
+  journal={arXiv preprint arXiv:2407.00066},
+  year={2024}
+}
+
+@article{shazeer2017outrageously,
+  title={Outrageously large neural networks: The sparsely-gated mixture-of-experts layer},
+  author={Shazeer, Noam and Mirhoseini, Azalia and Maziarz, Krzysztof and Davis, Andy and Le, Quoc and Hinton, Geoffrey and Dean, Jeff},
+  journal={arXiv preprint arXiv:1701.06538},
+  year={2017}
+}
+
+@article{fedus2022switch,
+  title={Switch transformers: Scaling to trillion parameter models with simple and efficient sparsity},
+  author={Fedus, William and Zoph, Barret and Shazeer, Noam},
+  journal={Journal of Machine Learning Research},
+  volume={23},
+  number={120},
+  pages={1--39},
+  year={2022}
+}
+
+@article{jiang2024mixtral,
+  title={Mixtral of experts},
+  author={Jiang, Albert Q and Sablayrolles, Alexandre and Roux, Antoine and Mensch, Arthur and Savary, Blanche and Bamford, Chris and Chaplot, Devendra Singh and Casas, Diego de las and Hanna, Emma Bou and Bressand, Florian and others},
+  journal={arXiv preprint arXiv:2401.04088},
+  year={2024}
+}
+
+@article{xue2024moe,
+  title={Moe-infinity: Efficient moe inference on personal machines with sparsity-aware expert cache},
+  author={Xue, Leyang and Fu, Yao and Lu, Zhan and Mai, Luo and Marina, Mahesh},
+  journal={arXiv preprint arXiv:2401.14361},
+  year={2024}
+}
+
+@article{kamahori2024fiddler,
+  title={Fiddler: Cpu-gpu orchestration for fast inference of mixture-of-experts models},
+  author={Kamahori, Keisuke and Tang, Tian and Gu, Yile and Zhu, Kan and Kasikci, Baris},
+  journal={arXiv preprint arXiv:2402.07033},
+  year={2024}
+}
+
+@article{yu2025fmoe,
+  title={fMoE: fine-grained expert offloading for large mixture-of-experts serving},
+  author={Yu, Hanfei and Cui, Xingqi and Zhang, Hong and Wang, Hao and Wang, Hao},
+  journal={arXiv e-prints},
+  pages={arXiv--2502},
+  year={2025}
+}
+
+@inproceedings{zhong2025hybrimoe,
+  title={Hybrimoe: Hybrid cpu-gpu scheduling and cache management for efficient moe inference},
+  author={Zhong, Shuzhang and Sun, Yanfan and Liang, Ling and Wang, Runsheng and Huang, Ru and Li, Meng},
+  booktitle={2025 62nd ACM/IEEE Design Automation Conference (DAC)},
+  pages={1--7},
+  year={2025},
+  organization={IEEE}
+}
+
+@inproceedings{yu2022orca,
+  title={Orca: A distributed serving system for $\{$Transformer-Based$\}$ generative models},
+  author={Yu, Gyeong-In and Jeong, Joo Seong and Kim, Geon-Woo and Kim, Soojeong and Chun, Byung-Gon},
+  booktitle={16th USENIX symposium on operating systems design and implementation (OSDI 22)},
+  pages={521--538},
+  year={2022}
+}
+
+@inproceedings{kwon2023efficient,
+  title={Efficient memory management for large language model serving with pagedattention},
+  author={Kwon, Woosuk and Li, Zhuohan and Zhuang, Siyuan and Sheng, Ying and Zheng, Lianmin and Yu, Cody Hao and Gonzalez, Joseph and Zhang, Hao and Stoica, Ion},
+  booktitle={Proceedings of the 29th symposium on operating systems principles},
+  pages={611--626},
+  year={2023}
+}
+
+@article{agrawal2023sarathi,
+  title={Sarathi: Efficient llm inference by piggybacking decodes with chunked prefills},
+  author={Agrawal, Amey and Panwar, Ashish and Mohan, Jayashree and Kwatra, Nipun and Gulavani, Bhargav S and Ramjee, Ramachandran},
+  journal={arXiv preprint arXiv:2308.16369},
+  year={2023}
+}
+
+@inproceedings{patel2024splitwise,
+  title={Splitwise: Efficient generative llm inference using phase splitting},
+  author={Patel, Pratyush and Choukse, Esha and Zhang, Chaojie and Shah, Aashaka and Goiri, {\'I}{\~n}igo and Maleki, Saeed and Bianchini, Ricardo},
+  booktitle={2024 ACM/IEEE 51st Annual International Symposium on Computer Architecture (ISCA)},
+  pages={118--132},
+  year={2024},
+  organization={IEEE}
+}
+
+@inproceedings{aminabadi2022deepspeed,
+  title={Deepspeed-inference: enabling efficient inference of transformer models at unprecedented scale},
+  author={Aminabadi, Reza Yazdani and Rajbhandari, Samyam and Awan, Ammar Ahmad and Li, Cheng and Li, Du and Zheng, Elton and Ruwase, Olatunji and Smith, Shaden and Zhang, Minjia and Rasley, Jeff and others},
+  booktitle={SC22: International Conference for High Performance Computing, Networking, Storage and Analysis},
+  pages={1--15},
+  year={2022},
+  organization={IEEE}
+}
+
+@inproceedings{sheng2023flexgen,
+  title={Flexgen: High-throughput generative inference of large language models with a single gpu},
+  author={Sheng, Ying and Zheng, Lianmin and Yuan, Binhang and Li, Zhuohan and Ryabinin, Max and Chen, Beidi and Liang, Percy and R{\'e}, Christopher and Stoica, Ion and Zhang, Ce},
+  booktitle={International Conference on Machine Learning},
+  pages={31094--31116},
+  year={2023},
+  organization={PMLR}
+}
+
+@article{na2025flexinfer,
+  title={Flexinfer: Flexible llm inference with cpu computations},
+  author={Na, Seonjin and Jeong, Geonhwa and Ahn, Byung H and Jezghani, Aaron and Young, Jeffrey and Hughes, Christopher J and Krishna, Tushar and Kim, Hyesoon},
+  journal={Proceedings of Machine Learning and Systems},
+  volume={7},
   year={2025}
 }
