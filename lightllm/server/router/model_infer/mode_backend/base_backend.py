@@ -216,6 +216,12 @@ class ModeBackend:
         if self.args.enable_multimodal:
             g_infer_context.init_cpu_embed_cache_client()
 
+        # Initialize node-local comm primitives before LoRA preload.
+        # Batched LoRA startup may use rank0 broadcast fast path, which needs this group.
+        if not hasattr(self, "node_nccl_group"):
+            self.node_broadcast_tensor = torch.tensor([0], dtype=torch.int32, device="cuda", requires_grad=False)
+            self.node_nccl_group = create_new_group_for_current_node("nccl")
+
         model_cfg, _ = PretrainedConfig.get_config_dict(self.weight_dir)
         self._apply_colora_speculation_env()
 
@@ -297,8 +303,10 @@ class ModeBackend:
             )
 
         # 用于协同读取 ShmObjsIOBuffer 中的请求信息的通信tensor和通信组对象。
-        self.node_broadcast_tensor = torch.tensor([0], dtype=torch.int32, device="cuda", requires_grad=False)
-        self.node_nccl_group = create_new_group_for_current_node("nccl")
+        # May already be initialized before LoRA adapter preload.
+        if not hasattr(self, "node_nccl_group"):
+            self.node_broadcast_tensor = torch.tensor([0], dtype=torch.int32, device="cuda", requires_grad=False)
+            self.node_nccl_group = create_new_group_for_current_node("nccl")
 
         # 用于在多节点tp模式下协同读取 ShmObjsIOBuffer 中的请求信息的通信tensor和通信组对象。
         if self.is_multinode_tp:
