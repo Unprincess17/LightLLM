@@ -260,6 +260,18 @@ def make_argument_parser() -> argparse.ArgumentParser:
         help="Maximum number of concurrent paused COLoRA CPU continuations. Controls concurrency to avoid overwhelming CPU.",
     )
     parser.add_argument(
+        "--colora_hit_indexing",
+        type=str,
+        choices=["gpu", "cpu"],
+        default="gpu",
+        help=(
+            "Where to compute hit-path indexing (hit_mask, hit_rows, hit_unique_adapters, hit_inverse): "
+            "'gpu' uses torch.isin + nonzero + unique(return_inverse=True) on the CUDA device (current default); "
+            "'cpu' materializes valid_bins on the host once per expert call and replaces those sync-heavy GPU ops "
+            "with Python/numpy set-membership, only H2D-ing the resulting small index tensors."
+        ),
+    )
+    parser.add_argument(
         "--force_slow_lora_path",
         action="store_true",
         help="""Force use of slow path for LoRA (per-expert computation).

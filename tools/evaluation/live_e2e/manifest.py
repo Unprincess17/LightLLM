@@ -19,6 +19,8 @@ class LiveE2ERun:
     cpu_queue_depth: Optional[int] = None
     cpu_batch_timeout_us: Optional[int] = None
     max_continuations: Optional[int] = None
+    # Phase 5: server flag --colora_hit_indexing {gpu|cpu} (optional; default server gpu).
+    colora_hit_indexing: Optional[str] = None
     cpu_kernel_mode: Optional[str] = None
     coalescing_packer: Optional[bool] = None
     speculative_dispatch: Optional[bool] = None
@@ -66,6 +68,7 @@ class LiveE2ERun:
             "cpu_queue_depth": self.cpu_queue_depth,
             "cpu_batch_timeout_us": self.cpu_batch_timeout_us,
             "max_continuations": self.max_continuations,
+            "colora_hit_indexing": self.colora_hit_indexing,
             "cpu_kernel_mode": self.cpu_kernel_mode,
             "coalescing_packer": self.coalescing_packer,
             "speculative_dispatch": self.speculative_dispatch,

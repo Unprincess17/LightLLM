@@ -128,6 +128,7 @@ COLORA_SPECULATIVE_DISPATCH="0"
 COLORA_SPEC_LAYER_WHITELIST=""
 COLORA_REQUEST_SKIP=""
 COLORA_MAX_CONTINUATIONS=""
+COLORA_HIT_INDEXING=""
 SERVER_LOG_PATH=""
 SERVER_PID=""
 SERVER_STDOUT_LOG=""
@@ -327,6 +328,7 @@ while [[ $# -gt 0 ]]; do
         --colora_spec_layer_whitelist) COLORA_SPEC_LAYER_WHITELIST="$2"; shift 2 ;;
 		--colora_request_skip) COLORA_REQUEST_SKIP="$2"; shift 2 ;;
 		--colora_max_continuations) COLORA_MAX_CONTINUATIONS="$2"; shift 2 ;;
+		--colora_hit_indexing) COLORA_HIT_INDEXING="$2"; shift 2 ;;
         --server_log_path) SERVER_LOG_PATH="$2"; shift 2 ;;
         --server_stdout_log) SERVER_STDOUT_LOG="$2"; shift 2 ;;
         --server_host) SERVER_HOST="$2"; shift 2 ;;
@@ -621,6 +623,9 @@ if [[ -n "$COLORA_REQUEST_SKIP" ]]; then
 fi
 if [[ -n "$COLORA_MAX_CONTINUATIONS" ]]; then
     SERVER_ARGS+=(--colora_max_continuations "$COLORA_MAX_CONTINUATIONS")
+fi
+if [[ -n "$COLORA_HIT_INDEXING" ]]; then
+    SERVER_ARGS+=(--colora_hit_indexing "$COLORA_HIT_INDEXING")
 fi
 # Redirect server output
 if [[ -n "$SERVER_STDOUT_LOG" ]]; then

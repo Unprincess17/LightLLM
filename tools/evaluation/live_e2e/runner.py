@@ -52,6 +52,8 @@ def build_benchmark_command(run: LiveE2ERun, benchmark_script: str) -> str:
         parts.append(f"--colora_cpu_batch_timeout_us {run.cpu_batch_timeout_us}")
     if run.max_continuations is not None:
         parts.append(f"--colora_max_continuations {run.max_continuations}")
+    if run.colora_hit_indexing is not None:
+        parts.append(f"--colora_hit_indexing {str(run.colora_hit_indexing).strip().lower()}")
     if run.temporal_prefetch is not None:
         if run.temporal_prefetch:
             parts.append("--colora_temporal_prefetch")

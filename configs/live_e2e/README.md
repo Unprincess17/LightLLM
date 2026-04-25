@@ -39,6 +39,7 @@ Key mapping:
 - `warmup_adapter_trace_path` -> `--warmup_adapter_trace_path <jsonl>`
 - `measurement_adapter_trace_path` -> `--measure_adapter_trace_path <jsonl>`
 - `adapter_trace_path` (legacy alias) -> mapped to `measurement_adapter_trace_path` when explicit measurement field is not set
+- `colora_hit_indexing` (optional) -> `--colora_hit_indexing gpu|cpu` (Phase 5 server flag; omit for server default)
 - `server_host` -> `--server_host <host>` (for fake server or custom endpoint)
 - `server_port` -> `--server_port <port>` (for fake server or avoiding default-port collisions)
 
