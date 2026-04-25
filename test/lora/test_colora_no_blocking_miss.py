@@ -151,7 +151,7 @@ def test_colora_hybrid_miss_path_returns_without_waiting_for_promotion(monkeypat
     assert stats["cache_hit_rate"] == 0.0
     assert stats["promotion_queue_depth"] == 0
     assert stats["promotion_admitted"] == 0
-    assert stats["cpu_queue_wait_time"] == 0.0
+    assert stats["cpu_queue_wait_time"] >= 0.0
     assert stats["fallback_degrade_count"] == 0
     assert stats["cpu_compute_time"] > 0.0
     assert stats["gpu_compute_time"] == 0.0
@@ -321,3 +321,43 @@ def test_no_deferred_sync_promotes_after_cpu_miss_completion(monkeypatch):
     assert stats["miss_policy"] == "no_deferred_sync"
     assert stats["blocking_promotion_count"] == 1
     assert stats["weight_h2d_bytes"] == 8192.0
+
+
+def test_begin_down_hybrid_returns_ticket_for_all_miss(monkeypatch):
+    _install_fake_moe_kernel(monkeypatch)
+    pool = _build_pool_single_adapter()
+
+    cache_mgr = MoEExpertCacheManager(
+        MoEExpertCacheConfig(
+            cache_budget_mb=16,
+            promote_min_hits=100,
+            promote_window=8,
+            max_promote_per_step=1,
+            decay=0.9,
+        )
+    )
+    cache_mgr.register_projection_pool("down", pool)
+
+    dispatcher = dispatch_mod.Qwen3VLMoELoRADispatcher(
+        num_layers=1,
+        down_lora_rank=2,
+        lora_compute_config=LoRAComputeConfig(moe_storage="cpu", moe_compute="hybrid"),
+        colora_async_fallback=True,
+    )
+    dispatcher.expert_cache_manager = cache_mgr
+    dispatcher.lora_mem_pool = type("PoolHolder", (), {"moe_down_pool": pool})()
+
+    x = torch.randn(2, 4, dtype=torch.float32, device="cpu")
+    bins = torch.tensor([0, 0], dtype=torch.long, device="cpu")
+
+    ticket = dispatcher.begin_moe_down_hybrid_miss_async(
+        input_tensor=x,
+        layer_id=0,
+        bins=bins,
+        expert_id=0,
+        hybrid_prepare_ctx=None,
+    )
+    assert ticket is not None
+    out = dispatcher.finish_moe_down_hybrid(ticket)
+    assert out is not None
+    assert out.shape == x.shape

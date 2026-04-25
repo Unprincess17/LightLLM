@@ -1154,18 +1154,61 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
 
                     w1, w3, w2 = current_weights
 
-                    # 4.4.3 Compute Base GEMM
-                    with (NvtxAnnotate(gpu_stream_label) if gpu_stream_label is not None else nullcontext()):
-                        with NvtxAnnotate("MoE_GateGEMM"):
-                            gate_out = torch.mm(expert_input, w1.T)
-                        with NvtxAnnotate("MoE_UpGEMM"):
-                            up_out = torch.mm(expert_input, w3.T)
-
-                    # 4.4.4 Apply Per-Expert LoRA (Gate/Up)
+                    # 4.4.3–4.4.4 Gate/Up base GEMMs + LoRA (schedule CPU miss before each GEMM when hybrid tickets are enabled)
                     gate_up_bind_fn = getattr(self, "_maybe_bind_fused_gate_up_exact", None)
                     bound_gate_up = None
+                    use_hybrid_ticket_path = False
+                    if dispatcher is not None and callable(getattr(dispatcher, "_should_use_hybrid_moe_compute", None)):
+                        try:
+                            use_hybrid_ticket_path = bool(dispatcher._should_use_hybrid_moe_compute())
+                        except Exception:
+                            use_hybrid_ticket_path = False
+
+                    def _resolve_lora_dispatch_input(base_input: torch.Tensor, reuse_packed_input: bool):
+                        if pack_meta is None:
+                            return base_input, expert_req_bins, None
+                        packed_bins_local = pack_meta["packed_bins"]
+                        if reuse_packed_input:
+                            packed_input_local = pack_meta["packed_activations"]
+                        else:
+                            packed_input_local = base_input.index_select(0, pack_meta["token_positions"]).contiguous()
+                        return packed_input_local, packed_bins_local, pack_meta["token_positions"]
+
+                    def _resolve_shared_prepare_ctx(packed_input: torch.Tensor, packed_bins: Optional[torch.Tensor]):
+                        if (
+                            packed_bins is None
+                            or dispatcher is None
+                            or not callable(getattr(dispatcher, "build_moe_hybrid_shared_prepare_context", None))
+                        ):
+                            return None
+                        local_key = (
+                            f"{int(layer_weight.layer_num_)}:{int(local_expert_idx)}:"
+                            f"{int(packed_bins.shape[0])}:{int(packed_bins.data_ptr())}"
+                        )
+                        local_ctx = expert_hybrid_prepare_ctx_cache.get(local_key)
+                        if local_ctx is None:
+                            local_ctx = dispatcher.build_moe_hybrid_shared_prepare_context(
+                                batch_size=int(packed_input.shape[0]),
+                                bins=packed_bins,
+                                expert_id=local_expert_idx,
+                            )
+                            expert_hybrid_prepare_ctx_cache[local_key] = local_ctx
+                        return local_ctx
+
+                    def _maybe_scatter_from_packed(
+                        packed_output: torch.Tensor,
+                        token_positions: Optional[torch.Tensor],
+                        total_tokens: int,
+                    ) -> torch.Tensor:
+                        if token_positions is None:
+                            return packed_output
+                        return self._scatter_lora_from_packed(
+                            packed_output=packed_output,
+                            token_positions=token_positions,
+                            total_tokens=total_tokens,
+                        )
+
                     if callable(gate_up_bind_fn):
-                        # Exact bind only: same layer/step/op/joint-key and identical row-group signature.
                         bound_gate_up = gate_up_bind_fn(
                             expert_input=expert_input,
                             infer_state=infer_state,
@@ -1177,7 +1220,139 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
                             colora_stats=colora_stats,
                         )
 
-                    if bound_gate_up is None:
+                    gpu_ctx = NvtxAnnotate(gpu_stream_label) if gpu_stream_label is not None else nullcontext()
+
+                    if bound_gate_up is not None:
+                        with gpu_ctx:
+                            with NvtxAnnotate("MoE_GateGEMM"):
+                                gate_out = torch.mm(expert_input, w1.T)
+                            with NvtxAnnotate("MoE_UpGEMM"):
+                                up_out = torch.mm(expert_input, w3.T)
+                        gate_lora, up_lora = bound_gate_up
+                    elif use_hybrid_ticket_path and dispatcher is not None:
+                        begin_gate_fn = getattr(dispatcher, "begin_moe_gate_hybrid_miss_async", None)
+                        finish_gate_fn = getattr(dispatcher, "finish_moe_gate_hybrid", None)
+                        begin_up_fn = getattr(dispatcher, "begin_moe_up_hybrid_miss_async", None)
+                        finish_up_fn = getattr(dispatcher, "finish_moe_up_hybrid", None)
+                        if (
+                            callable(begin_gate_fn)
+                            and callable(finish_gate_fn)
+                            and callable(begin_up_fn)
+                            and callable(finish_up_fn)
+                        ):
+                            gate_input, gate_bins, gate_token_positions = _resolve_lora_dispatch_input(
+                                expert_input, reuse_packed_input=True
+                            )
+                            gate_shared_ctx = _resolve_shared_prepare_ctx(gate_input, gate_bins)
+                            with NvtxAnnotate("MoE_GateLoRA_PreAsync"):
+                                gate_ticket = begin_gate_fn(
+                                    input_tensor=gate_input,
+                                    layer_id=layer_weight.layer_num_,
+                                    bins=gate_bins,
+                                    expert_id=local_expert_idx,
+                                    hybrid_prepare_ctx=gate_shared_ctx,
+                                )
+                            with gpu_ctx:
+                                with NvtxAnnotate("MoE_GateGEMM"):
+                                    gate_out = torch.mm(expert_input, w1.T)
+                            if gate_ticket is not None:
+                                with NvtxAnnotate("MoE_GateLoRA_JoinHybrid"):
+                                    gate_packed = finish_gate_fn(gate_ticket)
+                                gate_lora = _maybe_scatter_from_packed(
+                                    gate_packed, gate_token_positions, int(expert_input.shape[0])
+                                )
+                            else:
+                                with NvtxAnnotate("MoE_GateLoRA"):
+                                    gate_lora = self._dispatch_lora_with_optional_coalescing(
+                                        dispatch_fn=self.lora_dispatcher_.batch_apply_gate_lora,
+                                        input_tensor=expert_input,
+                                        layer_id=layer_weight.layer_num_,
+                                        req_bins=expert_req_bins,
+                                        expert_id=local_expert_idx,
+                                        pack_meta=pack_meta,
+                                        hybrid_prepare_ctx_cache=expert_hybrid_prepare_ctx_cache,
+                                        reuse_packed_input=True,
+                                        phase_name="Gate",
+                                        study2_prefix=study2_prefix,
+                                    )
+                            self._merge_colora_stats(colora_stats)
+
+                            up_input, up_bins, up_token_positions = _resolve_lora_dispatch_input(
+                                expert_input, reuse_packed_input=True
+                            )
+                            up_shared_ctx = _resolve_shared_prepare_ctx(up_input, up_bins)
+                            with NvtxAnnotate("MoE_UpLoRA_PreAsync"):
+                                up_ticket = begin_up_fn(
+                                    input_tensor=up_input,
+                                    layer_id=layer_weight.layer_num_,
+                                    bins=up_bins,
+                                    expert_id=local_expert_idx,
+                                    hybrid_prepare_ctx=up_shared_ctx,
+                                )
+                            with gpu_ctx:
+                                with NvtxAnnotate("MoE_UpGEMM"):
+                                    up_out = torch.mm(expert_input, w3.T)
+                            if up_ticket is not None:
+                                with NvtxAnnotate("MoE_UpLoRA_JoinHybrid"):
+                                    up_packed = finish_up_fn(up_ticket)
+                                up_lora = _maybe_scatter_from_packed(
+                                    up_packed, up_token_positions, int(expert_input.shape[0])
+                                )
+                            else:
+                                with NvtxAnnotate("MoE_UpLoRA"):
+                                    up_lora = self._dispatch_lora_with_optional_coalescing(
+                                        dispatch_fn=self.lora_dispatcher_.batch_apply_up_lora,
+                                        input_tensor=expert_input,
+                                        layer_id=layer_weight.layer_num_,
+                                        req_bins=expert_req_bins,
+                                        expert_id=local_expert_idx,
+                                        pack_meta=pack_meta,
+                                        hybrid_prepare_ctx_cache=expert_hybrid_prepare_ctx_cache,
+                                        reuse_packed_input=True,
+                                        phase_name="Up",
+                                        study2_prefix=study2_prefix,
+                                    )
+                            self._merge_colora_stats(colora_stats)
+                        else:
+                            with gpu_ctx:
+                                with NvtxAnnotate("MoE_GateGEMM"):
+                                    gate_out = torch.mm(expert_input, w1.T)
+                                with NvtxAnnotate("MoE_UpGEMM"):
+                                    up_out = torch.mm(expert_input, w3.T)
+                            with NvtxAnnotate("MoE_GateLoRA"):
+                                gate_lora = self._dispatch_lora_with_optional_coalescing(
+                                    dispatch_fn=self.lora_dispatcher_.batch_apply_gate_lora,
+                                    input_tensor=expert_input,
+                                    layer_id=layer_weight.layer_num_,
+                                    req_bins=expert_req_bins,
+                                    expert_id=local_expert_idx,
+                                    pack_meta=pack_meta,
+                                    hybrid_prepare_ctx_cache=expert_hybrid_prepare_ctx_cache,
+                                    reuse_packed_input=True,
+                                    phase_name="Gate",
+                                    study2_prefix=study2_prefix,
+                                )
+                                self._merge_colora_stats(colora_stats)
+                            with NvtxAnnotate("MoE_UpLoRA"):
+                                up_lora = self._dispatch_lora_with_optional_coalescing(
+                                    dispatch_fn=self.lora_dispatcher_.batch_apply_up_lora,
+                                    input_tensor=expert_input,
+                                    layer_id=layer_weight.layer_num_,
+                                    req_bins=expert_req_bins,
+                                    expert_id=local_expert_idx,
+                                    pack_meta=pack_meta,
+                                    hybrid_prepare_ctx_cache=expert_hybrid_prepare_ctx_cache,
+                                    reuse_packed_input=True,
+                                    phase_name="Up",
+                                    study2_prefix=study2_prefix,
+                                )
+                                self._merge_colora_stats(colora_stats)
+                    else:
+                        with gpu_ctx:
+                            with NvtxAnnotate("MoE_GateGEMM"):
+                                gate_out = torch.mm(expert_input, w1.T)
+                            with NvtxAnnotate("MoE_UpGEMM"):
+                                up_out = torch.mm(expert_input, w3.T)
                         with NvtxAnnotate("MoE_GateLoRA"):
                             gate_lora = self._dispatch_lora_with_optional_coalescing(
                                 dispatch_fn=self.lora_dispatcher_.batch_apply_gate_lora,
@@ -1206,8 +1381,6 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
                                 study2_prefix=study2_prefix,
                             )
                             self._merge_colora_stats(colora_stats)
-                    else:
-                        gate_lora, up_lora = bound_gate_up
 
                     gate_out += gate_lora
                     up_out += up_lora
@@ -1217,23 +1390,69 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
                         with NvtxAnnotate("MoE_Activation"):
                             current_hidden = torch.nn.functional.silu(gate_out) * up_out
 
-                        # 4.4.6 Down Projection Base
+                        down_ticket = None
+                        down_input = None
+                        down_bins = None
+                        down_token_positions = None
+                        if use_hybrid_ticket_path and dispatcher is not None:
+                            begin_down_fn = getattr(dispatcher, "begin_moe_down_hybrid_miss_async", None)
+                            finish_down_fn = getattr(dispatcher, "finish_moe_down_hybrid", None)
+                            if callable(begin_down_fn) and callable(finish_down_fn):
+                                down_input, down_bins, down_token_positions = _resolve_lora_dispatch_input(
+                                    current_hidden, reuse_packed_input=False
+                                )
+                                down_shared_ctx = _resolve_shared_prepare_ctx(down_input, down_bins)
+                                with NvtxAnnotate("MoE_DownLoRA_PreAsync"):
+                                    down_ticket = begin_down_fn(
+                                        input_tensor=down_input,
+                                        layer_id=layer_weight.layer_num_,
+                                        bins=down_bins,
+                                        expert_id=local_expert_idx,
+                                        hybrid_prepare_ctx=down_shared_ctx,
+                                    )
+
                         with NvtxAnnotate("MoE_DownGEMM"):
                             down_out = torch.mm(current_hidden, w2.T)
 
                     # 4.4.7 Apply Per-Expert LoRA (Down)
                     with NvtxAnnotate("MoE_DownLoRA"):
-                        down_lora = self._dispatch_lora_with_optional_coalescing(
-                            dispatch_fn=self.lora_dispatcher_.batch_apply_down_lora,
-                            input_tensor=current_hidden,
-                            layer_id=layer_weight.layer_num_,
-                            req_bins=expert_req_bins,
-                            expert_id=local_expert_idx,
-                            pack_meta=pack_meta,
-                            hybrid_prepare_ctx_cache=expert_hybrid_prepare_ctx_cache,
-                            phase_name="Down",
-                            study2_prefix=study2_prefix,
-                        )
+                        if (
+                            use_hybrid_ticket_path
+                            and dispatcher is not None
+                            and down_ticket is not None
+                            and down_input is not None
+                        ):
+                            finish_down_fn = getattr(dispatcher, "finish_moe_down_hybrid", None)
+                            if callable(finish_down_fn):
+                                with NvtxAnnotate("MoE_DownLoRA_JoinHybrid"):
+                                    down_packed = finish_down_fn(down_ticket)
+                                down_lora = _maybe_scatter_from_packed(
+                                    down_packed, down_token_positions, int(current_hidden.shape[0])
+                                )
+                            else:
+                                down_lora = self._dispatch_lora_with_optional_coalescing(
+                                    dispatch_fn=self.lora_dispatcher_.batch_apply_down_lora,
+                                    input_tensor=current_hidden,
+                                    layer_id=layer_weight.layer_num_,
+                                    req_bins=expert_req_bins,
+                                    expert_id=local_expert_idx,
+                                    pack_meta=pack_meta,
+                                    hybrid_prepare_ctx_cache=expert_hybrid_prepare_ctx_cache,
+                                    phase_name="Down",
+                                    study2_prefix=study2_prefix,
+                                )
+                        else:
+                            down_lora = self._dispatch_lora_with_optional_coalescing(
+                                dispatch_fn=self.lora_dispatcher_.batch_apply_down_lora,
+                                input_tensor=current_hidden,
+                                layer_id=layer_weight.layer_num_,
+                                req_bins=expert_req_bins,
+                                expert_id=local_expert_idx,
+                                pack_meta=pack_meta,
+                                hybrid_prepare_ctx_cache=expert_hybrid_prepare_ctx_cache,
+                                phase_name="Down",
+                                study2_prefix=study2_prefix,
+                            )
                         self._merge_colora_stats(colora_stats)
                     if shared_ctx_key in expert_hybrid_prepare_ctx_cache:
                         layer_hybrid_prepare_ctx_cache[shared_ctx_key] = expert_hybrid_prepare_ctx_cache[shared_ctx_key]
