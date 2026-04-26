@@ -19,7 +19,143 @@ from lightllm.utils.log_utils import init_logger
 from lightllm.utils.nvtx_utils import NvtxAnnotate
 
 logger = init_logger(__name__)
-_BGMV_DEBUG_BOUNDS = os.environ.get("LIGHTLLM_BGMV_DEBUG_BOUNDS", "0") == "1"
+
+
+def bgmv_debug_bounds_enabled() -> bool:
+    """True when ``LIGHTLLM_BGMV_DEBUG_BOUNDS=1`` (read at call time so tests can toggle)."""
+    return os.environ.get("LIGHTLLM_BGMV_DEBUG_BOUNDS", "0") == "1"
+
+
+def _coerce_req_bins_for_bgmv(req_bins: torch.Tensor, batch_size: int) -> torch.Tensor:
+    """Return ``req_bins[:batch_size]`` as contiguous ``int32`` on the same device as ``req_bins``."""
+    if req_bins.dim() != 1:
+        raise ValueError(f"[BGMV] req_bins must be 1-D, got shape {tuple(req_bins.shape)}")
+    if req_bins.shape[0] < batch_size:
+        raise ValueError(
+            f"[BGMV] req_bins length {req_bins.shape[0]} < batch_size {batch_size}"
+        )
+    head = req_bins[:batch_size]
+    if head.dtype not in (torch.int32, torch.int64):
+        raise TypeError(
+            f"[BGMV] req_bins must be int32 or int64, got {head.dtype}"
+        )
+    if head.is_contiguous() and head.dtype == torch.int32:
+        return head
+    return head.contiguous().to(dtype=torch.int32)
+
+
+def validate_bgmv_dispatch_inputs(
+    *,
+    projection: str,
+    y: torch.Tensor,
+    x: torch.Tensor,
+    a_buffer: torch.Tensor,
+    b_buffer: torch.Tensor,
+    a_start: torch.Tensor,
+    a_len: torch.Tensor,
+    a_scaling: torch.Tensor,
+    req_bins: torch.Tensor,
+    h_in: int,
+    h_out: int,
+    max_rank: int,
+    pool_size: int,
+    layer_id: int,
+    a_rank: torch.Tensor | None = None,
+) -> None:
+    """Host-side checks before ``bgmv_kernel`` (syncs device tensors).
+
+    Intended for ``LIGHTLLM_BGMV_DEBUG_BOUNDS=1`` and unit tests; keep messages actionable.
+    """
+    batch_size = int(x.shape[0])
+    if req_bins.shape[0] < batch_size:
+        raise AssertionError(
+            f"[BGMV:{projection}] req_bins len {req_bins.shape[0]} < batch_size {batch_size}"
+        )
+    rb = req_bins[:batch_size]
+    if rb.dim() != 1:
+        raise AssertionError(f"[BGMV:{projection}] req_bins must be 1-D, got {tuple(rb.shape)}")
+    if not rb.is_contiguous():
+        raise AssertionError(
+            f"[BGMV:{projection}] req_bins[:batch_size] must be contiguous "
+            f"(strides={tuple(rb.stride())})"
+        )
+    if rb.dtype not in (torch.int32, torch.int64):
+        raise AssertionError(
+            f"[BGMV:{projection}] req_bins dtype must be int32/int64, got {rb.dtype}"
+        )
+
+    for name, t in (
+        ("a_start", a_start),
+        ("a_len", a_len),
+        ("a_scaling", a_scaling),
+    ):
+        if t.dim() != 1:
+            raise AssertionError(f"[BGMV:{projection}] {name} must be 1-D, got {tuple(t.shape)}")
+        if not t.is_contiguous():
+            raise AssertionError(f"[BGMV:{projection}] {name} must be contiguous")
+    if a_start.dtype not in (torch.int32, torch.int64):
+        raise AssertionError(f"[BGMV:{projection}] a_start dtype must be integral, got {a_start.dtype}")
+    if a_len.dtype not in (torch.int32, torch.int64):
+        raise AssertionError(f"[BGMV:{projection}] a_len dtype must be integral, got {a_len.dtype}")
+    if not a_scaling.dtype.is_floating_point:
+        raise AssertionError(f"[BGMV:{projection}] a_scaling must be floating dtype, got {a_scaling.dtype}")
+
+    n_adapters = int(a_start.shape[0])
+    if n_adapters == 0:
+        raise AssertionError(f"[BGMV:{projection}] empty metadata (a_start has 0 rows)")
+    if a_len.shape[0] != n_adapters or a_scaling.shape[0] != n_adapters:
+        raise AssertionError(
+            f"[BGMV:{projection}] metadata length mismatch: "
+            f"a_start={n_adapters}, a_len={a_len.shape[0]}, a_scaling={a_scaling.shape[0]}"
+        )
+
+    if int(y.shape[0]) != batch_size or int(y.shape[0]) != int(x.shape[0]):
+        raise AssertionError(
+            f"[BGMV:{projection}] y/x batch mismatch: y0={y.shape[0]} x0={x.shape[0]} batch_size={batch_size}"
+        )
+
+    rb_min = int(rb.min().item())
+    rb_max = int(rb.max().item())
+    if rb_min < 0:
+        raise AssertionError(
+            f"[BGMV:{projection}] req_bins contains negative entries (min={rb_min}); "
+            "BGMV does not mask no-adapter rows — fix bins or use CPU/naive LoRA for mixed batches."
+        )
+    if rb_max >= n_adapters:
+        raise AssertionError(
+            f"[BGMV:{projection}] req_bins out of range: max={rb_max} >= num_adapters={n_adapters}"
+        )
+
+    ua = torch.unique(rb.detach())
+    starts = a_start[ua.long()]
+    lens = a_len[ua.long()]
+    slots = starts.to(dtype=torch.long) + int(layer_id)
+    smin = int(slots.min().item())
+    smax = int(slots.max().item())
+    if smin < 0:
+        raise AssertionError(
+            f"[BGMV:{projection}] computed slot min {smin} < 0 (layer_id={layer_id})"
+        )
+    if smax >= int(pool_size):
+        raise AssertionError(
+            f"[BGMV:{projection}] slot out of pool: max slot {smax} >= pool_size {pool_size} "
+            f"(layer_id={layer_id})"
+        )
+    if bool((lens <= 0).any().item()):
+        bad = ua[(lens <= 0)].detach().cpu().tolist()
+        raise AssertionError(
+            f"[BGMV:{projection}] a_len has non-positive entries for adapter row(s) {bad}"
+        )
+
+    # Optional: full pool metadata should have positive rank for selected adapters.
+    if a_rank is not None and int(a_rank.shape[0]) == n_adapters:
+        ranks = a_rank[ua.long()]
+        if bool((ranks <= 0).any().item()):
+            bad = ua[(ranks <= 0)].detach().cpu().tolist()
+            raise AssertionError(
+                f"[BGMV:{projection}] a_rank non-positive for adapter row(s) {bad} "
+                "(uninitialized or zero-rank adapter metadata)"
+            )
 
 @triton.jit
 def bgmv_kernel(
@@ -155,6 +291,9 @@ def dispatch_bgmv(
     a_hidden_dim: int | None = None,
     b_hidden_dim: int | None = None,
     layer_id: int = 0,  # Layer ID for slot offset
+    *,
+    projection: str = "dispatch_bgmv",
+    a_rank: torch.Tensor | None = None,
 ):
     """
     Batched GPU Memory View (BGMV) dispatch.
@@ -167,6 +306,8 @@ def dispatch_bgmv(
     batch_size = x.shape[0]
     if batch_size == 0:
         return
+
+    req_bins_launch = _coerce_req_bins_for_bgmv(req_bins, int(batch_size))
 
     # Infer dimensions if not provided
     h_in = a_hidden_dim if a_hidden_dim is not None else x.shape[1]
@@ -181,10 +322,31 @@ def dispatch_bgmv(
 
     assert a_len.shape[0] != 0, f"a_len tensor is empty, cannot proceed with dispatch_bgmv"
 
-    if _BGMV_DEBUG_BOUNDS:
-        # Debug-only bounds check; disabled by default to avoid forcing host sync.
-        max_slot = (a_start + layer_id).max().item()
-        assert max_slot < pool_size, f"Slot location out of bounds: max slot {max_slot} >= pool size {pool_size}"
+    # Always reject negative bins (kernel has no no-adapter mask).
+    if int(req_bins_launch.min().item()) < 0:
+        raise ValueError(
+            f"[BGMV:{projection}] req_bins contains negative values (min="
+            f"{int(req_bins_launch.min().item())}); use naive/CPU LoRA or fix adapter bins."
+        )
+
+    if bgmv_debug_bounds_enabled():
+        validate_bgmv_dispatch_inputs(
+            projection=projection,
+            y=y,
+            x=x,
+            a_buffer=a_buffer,
+            b_buffer=b_buffer,
+            a_start=a_start,
+            a_len=a_len,
+            a_scaling=a_scaling,
+            req_bins=req_bins_launch,
+            h_in=h_in,
+            h_out=h_out,
+            max_rank=max_rank,
+            pool_size=pool_size,
+            layer_id=layer_id,
+            a_rank=a_rank,
+        )
 
     # Helper to pick block size
     def get_block_n(dim):
@@ -202,7 +364,7 @@ def dispatch_bgmv(
 
     bgmv_kernel[grid](
         y, x, a_buffer, b_buffer,
-        a_start, a_len, a_scaling, req_bins,
+        a_start, a_len, a_scaling, req_bins_launch,
         y.stride(0), y.stride(1),
         x.stride(0), x.stride(1),
         a_buffer.stride(0), a_buffer.stride(1), a_buffer.stride(2),
@@ -228,6 +390,9 @@ def batch_lora_get_qkv(
     a_hidden_dim: int = None,
     b_hidden_dim: int = None,
     layer_id: int = 0,
+    *,
+    projection: str = "batch_lora_get_qkv",
+    a_rank: torch.Tensor | None = None,
 ):
     """
     Supports separate dimensions for GQA K/V projections.
@@ -236,7 +401,9 @@ def batch_lora_get_qkv(
     dispatch_bgmv(
         y, x, a_buffer, b_buffer, a_start, a_len, a_scaling, req_bins,
         a_hidden_dim=a_hidden_dim, b_hidden_dim=b_hidden_dim,
-        layer_id=layer_id
+        layer_id=layer_id,
+        projection=projection,
+        a_rank=a_rank,
     )
     
 @NvtxAnnotate
@@ -247,10 +414,13 @@ def batch_lora_get_o(
     a_hidden_dim: int = None,
     b_hidden_dim: int = None,
     layer_id: int = 0,
+    *,
+    projection: str = "batch_lora_get_o",
+    a_rank: torch.Tensor | None = None,
 ):
     dispatch_bgmv(y, x, a_buffer, b_buffer, a_start, a_len, a_scaling, req_bins,
                   a_hidden_dim=a_hidden_dim, b_hidden_dim=b_hidden_dim,
-                  layer_id=layer_id)
+                  layer_id=layer_id, projection=projection, a_rank=a_rank)
 
 @NvtxAnnotate
 def batch_lora_get_mlp(
@@ -260,10 +430,13 @@ def batch_lora_get_mlp(
     a_hidden_dim: int = None,
     b_hidden_dim: int = None,
     layer_id: int = 0,
+    *,
+    projection: str = "batch_lora_get_mlp",
+    a_rank: torch.Tensor | None = None,
 ):
     dispatch_bgmv(y, x, a_buffer, b_buffer, a_start, a_len, a_scaling, req_bins,
                   a_hidden_dim=a_hidden_dim, b_hidden_dim=b_hidden_dim,
-                  layer_id=layer_id)
+                  layer_id=layer_id, projection=projection, a_rank=a_rank)
 
 def batch_lora_get_vl(
     y: torch.Tensor, x: torch.Tensor, a_buffer: torch.Tensor, b_buffer: torch.Tensor,
@@ -272,7 +445,10 @@ def batch_lora_get_vl(
     a_hidden_dim: int = None,
     b_hidden_dim: int = None,
     layer_id: int = 0,
+    *,
+    projection: str = "batch_lora_get_vl",
+    a_rank: torch.Tensor | None = None,
 ):
     dispatch_bgmv(y, x, a_buffer, b_buffer, a_start, a_len, a_scaling, req_bins,
                   a_hidden_dim=a_hidden_dim, b_hidden_dim=b_hidden_dim,
-                  layer_id=layer_id)
+                  layer_id=layer_id, projection=projection, a_rank=a_rank)

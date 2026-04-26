@@ -18,8 +18,6 @@ Key Design:
 Debugging:
 - Set LIGHTLLM_LOGGING=DEBUG to enable verbose LoRA logging
 """
-import attr
-from networkx import attribute_assortativity_coefficient
 import torch
 import os
 import logging
@@ -402,14 +400,31 @@ class LoRAModulePool:
             logger.warning(f"[LoRA] No valid layers for adapter in pool (num_layers={self.num_layers})")
             return False
 
-        # Extend metadata - a_len stores number of slots (layers * experts) this adapter occupies
+        # Reserve the full per-adapter slot span (must match ``can_fit`` / kernel layout).
+        #
+        # ``valid_layers`` only counts keys present in the checkpoint, but flat attention writes
+        # to ``loc_start + buffer_layer_id`` which can be sparse (e.g. layers {0, 27}). Using
+        # ``valid_layers`` for ``a_len`` made ``_compute_location()`` advance too little and
+        # caused **overlapping adapter buffers** → BGMV illegal memory access once enough
+        # adapters were loaded.
+        slots_reserved = int(self.num_layers) * int(self.num_experts)
+        if valid_layers < slots_reserved:
+            logger.warning(
+                "[LoRA] Adapter checkpoint covers %s/%s logical layers; reserving %s contiguous "
+                "slots per adapter anyway (missing layers remain zero-initialized).",
+                valid_layers,
+                slots_reserved,
+                slots_reserved,
+            )
+
+        # Extend metadata - a_len stores contiguous slots this adapter occupies in the buffer
         self.a_start = torch.cat([
             self.a_start,
             torch.tensor([loc_start], dtype=torch.long, device=self.a_start.device)
         ])
         self.a_len = torch.cat([
             self.a_len,
-            torch.tensor([valid_layers], dtype=torch.long, device=self.a_len.device)
+            torch.tensor([slots_reserved], dtype=torch.long, device=self.a_len.device)
         ])
         self.a_scaling = torch.cat([
             self.a_scaling,

@@ -1497,6 +1497,22 @@ class ModeBackend:
         # Use expanded_bins for batched mode (per-token adapter indices)
         req_bins = expanded_bins
 
+        attn_pool = getattr(getattr(self, "lora_mem_pool", None), "attn_q_pool", None)
+        if attn_pool is not None and expanded_bins.numel() > 0:
+            n_loaded = int(attn_pool.a_start.shape[0])
+            pos_bins = expanded_bins[expanded_bins >= 0]
+            if pos_bins.numel() and int(pos_bins.max().item()) >= n_loaded:
+                mx = int(pos_bins.max().item())
+                self.logger.error(
+                    "[LoRA Backend] req_bins max %s >= loaded attention adapters %s — BGMV would index past metadata",
+                    mx,
+                    n_loaded,
+                )
+                raise RuntimeError(
+                    f"Batched LoRA adapter bin out of range (max_bin={mx}, num_loaded_adapters={n_loaded}); "
+                    "load missing adapters, raise lora_max_size, or fix adapter_id / req_bins mapping."
+                )
+
         # Initialize batched mode for all dispatchers
         for dispatcher in self.lora_dispatchers:
             try:
