@@ -358,6 +358,11 @@ def test_begin_down_hybrid_returns_ticket_for_all_miss(monkeypatch):
         hybrid_prepare_ctx=None,
     )
     assert ticket is not None
+    assert ticket.state.miss_future is None
     out = dispatcher.finish_moe_down_hybrid(ticket)
     assert out is not None
     assert out.shape == x.shape
+    stats = dispatcher.pop_colora_stats()
+    assert stats["cpu_async_submitted"] == 0
+    assert stats["cpu_inline_executed"] == 1
+    assert stats["cpu_join_stall_time"] == 0.0

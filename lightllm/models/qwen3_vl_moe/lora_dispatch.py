@@ -52,11 +52,29 @@ try:
         batch_lora_get_o,
         batch_lora_get_mlp,
         batch_lora_get_vl,
+        bgmv_debug_bounds_enabled,
     )
     BGMV_AVAILABLE = True
 except ImportError:
     BGMV_AVAILABLE = False
+
+    def bgmv_debug_bounds_enabled() -> bool:  # type: ignore[misc]
+        return False
+
     # Fallback: naive per-request computation
+
+
+def _bgmv_trace_kwargs(pool, projection: str, *, compact: bool = False) -> dict:
+    """Forward ``projection`` / optional ``a_rank`` into BGMV entrypoints."""
+    if not BGMV_AVAILABLE:
+        return {}
+    kw: dict = {"projection": projection}
+    if compact or not bgmv_debug_bounds_enabled():
+        return kw
+    rank = getattr(pool, "a_rank", None)
+    if rank is not None and rank.numel() > 0:
+        kw["a_rank"] = rank
+    return kw
 
 # AVX CPU kernels: import symbols only — JIT compile is deferred (see _touch_*_avx_flags)
 # so importing this module does not block on torch cpp_extension file locks.
@@ -318,9 +336,13 @@ class _MoEHybridPhaseState:
     gpu_compute_time: float = 0.0
     cpu_compute_time: float = 0.0
     cpu_queue_wait_time: float = 0.0
+    cpu_queue_admit_wait_time: float = 0.0
+    cpu_join_stall_time: float = 0.0
     d2h_bytes: float = 0.0
     h2d_bytes: float = 0.0
     fallback_degrade_count: int = 0
+    cpu_async_submitted: int = 0
+    cpu_inline_executed: int = 0
     moe_kernel_calls: int = 0
     moe_kernel_tokens: int = 0
     blocking_promotion_time: float = 0.0
@@ -854,12 +876,16 @@ class Qwen3VLMoELoRADispatcher:
             "cpu_compute_time": 0.0,
             "gpu_compute_time": 0.0,
             "cpu_queue_wait_time": 0.0,
+            "cpu_queue_admit_wait_time": 0.0,
+            "cpu_join_stall_time": 0.0,
             "d2h_bytes": 0.0,
             "h2d_bytes": 0.0,
             "weight_h2d_bytes": 0.0,
             "weight_h2d_time": 0.0,
             "overlap_ratio": 0.0,
             "fallback_degrade_count": 0,
+            "cpu_async_submitted": 0,
+            "cpu_inline_executed": 0,
             "blocking_promotion_count": 0,
             "miss_policy": MISS_POLICY_CPU_FIRST,
             "overlap_mode": self.colora_overlap_mode,
@@ -1495,12 +1521,16 @@ class Qwen3VLMoELoRADispatcher:
             "cpu_compute_time": 0.0,
             "gpu_compute_time": 0.0,
             "cpu_queue_wait_time": 0.0,
+            "cpu_queue_admit_wait_time": 0.0,
+            "cpu_join_stall_time": 0.0,
             "d2h_bytes": 0.0,
             "h2d_bytes": 0.0,
             "weight_h2d_bytes": 0.0,
             "weight_h2d_time": 0.0,
             "overlap_ratio": 0.0,
             "fallback_degrade_count": 0,
+            "cpu_async_submitted": 0,
+            "cpu_inline_executed": 0,
             "blocking_promotion_count": 0,
             "miss_policy": default_miss_policy,
             "overlap_mode": self.colora_overlap_mode,
@@ -1524,6 +1554,22 @@ class Qwen3VLMoELoRADispatcher:
 
     def _should_use_async_cpu_fallback(self) -> bool:
         return self.colora_async_fallback and self.colora_overlap_mode != OVERLAP_MODE_NO_OVERLAP
+
+    def _has_cpu_miss_overlap_opportunity(
+        self,
+        state: _MoEHybridPhaseState,
+        input_tensor: torch.Tensor,
+    ) -> bool:
+        if not self._should_use_async_cpu_fallback():
+            return False
+        if input_tensor.device.type != "cuda":
+            return False
+        if not state.ready_slots:
+            return False
+        if not BGMV_AVAILABLE:
+            return False
+        cache_a, cache_b = state.manager.get_projection_buffers(state.projection)
+        return cache_a is not None and cache_b is not None
 
     def _get_or_create_cpu_executor(self) -> ThreadPoolExecutor:
         if self._cpu_executor is None:
@@ -2212,7 +2258,7 @@ class Qwen3VLMoELoRADispatcher:
         if state is None:
             return self._get_output_buffer(input_tensor, pool)
 
-        self._hybrid_try_submit_cpu_miss(state=state, input_tensor=input_tensor, pool=pool, worker_owned_d2h=False)
+        self._hybrid_try_submit_cpu_miss(state=state, input_tensor=input_tensor, pool=pool, worker_owned_d2h=True)
         self._hybrid_run_gpu_hit(state=state, input_tensor=input_tensor, pool=pool)
         self._hybrid_finalize_miss(state=state, input_tensor=input_tensor, pool=pool)
         self._hybrid_finalize_stats(state)
@@ -2391,12 +2437,19 @@ class Qwen3VLMoELoRADispatcher:
         assert state.miss_mask is not None
         assert state.valid_pos is not None and state.valid_bins is not None
         with NvtxAnnotate("COLoRA_MissPath_CheckAndPrepare"):
-            if not torch.any(state.miss_mask):
+            if not state.miss_keys:
                 return
-            miss_rows = torch.nonzero(state.miss_mask, as_tuple=False).squeeze(-1)
-            state.miss_pos = state.valid_pos.index_select(0, miss_rows)
-            state.miss_bins = state.valid_bins.index_select(0, miss_rows)
+            if not state.ready_slots:
+                state.miss_pos = state.valid_pos
+                state.miss_bins = state.valid_bins
+            else:
+                miss_rows = torch.nonzero(state.miss_mask, as_tuple=False).squeeze(-1)
+                state.miss_pos = state.valid_pos.index_select(0, miss_rows)
+                state.miss_bins = state.valid_bins.index_select(0, miss_rows)
             assert state.miss_pos is not None and state.miss_bins is not None
+
+            if int(state.miss_pos.numel()) == int(input_tensor.shape[0]):
+                state.miss_input = input_tensor
 
             if input_tensor.device.type == "cuda":
                 state.d2h_bytes += float(
@@ -2406,9 +2459,12 @@ class Qwen3VLMoELoRADispatcher:
                 state.miss_pos.numel() * pool.value_buffer.shape[2] * input_tensor.element_size()
             )
 
-            if self._should_use_async_cpu_fallback():
+            if self._has_cpu_miss_overlap_opportunity(state, input_tensor):
+                reserve_t0 = time.perf_counter()
                 if self._reserve_async_queue_slot():
+                    state.cpu_queue_admit_wait_time += max(time.perf_counter() - reserve_t0, 0.0)
                     state.async_overlap_used = True
+                    state.cpu_async_submitted += 1
                     enqueue_ts = time.perf_counter()
                     miss_plan = self._build_cpu_group_plan(state.miss_bins)
                     miss_pos = state.miss_pos
@@ -2447,12 +2503,15 @@ class Qwen3VLMoELoRADispatcher:
 
                     state.miss_future = self._get_or_create_cpu_executor().submit(_miss_worker)
                 else:
+                    state.cpu_queue_admit_wait_time += max(time.perf_counter() - reserve_t0, 0.0)
                     state.fallback_degrade_count += 1
 
     def _hybrid_run_gpu_hit(self, state: _MoEHybridPhaseState, input_tensor: torch.Tensor, pool) -> None:
         assert state.hit_mask is not None and state.miss_mask is not None
         assert state.valid_pos is not None and state.valid_bins is not None
         with NvtxAnnotate("COLoRA_HitPath_Prepare"):
+            if not state.ready_slots:
+                return
             if not torch.any(state.hit_mask):
                 return
             # Phase 4: look up / populate projection-invariant hit indexing memo.
@@ -2579,6 +2638,7 @@ class Qwen3VLMoELoRADispatcher:
                             a_hidden_dim=hit_input.shape[1],
                             b_hidden_dim=hit_output.shape[1],
                             layer_id=0,
+                            **_bgmv_trace_kwargs(pool, "colora_gpu_hit/moe", compact=True),
                         )
 
                     with NvtxAnnotate("COLoRA_GPU_Hit_Writeback"):
@@ -2605,6 +2665,8 @@ class Qwen3VLMoELoRADispatcher:
     def _hybrid_finalize_miss(self, state: _MoEHybridPhaseState, input_tensor: torch.Tensor, pool) -> None:
         assert state.miss_mask is not None
         with NvtxAnnotate("COLoRA_MissPath_ExecuteAndCommit"):
+            if not state.miss_keys:
+                return
             if not torch.any(state.miss_mask):
                 return
             assert state.miss_pos is not None and state.miss_bins is not None
@@ -2613,7 +2675,9 @@ class Qwen3VLMoELoRADispatcher:
 
             if state.miss_future is not None:
                 with NvtxAnnotate("COLoRA_CPU_Miss_Path_AsyncJoin"):
+                    join_t0 = time.perf_counter()
                     miss_output, queue_wait, cpu_t, kernel_calls, kernel_tokens = state.miss_future.result()
+                    state.cpu_join_stall_time += max(time.perf_counter() - join_t0, 0.0)
             else:
                 with NvtxAnnotate("COLoRA_CPU_Miss_Path"):
                     t0 = time.perf_counter()
@@ -2632,6 +2696,7 @@ class Qwen3VLMoELoRADispatcher:
                     )
                     queue_wait = 0.0
                     cpu_t = time.perf_counter() - t0
+                    state.cpu_inline_executed += 1
 
             with NvtxAnnotate("COLoRA_MissPath_Writeback"):
                 state.output.index_copy_(0, state.miss_pos, miss_output)
@@ -2668,6 +2733,8 @@ class Qwen3VLMoELoRADispatcher:
             "cpu_compute_time": state.cpu_compute_time,
             "gpu_compute_time": state.gpu_compute_time,
             "cpu_queue_wait_time": state.cpu_queue_wait_time,
+            "cpu_queue_admit_wait_time": state.cpu_queue_admit_wait_time,
+            "cpu_join_stall_time": state.cpu_join_stall_time,
             "d2h_bytes": state.d2h_bytes,
             "h2d_bytes": state.h2d_bytes,
             "weight_h2d_bytes": state.blocking_promotion_bytes,
@@ -2675,6 +2742,8 @@ class Qwen3VLMoELoRADispatcher:
             "overlap_ratio": overlap_ratio,
             "overlap_down_gemm_ms": 0.0,
             "fallback_degrade_count": int(state.fallback_degrade_count),
+            "cpu_async_submitted": int(state.cpu_async_submitted),
+            "cpu_inline_executed": int(state.cpu_inline_executed),
             "blocking_promotion_count": int(state.blocking_promotion_count),
             "miss_policy": state.miss_policy,
             "overlap_mode": self.colora_overlap_mode,
@@ -2960,6 +3029,16 @@ class Qwen3VLMoELoRADispatcher:
         logger.debug(f"[LoRA Transfer] a_dest[0].shape={a_dest[0].shape if len(a_dest) > 0 else 'empty'}, b_dest[0].shape={b_dest[0].shape if len(b_dest) > 0 else 'empty'}")
         logger.debug(f"[LoRA Transfer] pool.key_buffer.shape={pool.key_buffer.shape}, pool.value_buffer.shape={pool.value_buffer.shape}")
 
+        pool_size = int(pool.key_buffer.shape[0])
+        num_meta = int(pool.a_start.shape[0])
+        for i in range(len(global_adapter_ids)):
+            gid = int(global_adapter_ids[i].item())
+            if gid < 0 or gid >= num_meta:
+                raise RuntimeError(
+                    f"[LoRA Transfer] global adapter id {gid} out of metadata range [0, {num_meta}) "
+                    f"(pool={type(pool).__name__})"
+                )
+
         # Async transfer using dedicated stream
         if self.transfer_stream is not None:
             with torch.cuda.stream(self.transfer_stream):
@@ -2968,6 +3047,11 @@ class Qwen3VLMoELoRADispatcher:
                     if adapter_id < 0:
                         continue
                     slot = cpu_slots[i].item()
+                    if slot < 0 or slot >= pool_size:
+                        raise RuntimeError(
+                            f"[LoRA Transfer] computed slot {slot} out of buffer bounds [0, {pool_size}) "
+                            f"(adapter_id={adapter_id}, layer_id={layer_id})"
+                        )
                     logger.debug(f"[LoRA Transfer] i={i}, slot={slot}, key_buffer[{slot}].shape={pool.key_buffer[slot].shape}, value_buffer[{slot}].shape={pool.value_buffer[slot].shape}")
                     a_dest[i].copy_(pool.key_buffer[slot], non_blocking=True)
                     b_dest[i].copy_(pool.value_buffer[slot], non_blocking=True)
@@ -2979,6 +3063,11 @@ class Qwen3VLMoELoRADispatcher:
                 if adapter_id < 0:
                     continue
                 slot = cpu_slots[i].item()
+                if slot < 0 or slot >= pool_size:
+                    raise RuntimeError(
+                        f"[LoRA Transfer] computed slot {slot} out of buffer bounds [0, {pool_size}) "
+                        f"(adapter_id={adapter_id}, layer_id={layer_id})"
+                    )
                 a_dest[i].copy_(pool.key_buffer[slot])
                 b_dest[i].copy_(pool.value_buffer[slot])
 
@@ -3021,8 +3110,9 @@ class Qwen3VLMoELoRADispatcher:
                 )
 
                 # 4. Create TEMPORARY compact metadata for kernel
-                temp_a_start = torch.arange(active_count, device=input_tensor.device, dtype=torch.int32)
-                temp_a_len = torch.ones(active_count, device=input_tensor.device, dtype=torch.int32)
+                temp_a_start, temp_a_len = self._get_bgmv_temp_index_buffers(
+                    input_tensor.device, int(active_count)
+                )
                 temp_scaling = pool.a_scaling[unique_adapters.long().cpu()].to(input_tensor.device).to(input_tensor.device)
 
                 # 5. Launch kernel with REMAPPED indices
@@ -3034,7 +3124,8 @@ class Qwen3VLMoELoRADispatcher:
                     inverse_indices,
                     a_hidden_dim=input_tensor.shape[1],
                     b_hidden_dim=output.shape[1],
-                    layer_id=0
+                    layer_id=0,
+                    **_bgmv_trace_kwargs(pool, "batch_apply_q_lora/attn_q/compact", compact=True),
                 )
             else:
                 # Standard GPU path
@@ -3046,7 +3137,8 @@ class Qwen3VLMoELoRADispatcher:
                     pool.a_len,
                     pool.a_scaling,
                     bins,
-                    layer_id=layer_id
+                    layer_id=layer_id,
+                    **_bgmv_trace_kwargs(pool, "batch_apply_q_lora/attn_q"),
                 )
             return output
         else:
@@ -3085,8 +3177,9 @@ class Qwen3VLMoELoRADispatcher:
                     pool, layer_id, unique_adapters,
                     self.gpu_scratchpad_a, self.gpu_scratchpad_b
                 )
-                temp_a_start = torch.arange(active_count, device=input_tensor.device, dtype=torch.int32)
-                temp_a_len = torch.ones(active_count, device=input_tensor.device, dtype=torch.int32)
+                temp_a_start, temp_a_len = self._get_bgmv_temp_index_buffers(
+                    input_tensor.device, int(active_count)
+                )
                 temp_scaling = pool.a_scaling[unique_adapters.long().cpu()].to(input_tensor.device)
                 batch_lora_get_qkv(
                     output, input_tensor,
@@ -3095,7 +3188,8 @@ class Qwen3VLMoELoRADispatcher:
                     inverse_indices,
                     a_hidden_dim=input_tensor.shape[1],
                     b_hidden_dim=output.shape[1],
-                    layer_id=0
+                    layer_id=0,
+                    **_bgmv_trace_kwargs(pool, "batch_apply_k_lora/attn_k/compact", compact=True),
                 )
             else:
                 batch_lora_get_qkv(
@@ -3104,7 +3198,8 @@ class Qwen3VLMoELoRADispatcher:
                     pool.a_start, pool.a_len, pool.a_scaling, bins,
                     a_hidden_dim=input_tensor.shape[1],
                     b_hidden_dim=output.shape[1],
-                    layer_id=layer_id
+                    layer_id=layer_id,
+                    **_bgmv_trace_kwargs(pool, "batch_apply_k_lora/attn_k"),
                 )
             return output
         else:
@@ -3142,8 +3237,9 @@ class Qwen3VLMoELoRADispatcher:
                     pool, layer_id, unique_adapters,
                     self.gpu_scratchpad_a, self.gpu_scratchpad_b
                 )
-                temp_a_start = torch.arange(active_count, device=input_tensor.device, dtype=torch.int32)
-                temp_a_len = torch.ones(active_count, device=input_tensor.device, dtype=torch.int32)
+                temp_a_start, temp_a_len = self._get_bgmv_temp_index_buffers(
+                    input_tensor.device, int(active_count)
+                )
                 temp_scaling = pool.a_scaling[unique_adapters.long().cpu()].to(input_tensor.device)
                 batch_lora_get_qkv(
                     output, input_tensor,
@@ -3152,7 +3248,8 @@ class Qwen3VLMoELoRADispatcher:
                     inverse_indices,
                     a_hidden_dim=input_tensor.shape[1],
                     b_hidden_dim=output.shape[1],
-                    layer_id=0
+                    layer_id=0,
+                    **_bgmv_trace_kwargs(pool, "batch_apply_v_lora/attn_v/compact", compact=True),
                 )
             else:
                 batch_lora_get_qkv(
@@ -3161,7 +3258,8 @@ class Qwen3VLMoELoRADispatcher:
                     pool.a_start, pool.a_len, pool.a_scaling, bins,
                     a_hidden_dim=input_tensor.shape[1],
                     b_hidden_dim=output.shape[1],
-                    layer_id=layer_id
+                    layer_id=layer_id,
+                    **_bgmv_trace_kwargs(pool, "batch_apply_v_lora/attn_v"),
                 )
             return output
         else:
@@ -3198,8 +3296,9 @@ class Qwen3VLMoELoRADispatcher:
                     pool, layer_id, unique_adapters,
                     self.gpu_scratchpad_a, self.gpu_scratchpad_b
                 )
-                temp_a_start = torch.arange(active_count, device=input_tensor.device, dtype=torch.int32)
-                temp_a_len = torch.ones(active_count, device=input_tensor.device, dtype=torch.int32)
+                temp_a_start, temp_a_len = self._get_bgmv_temp_index_buffers(
+                    input_tensor.device, int(active_count)
+                )
                 temp_scaling = pool.a_scaling[unique_adapters.long().cpu()].to(input_tensor.device)
                 batch_lora_get_o(
                     output,
@@ -3207,7 +3306,8 @@ class Qwen3VLMoELoRADispatcher:
                     self.gpu_scratchpad_a, self.gpu_scratchpad_b,
                     temp_a_start, temp_a_len, temp_scaling,
                     inverse_indices,
-                    layer_id=0
+                    layer_id=0,
+                    **_bgmv_trace_kwargs(pool, "batch_apply_o_lora/attn_o/compact", compact=True),
                 )
             else:
                 batch_lora_get_o(
@@ -3219,7 +3319,8 @@ class Qwen3VLMoELoRADispatcher:
                     pool.a_len,
                     pool.a_scaling,
                     bins,
-                    layer_id=layer_id
+                    layer_id=layer_id,
+                    **_bgmv_trace_kwargs(pool, "batch_apply_o_lora/attn_o"),
                 )
             return output
         else:
@@ -3299,10 +3400,11 @@ class Qwen3VLMoELoRADispatcher:
                             pool, buffer_layer_id, unique_adapters,
                             self.gpu_scratchpad_a, self.gpu_scratchpad_b
                         )
-                        temp_a_start = torch.arange(active_count, device=input_tensor.device, dtype=torch.int32)
-                        temp_a_len = torch.ones(active_count, device=input_tensor.device, dtype=torch.int32)
+                        temp_a_start, temp_a_len = self._get_bgmv_temp_index_buffers(
+                            input_tensor.device, int(active_count)
+                        )
                         temp_scaling = pool.a_scaling[unique_adapters.long().cpu()].to(input_tensor.device)
-                        
+
                     batch_lora_get_mlp(
                         output,
                         input_tensor,
@@ -3311,7 +3413,8 @@ class Qwen3VLMoELoRADispatcher:
                         inverse_indices,
                         a_hidden_dim=input_tensor.shape[1],
                         b_hidden_dim=output.shape[1],
-                        layer_id=0
+                        layer_id=0,
+                        **_bgmv_trace_kwargs(pool, "batch_apply_gate_lora/moe_gate/compact", compact=True),
                     )
             else:
                 with NvtxAnnotate("batch_apply_gate_lora_gpu"):
@@ -3326,7 +3429,8 @@ class Qwen3VLMoELoRADispatcher:
                         bins,
                         a_hidden_dim=input_tensor.shape[1],
                         b_hidden_dim=output.shape[1],
-                        layer_id=buffer_layer_id
+                        layer_id=buffer_layer_id,
+                        **_bgmv_trace_kwargs(pool, "batch_apply_gate_lora/moe_gate"),
                     )
             return output
         else:
@@ -3400,8 +3504,9 @@ class Qwen3VLMoELoRADispatcher:
                     pool, buffer_layer_id, unique_adapters,
                     self.gpu_scratchpad_a, self.gpu_scratchpad_b
                 )
-                temp_a_start = torch.arange(active_count, device=input_tensor.device, dtype=torch.int32)
-                temp_a_len = torch.ones(active_count, device=input_tensor.device, dtype=torch.int32)
+                temp_a_start, temp_a_len = self._get_bgmv_temp_index_buffers(
+                    input_tensor.device, int(active_count)
+                )
                 temp_scaling = pool.a_scaling[unique_adapters.long().cpu()].to(input_tensor.device)
                 batch_lora_get_mlp(
                     output,
@@ -3411,7 +3516,8 @@ class Qwen3VLMoELoRADispatcher:
                     inverse_indices,
                     a_hidden_dim=input_tensor.shape[1],
                     b_hidden_dim=output.shape[1],
-                    layer_id=0
+                    layer_id=0,
+                    **_bgmv_trace_kwargs(pool, "batch_apply_up_lora/moe_up/compact", compact=True),
                 )
             else:
                 batch_lora_get_mlp(
@@ -3425,7 +3531,8 @@ class Qwen3VLMoELoRADispatcher:
                     bins,
                     a_hidden_dim=input_tensor.shape[1],
                     b_hidden_dim=output.shape[1],
-                    layer_id=buffer_layer_id
+                    layer_id=buffer_layer_id,
+                    **_bgmv_trace_kwargs(pool, "batch_apply_up_lora/moe_up"),
                 )
             return output
         else:
@@ -3499,8 +3606,9 @@ class Qwen3VLMoELoRADispatcher:
                     pool, buffer_layer_id, unique_adapters,
                     self.gpu_scratchpad_a, self.gpu_scratchpad_b
                 )
-                temp_a_start = torch.arange(active_count, device=input_tensor.device, dtype=torch.int32)
-                temp_a_len = torch.ones(active_count, device=input_tensor.device, dtype=torch.int32)
+                temp_a_start, temp_a_len = self._get_bgmv_temp_index_buffers(
+                    input_tensor.device, int(active_count)
+                )
                 temp_scaling = pool.a_scaling[unique_adapters.long().cpu()].to(input_tensor.device)
                 batch_lora_get_mlp(
                     output, input_tensor,
@@ -3509,7 +3617,8 @@ class Qwen3VLMoELoRADispatcher:
                     inverse_indices,
                     a_hidden_dim=input_tensor.shape[1],
                     b_hidden_dim=output.shape[1],
-                    layer_id=0
+                    layer_id=0,
+                    **_bgmv_trace_kwargs(pool, "batch_apply_down_lora/moe_down/compact", compact=True),
                 )
             else:
                 batch_lora_get_mlp(
@@ -3518,7 +3627,8 @@ class Qwen3VLMoELoRADispatcher:
                     pool.a_start, pool.a_len, pool.a_scaling, bins,
                     a_hidden_dim=input_tensor.shape[1],
                     b_hidden_dim=output.shape[1],
-                    layer_id=buffer_layer_id
+                    layer_id=buffer_layer_id,
+                    **_bgmv_trace_kwargs(pool, "batch_apply_down_lora/moe_down"),
                 )
             return output
         else:
@@ -3569,8 +3679,9 @@ class Qwen3VLMoELoRADispatcher:
                     pool, layer_id, unique_adapters,
                     self.gpu_scratchpad_a, self.gpu_scratchpad_b
                 )
-                temp_a_start = torch.arange(active_count, device=input_tensor.device, dtype=torch.int32)
-                temp_a_len = torch.ones(active_count, device=input_tensor.device, dtype=torch.int32)
+                temp_a_start, temp_a_len = self._get_bgmv_temp_index_buffers(
+                    input_tensor.device, int(active_count)
+                )
                 temp_scaling = pool.a_scaling[unique_adapters.long().cpu()].to(input_tensor.device)
                 batch_lora_get_vl(
                     output, input_tensor,
@@ -3579,7 +3690,8 @@ class Qwen3VLMoELoRADispatcher:
                     inverse_indices,
                     a_hidden_dim=input_tensor.shape[1],
                     b_hidden_dim=output.shape[1],
-                    layer_id=0
+                    layer_id=0,
+                    **_bgmv_trace_kwargs(pool, f"batch_apply_vl_lora/{target_type}/compact", compact=True),
                 )
             else:
                 batch_lora_get_vl(
@@ -3588,7 +3700,8 @@ class Qwen3VLMoELoRADispatcher:
                     pool.a_start, pool.a_len, pool.a_scaling, bins,
                     a_hidden_dim=input_tensor.shape[1],
                     b_hidden_dim=output.shape[1],
-                    layer_id=layer_id
+                    layer_id=layer_id,
+                    **_bgmv_trace_kwargs(pool, f"batch_apply_vl_lora/{target_type}"),
                 )
             return output
         else:
