@@ -1,6 +1,5 @@
 import torch
 import time
-import json
 from typing import List, Optional, Callable, Dict, Any
 from queue import Queue
 from lightllm.server.router.model_infer.mode_backend.base_backend import ModeBackend
@@ -295,31 +294,6 @@ class ChunkedPrefillBackend(ModeBackend):
             overlap_stream.synchronize()
             logits_rows = int(model_output.logits.shape[0])
             if logits_rows != len(run_reqs_norm):
-                # region agent log
-                try:
-                    with open("/home/shufan/LightLLM-integrate-to-SLoRA/.cursor/debug-93213c.log", "a", encoding="utf-8") as f:
-                        f.write(
-                            json.dumps(
-                                {
-                                    "sessionId": "93213c",
-                                    "runId": "post-fix",
-                                    "hypothesisId": "R2-H1",
-                                    "location": "chunked_prefill/impl.py:decode_normal:align_before_sample",
-                                    "message": "aligning decode inputs with logits rows",
-                                    "data": {
-                                        "logits_rows": logits_rows,
-                                        "run_reqs_norm_len_before": len(run_reqs_norm),
-                                        "b_req_idx_len_before": int(model_input.b_req_idx.shape[0]),
-                                        "b_mtp_index_len_before": int(model_input.b_mtp_index.shape[0]),
-                                    },
-                                    "timestamp": int(time.time() * 1000),
-                                }
-                            )
-                            + "\n"
-                        )
-                except Exception:
-                    pass
-                # endregion
                 run_reqs_norm = run_reqs_norm[:logits_rows]
                 model_input.b_req_idx = model_input.b_req_idx[:logits_rows]
                 model_input.b_mtp_index = model_input.b_mtp_index[:logits_rows]
@@ -738,3 +712,4 @@ class ChunkedPrefillBackend(ModeBackend):
 
         # Return a zero-copy view slice
         return self._mock_logit_buffer[:total_tokens]
+

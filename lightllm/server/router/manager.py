@@ -39,25 +39,6 @@ from lightllm.utils.envs_utils import get_unique_server_name
 
 
 logger = init_logger(__name__)
-_AGENT_DEBUG_LOG_PATH = "/home/shufan/LightLLM-integrate-to-SLoRA/.cursor/debug-93213c.log"
-_AGENT_DEBUG_SESSION_ID = "93213c"
-
-
-def _agent_debug_log(location: str, message: str, data: dict, hypothesis_id: str, run_id: str = "pre-fix") -> None:
-    try:
-        payload = {
-            "sessionId": _AGENT_DEBUG_SESSION_ID,
-            "runId": run_id,
-            "hypothesisId": hypothesis_id,
-            "location": location,
-            "message": message,
-            "data": data,
-            "timestamp": int(time.time() * 1000),
-        }
-        with open(_AGENT_DEBUG_LOG_PATH, "a", encoding="utf-8") as _f:
-            _f.write(json.dumps(payload, ensure_ascii=True) + "\n")
-    except Exception:
-        pass
 
 
 class RouterManager:
@@ -157,17 +138,6 @@ class RouterManager:
         return
 
     def cleanup_shared_memory(self):
-        # #region agent log
-        _agent_debug_log(
-            location="server/router/manager.py:cleanup_shared_memory",
-            message="cleanup_shared_memory entered",
-            data={
-                "has_shared_token_load": bool(getattr(self, "shared_token_load", None) is not None),
-                "has_running_batch": bool(getattr(self, "running_batch", None) is not None),
-            },
-            hypothesis_id="H26",
-        )
-        # #endregion
         if hasattr(self, "cpu_cache_client") and self.cpu_cache_client is not None:
             self.cpu_cache_client.cleanup_shared_memory()
             self.cpu_cache_client = None
@@ -189,14 +159,6 @@ class RouterManager:
         if hasattr(self, "shm_req_manager") and self.shm_req_manager is not None:
             self.shm_req_manager.destroy()
             self.shm_req_manager = None
-        # #region agent log
-        _agent_debug_log(
-            location="server/router/manager.py:cleanup_shared_memory",
-            message="cleanup_shared_memory finished",
-            data={"shared_token_load_cleared": bool(getattr(self, "shared_token_load", None) is None)},
-            hypothesis_id="H26",
-        )
-        # #endregion
         return
 
     async def wait_to_model_ready(self):
@@ -800,3 +762,4 @@ def start_router_process(args, pipe_writer):
     pipe_writer.send("init ok")
     loop.run_until_complete(router.loop_for_fwd())
     return
+

@@ -192,6 +192,38 @@ def test_validate_wrong_req_bins_dtype():
         )
 
 
+def test_validate_adapter_span_exceeds_pool():
+    """``a_start + layer_id`` can be in range while ``[a_start, a_start+a_len)`` overflows."""
+    pool_size = 20
+    h_in = h_out = max_rank = 8
+    batch = 1
+    a_buf = torch.zeros(pool_size, max_rank, h_in)
+    b_buf = torch.zeros(pool_size, max_rank, h_out)
+    x = torch.zeros(batch, h_in)
+    y = torch.zeros(batch, h_out)
+    starts = torch.tensor([15], dtype=torch.int32)
+    a_len = torch.tensor([10], dtype=torch.int32)
+    scaling = torch.ones(1, dtype=torch.float32)
+    req = torch.tensor([0], dtype=torch.int32)
+    with pytest.raises(AssertionError, match="span exceeds pool"):
+        validate_bgmv_dispatch_inputs(
+            projection="test",
+            y=y,
+            x=x,
+            a_buffer=a_buf,
+            b_buffer=b_buf,
+            a_start=starts,
+            a_len=a_len,
+            a_scaling=scaling,
+            req_bins=req,
+            h_in=h_in,
+            h_out=h_out,
+            max_rank=max_rank,
+            pool_size=pool_size,
+            layer_id=0,
+        )
+
+
 def test_validate_slot_out_of_pool():
     n = 2
     pool_size = 5  # deliberately too small for layer_id=3

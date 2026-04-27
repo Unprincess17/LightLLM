@@ -49,30 +49,6 @@ from lightllm.server.pd_io_struct import NIXLChunckedTransTaskRet
 from .multi_level_kv_cache import MultiLevelKvCacheModule
 from lightllm.server.embed_cache.embed_cache_client import CpuEmbedCacheClient
 
-import sys
-print(f"DEBUG: Loading base_backend from {__file__}", file=sys.stderr)
-
-
-def _agent_cuda_debug(location: str, message: str, data: dict, hypothesis_id: str) -> None:
-    try:
-        with open("/home/shufan/LightLLM-integrate-to-SLoRA/.cursor/debug-93213c.log", "a", encoding="utf-8") as f:
-            f.write(
-                json.dumps(
-                    {
-                        "sessionId": "93213c",
-                        "runId": "pre-fix",
-                        "hypothesisId": hypothesis_id,
-                        "location": location,
-                        "message": message,
-                        "data": data,
-                        "timestamp": int(time.time() * 1000),
-                    }
-                )
-                + "\n"
-            )
-    except Exception:
-        pass
-
 class ModeBackend:
     def __init__(self) -> None:
         self.shm_req_manager = ShmReqManager()
@@ -457,37 +433,19 @@ class ModeBackend:
     def _try_read_new_reqs_normal(self):
         try:
             torch.cuda.synchronize()
-        except Exception as e:
-            _agent_cuda_debug(
-                "base_backend.py:_try_read_new_reqs_normal",
-                "cuda sync failed before node_broadcast_tensor fill",
-                {"error": str(e)},
-                "HC1",
-            )
+        except Exception:
             raise
         if self.is_master_in_node:
             if self.shm_reqs_io_buffer.is_ready():
                 self.node_broadcast_tensor.fill_(1)
             else:
                 self.node_broadcast_tensor.fill_(0)
-            _agent_cuda_debug(
-                "base_backend.py:_try_read_new_reqs_normal",
-                "prepared node_broadcast_tensor",
-                {"value": int(self.node_broadcast_tensor.item()), "is_master_in_node": bool(self.is_master_in_node)},
-                "HC2",
-            )
 
         src_rank_id = self.args.node_rank * self.node_world_size
         dist.broadcast(self.node_broadcast_tensor, src=src_rank_id, group=self.node_nccl_group, async_op=False)
         try:
             torch.cuda.synchronize()
-        except Exception as e:
-            _agent_cuda_debug(
-                "base_backend.py:_try_read_new_reqs_normal",
-                "cuda sync failed after node_broadcast_tensor broadcast",
-                {"error": str(e), "src_rank_id": int(src_rank_id)},
-                "HC3",
-            )
+        except Exception:
             raise
         new_buffer_is_ready = self.node_broadcast_tensor.detach().item()
         if new_buffer_is_ready:
@@ -893,33 +851,6 @@ class ModeBackend:
         b_prefill_has_output_cpu: torch.Tensor = None,
         mask_func: Optional[Callable] = None,
     ):
-        if logits.shape[0] != len(run_reqs):
-            # #region agent log
-            with open("/home/shufan/LightLLM-integrate-to-SLoRA/.cursor/debug-93213c.log", "a", encoding="utf-8") as _f:
-                _f.write(
-                    json.dumps(
-                        {
-                            "sessionId": "93213c",
-                            "runId": "pre-fix",
-                            "hypothesisId": "H7",
-                            "location": "base_backend.py:_sample_and_scatter_token",
-                            "message": "logits/run_reqs mismatch before sampling",
-                            "data": {
-                                "is_prefill": bool(is_prefill),
-                                "logits_rows": int(logits.shape[0]),
-                                "run_reqs_len": int(len(run_reqs)),
-                                "b_req_idx_len": int(b_req_idx.shape[0]) if b_req_idx is not None else -1,
-                                "req_idxs": [int(getattr(r, "req_idx", -1)) for r in run_reqs[:8]],
-                                "has_continuation": [bool(getattr(r, "colora_continuation", None) is not None) for r in run_reqs[:8]],
-                                "is_paused": [bool(getattr(r, "colora_paused", False)) for r in run_reqs[:8]],
-                            },
-                            "timestamp": int(time.time() * 1000),
-                        }
-                    )
-                    + "\n"
-                )
-            # #endregion
-
         if mask_func is not None:
             assert len(run_reqs) == logits.shape[0]
             mask_func(run_reqs, logits)
@@ -1348,12 +1279,16 @@ class ModeBackend:
 
                 # Load into memory pool
                 pool_load_t0 = time.perf_counter()
-                self.lora_mem_pool.load_adapter(
+                loaded_ok = self.lora_mem_pool.load_adapter(
                     adapter_dir=adapter_dir,
                     rank=rank,
                     scaling=scaling,
                     layer_weights=layer_weights
                 )
+                if not loaded_ok:
+                    raise RuntimeError(
+                        f"Failed to load adapter_id={adapter_id} ({adapter_dir}) into memory pool"
+                    )
                 pool_load_t1 = time.perf_counter()
 
                 total_ms = (pool_load_t1 - preload_start_t) * 1000.0
@@ -1383,6 +1318,7 @@ class ModeBackend:
                 self.logger.error(f"[LoRA Backend] Failed to load adapter {adapter_id} from {adapter_dir}: {e}")
                 import traceback
                 traceback.print_exc()
+                raise
 
         # Create dispatcher for each layer
         self.lora_dispatchers = []
@@ -1469,7 +1405,19 @@ class ModeBackend:
         active_adapter_ids = set()
         for req in batch.reqs:
             adapter_id = normalize_req_adapter_id(getattr(req, "adapter_id", 0))
-            adapter_bin = get_req_adapter_bin(req)
+            if adapter_id <= 0:
+                adapter_bin = -1
+            else:
+                adapter_dir = self.lora_adapter_dirs.get(adapter_id) if hasattr(self, "lora_adapter_dirs") else None
+                if adapter_dir is None:
+                    raise RuntimeError(
+                        f"Unknown adapter_id={adapter_id} in request; known ids={sorted(self.lora_adapter_dirs.keys())}"
+                    )
+                adapter_bin = int(self.lora_mem_pool.get_adapter_idx(adapter_dir))
+                if adapter_bin < 0:
+                    raise RuntimeError(
+                        f"adapter_id={adapter_id} ({adapter_dir}) is not loaded in memory pool"
+                    )
             req_bins_list.append(adapter_bin)
             if adapter_id > 0:
                 active_adapter_ids.add(adapter_id)
@@ -1496,21 +1444,13 @@ class ModeBackend:
 
         # Use expanded_bins for batched mode (per-token adapter indices)
         req_bins = expanded_bins
-
-        attn_pool = getattr(getattr(self, "lora_mem_pool", None), "attn_q_pool", None)
-        if attn_pool is not None and expanded_bins.numel() > 0:
-            n_loaded = int(attn_pool.a_start.shape[0])
-            pos_bins = expanded_bins[expanded_bins >= 0]
-            if pos_bins.numel() and int(pos_bins.max().item()) >= n_loaded:
-                mx = int(pos_bins.max().item())
-                self.logger.error(
-                    "[LoRA Backend] req_bins max %s >= loaded attention adapters %s — BGMV would index past metadata",
-                    mx,
-                    n_loaded,
-                )
+        if req_bins.numel() > 0:
+            pos_bins = req_bins[req_bins >= 0]
+            max_pos_bin = int(pos_bins.max().item()) if pos_bins.numel() > 0 else -1
+            loaded_count = int(len(self.lora_mem_pool.adapter_dirs))
+            if max_pos_bin >= loaded_count:
                 raise RuntimeError(
-                    f"Batched LoRA adapter bin out of range (max_bin={mx}, num_loaded_adapters={n_loaded}); "
-                    "load missing adapters, raise lora_max_size, or fix adapter_id / req_bins mapping."
+                    f"req_bins out of range before dispatch: max_bin={max_pos_bin}, loaded_count={loaded_count}"
                 )
 
         # Initialize batched mode for all dispatchers
@@ -1588,3 +1528,4 @@ class ModeBackend:
         self.lora_mem_pool = None
         self.lora_dispatchers = []
         self.moe_expert_cache_manager = None
+

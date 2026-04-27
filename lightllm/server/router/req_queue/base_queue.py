@@ -8,27 +8,6 @@ from lightllm.common.basemodel.infer_lock import g_router_lock
 from lightllm.utils.config_utils import get_fixed_kv_len
 from lightllm.server.core.objs import StartArgs
 
-_AGENT_DEBUG_LOG_PATH = "/home/shufan/LightLLM-integrate-to-SLoRA/.cursor/debug-93213c.log"
-_AGENT_DEBUG_SESSION_ID = "93213c"
-
-
-def _agent_debug_log(location: str, message: str, data: dict, hypothesis_id: str, run_id: str = "pre-fix") -> None:
-    try:
-        payload = {
-            "sessionId": _AGENT_DEBUG_SESSION_ID,
-            "runId": run_id,
-            "hypothesisId": hypothesis_id,
-            "location": location,
-            "message": message,
-            "data": data,
-            "timestamp": int(time.time() * 1000),
-        }
-        with open(_AGENT_DEBUG_LOG_PATH, "a", encoding="utf-8") as _f:
-            _f.write(json.dumps(payload, ensure_ascii=True) + "\n")
-    except Exception:
-        pass
-
-
 class BaseQueue:
     def __init__(self, args: StartArgs, router, dp_index, dp_size_in_node) -> None:
         self.args = args
@@ -102,39 +81,13 @@ class BaseQueue:
         raise NotImplementedError()
 
     def update_token_load(self, current_batch: Batch, force_update=False):
-        # #region agent log
         if self.router.shared_token_load is None:
-            _agent_debug_log(
-                location="server/router/req_queue/base_queue.py:update_token_load",
-                message="shared_token_load is None before update",
-                data={
-                    "force_update": bool(force_update),
-                    "has_running_batch": bool(current_batch is not None),
-                    "dp_index": int(self.dp_index),
-                },
-                hypothesis_id="H26",
-            )
             # Router is shutting down and shared memory already cleaned.
             # Skip token-load update to avoid crashing during teardown race.
             return
-        # #endregion
         if self.router.shared_token_load.need_update_dynamic_max_load() or force_update:
             estimated_peak_token_count, dynamic_max_load = self.calcu_batch_token_load(current_batch)
             token_ratio1 = self.router.get_used_tokens(self.dp_index) / self.router.max_total_token_num
-            # #region agent log
-            _agent_debug_log(
-                location="server/router/req_queue/base_queue.py:update_token_load",
-                message="updating token load",
-                data={
-                    "force_update": bool(force_update),
-                    "dp_index": int(self.dp_index),
-                    "token_ratio": float(token_ratio1),
-                    "estimated_peak_token_count": int(estimated_peak_token_count),
-                    "dynamic_max_load": float(dynamic_max_load),
-                },
-                hypothesis_id="H29",
-            )
-            # #endregion
             with g_router_lock.obj:
                 self.router.shared_token_load.set_current_load(token_ratio1, self.dp_index)
                 self.router.shared_token_load.set_estimated_peak_token_count(estimated_peak_token_count, self.dp_index)

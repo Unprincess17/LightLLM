@@ -42,27 +42,6 @@ from rpyc.utils.classic import obtain
 
 logger = init_logger(__name__)
 
-# Debug session instrumentation (temporary).
-_AGENT_DEBUG_LOG_PATH = "/home/shufan/LightLLM-integrate-to-SLoRA/.cursor/debug-93213c.log"
-_AGENT_DEBUG_SESSION_ID = "93213c"
-
-
-def _agent_debug_log(location: str, message: str, data: dict, hypothesis_id: str, run_id: str = "pre-fix") -> None:
-    try:
-        payload = {
-            "sessionId": _AGENT_DEBUG_SESSION_ID,
-            "runId": run_id,
-            "hypothesisId": hypothesis_id,
-            "location": location,
-            "message": message,
-            "data": data,
-            "timestamp": int(time.time() * 1000),
-        }
-        with open(_AGENT_DEBUG_LOG_PATH, "a", encoding="utf-8") as _f:
-            _f.write(json.dumps(payload, ensure_ascii=True) + "\n")
-    except Exception:
-        pass
-
 
 class HttpServerManager:
     def __init__(
@@ -214,21 +193,6 @@ class HttpServerManager:
                 if base_name in self.lora_name_to_id:
                     resolution = "basename_map"
                     resolved_adapter_id = int(self.lora_name_to_id[base_name])
-
-        # #region agent log
-        _agent_debug_log(
-            location="server/httpserver/manager.py:_resolve_request_adapter_id",
-            message="Resolved request adapter token",
-            data={
-                "request_index": int(request_index),
-                "adapter_token": adapter_name,
-                "resolved_adapter_id": int(resolved_adapter_id),
-                "resolution": resolution,
-                "known_map_size": int(len(self.lora_name_to_id)),
-            },
-            hypothesis_id="H1",
-        )
-        # #endregion
 
         if resolved_adapter_id > 0:
             return resolved_adapter_id
@@ -926,3 +890,4 @@ class ReqStatus:
             if not req.can_release():
                 return False
         return True
+
