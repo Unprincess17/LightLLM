@@ -147,6 +147,21 @@ def validate_bgmv_dispatch_inputs(
             f"[BGMV:{projection}] a_len has non-positive entries for adapter row(s) {bad}"
         )
 
+    # Pool layout: each adapter owns contiguous buffer slots ``[a_start, a_start + a_len)``
+    # (``LoRAModulePool``). The kernel loads ``a_start + layer_id``; that index must stay
+    # inside the pool, and the declared span must not extend past ``pool_size`` or later
+    # layers / other code would read/write OOB relative to ``a_buffer`` / ``b_buffer``.
+    span_end_excl = starts.to(dtype=torch.long) + lens.to(dtype=torch.long)
+    span_overflow = span_end_excl > int(pool_size)
+    if bool(span_overflow.any().item()):
+        bad = ua[span_overflow].detach().cpu().tolist()
+        worst = int(span_end_excl.max().item())
+        raise AssertionError(
+            f"[BGMV:{projection}] adapter slot span exceeds pool: max exclusive end "
+            f"a_start+a_len={worst} > pool_size={pool_size} (adapter row(s) {bad}, "
+            f"layer_id={layer_id})"
+        )
+
     # Optional: full pool metadata should have positive rank for selected adapters.
     if a_rank is not None and int(a_rank.shape[0]) == n_adapters:
         ranks = a_rank[ua.long()]
