@@ -37,3 +37,4 @@ benchmark_lora.log
 .cursor/
 tools/common/nsys/run_layer_moe_from_timings.sh
 configs/live_e2e/*.yaml
+.codex
