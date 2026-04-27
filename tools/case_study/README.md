@@ -637,3 +637,51 @@ Reproducibility note:
 
 - `B13` is a pure assembly stage. It does not require any undocumented manual edits, and every figure in the manifest lists the exact source artifact paths plus the plotting script that produced it.
 - If you want the onset-to-plateau `Fig. 4`, regenerate the richer `B10` sweep above into the run-scoped default sweep directory before running `B13`.
+
+## P1 Workload Diagnosis Wrapper
+
+Use `tools/case_study/workload_diagnosis.py` as a lightweight adapter around existing B7/B8 outputs when you need the P1 contract files under `results/workload_diagnosis/`.
+
+### 1) Alibaba stratified sample (deterministic)
+
+```bash
+python tools/case_study/workload_diagnosis.py sample-alibaba \
+  --input_csv /home/shufan/alibaba-clusterdata/cluster-trace-v2026-GenAI/filtered_lora_args.csv \
+  --output_csv /tmp/alibaba_filtered_lora_args_sampled_256.csv \
+  --sample_size 256 \
+  --seed 7
+```
+
+The sampler uses request-level LoRA-combination strata so minority combinations are preserved better than pure first-N slicing.
+
+### 2) Pressure trace generation from seed JSONL traces
+
+```bash
+python tools/case_study/workload_diagnosis.py generate-pressure \
+  --input_jsonl path/to/seed_a.jsonl path/to/seed_b.jsonl \
+  --output_jsonl /tmp/pressure_trace_256.jsonl \
+  --target_count 256 \
+  --burst_length 4 \
+  --seed 7
+```
+
+This generator replays short same-adapter bursts to raise miss pressure while preserving JSONL compatibility for downstream tooling.
+
+### 3) Build required P1 artifacts from existing run outputs
+
+Prepare a workload manifest (example: `configs/evaluation/colora_kpi/workload_diagnosis_workloads.example.json`) pointing each workload to its run root.
+
+```bash
+python tools/case_study/workload_diagnosis.py summarize \
+  --workloads_json configs/evaluation/colora_kpi/workload_diagnosis_workloads.example.json \
+  --output_dir results/workload_diagnosis \
+  --summary_budget 2048 \
+  --topk_key 1000
+```
+
+Outputs:
+
+- `results/workload_diagnosis/summary.csv`
+- `results/workload_diagnosis/fig_locality_cdf.pdf`
+- `results/workload_diagnosis/fig_miss_vs_cache.pdf`
+- `results/workload_diagnosis/fig_reuse_distance.pdf`
