@@ -1,0 +1,44 @@
+# P2 Cold Miss Recovery Microbenchmark Configuration
+#
+# Controls the single-layer MoE expert-LoRA decode cold-miss benchmark
+# that compares load_then_run (promotion-first) vs cpu_first (execution-first).
+
+hidden_size: 4096
+intermediate_size: 14336
+num_experts: 64
+topk: 8
+
+ranks:
+  - 8
+  - 16
+  - 32
+  - 64
+
+batch_sizes:
+  - 1
+  - 2
+  - 4
+  - 8
+
+dtype: fp16
+projection: gate
+
+repeats: 10
+warmup_iters: 10
+measurement_iters: 100
+
+cache_budget_mb: 64
+
+# CPU execution settings
+cpu_threads: 2
+cpu_kernel_mode: avx       # avx or naive
+numa_node: null             # null = auto; set to int for explicit binding
+
+# Expert cache
+promote_min_hits: 1
+promote_window: 16
+max_promote_per_step: 8
+decay: 0.9
+
+# Output
+output_dir: results/microbench_cold_recovery

@@ -40,3 +40,4 @@ configs/live_e2e/*.yaml
 .codex
 
 results/
+autoresearch-results.tsv

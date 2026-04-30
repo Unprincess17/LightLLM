@@ -177,3 +177,140 @@ def moe_batch_lora_down_avx(
         x.shape[0], x.shape[1], B.shape[1], scaling
     )
     return output
+
+
+def moe_lora_multi_adapter_avx(
+    x: torch.Tensor,
+    A_all: torch.Tensor,
+    B_all: torch.Tensor,
+    adapter_ids: torch.Tensor,
+    scaling: torch.Tensor,
+    uniform_scaling: float = 0.0,
+) -> torch.Tensor:
+    """Batched multi-adapter LoRA: each token uses its own adapter's weights.
+
+    Eliminates Python per-adapter loop overhead by running the entire
+    gate+up computation in a single C++ kernel call.
+
+    Args:
+        x: Input tensor [N, H]
+        A_all: Stacked A matrices [num_adapters, R, H]
+        B_all: Stacked B matrices [num_adapters, R, H]
+        adapter_ids: Per-token adapter index [N] (0-based LongTensor, CPU)
+        scaling: Per-adapter scaling [num_adapters] (FloatTensor, CPU)
+        uniform_scaling: If > 0, use this for all adapters (ignore scaling tensor)
+
+    Returns:
+        LoRA output [N, H]
+    """
+    ensure_kernel_loaded()
+    if _moe_lora_cpu_kernel is None:
+        raise RuntimeError("moe_lora_cpu_kernel extension failed to load")
+    N = x.shape[0]
+    H = x.shape[1]
+    R = A_all.shape[1]
+    num_adapters = A_all.shape[0]
+    output = torch.zeros(N, H, dtype=x.dtype, device=x.device)
+    # C++ binding expects int32 for adapter_ids
+    _adapter_ids_i32 = adapter_ids.to(dtype=torch.int32) if adapter_ids.dtype != torch.int32 else adapter_ids
+    _moe_lora_cpu_kernel.moe_lora_multi_adapter_avx(
+        x, A_all, B_all, _adapter_ids_i32, scaling, output,
+        N, H, R, num_adapters, uniform_scaling,
+    )
+    return output
+
+
+def moe_lora_pool_multi_adapter_avx(
+    key_buffer: torch.Tensor,
+    value_buffer: torch.Tensor,
+    x: torch.Tensor,
+    adapter_local_ids: torch.Tensor,
+    pool_offsets: torch.Tensor,
+    pool_ranks: torch.Tensor,
+    pool_scaling: torch.Tensor,
+    uniform_scaling: float = 0.0,
+) -> torch.Tensor:
+    """Pool-based multi-adapter LoRA: reads directly from pool buffers.
+
+    Avoids any tensor stacking/copying — reads A/B from the pool's
+    key_buffer/value_buffer using per-adapter offsets.
+
+    Args:
+        key_buffer: Pool key_buffer [total_slots, max_rank, H] (CPU bf16)
+        value_buffer: Pool value_buffer [total_slots, max_rank, H] (CPU bf16)
+        x: Input tensor [N, H] (CPU bf16)
+        adapter_local_ids: Per-token local adapter ID [N] (int32, CPU)
+            Maps each token to its index in pool_offsets/pool_ranks/pool_scaling.
+        pool_offsets: Per-adapter slot offset [num_unique] (int32, CPU)
+        pool_ranks: Per-adapter rank [num_unique] (int32, CPU)
+        pool_scaling: Per-adapter scaling [num_unique] (float32, CPU)
+        uniform_scaling: If > 0, use for all adapters
+
+    Returns:
+        LoRA output [N, H] (CPU bf16)
+    """
+    ensure_kernel_loaded()
+    if _moe_lora_cpu_kernel is None:
+        raise RuntimeError("moe_lora_cpu_kernel extension failed to load")
+    N = x.shape[0]
+    H = x.shape[1]
+    max_rank = key_buffer.shape[1]
+    num_unique = pool_offsets.shape[0]
+    output = torch.zeros(N, H, dtype=x.dtype, device=x.device)
+    _local_ids_i32 = adapter_local_ids.to(dtype=torch.int32) if adapter_local_ids.dtype != torch.int32 else adapter_local_ids
+    _offsets_i32 = pool_offsets.to(dtype=torch.int32) if pool_offsets.dtype != torch.int32 else pool_offsets
+    _ranks_i32 = pool_ranks.to(dtype=torch.int32) if pool_ranks.dtype != torch.int32 else pool_ranks
+    _moe_lora_cpu_kernel.moe_lora_pool_multi_adapter_avx(
+        key_buffer, value_buffer, x, output,
+        _local_ids_i32, _offsets_i32, _ranks_i32, pool_scaling,
+        N, H, max_rank, num_unique, uniform_scaling,
+    )
+    return output
+
+
+def moe_lora_pool_fp16_multi_adapter_avx(
+    key_buffer: torch.Tensor,
+    value_buffer: torch.Tensor,
+    x: torch.Tensor,
+    adapter_local_ids: torch.Tensor,
+    pool_offsets: torch.Tensor,
+    pool_ranks: torch.Tensor,
+    pool_scaling: torch.Tensor,
+    uniform_scaling: float = 0.0,
+) -> torch.Tensor:
+    """Pool-based multi-adapter LoRA with fp16 weights.
+
+    Reads fp16 weights from pool buffers directly, converts to fp32
+    on-the-fly using F16C instructions. Input x is bf16 (activation),
+    output is bf16. No tensor copying or stacking in Python.
+
+    Args:
+        key_buffer: Pool key_buffer [total_slots, max_rank, H] (CPU fp16)
+        value_buffer: Pool value_buffer [total_slots, max_rank, H] (CPU fp16)
+        x: Input tensor [N, H] (CPU bf16)
+        adapter_local_ids: Per-token local adapter ID [N] (int32, CPU)
+        pool_offsets: Per-adapter slot offset [num_unique] (int32, CPU)
+        pool_ranks: Per-adapter rank [num_unique] (int32, CPU)
+        pool_scaling: Per-adapter scaling [num_unique] (float32, CPU)
+        uniform_scaling: If > 0, use for all adapters
+
+    Returns:
+        LoRA output [N, H] (CPU bf16)
+    """
+    ensure_kernel_loaded()
+    if _moe_lora_cpu_kernel is None:
+        raise RuntimeError("moe_lora_cpu_kernel extension failed to load")
+    N = x.shape[0]
+    H = x.shape[1]
+    max_rank = key_buffer.shape[1]
+    num_unique = pool_offsets.shape[0]
+    output = torch.zeros(N, H, dtype=x.dtype, device=x.device)
+    _local_ids_i32 = adapter_local_ids.to(dtype=torch.int32) if adapter_local_ids.dtype != torch.int32 else adapter_local_ids
+    _offsets_i32 = pool_offsets.to(dtype=torch.int32) if pool_offsets.dtype != torch.int32 else pool_offsets
+    _ranks_i32 = pool_ranks.to(dtype=torch.int32) if pool_ranks.dtype != torch.int32 else pool_ranks
+    _moe_lora_cpu_kernel.moe_lora_pool_fp16_multi_adapter_avx(
+        key_buffer, value_buffer, x, output,
+        _local_ids_i32, _offsets_i32, _ranks_i32, pool_scaling,
+        N, H, max_rank, num_unique, uniform_scaling,
+    )
+    return output
