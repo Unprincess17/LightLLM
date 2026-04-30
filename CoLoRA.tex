@@ -143,12 +143,12 @@ We present CoLoRA, a serving runtime that treats GPU memory misses as an executi
 \section{Introduction}
 \label{sec:introduction}
 
-Large-scale LLM serving is increasingly shaped by the convergence of two trends: sparse Mixture-of-Experts (MoE) base models~\cite{jiang2024mixtral} and LoRA-based multi-tenant adaptation~\cite{hu2022lora,sheng2024slora}. In practice, these trends meet in \emph{multi-LoRA MoE serving}. While existing multi-LoRA systems target dense modules such as attention layers and shared FFNs, they do not directly address adaptation on sparsely activated MoE expert layers~\cite{chen2024punica,sheng2024slora}. This gap is critical: MoE expert FFN blocks comprise the majority of model capacity, making them the natural target for tenant-specific specialization~\cite{sfedus2022switch,schulman2025lora}. This combination couples the compute efficiency of MoE with the parameter efficiency of LoRA. However, it creates a new serving regime in which request-time sparse routing and tenant-specific adapter selection jointly shape the active weights. This significantly enlarges and diversifies the inference working set, rendering it difficult to manage with existing caching strategies.
-% v2: Large-scale LLM serving is increasingly shaped by the convergence of two trends that are individually effective but jointly nontrivial to serve: sparse Mixture-of-Experts (MoE) base models~\cite{jiang2024mixtral} and LoRA-based multi-tenant adaptation~\cite{hu2022lora,sheng2024slora}. In practice, these trends naturally meet in \emph{multi-LoRA MoE serving}. Existing multi-LoRA serving systems, however, are primarily designed for dense backbones and do not directly address adaptation on sparsely activated MoE expert layers~\cite{chen2024punica,sheng2024slora}. Such adaptation is both natural and important: MoE expert FFN blocks comprise a large fraction of model capacity and are a natural target for tenant-specific specialization~\cite{sfedus2022switch, schulman2025lora}. The resulting combination is attractive because it couples the compute efficiency of MoE with the parameter efficiency of LoRA. At the same time, it creates a new serving regime in which request-time sparse routing and tenant-specific adapter selection jointly shape the active weight set, making the inference working set larger, more diverse, and harder to manage efficiently.
+Large-scale LLM serving is increasingly shaped by the convergence of two trends: sparse Mixture-of-Experts (MoE) base models~\cite{jiang2024mixtral} and LoRA-based multi-tenant adaptation~\cite{hu2022lora,sheng2024slora}. In practice, these trends meet in \emph{multi-LoRA MoE serving}. While existing multi-LoRA systems target dense modules such as attention layers and shared FFNs, they do not directly address adaptation on sparsely activated MoE expert layers~\cite{chen2024punica,sheng2024slora}. This gap is critical: MoE expert FFN blocks comprise the majority of model capacity, making them the natural target for tenant-specific specialization~\cite{fedus2022switch,schulman2025lora}. This combination couples the compute efficiency of MoE with the parameter efficiency of LoRA. However, it creates a new serving regime in which request-time sparse routing and tenant-specific adapter selection jointly shape the active weights. This significantly enlarges and diversifies the inference working set, rendering it difficult to manage with existing caching strategies.
+% v2: Large-scale LLM serving is increasingly shaped by the convergence of two trends that are individually effective but jointly nontrivial to serve: sparse Mixture-of-Experts (MoE) base models~\cite{jiang2024mixtral} and LoRA-based multi-tenant adaptation~\cite{hu2022lora,sheng2024slora}. In practice, these trends naturally meet in \emph{multi-LoRA MoE serving}. Existing multi-LoRA serving systems, however, are primarily designed for dense backbones and do not directly address adaptation on sparsely activated MoE expert layers~\cite{chen2024punica,sheng2024slora}. Such adaptation is both natural and important: MoE expert FFN blocks comprise a large fraction of model capacity and are a natural target for tenant-specific specialization~\cite{fedus2022switch, schulman2025lora}. The resulting combination is attractive because it couples the compute efficiency of MoE with the parameter efficiency of LoRA. At the same time, it creates a new serving regime in which request-time sparse routing and tenant-specific adapter selection jointly shape the active weight set, making the inference working set larger, more diverse, and harder to manage efficiently.
 %
 %Note: In this version, \cite{gale2023megablocks} to be moved to Related Work if not cited elsewhere.
 %
-% v1: Large-scale LLM serving is increasingly shaped by the convergence of two trends that are each effective in isolation but jointly challenging in deployment: sparse Mixture-of-Experts (MoE) base models~\cite{jiang2024mixtral} and LoRA-based multi-tenant adaptation~\cite{hu2022lora,sheng2024slora}. In production settings, these trends naturally meet in \emph{multi-LoRA MoE serving}. While LoRA is widely used as a lightweight mechanism for tenant-specific customization, existing multi-LoRA serving systems have largely been designed for dense-model adaptation rather than expert-layer adaptation in sparse MoE models~\cite{chen2024punica,sheng2024slora}. Extending LoRA to MoE expert layers is both natural and practically important, because expert FFN blocks account for a large fraction of model capacity and provide a high-leverage target for task- or tenant-specific specialization~\cite{sfedus2022switch, schulman2025lora}. This combination is appealing from a deployment perspective: MoE reduces base-model compute, while LoRA enables efficient per-tenant customization without replicating the full model. However, it also creates a distinct serving regime in which dynamic sparse routing~\cite{gale2023megablocks} and long-tailed multi-tenant adaptation~\cite{} jointly determine which expert- and adapter-side weights are needed for each request, increasing access diversity and complicating locality management during inference.
+% v1: Large-scale LLM serving is increasingly shaped by the convergence of two trends that are each effective in isolation but jointly challenging in deployment: sparse Mixture-of-Experts (MoE) base models~\cite{jiang2024mixtral} and LoRA-based multi-tenant adaptation~\cite{hu2022lora,sheng2024slora}. In production settings, these trends naturally meet in \emph{multi-LoRA MoE serving}. While LoRA is widely used as a lightweight mechanism for tenant-specific customization, existing multi-LoRA serving systems have largely been designed for dense-model adaptation rather than expert-layer adaptation in sparse MoE models~\cite{chen2024punica,sheng2024slora}. Extending LoRA to MoE expert layers is both natural and practically important, because expert FFN blocks account for a large fraction of model capacity and provide a high-leverage target for task- or tenant-specific specialization~\cite{fedus2022switch, schulman2025lora}. This combination is appealing from a deployment perspective: MoE reduces base-model compute, while LoRA enables efficient per-tenant customization without replicating the full model. However, it also creates a distinct serving regime in which dynamic sparse routing~\cite{gale2023megablocks} and long-tailed multi-tenant adaptation~\cite{} jointly determine which expert- and adapter-side weights are needed for each request, increasing access diversity and complicating locality management during inference.
 
 This enlarged and more diverse working set becomes especially problematic during \emph{decode} in prefill--decode deployments~\cite{agrawal2023sarathi,patel2024splitwise}. Unlike prefill, which can often amortize weight-loading costs across many prompt tokens, decode operates under tight inter-token latency SLOs: generation is highly memory-bandwidth bound, and any weight miss on the critical path directly translates to pipeline stalls and ITL degradation. Consequently, the granularity of weight management becomes critical: in pure MoE serving, the natural unit is the expert; in conventional multi-LoRA serving, it is the adapter, and prior systems such as S-LoRA~\cite{sheng2024slora} and VaLoRA~\cite{mi2025empower} therefore adopt adapter-centric designs that assume dense adapter loading. 
 
@@ -496,10 +496,50 @@ Note:
 
 - compare CoLoRA against a ``skip-reinsert only'' variant (no deferred promotion/prefetch) to quantify the marginal gain of background optimizations under sustained cache pressure.~\ref{subsec:scheduler}
 
-\subsection{Microbenchmark Evaluations / Ablation Study}
-Note:
 
-- Measuring reinsertion latency (callback + D2H + state merge) and show it remains $<5\%$ of per-token decode time under typical cache pressure.~\ref{subsec:scheduler}
+\subsection{Microbenchmark Evaluation}
+\label{subsec:microbenchmark}
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\linewidth]{figures/fig_cold_recovery_singlecol.pdf}
+  \caption{
+  NOTE: placeholder!! Polish the layout and position after all data!!
+  Single-miss recovery microbenchmark at one MoE layer.
+  (a) Latency breakdown for representative decode configurations. Promotion-first is dominated by H2D transfer of the full expert--LoRA object, while execution-first moves only activation/residual-sized state and computes the missing LoRA residual on CPU.
+  (b) Speedup of execution-first over promotion-first across rank and batch-size sweeps. Execution-first achieves a 4.54$\times$ geometric mean speedup over 16 configurations, with larger gains when rank is high and decode batch size is small.
+  }
+\label{fig:microbreakdown}
+\end{figure}
+
+We first isolate the cost of recovering a single cold expert--LoRA miss at one MoE layer. This microbenchmark removes request scheduling, cache replacement, queueing, and cross-request overlap effects, and compares only the synchronous recovery work required by the current token. The goal is not to measure end-to-end serving performance, but to test whether execution-first recovery is a practical substrate for cold-miss handling.
+
+We compare two recovery policies. In promotion-first recovery, the runtime first restores the missing expert--LoRA object to GPU memory and then executes the LoRA residual on the GPU. In execution-first recovery, the runtime exports the current token activation to the host, computes only the missing LoRA residual on CPU using host-resident weights, and returns the residual for reintegration into the GPU decode stream. Thus, the two policies differ in what must be moved synchronously on the current token's critical path: promotion-first moves the full expert--LoRA object, whereas execution-first moves only activation- and residual-sized state.
+
+We decompose execution-first service time into packing, D2H activation transfer, CPU LoRA computation, H2D residual transfer, and merge. We decompose promotion-first service time into admission, H2D weight transfer, and GPU LoRA execution. This decomposition follows the latency model in Section~\ref{subsec:feasibility}: execution-first incurs
+\[
+T_{\mathrm{cold}} =
+T_{\mathrm{pack}} + T_{\mathrm{D2H}} + T_{\mathrm{cpu}} +
+T_{\mathrm{H2D}} + T_{\mathrm{merge}},
+\]
+whereas promotion-first incurs
+\[
+T_{\mathrm{promote}} =
+T_{\mathrm{admit}} + T_{\mathrm{H2D\text{-}weights}} + T_{\mathrm{gpu}}.
+\]
+We sweep LoRA rank $\{8,16,32,64\}$ and decode batch size $\{1,2,4,8\}$, covering the small-batch regime where decode stalls are most visible.
+
+
+Figure~\ref{fig:microbreakdown} reports the service time of one cold expert--LoRA miss. Across 16 rank/batch configurations, execution-first reduces recovery service time by a geometric mean of 4.54$\times$, with speedups ranging from 2.18$\times$ to 9.24$\times$. The breakdown shows that promotion-first is dominated by H2D transfer of the full expert--LoRA object, and this cost grows with rank. In contrast, execution-first transfers only the current activation and returned residual, so its data movement remains much smaller; the remaining cost is primarily CPU LoRA computation and staging overhead.
+
+These results support the core mechanism behind CoLoRA: for the current decode token, completing the missing LoRA residual can be substantially cheaper than first restoring GPU residency. This does not mean that CPU execution is generally faster than GPU execution. Rather, the advantage comes from changing the foreground recovery payload. Promotion-first pays the cost of restoring a full weight object before useful work can resume, while execution-first pays the cost of exchanging activation-sized state and computing only the missing residual.
+
+The experiment also exposes the boundary of the mechanism. As rank and batch size increase, CPU computation and staging overhead become more visible, reducing the margin over promotion-first. This is expected: execution-first targets cache-pressured decode regimes where cold misses have weak near-term reuse and the current token requires only a small amount of LoRA-side work. When reuse is strong enough to amortize promotion, or when cold-path CPU work becomes too large, promotion-first can become more competitive. Section~\ref{subsec:todo:} evaluates whether this per-miss advantage translates into lower TPOT under realistic mixed hit/miss workloads with scheduling, overlap, and cache pressure.
+
+\subsection{Ablation Study}
+% Note:
+
+% - Measuring reinsertion latency (callback + D2H + state merge) and show it remains $<5\%$ of per-token decode time under typical cache pressure.~\ref{subsec:scheduler}
 
 \subsection{Sensitivity Analysis}
 Note:

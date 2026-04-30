@@ -100,6 +100,7 @@ except ImportError:
 
 try:
     from lightllm._kernels.lora.moe_lora_cpu_kernel import (
+        moe_batch_lora_avx,
         moe_batch_lora_gate_avx,
         moe_batch_lora_up_avx,
         moe_batch_lora_down_avx,
@@ -348,6 +349,12 @@ class _MoEHybridPhaseState:
     blocking_promotion_time: float = 0.0
     blocking_promotion_bytes: float = 0.0
     blocking_promotion_count: int = 0
+    # P2 microbench component timings (seconds)
+    pack_time: float = 0.0
+    d2h_activation_time: float = 0.0
+    h2d_residual_time: float = 0.0
+    merge_time: float = 0.0
+    admit_time: float = 0.0
 
 
 @dataclass
@@ -905,6 +912,11 @@ class Qwen3VLMoELoRADispatcher:
             "prefetch_stale": 0,
             "prefetch_false_positives": 0,
             "prefetch_slot_overwrite": 0,
+            "pack_time": 0.0,
+            "d2h_activation_time": 0.0,
+            "h2d_residual_time": 0.0,
+            "merge_time": 0.0,
+            "admit_time": 0.0,
         }
 
         # Check if any LoRA is enabled
@@ -1364,7 +1376,15 @@ class Qwen3VLMoELoRADispatcher:
         return_to_original_device: bool = True,
         temporal_prefetch_context: Optional[Tuple[int, int, int]] = None,
     ) -> Tuple[torch.Tensor, int, int]:
-        """Strict MoE CPU fallback: AVX MoE kernels or PyTorch reference (``naive``)."""
+        """Strict MoE CPU fallback: AVX MoE kernels or PyTorch reference (``naive``).
+        
+        Returns: (output, kernel_calls, kernel_tokens)
+        
+        Note: Timing is tracked internally in self._last_colora_stats:
+            - d2h_activation_time: input D2H transfer (if input was on CUDA)
+            - h2d_residual_time: output H2D transfer (if returning to CUDA)
+            Both happen OUTSIDE cpu_compute_time measurement in the caller.
+        """
         cpu_kernel_mode = _colora_resolved_cpu_kernel_mode()
         if cpu_kernel_mode != "naive":
             self._require_moe_cpu_kernel(mode=projection)
@@ -1381,15 +1401,25 @@ class Qwen3VLMoELoRADispatcher:
             original_dtype = input_tensor.dtype
 
             with NvtxAnnotate(f"{nvtx_root}/HostTensorPrep"):
+                _d2h_t0 = time.perf_counter()
                 compute_input = input_tensor
                 if compute_input.device.type != "cpu":
                     compute_input = compute_input.to(device="cpu", non_blocking=True)
-                if compute_input.dtype != torch.bfloat16:
-                    compute_input = compute_input.to(dtype=torch.bfloat16)
+                # For naive mode: convert directly to float32 upfront (faster CPU compute)
+                if cpu_kernel_mode == "naive":
+                    if compute_input.dtype != torch.float32:
+                        compute_input = compute_input.to(dtype=torch.float32)
+                else:
+                    if compute_input.dtype != torch.bfloat16:
+                        compute_input = compute_input.to(dtype=torch.bfloat16)
+                if input_tensor.device.type != "cpu":
+                    self._last_colora_stats["d2h_activation_time"] += max(time.perf_counter() - _d2h_t0, 0.0)
 
             batch_size = compute_input.shape[0]
             output_dim = pool.value_buffer.shape[2]
-            output = torch.zeros(batch_size, output_dim, dtype=torch.bfloat16, device="cpu")
+            # Use float32 for naive mode output (faster matmul, converts once at H2D)
+            output_dtype = torch.float32 if cpu_kernel_mode == "naive" else torch.bfloat16
+            output = torch.zeros(batch_size, output_dim, dtype=output_dtype, device="cpu")
 
             if len(req_bins) > batch_size:
                 req_bins = req_bins[:batch_size]
@@ -1461,10 +1491,13 @@ class Qwen3VLMoELoRADispatcher:
                             B = pool.value_buffer[loc, :a_rank]
 
                         with NvtxAnnotate(f"{adapter_nvtx}/WeightHostPrep"):
-                            if A.device.type != "cpu" or A.dtype != torch.bfloat16:
-                                A = A.to(device="cpu", dtype=torch.bfloat16)
-                            if B.device.type != "cpu" or B.dtype != torch.bfloat16:
-                                B = B.to(device="cpu", dtype=torch.bfloat16)
+                            # For naive mode, convert directly to float32 for faster matmul
+                            # (bf16 CPU matmul is very slow without AVX-512 BF16 support)
+                            target_dtype = torch.float32 if cpu_kernel_mode == "naive" else torch.bfloat16
+                            if A.dtype != target_dtype:
+                                A = A.to(dtype=target_dtype)
+                            if B.dtype != target_dtype:
+                                B = B.to(dtype=target_dtype)
                             if not A.is_contiguous():
                                 A = A.contiguous()
                             if not B.is_contiguous():
@@ -1474,23 +1507,39 @@ class Qwen3VLMoELoRADispatcher:
                             if not batch_input.is_contiguous():
                                 batch_input = batch_input.contiguous()
 
-                        # Stage-1: x @ A^T (naive matmul or AVX gate path)
-                        with NvtxAnnotate(f"{adapter_nvtx}/Stage1_{cpu_kernel_mode}_gate"):
-                            intermediate = gate_kernel(batch_input, A, 1.0)
-                        # Stage-2: intermediate @ B, projection-specific kernel.
-                        with NvtxAnnotate(f"{adapter_nvtx}/Stage2_{cpu_kernel_mode}_{proj_lower}"):
-                            batch_output = stage2_kernel(intermediate, B, scaling=a_scaling)
+                        # Use fused kernel for small batches to save kernel launch overhead
+                        # Fusing gate + up gives ~1.6x speedup for single token case
+                        n_tokens = len(req_indices)
+                        a_rank = A.shape[0]
+                        if cpu_kernel_mode != "naive" and n_tokens <= 2 and a_rank <= 128 and proj_lower in ("gate", "up"):
+                            with NvtxAnnotate(f"{adapter_nvtx}/Fused_{cpu_kernel_mode}_{proj_lower}_n{n_tokens}_r{a_rank}"):
+                                batch_output = moe_batch_lora_avx(batch_input, A, B, a_scaling)
+                            kernel_calls += 1
+                        else:
+                            # Stage-1: x @ A^T (naive matmul or AVX gate path)
+                            with NvtxAnnotate(f"{adapter_nvtx}/Stage1_{cpu_kernel_mode}_gate"):
+                                intermediate = gate_kernel(batch_input, A, 1.0)
+                            # Stage-2: intermediate @ B, projection-specific kernel.
+                            with NvtxAnnotate(f"{adapter_nvtx}/Stage2_{cpu_kernel_mode}_{proj_lower}"):
+                                batch_output = stage2_kernel(intermediate, B, scaling=a_scaling)
+                            kernel_calls += 2
                         output[req_indices] = batch_output
-
-                        kernel_calls += 2
                         kernel_tokens += int(len(req_indices))
                     finally:
                         if hot_handle is not None:
                             hot_handle.release()
 
+            # H2D transfer happens AFTER kernel computation (tracked separately)
             with NvtxAnnotate(f"{nvtx_root}/ReturnToOriginalDevice"):
                 if return_to_original_device and (original_device.type != "cpu" or original_dtype != torch.bfloat16):
+                    _h2d_t0 = time.perf_counter()
+                    # For naive mode: convert to bf16 on CPU first to halve H2D bandwidth
+                    if cpu_kernel_mode == "naive" and output.dtype != torch.bfloat16:
+                        output = output.to(dtype=torch.bfloat16, non_blocking=True)
                     output = output.to(device=original_device, dtype=original_dtype, non_blocking=True)
+                    if original_device.type == "cuda":
+                        torch.cuda.synchronize()
+                    self._last_colora_stats["h2d_residual_time"] += max(time.perf_counter() - _h2d_t0, 0.0)
 
             return output, kernel_calls, kernel_tokens
 
@@ -1550,6 +1599,11 @@ class Qwen3VLMoELoRADispatcher:
             "prefetch_stale": 0,
             "prefetch_false_positives": 0,
             "prefetch_slot_overwrite": 0,
+            "pack_time": 0.0,
+            "d2h_activation_time": 0.0,
+            "h2d_residual_time": 0.0,
+            "merge_time": 0.0,
+            "admit_time": 0.0,
         }
 
     def _should_use_async_cpu_fallback(self) -> bool:
@@ -2439,6 +2493,7 @@ class Qwen3VLMoELoRADispatcher:
         with NvtxAnnotate("COLoRA_MissPath_CheckAndPrepare"):
             if not state.miss_keys:
                 return
+            _pack_t0 = time.perf_counter()
             if not state.ready_slots:
                 state.miss_pos = state.valid_pos
                 state.miss_bins = state.valid_bins
@@ -2447,6 +2502,7 @@ class Qwen3VLMoELoRADispatcher:
                 state.miss_pos = state.valid_pos.index_select(0, miss_rows)
                 state.miss_bins = state.valid_bins.index_select(0, miss_rows)
             assert state.miss_pos is not None and state.miss_bins is not None
+            state.pack_time += max(time.perf_counter() - _pack_t0, 0.0)
 
             if int(state.miss_pos.numel()) == int(input_tensor.shape[0]):
                 state.miss_input = input_tensor
@@ -2462,7 +2518,9 @@ class Qwen3VLMoELoRADispatcher:
             if self._has_cpu_miss_overlap_opportunity(state, input_tensor):
                 reserve_t0 = time.perf_counter()
                 if self._reserve_async_queue_slot():
-                    state.cpu_queue_admit_wait_time += max(time.perf_counter() - reserve_t0, 0.0)
+                    _admit_elapsed = max(time.perf_counter() - reserve_t0, 0.0)
+                    state.cpu_queue_admit_wait_time += _admit_elapsed
+                    state.admit_time += _admit_elapsed
                     state.async_overlap_used = True
                     state.cpu_async_submitted += 1
                     enqueue_ts = time.perf_counter()
@@ -2497,7 +2555,12 @@ class Qwen3VLMoELoRADispatcher:
                                 adapter_group_plan=miss_plan,
                                 temporal_prefetch_context=decode_context,
                             )
-                            return miss_out, queue_wait, time.perf_counter() - t0, kernel_calls, kernel_tokens
+                            elapsed = time.perf_counter() - t0
+                            # Subtract H2D time that was tracked internally
+                            internal_h2d = self._last_colora_stats.get("h2d_residual_time", 0.0)
+                            self._last_colora_stats["h2d_residual_time"] = 0.0
+                            cpu_t = max(elapsed - internal_h2d, 0.0)
+                            return miss_out, queue_wait, cpu_t, kernel_calls, kernel_tokens, internal_h2d
                         finally:
                             self._release_async_queue_slot()
 
@@ -2676,14 +2739,19 @@ class Qwen3VLMoELoRADispatcher:
             if state.miss_future is not None:
                 with NvtxAnnotate("COLoRA_CPU_Miss_Path_AsyncJoin"):
                     join_t0 = time.perf_counter()
-                    miss_output, queue_wait, cpu_t, kernel_calls, kernel_tokens = state.miss_future.result()
+                    # Returns: miss_output, queue_wait, cpu_t, kernel_calls, kernel_tokens, internal_h2d
+                    miss_output, queue_wait, cpu_t, kernel_calls, kernel_tokens, internal_h2d = state.miss_future.result()
                     state.cpu_join_stall_time += max(time.perf_counter() - join_t0, 0.0)
+                    state.h2d_residual_time += internal_h2d
             else:
                 with NvtxAnnotate("COLoRA_CPU_Miss_Path"):
                     t0 = time.perf_counter()
                     miss_input = state.miss_input
                     if miss_input is None:
+                        _d2h_t0 = time.perf_counter()
                         miss_input = input_tensor.index_select(0, state.miss_pos).contiguous()
+                        if input_tensor.device.type == "cuda":
+                            state.d2h_activation_time += max(time.perf_counter() - _d2h_t0, 0.0)
                     miss_plan = self._build_cpu_group_plan(state.miss_bins)
                     miss_output, kernel_calls, kernel_tokens = self._strict_moe_cpu_batch_lora(
                         miss_input,
@@ -2696,10 +2764,22 @@ class Qwen3VLMoELoRADispatcher:
                     )
                     queue_wait = 0.0
                     cpu_t = time.perf_counter() - t0
+                    # H2D transfer is tracked separately in h2d_residual_time, not cpu_compute_time
+                    if miss_output.device.type == "cuda" and miss_input.device.type == "cpu":
+                        # _strict_moe_cpu_batch_lora internally did the H2D and tracked it
+                        # We need to: 1) transfer to state, 2) subtract from cpu_t
+                        internal_h2d = self._last_colora_stats.get("h2d_residual_time", 0.0)
+                        state.h2d_residual_time += internal_h2d
+                        cpu_t = max(cpu_t - internal_h2d, 0.0)
+                        self._last_colora_stats["h2d_residual_time"] = 0.0
                     state.cpu_inline_executed += 1
 
+            _merge_t0 = time.perf_counter()
             with NvtxAnnotate("COLoRA_MissPath_Writeback"):
                 state.output.index_copy_(0, state.miss_pos, miss_output)
+            if miss_output.device.type == "cuda":
+                torch.cuda.synchronize()
+            state.merge_time += max(time.perf_counter() - _merge_t0, 0.0)
             with NvtxAnnotate("COLoRA_MissPath_StatsAccumulate"):
                 state.cpu_compute_time += float(cpu_t)
                 state.cpu_queue_wait_time += float(queue_wait)
@@ -2765,6 +2845,13 @@ class Qwen3VLMoELoRADispatcher:
             "prefetch_slot_overwrite": int(
                 self._temporal_hot_cache.get_slot_overwrite_count() if self._temporal_hot_cache is not None else 0
             ),
+            # P2 microbench component timings
+            # Combine state-level and _strict_moe_cpu_batch_lora-level timings
+            "pack_time": state.pack_time,
+            "d2h_activation_time": state.d2h_activation_time + float(self._last_colora_stats.get("d2h_activation_time", 0.0)),
+            "h2d_residual_time": state.h2d_residual_time + float(self._last_colora_stats.get("h2d_residual_time", 0.0)),
+            "merge_time": state.merge_time,
+            "admit_time": state.admit_time,
         }
 
     def begin_moe_hybrid_miss_async(
