@@ -85,24 +85,6 @@ PAYLOAD_FIELDS = [
     "execution_residual_bytes", "payload_ratio",
 ]
 
-AGG_RECOVERY_EXTRA_FIELDS = [
-    "n_repeats",
-    "service_time_us_mean", "service_time_us_std",
-    "component_sum_us_mean", "component_sum_us_std",
-    "residual_us_mean", "residual_us_std",
-    "exposed_time_us_mean", "exposed_time_us_std",
-    # Component fields in alphabetical order
-    "TD2H_activation_us_mean", "TD2H_activation_us_std",
-    "TH2D_residual_us_mean", "TH2D_residual_us_std",
-    "TH2D_weights_us_mean", "TH2D_weights_us_std",
-    "Tadmit_us_mean", "Tadmit_us_std",
-    "Tcpu_us_mean", "Tcpu_us_std",
-    "Tgpu_us_mean", "Tgpu_us_std",
-    "Tmerge_us_mean", "Tmerge_us_std",
-    "Tpack_us_mean", "Tpack_us_std",
-]
-
-
 def test_recovery_csv_fieldnames_match(runner_module):
     """Verify the RECOVERY_FIELDS constant in the runner matches the contract."""
     assert runner_module.RECOVERY_FIELDS == RECOVERY_FIELDS
@@ -185,10 +167,8 @@ def test_plot_script_exists():
     assert PLOT_SCRIPT_PATH.exists(), f"plot script not found at {PLOT_SCRIPT_PATH}"
 
 
-def test_aggregated_csv_field_contract():
-    """Verify the aggregation function produces expected fields."""
-    import sys
-    mod = _load_runner_module()
+def test_aggregated_csv_field_contract(runner_module):
+    """Verify _aggregate_repeats matches AGG_FIELDS (median + MAD per numeric column)."""
     sample_rows = [
         {
             "policy": "cpu_first", "lora_rank": 16, "batch_size": 4,
@@ -207,16 +187,16 @@ def test_aggregated_csv_field_contract():
             "exposed_time_us": 0.0,
         },
     ]
-    agg = mod._aggregate_repeats(sample_rows)
+    agg = runner_module._aggregate_repeats(sample_rows)
     assert len(agg) == 1
     row = agg[0]
     assert row["policy"] == "cpu_first"
     assert row["lora_rank"] == 16
     assert row["batch_size"] == 4
     assert row["n_repeats"] == 2
-    assert "service_time_us_mean" in row
-    assert "service_time_us_std" in row
-    for field in AGG_RECOVERY_EXTRA_FIELDS:
+    assert "service_time_us_median" in row
+    assert "service_time_us_mad" in row
+    for field in runner_module.AGG_FIELDS:
         assert field in row, f"aggregated row missing field: {field}"
 
 

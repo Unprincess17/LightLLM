@@ -338,10 +338,10 @@ void moe_lora_up_kernel(
     const bf16* x, const bf16* B_mat, bf16* out,
     int N, int R, int H, float scaling) {
 
-    float x_f32[256];  // Pre-convert small R to f32
-
     #pragma omp parallel for schedule(dynamic, 2)
     for (int n = 0; n < N; ++n) {
+        float x_f32[256];
+
         const bf16* x_ptr = x + n * R;
         bf16* out_ptr = out + n * H;
 
@@ -383,10 +383,10 @@ void moe_lora_down_kernel(
     const bf16* x, const bf16* B_mat, bf16* out,
     int N, int R, int H, float scaling) {
 
-    float x_f32[256];
-
     #pragma omp parallel for schedule(dynamic, 1)
     for (int n = 0; n < N; ++n) {
+        float x_f32[256];
+
         const bf16* x_ptr = x + n * R;
         bf16* out_ptr = out + n * H;
 

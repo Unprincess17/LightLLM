@@ -778,7 +778,7 @@ def run_sweep(config: MicrobenchConfig, overlap_benchmark: bool = False) -> None
     _write_recovery_csv(output_dir / "microbench_cold_recovery.csv", recovery_rows)
     _write_payload_csv(output_dir / "microbench_payload_size.csv", payload_rows)
 
-    # Also write aggregated (mean across repeats)
+    # Also write aggregated (median + MAD across repeats)
     agg_rows = _aggregate_repeats(recovery_rows)
     _write_aggregated_csv(output_dir / "microbench_cold_recovery_aggregated.csv", agg_rows)
 
