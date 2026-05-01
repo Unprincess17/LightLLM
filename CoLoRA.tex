@@ -157,7 +157,7 @@ In multi-LoRA MoE decode, however, a request only needs the LoRA residuals for t
 %
 % v1: This expanded and more diverse working set is especially problematic during \emph{decode} in prefill--decode deployments~\cite{agrawal2023sarathi,patel2024splitwise}. Prefill can often amortize weight-loading costs across many prompt tokens, but decode exposes them directly: generation proceeds one token at a time, effective batch sizes are small, and any miss on the per-token execution path is immediately reflected in token latency. In pure MoE serving, the natural unit of management is the expert, while in conventional multi-LoRA serving it is the adapter; accordingly, prior systems such as S-LoRA~\cite{sheng2024slora} and VaLoRA~\cite{mi2025empower} adopt adapter-centric designs. In multi-LoRA MoE decode, however, a request only needs the LoRA residuals associated with the \emph{selected} experts. The effective unit of access and reuse is therefore neither an expert alone nor an adapter alone, but a joint expert--LoRA object. This shift is important because expert-layer LoRA is materially larger than the attention-layer LoRA targeted by most prior multi-LoRA systems. In transformer MoE models, LoRA attached to expert FFN blocks scales with the wide feed-forward dimensions rather than the narrower attention projections~\cite{shazeer2017outrageously}. As a result, each expert--LoRA object occupies substantially more memory, while only limited residual GPU memory remains available for caching because the base MoE model itself is typically kept resident on device~\cite{zhu2024deepseek}. Multi-LoRA MoE decode therefore shifts the cache locality regime: the effective working set becomes both larger and more fragmented, weakening the concentrated hot set on which conventional sparse-serving caches rely.
 
-To quantify the locality regime introduced by multi-LoRA MoE decode, we conduct a trace-driven study using Alibaba LoRA serving traces augmented with realistic MoE expert routing patterns~\cite{lin2025understanding}. The study shows that once access is modeled at the granularity of joint expert--LoRA objects, the hot set becomes markedly less concentrated. As shown in Figure~\ref{fig:motivation-breakdown}(a), locality is highly concentrated under expert-only modeling: a 2K-object cache covers 98.4\% of accesses. Under realistic joint-object modeling, however, this concentration collapses: the same cache budget covers only 21.8\% and 13.9\% of accesses under correlated (C2) and independent (C1) adapter--expert assignment, respectively. This fragmentation makes simply adding cache capacity far less effective. In Figure~\ref{fig:motivation-breakdown}(b), expert-only modeling reaches its target P99 TPOT with a cache that stores just 2K objects, whereas the realistic joint-object workloads still fail to reach that same target even when the cache is expanded to 65K objects, over 32$\times$ larger. At the budget where expert-only modeling has already reached diminishing returns, the penalty concentrates in the tail: median TPOT remains near 1.2\,ms, while P99 TPOT rises to 6.70\,ms, a 5.6$\times$ slowdown (Figure~\ref{fig:motivation-breakdown}(c)). Together, these results show that in multi-LoRA MoE decode, GPU-cold misses are not transient anomalies removable through modest cache growth; they are persistent tail events on the decode critical path.
+To quantify the locality regime introduced by multi-LoRA MoE decode, we conduct a trace-driven study using Alibaba LoRA serving traces augmented with realistic MoE expert routing patterns~\cite{lin2025understanding}. The study shows that once access is modeled at the granularity of joint expert--LoRA objects, the hot set becomes markedly less concentrated. As shown in Figure~\ref{fig:motivation-breakdown}(a), locality is highly concentrated under expert-only modeling: a 2K-object cache covers 98.4\% of accesses. Under realistic joint-object modeling, however, this concentration collapses: the same cache budget covers only 21.8\% and 13.9\% of accesses under correlated (C2) and independent (C1) adapter--expert assignment, respectively. This fragmentation makes simply adding cache capacity far less effective. In Figure~\ref{fig:motivation-breakdown}(b), expert-only modeling reaches its target P99 Time-Per-Output-Tokens (TPOT) with a cache that stores just 2K objects, whereas the realistic joint-object workloads still fail to reach that same target even when the cache is expanded to 65K objects, over 32$\times$ larger. At the budget where expert-only modeling has already reached diminishing returns, the penalty concentrates in the tail: median TPOT remains near 1.2\,ms, while P99 TPOT rises to 6.70\,ms, a 5.6$\times$ slowdown (Figure~\ref{fig:motivation-breakdown}(c)). Together, these results show that in multi-LoRA MoE decode, GPU-cold misses are not transient anomalies removable through modest cache growth; they are persistent tail events on the decode critical path.
 
 % v2: To quantify the locality regime introduced by multi-LoRA MoE decode, we conduct a trace-driven study using Alibaba LoRA serving traces~\cite{lin2025understanding}. The study shows that once access is modeled at the granularity of joint expert--LoRA objects, the hot set becomes markedly less concentrated. As shown in Figure~\ref{fig:motivation-breakdown}(a), the top-1K objects account for 89.1\% of accesses under expert-only modeling (\texttt{C0}), but only 41.4\% and 33.1\% under joint-object modeling (\texttt{C1/C2}), respectively. This reduced concentration makes cache scaling far less effective: in Figure~\ref{fig:motivation-breakdown}(b), an expert-only oracle reaches near-ideal P99 TPOT with a cache budget of just 2K objects, whereas realistic joint-object workloads require up to 16$\times$ more capacity to reach the same target. Under practical cache budgets, the remaining penalty is concentrated in the latency tail rather than the median. Figure~\ref{fig:motivation-breakdown}(c) shows that median TPOT remains near 1.2\,ms, while P99 TPOT rises to 7.06\,ms, a roughly 6$\times$ slowdown. Together, these results show that in multi-LoRA MoE decode, GPU-cold misses are not rare outliers that can be removed by modest cache growth; they are persistent tail events on the decode critical path.
 %
@@ -469,33 +469,25 @@ We implement residency management as a background service, separate from foregro
 
 \subsection{Experiment Setup}
 \label{setup}
-Note:
 
-1. models: qwen3 vl moe 30B-A3B. Mixstral 8*7B. Consider about 235B model, if can rent 8*A100 asap.
+\paragraph{Testbed and model.}
+We evaluate CoLoRA on a server with 2 NVIDIA A100 GPUs, an Intel Xeon Gold 5520+ CPU, and 376~GiB host memory. Unless otherwise stated, all experiments use a single inference server instance. The base model remains resident on GPU, while expert--LoRA objects are stored in host memory and cached in GPU memory on demand. CPU cold-path workers are pinned to physical cores and use pinned host buffers for activation and residual transfers. We use Qwen3-VL-MoE-30B-A3B as the sparse MoE backbone, with LoRA modules attached to expert FFN layers. The runtime manages residency at expert--LoRA granularity, keyed by projection, layer, expert, and adapter identity.
 
-2. Baselines: 
+% Additional backbones such as Mixtral-8$\times$7B and larger 235B-class MoE
+% models are left for future evaluation due to time constraints.
 
-- S-LoRA, load-then-run
+\paragraph{Baselines and variants.}
+We evaluate three miss-recovery policies in the same VaLoRA-based runtime. All policies use the same expert--LoRA cache object definition and differ only in how they handle a demand miss. \textsc{Load-then-run} is the promotion-first baseline: on a miss, it synchronously promotes the required expert--LoRA object to GPU before continuing the current token. \textsc{CoLoRA-Min} isolates execution-first recovery by disabling deferred promotion and temporal prefetching: GPU-resident objects execute on the GPU hot path, while cold objects use the CPU cold path. \textsc{CoLoRA-Full} enables the full policy, adding deferred promotion and temporal prefetching as future-reuse optimizations. We use additional intermediate variants for ablation.
 
-- Toppings, exec-first, no deferred promotion
+\paragraph{Workloads and datasets.}
+We evaluate production-like and controlled workloads. Production-like workloads sample request arrivals and LoRA adapter IDs from Alibaba serving traces. Controlled workloads vary request arrivals, warmup/measurement overlap, adapter diversity, and cache budget to stress high-miss regimes and study boundary conditions. In both cases, prompt and output lengths are drawn from LMSYS-CHAT-1M~\cite{zheng2023lmsyschat1m} and QMSum~\cite{zhong2021qmsum,tan2024lloco}, and expert--LoRA accesses are generated during replay by the MoE router.
 
-- Extend the SOTAs to use expert--lora level cache unit
-
-3. Traces: 
-
-- Scaled production workload. Sampled from Alibaba trace. Overall XX loras.
-
-- Synthetic workload. Poisson distribution. Distinct id~\cite{li2025toppings}
-
-4. Datasets:
-
-LMSYS-CHAT-1M and QMSum. Don't use sharegpt-v3, which is old.
+\paragraph{Metrics.}
+We focus on decode latency and report TPOT at P50, P90, P95, and P99, along with TTFT, end-to-end latency, request throughput, and output-token throughput when applicable. For cache-pressure analysis, we distinguish lookup-time misses from post-recovery residency: \emph{demand-key miss rate} is the fraction of expert--LoRA accesses that are non-resident when first requested, while \emph{post-recovery cache hit rate} records whether the object is resident when GPU execution occurs. This prevents promotion-first baselines from appearing miss-free simply because they synchronously promote missing objects before execution. We also log recovery counters, including blocking promotions, CPU cold-path executions, weight H2D traffic, activation/residual transfers, queueing time, reinsertion latency, and prefetch/promotion activity. For fairness, each workload is replayed across variants with identical configurations and seeds after cache-pressure calibration at expert--LoRA granularity; results are averaged over three runs unless otherwise stated.
 
 \subsection{LLM Inference Server Performance}
-Note:
-
-- compare CoLoRA against a ``skip-reinsert only'' variant (no deferred promotion/prefetch) to quantify the marginal gain of background optimizations under sustained cache pressure.~\ref{subsec:scheduler}
-
+\paragraph{Scaled production workloads.}
+\paragraph{Controlled pressure workloads.}
 
 \subsection{Microbenchmark Evaluation}
 \label{subsec:microbenchmark}
