@@ -97,6 +97,24 @@ def parse_args():
         default=42,
         help="Random seed for Poisson adapter sampling",
     )
+    parser.add_argument(
+        "--max_concurrent_requests",
+        type=int,
+        default=None,
+        help=(
+            "Cap the number of concurrent in-flight requests. "
+            "Defaults to len(prompts) (no cap)."
+        ),
+    )
+    parser.add_argument(
+        "--rps",
+        type=float,
+        default=3.0,
+        help=(
+            "Target requests per second. Requests are staggered at 1/rps "
+            "intervals. Set to 0 for immediate (burst) dispatch."
+        ),
+    )
     parser.add_argument("--mode", type=str, default="detached", choices=["merged", "detached"], help="LoRA mode")
     parser.add_argument("--num_requests", type=int, default=DEFAULT_NUM_REQUESTS, help="Number of requests to send")
     parser.add_argument(
@@ -124,6 +142,13 @@ def parse_args():
         type=str,
         default=None,
         help="Optional JSONL path for per-request metrics",
+    )
+    parser.add_argument(
+        "--phase",
+        type=str,
+        default=None,
+        choices=["warmup", "measurement"],
+        help="Phase label written into each per-request metrics row",
     )
     parser.add_argument("--vision", action="store_true", help="Use image input")
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
@@ -529,6 +554,9 @@ def test_batch_generation(
     print_per_request: bool,
     top_k_slowest: int,
     per_request_log_path: Optional[str],
+    phase: Optional[str] = None,
+    max_concurrent_requests: Optional[int] = None,
+    rps: float = 3.0,
 ):
     """Test batch generation with multiple concurrent prompts.
 
@@ -537,7 +565,7 @@ def test_batch_generation(
     - ``str``: same adapter for all requests.
     - ``List[Optional[str]]``: per-request adapter IDs (must match ``prompts`` length).
     """
-    print(f"\n=== Concurrent Batch Generation ({len(prompts)} requests) ===")
+    print(f"\n=== Concurrent Batch Generation ({len(prompts)} requests, rps={rps}) ===")
 
     if not prompts:
         print("No prompts provided. Skipping batch generation.")
@@ -579,12 +607,16 @@ def test_batch_generation(
         }
 
     # Dispatch all requests concurrently
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(prompts)) as executor:
+    workers = min(len(prompts), max_concurrent_requests) if max_concurrent_requests else len(prompts)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
         # Submit tasks and store future-to-prompt mapping
-        future_to_req = {
-            executor.submit(fetch, prompt_text, req_adapter_id): idx
-            for idx, (prompt_text, req_adapter_id) in enumerate(zip(prompts, request_adapter_ids))
-        }
+        future_to_req = {}
+        inter_arrival = 1.0 / rps if rps > 0 else 0.0
+        for idx, (prompt_text, req_adapter_id) in enumerate(zip(prompts, request_adapter_ids)):
+            if idx > 0 and inter_arrival > 0:
+                time.sleep(inter_arrival)
+            future = executor.submit(fetch, prompt_text, req_adapter_id)
+            future_to_req[future] = idx
         
         # As each request completes, collect the results
         for future in concurrent.futures.as_completed(future_to_req):
@@ -602,13 +634,16 @@ def test_batch_generation(
                     completion_tokens = result.get("usage", {}).get("completion_tokens", 0)
 
                 request_metrics[idx] = {
+                    "request_id": f"req_{idx:06d}",
                     "index": idx,
                     "adapter_id": _format_adapter_id(request_adapter_ids[idx]),
+                    "phase": phase,
                     "status": "error" if "error" in result else "ok",
                     "latency_s": latency,
                     "start_offset_s": req_start - start_time,
                     "finish_offset_s": req_end - start_time,
                     "completion_tokens": completion_tokens,
+                    "tpot_mean_us": (latency * 1e6 / completion_tokens) if completion_tokens > 0 and latency > 0 else None,
                     "token_throughput": (completion_tokens / latency) if latency > 0 else 0.0,
                     "error": result.get("error") if "error" in result else None,
                 }
@@ -616,13 +651,16 @@ def test_batch_generation(
                 results[idx] = {"error": str(exc)}
                 failed_time = time.perf_counter()
                 request_metrics[idx] = {
+                    "request_id": f"req_{idx:06d}",
                     "index": idx,
                     "adapter_id": _format_adapter_id(request_adapter_ids[idx]),
+                    "phase": phase,
                     "status": "error",
-                    "latency_s": failed_time - start_time,
+                    "latency_s": None,
                     "start_offset_s": 0.0,
                     "finish_offset_s": failed_time - start_time,
                     "completion_tokens": 0,
+                    "tpot_mean_us": None,
                     "token_throughput": 0.0,
                     "error": str(exc),
                 }
@@ -768,6 +806,7 @@ def main():
         + ", ".join(f"{adapter}:{count}" for adapter, count in adapter_counts.items())
     )
     print(f"Num requests (Target Batch Size): {effective_num_requests}")
+    print(f"Target RPS: {args.rps}")
     print("=" * 60)
 
     client = MoELoRAPIClient(args.url, args.model)
@@ -801,6 +840,9 @@ def main():
         print_per_request=args.print_per_request,
         top_k_slowest=args.top_k_slowest,
         per_request_log_path=args.per_request_log_path,
+        phase=args.phase,
+        max_concurrent_requests=args.max_concurrent_requests,
+        rps=args.rps,
     )
 
     return 0

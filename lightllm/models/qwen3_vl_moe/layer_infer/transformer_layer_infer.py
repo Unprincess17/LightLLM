@@ -3,6 +3,7 @@ import torch.functional as F
 import torch.distributed as dist
 import numpy as np
 import os
+import time
 import logging
 from functools import partial
 from typing import Tuple, Optional, Dict, Any, List
@@ -18,7 +19,7 @@ from lightllm.models.qwen3.triton_kernel.qk_norm import qk_rmsnorm_forward
 from lightllm.distributed import all_reduce
 from lightllm.utils.dist_utils import get_global_world_size
 from lightllm.models.qwen3_vl.triton_kernel.deepstack_multimodal_emb import apply_deepstack_features
-from lightllm.models.qwen3_vl_moe.lora_dispatch import SpecJobKey
+from lightllm.models.qwen3_vl_moe.lora_dispatch import SpecJobKey, MISS_POLICY_CPU_FIRST
 from lightllm.utils.nvtx_utils import NvtxAnnotate
 
 # Configure logging using global env var
@@ -26,6 +27,10 @@ _LOG_LEVEL = os.environ.get("LIGHTLLM_LOGGING", "INFO").upper()
 _LOG_LEVEL = getattr(logging, _LOG_LEVEL, logging.INFO)
 logger = logging.getLogger("lightllm.lora.infer")
 logger.setLevel(_LOG_LEVEL)
+
+
+# Enable lock contention profiling via environment variable
+_LOCK_PROFILING_ENABLED = os.environ.get("COLORA_LOCK_PROFILING", "0") == "1"
 
 
 def _parse_layer_whitelist(raw: str, label: str):
@@ -39,6 +44,71 @@ def _parse_layer_whitelist(raw: str, label: str):
         except ValueError:
             logger.warning("[COLoRA][%s] Ignore invalid whitelist token '%s'", label, token)
     return frozenset(whitelist)
+
+
+class _LightweightLockProfiler:
+    """Minimal overhead lock contention profiler for g_infer_state_lock.
+
+    Uses nanosecond-precision timing to measure:
+    - Wait time: Time spent waiting to acquire the lock
+    - Hold time: Time spent holding the lock
+    - Max wait: Maximum single wait time (indicates peak contention)
+    - Count: Number of acquisitions
+
+    Overhead: ~2-3 ns per timing call, only active when enabled.
+    """
+
+    __slots__ = ("_lock", "_stats", "_wait_key", "_hold_key", "_max_wait_key", "_count_key",
+                  "_start_wait", "_start_hold", "wait_time")
+
+    def __init__(self, lock, stats_dict: Dict[str, float], lock_name: str = "infer_state"):
+        """Initialize profiler for a given lock and stats dictionary.
+
+        Args:
+            lock: The threading.Lock or RLock to profile
+            stats_dict: Dictionary to accumulate metrics in
+            lock_name: Prefix for metric keys (default: "infer_state")
+        """
+        self._lock = lock
+        self._stats = stats_dict
+        self._wait_key = f"{lock_name}_lock_wait_ns"
+        self._hold_key = f"{lock_name}_lock_hold_ns"
+        self._max_wait_key = f"{lock_name}_lock_max_wait_ns"
+        self._count_key = f"{lock_name}_lock_count"
+        self._start_wait = 0
+        self._start_hold = 0
+        self.wait_time = 0
+
+    def __enter__(self):
+        """Acquire lock and measure wait time."""
+        if not _LOCK_PROFILING_ENABLED:
+            self._lock.acquire()
+            return self
+
+        self._start_wait = time.perf_counter_ns()
+        self._lock.acquire()
+        self.wait_time = time.perf_counter_ns() - self._start_wait
+        self._start_hold = time.perf_counter_ns()
+        return self
+
+    def __exit__(self, *args):
+        """Release lock and record metrics."""
+        if not _LOCK_PROFILING_ENABLED:
+            self._lock.release()
+            return
+
+        hold_time = time.perf_counter_ns() - self._start_hold
+
+        # Atomic increments (stats_dict is per-call, no contention on the dict itself)
+        self._stats[self._count_key] = self._stats.get(self._count_key, 0) + 1
+        self._stats[self._wait_key] = self._stats.get(self._wait_key, 0) + self.wait_time
+        self._stats[self._hold_key] = self._stats.get(self._hold_key, 0) + hold_time
+        # Track maximum single wait time (peak contention indicator)
+        current_max = self._stats.get(self._max_wait_key, 0)
+        self._stats[self._max_wait_key] = max(current_max, self.wait_time)
+
+        self._lock.release()
+        return False
 
 
 class Qwen3VLMOETransformerLayerInfer(Qwen3MOETransformerLayerInfer):
@@ -650,7 +720,13 @@ class Qwen3VLMOETransformerLayerInfer(Qwen3MOETransformerLayerInfer):
             return False
         if getattr(infer_state, "colora_pre_ffn_hidden", None) is None:
             return False
-        return getattr(self.lora_dispatcher_, "expert_cache_manager", None) is not None
+        manager = getattr(self.lora_dispatcher_, "expert_cache_manager", None)
+        if manager is None:
+            return False
+        miss_policy = str(getattr(getattr(manager, "config", None), "miss_policy", MISS_POLICY_CPU_FIRST))
+        if miss_policy != MISS_POLICY_CPU_FIRST:
+            return False
+        return True
 
     def _strict_single_request_moe_cpu_lora(
         self,
@@ -754,6 +830,10 @@ class Qwen3VLMOETransformerLayerInfer(Qwen3MOETransformerLayerInfer):
         from lightllm.server.lora.expert_cache import ExpertCacheKey
 
         self._spec_bound_job_keys_current_call = set()
+
+        # Pre-create colora_stats for lock contention profiling
+        colora_stats = {} if not _LOCK_PROFILING_ENABLED else self._new_colora_stats()
+
         try:
             hidden_states = input.view(-1, self.embed_dim_)
             num_tokens = hidden_states.shape[0]
@@ -854,8 +934,7 @@ class Qwen3VLMOETransformerLayerInfer(Qwen3MOETransformerLayerInfer):
 
                 for token_idx, req_obj, adapter_bin, expert_ids in fully_cold_requests:
                     # Check if we've reached max concurrent continuations
-                    g_infer_state_lock.acquire()
-                    try:
+                    with _LightweightLockProfiler(g_infer_state_lock, colora_stats, "infer_state"):
                         current_paused = sum(
                             1 for r in g_infer_context.req_idx_to_req.values() if getattr(r, "colora_paused", False)
                         )
@@ -864,8 +943,6 @@ class Qwen3VLMOETransformerLayerInfer(Qwen3MOETransformerLayerInfer):
                                 f"[COLoRA] Max concurrent continuations reached ({current_paused}), skipping request"
                             )
                             continue
-                    finally:
-                        g_infer_state_lock.release()
 
                     # MoE input (post-FFN-norm) for this token; CPU copy for executor thread.
                     hidden_cpu = hidden_states[token_idx : token_idx + 1].detach().to(device="cpu", copy=True)
@@ -924,20 +1001,20 @@ class Qwen3VLMOETransformerLayerInfer(Qwen3MOETransformerLayerInfer):
                             continue
 
                     # Mark request as paused
-                    g_infer_state_lock.acquire()
-                    try:
+                    with _LightweightLockProfiler(g_infer_state_lock, colora_stats, "infer_state"):
                         req_obj.colora_continuation = continuation
                         req_obj.colora_paused = True
-                    finally:
-                        g_infer_state_lock.release()
+                        req_obj.colora_pause_time = time.time()  # Track pause time for timeout detection
 
                     # Submit to CPU executor
                     def cpu_complete_callback(future):
                         """Callback after CPU completion completes."""
                         from lightllm.common.basemodel.infer_lock import g_infer_state_lock
 
-                        g_infer_state_lock.acquire()
-                        try:
+                        # Use local stats for callback (runs in different thread, may outlive parent call)
+                        callback_stats = {} if not _LOCK_PROFILING_ENABLED else self._new_colora_stats()
+
+                        with _LightweightLockProfiler(g_infer_state_lock, callback_stats, "infer_state_callback"):
                             if future.exception() is not None:
                                 logger.error(f"[COLoRA] CPU completion failed: {future.exception()}")
                                 req_obj.colora_paused = False
@@ -945,8 +1022,10 @@ class Qwen3VLMOETransformerLayerInfer(Qwen3MOETransformerLayerInfer):
                             else:
                                 # Result already stored in continuation by complete_layer_on_cpu
                                 pass
-                        finally:
-                            g_infer_state_lock.release()
+                        # Merge callback lock stats into parent colora_stats if still accessible
+                        if _LOCK_PROFILING_ENABLED:
+                            for key, value in callback_stats.items():
+                                colora_stats[key] = colora_stats.get(key, 0) + value
                         # Put task in completion queue for the main loop to acknowledge
                         self.lora_dispatcher_.colora_completion_queue.put(task)
 
@@ -961,7 +1040,23 @@ class Qwen3VLMOETransformerLayerInfer(Qwen3MOETransformerLayerInfer):
             self._maybe_submit_decode_spec_gate_up(hidden_states, infer_state)
 
             # Shared pipelined expert loop with parent (single implementation of dual-stream MoE).
+            # Preserve lock contention stats collected during skip-and-reinsert phase
+            lock_stats = {}
+            if _LOCK_PROFILING_ENABLED:
+                for key in ["infer_state_lock_count", "infer_state_lock_wait_ns", "infer_state_lock_hold_ns",
+                            "infer_state_lock_max_wait_ns", "infer_state_callback_lock_count",
+                            "infer_state_callback_lock_wait_ns", "infer_state_callback_lock_hold_ns",
+                            "infer_state_callback_lock_max_wait_ns"]:
+                    if key in colora_stats:
+                        lock_stats[key] = colora_stats[key]
+
             colora_stats = self._new_colora_stats()
+
+            # Merge lock stats into final colora_stats
+            if lock_stats:
+                for key, value in lock_stats.items():
+                    colora_stats[key] = value
+
             final_output = self._moe_ffn_pipelined_per_expert_from_topk(
                 hidden_states,
                 topk_weights,
@@ -1208,6 +1303,7 @@ class Qwen3VLMOETransformerLayerInfer(Qwen3MOETransformerLayerInfer):
         cont.saved_hidden = saved
         cont.completed = True
         req_obj.colora_paused = False
+        req_obj.colora_pause_time = 0.0  # Clear pause time when successfully unpaused
 
     def _complete_layer_on_cpu(self, task):
         """Backward-compatible wrapper for the layer-local CPU completion path."""

@@ -102,6 +102,161 @@ class ModeBackend:
             adapter_dirs[adapter_id] = abs_dir
         return adapter_dirs
 
+    def _fetch_adapter_weights(self, adapter_dir: str) -> Tuple[int, float, Dict]:
+        """Load LoRA weights from disk with TP broadcast fast path.
+
+        Returns:
+            (rank, scaling, layer_weights) where layer_weights is the dict
+            expected by LoRAMemPool.load_adapter().
+        """
+        import json
+        from lightllm.server.lora import LoRAAdapterLoader, LoRATargetType
+
+        config_path = os.path.join(adapter_dir, "adapter_config.json")
+        with open(config_path, "r") as f:
+            adapter_config = json.load(f)
+        lora_r = adapter_config.get("r", 64)
+        lora_alpha = adapter_config.get("lora_alpha", 1.0)
+        rank = lora_r
+        scaling = lora_alpha / lora_r
+
+        can_rank0_broadcast = (
+            self.node_world_size > 1
+            and dist.is_available()
+            and dist.is_initialized()
+        )
+        node_src_rank = self.args.node_rank * self.node_world_size
+        tp_world_size = get_global_world_size()
+
+        config = self.model.config
+        hidden_size = config.get("hidden_size", 4096)
+        intermediate_size = config.get("intermediate_size", 11008)
+        num_heads = config.get("num_attention_heads", 32)
+        head_dim = config.get("head_dim", 128)
+        num_kv_heads = config.get("num_key_value_heads", num_heads)
+        attn_internal = num_heads * head_dim
+        kv_internal = num_kv_heads * head_dim
+        moe_intermediate = config.get("moe_intermediate_size", intermediate_size)
+        vocab_size = config.get("vocab_size", 151936)
+
+        expected_tp_dims = {
+            LoRATargetType.ATTN_Q_PROJ: (hidden_size, attn_internal),
+            LoRATargetType.ATTN_K_PROJ: (hidden_size, kv_internal),
+            LoRATargetType.ATTN_V_PROJ: (hidden_size, kv_internal),
+            LoRATargetType.ATTN_O_PROJ: (attn_internal, hidden_size),
+            LoRATargetType.MOE_EXPERT_GATE: (hidden_size, moe_intermediate),
+            LoRATargetType.MOE_EXPERT_UP: (hidden_size, moe_intermediate),
+            LoRATargetType.MOE_EXPERT_DOWN: (moe_intermediate, hidden_size),
+            LoRATargetType.LM_HEAD: (hidden_size, vocab_size),
+        }
+
+        def _tp_shard_weights(layer_weights, tp_rank, tp_world_size):
+            if tp_world_size == 1:
+                return layer_weights
+
+            def _maybe_shard(weight, expected_full_dim):
+                if weight is None:
+                    return None
+                dim = weight.shape[-1]
+                if dim == expected_full_dim and dim % tp_world_size == 0:
+                    split_size = dim // tp_world_size
+                    start = tp_rank * split_size
+                    end = (tp_rank + 1) * split_size
+                    return weight[:, start:end].clone()
+                return weight.clone()
+
+            sharded_weights = {}
+            for layer_id, target_weights in layer_weights.items():
+                sharded_weights[layer_id] = {}
+                for target_type, module_weights in target_weights.items():
+                    a_expected, b_expected = expected_tp_dims.get(target_type, (None, None))
+                    if isinstance(module_weights, dict) and "A" in module_weights:
+                        A = module_weights["A"]
+                        B = module_weights["B"]
+                        sharded_weights[layer_id][target_type] = {
+                            "A": _maybe_shard(A, a_expected),
+                            "B": _maybe_shard(B, b_expected),
+                        }
+                    elif isinstance(module_weights, dict):
+                        sharded_experts = {}
+                        for expert_id, weights in module_weights.items():
+                            A = weights["A"]
+                            B = weights["B"]
+                            sharded_experts[expert_id] = {
+                                "A": _maybe_shard(A, a_expected),
+                                "B": _maybe_shard(B, b_expected),
+                            }
+                        sharded_weights[layer_id][target_type] = sharded_experts
+            return sharded_weights
+
+        layer_weights = None
+        if can_rank0_broadcast:
+            try:
+                if self.rank_in_node == 0:
+                    full_layer_weights = LoRAAdapterLoader.load_from_dir(
+                        adapter_dir=adapter_dir,
+                        network_config=self.model.config,
+                        dtype=self.model.data_type,
+                        device="cpu",
+                    )
+                    for target_rank_in_node in range(self.node_world_size):
+                        target_tp_rank = node_src_rank + target_rank_in_node
+                        sharded_weights = _tp_shard_weights(
+                            full_layer_weights,
+                            target_tp_rank,
+                            tp_world_size,
+                        )
+                        payload = {
+                            "ok": True,
+                            "rank": rank,
+                            "scaling": scaling,
+                            "layer_weights": sharded_weights,
+                        }
+                        if target_rank_in_node == 0:
+                            received = payload
+                        else:
+                            dist.send_object_list(
+                                [payload],
+                                dst=target_tp_rank,
+                                group=self.node_nccl_group,
+                            )
+                else:
+                    object_list = [None]
+                    dist.recv_object_list(
+                        object_list,
+                        src=node_src_rank,
+                        group=self.node_nccl_group,
+                    )
+                    received = object_list[0]
+
+                if not isinstance(received, dict) or not received.get("ok", False):
+                    raise RuntimeError(f"Invalid broadcast payload for {adapter_dir}")
+
+                rank = received["rank"]
+                scaling = received["scaling"]
+                layer_weights = received["layer_weights"]
+            except Exception as broadcast_err:
+                self.logger.warning(
+                    "[LoRA Backend] rank0 broadcast failed for %s (%s); falling back to per-rank local load",
+                    adapter_dir,
+                    broadcast_err,
+                )
+                layer_weights = LoRAAdapterLoader.load_from_dir(
+                    adapter_dir=adapter_dir,
+                    network_config=self.model.config,
+                    dtype=self.model.data_type,
+                    device="cpu",
+                )
+        else:
+            layer_weights = LoRAAdapterLoader.load_from_dir(
+                adapter_dir=adapter_dir,
+                network_config=self.model.config,
+                dtype=self.model.data_type,
+                device="cpu",
+            )
+
+        return rank, scaling, layer_weights
+
     def _apply_colora_speculation_env(self) -> None:
         spec_enabled = bool(getattr(self.args, "colora_speculative_dispatch", False))
         raw_whitelist = getattr(self.args, "colora_spec_layer_whitelist", "")
@@ -635,6 +790,7 @@ class ModeBackend:
 
         wait_pause_reqs = []
         paused_reqs = []
+        colora_paused_reqs = []  # Track requests paused by COLoRA
         finished_reqs = []
         prefill_reqs = []
         decode_reqs = []
@@ -668,6 +824,22 @@ class ModeBackend:
 
             if req_obj.colora_paused:
                 # Request is paused waiting for COLoRA CPU completion
+                # If detokenization has already marked this request as releasable
+                # (all output tokens processed) or request was aborted,
+                # treat it as finished regardless of CoLRA pause state.
+                # This prevents requests from being permanently stuck when
+                # colora_paused=True but request is actually done.
+                if req_obj.shm_req.can_released_mark or req_obj.shm_req.is_aborted:
+                    if support_overlap:
+                        # 延迟处理
+                        req_obj.filter_mark = True
+                        continue
+                    else:
+                        finished_reqs.append(req_obj)
+                    continue
+
+                # Track colora_paused requests for timeout detection
+                colora_paused_reqs.append(req_obj)
                 continue
 
             if req_obj.infer_aborted or req_obj.finish_status.is_finished():
@@ -732,6 +904,33 @@ class ModeBackend:
             g_infer_context.recover_paused_reqs(
                 paused_reqs=paused_reqs, is_master_in_dp=self.is_master_in_dp, can_alloc_token_num=can_alloc_token_num
             )
+
+        # Handle stuck COLoRA paused requests (timeout detection)
+        # If a request has been paused for too long, clear the pause state
+        # to allow recovery. This prevents requests from being stuck forever
+        # if the CPU completion worker crashes or hangs.
+        if colora_paused_reqs:
+            current_time = time.time()
+            colora_timeout = 30.0  # 30 seconds timeout for CPU completion
+            colora_timeout_reqs = []
+            for req_obj in colora_paused_reqs:
+                pause_duration = current_time - req_obj.colora_pause_time
+                if pause_duration > colora_timeout:
+                    logger.warning(
+                        f"[COLoRA] Request {req_obj.req_id} has been paused for "
+                        f"{pause_duration:.1f}s (timeout: {colora_timeout}s), "
+                        f"clearing pause state. Request may have incomplete state."
+                    )
+                    # Clear the pause state to unblock the request
+                    req_obj.colora_paused = False
+                    req_obj.colora_pause_time = 0.0
+                    req_obj.colora_continuation = None
+                    colora_timeout_reqs.append(req_obj)
+
+            # If we timed out any requests, they will be re-processed in next iteration
+            # They may have incomplete state but at least won't be stuck forever
+            if colora_timeout_reqs:
+                g_infer_context.recover_colora_paused_reqs(colora_timeout_reqs)
 
         return prefill_reqs, decode_reqs
 
@@ -1051,9 +1250,9 @@ class ModeBackend:
             else:
                 hidden_size = 2048
             vocab_size = config.get("vocab_size", 151936)
-            max_rank = 16  # Can be configured
+            max_rank = config.get("lora_max_rank", 16)  # Configurable, default 16
 
-            self.logger.info(f"[LoRA Backend] Config values: hidden_size={hidden_size}, intermediate_dim={intermediate_dim}, moe_intermediate_dim={moe_intermediate_dim}, num_heads={num_heads}, num_kv_heads={num_kv_heads}, head_dim={head_dim}")
+            self.logger.info(f"[LoRA Backend] Config values: hidden_size={hidden_size}, intermediate_dim={intermediate_dim}, moe_intermediate_dim={moe_intermediate_dim}, num_heads={num_heads}, num_kv_heads={num_kv_heads}, head_dim={head_dim}, max_rank={max_rank}")
 
             # Extract vision config for multimodal models
             vision_config = config.get("vision_config", None)
@@ -1101,9 +1300,15 @@ class ModeBackend:
                         f"moe_compute={moe_compute_mode}, but it is unavailable."
                     )
 
+            # - Memory per slot: ~(rank * (hiddenA + hiddenB)) * 2 bytes
+            num_experts = getattr(self.model.config, 'num_local_experts', 1)
+            estimated_slots_per_adapter = num_layers * num_experts
+            target_adapters = 256  # Support up to 64 concurrent adapters
+            pool_size = max(1024, target_adapters * estimated_slots_per_adapter)
+
             self.lora_mem_pool = create_lora_mem_pool(
                 num_layers=num_layers,
-                pool_size=1024,  # Can hold 1024 adapters
+                pool_size=pool_size,
                 max_rank=max_rank,
                 num_heads=num_heads,
                 head_dim=head_dim,
@@ -1118,7 +1323,9 @@ class ModeBackend:
                 vl_out_hidden_size=vl_out_hidden_size,
                 vl_depth=vl_depth,
                 moe_intermediate_dim=moe_intermediate_dim,
+                num_experts=num_experts,
                 tp_world_size=get_global_world_size(),
+                ep_world_size=1,
             )
 
             if use_colora_hybrid:
@@ -1161,164 +1368,88 @@ class ModeBackend:
             return
 
         # Load adapters into memory pool
-        from lightllm.server.lora import LoRATargetType
+        clone_count = getattr(self.args, "lora_clone_count", 1)
+        template_layer_weights = None
+        template_rank = None
+        template_scaling = None
 
-        # Startup profiling for adapter preload bottlenecks.
-        preload_prev_t = time.perf_counter()
-        can_rank0_broadcast = (
-            self.node_world_size > 1
-            and dist.is_available()
-            and dist.is_initialized()
-        )
-        node_src_rank = self.args.node_rank * self.node_world_size
-        for adapter_id, adapter_dir in lora_adapter_dirs.items():
-            try:
-                preload_start_t = time.perf_counter()
-                gap_ms = (preload_start_t - preload_prev_t) * 1000.0
-                broadcast_ms = 0.0
-                load_mode = "local_all_ranks"
-                load_obj_ms = 0.0
-                get_weights_ms = 0.0
+        if clone_count > 1:
+            if not lora_adapter_dirs:
+                raise ValueError(
+                    f"--lora_clone_count={clone_count} requires at least one directory in --lora_dir"
+                )
+            template_dir = next(iter(lora_adapter_dirs.values()))
+            template_rank, template_scaling, template_layer_weights = self._fetch_adapter_weights(template_dir)
 
-                # Load adapter using the model's LoRA loading function.
-                # In TP mode, try rank0-only disk load + broadcast to reduce duplicated slow I/O.
-                if can_rank0_broadcast:
-                    load_mode = "rank0_broadcast"
-                    try:
-                        payload = None
-                        if self.rank_in_node == 0:
-                            load_obj_t0 = time.perf_counter()
-                            adapter = self._load_lora_adapter_fn(
-                                adapter_dir=adapter_dir,
-                                network_config=self.model.config,
-                                data_type=self.model.data_type,
-                                device="cpu",
-                                swap=False
-                            )
-                            load_obj_t1 = time.perf_counter()
-                            load_obj_ms = (load_obj_t1 - load_obj_t0) * 1000.0
-
-                            rank = adapter.max_rank
-                            scaling = adapter.lora_alpha / adapter.max_rank
-                            get_weights_t0 = time.perf_counter()
-                            layer_weights = adapter.get_all_weights()
-                            get_weights_t1 = time.perf_counter()
-                            get_weights_ms = (get_weights_t1 - get_weights_t0) * 1000.0
-                            payload = {
-                                "ok": True,
-                                "rank": rank,
-                                "scaling": scaling,
-                                "layer_weights": layer_weights,
-                            }
-
-                        bcast_t0 = time.perf_counter()
-                        object_list = [payload]
-                        dist.broadcast_object_list(
-                            object_list,
-                            src=node_src_rank,
-                            group=self.node_nccl_group,
-                            device=torch.device("cuda", self.current_device_id),
-                        )
-                        bcast_t1 = time.perf_counter()
-                        broadcast_ms = (bcast_t1 - bcast_t0) * 1000.0
-
-                        received = object_list[0]
-                        if not isinstance(received, dict) or not received.get("ok", False):
-                            raise RuntimeError(
-                                f"Invalid broadcast payload for adapter {adapter_id} at {adapter_dir}"
-                            )
-
-                        rank = received["rank"]
-                        scaling = received["scaling"]
-                        layer_weights = received["layer_weights"]
-                    except Exception as broadcast_err:
-                        # Guarded fallback to current behavior if broadcast fails.
-                        self.logger.warning(
-                            "[LoRA Backend][StartupTiming] rank0 broadcast failed for adapter %s (%s): %s; "
-                            "falling back to per-rank local load",
-                            adapter_id,
-                            adapter_dir,
-                            broadcast_err,
-                        )
-                        load_mode = "fallback_local"
-                        load_obj_t0 = time.perf_counter()
-                        adapter = self._load_lora_adapter_fn(
-                            adapter_dir=adapter_dir,
-                            network_config=self.model.config,
-                            data_type=self.model.data_type,
-                            device="cuda",
-                            swap=False
-                        )
-                        load_obj_t1 = time.perf_counter()
-                        load_obj_ms = (load_obj_t1 - load_obj_t0) * 1000.0
-
-                        rank = adapter.max_rank
-                        scaling = adapter.lora_alpha / adapter.max_rank
-                        get_weights_t0 = time.perf_counter()
-                        layer_weights = adapter.get_all_weights()
-                        get_weights_t1 = time.perf_counter()
-                        get_weights_ms = (get_weights_t1 - get_weights_t0) * 1000.0
-                else:
-                    load_obj_t0 = time.perf_counter()
-                    adapter = self._load_lora_adapter_fn(
-                        adapter_dir=adapter_dir,
-                        network_config=self.model.config,
-                        data_type=self.model.data_type,
-                        device="cuda",
-                        swap=False
-                    )
-                    load_obj_t1 = time.perf_counter()
-                    load_obj_ms = (load_obj_t1 - load_obj_t0) * 1000.0
-
-                    rank = adapter.max_rank
-                    scaling = adapter.lora_alpha / adapter.max_rank
-                    get_weights_t0 = time.perf_counter()
-                    layer_weights = adapter.get_all_weights()
-                    get_weights_t1 = time.perf_counter()
-                    get_weights_ms = (get_weights_t1 - get_weights_t0) * 1000.0
-
-                # Load into memory pool
+            cloned_dirs: Dict[int, str] = {}
+            for i in range(1, clone_count + 1):
+                synthetic_dir = f"{template_dir}#clone_{i}"
+                cloned_dirs[i] = synthetic_dir
                 pool_load_t0 = time.perf_counter()
                 loaded_ok = self.lora_mem_pool.load_adapter(
-                    adapter_dir=adapter_dir,
-                    rank=rank,
-                    scaling=scaling,
-                    layer_weights=layer_weights
+                    adapter_dir=synthetic_dir,
+                    rank=template_rank,
+                    scaling=template_scaling,
+                    layer_weights=template_layer_weights,
                 )
                 if not loaded_ok:
                     raise RuntimeError(
-                        f"Failed to load adapter_id={adapter_id} ({adapter_dir}) into memory pool"
+                        f"Failed to load clone adapter_id={i} ({synthetic_dir}) into memory pool"
                     )
                 pool_load_t1 = time.perf_counter()
-
-                total_ms = (pool_load_t1 - preload_start_t) * 1000.0
                 pool_load_ms = (pool_load_t1 - pool_load_t0) * 1000.0
-
                 self.logger.info(
-                    "[LoRA Backend][StartupTiming] pid=%s rank=%s rank_in_node=%s adapter_id=%s "
-                    "gap_before_ms=%.2f load_obj_ms=%.2f get_weights_ms=%.2f pool_load_ms=%.2f bcast_ms=%.2f "
-                    "total_ms=%.2f mode=%s adapter_dir=%s",
+                    "[LoRA Backend][StartupTiming] pid=%s rank=%s adapter_id=%s "
+                    "pool_load_ms=%.2f mode=clone adapter_dir=%s",
                     os.getpid(),
                     self.global_rank,
-                    self.rank_in_node,
-                    adapter_id,
-                    gap_ms,
-                    load_obj_ms,
-                    get_weights_ms,
+                    i,
                     pool_load_ms,
-                    broadcast_ms,
-                    total_ms,
-                    load_mode,
-                    adapter_dir,
+                    synthetic_dir,
                 )
-                self.logger.info(f"[LoRA Backend] Loaded adapter {adapter_id} from {adapter_dir}")
-                preload_prev_t = pool_load_t1
+            self.lora_adapter_dirs = cloned_dirs
+            self.logger.info(
+                "[LoRA Backend] Created %s in-memory clones from template %s",
+                clone_count,
+                template_dir,
+            )
+        else:
+            for adapter_id, adapter_dir in lora_adapter_dirs.items():
+                try:
+                    preload_start_t = time.perf_counter()
+                    rank, scaling, layer_weights = self._fetch_adapter_weights(adapter_dir)
 
-            except Exception as e:
-                self.logger.error(f"[LoRA Backend] Failed to load adapter {adapter_id} from {adapter_dir}: {e}")
-                import traceback
-                traceback.print_exc()
-                raise
+                    pool_load_t0 = time.perf_counter()
+                    loaded_ok = self.lora_mem_pool.load_adapter(
+                        adapter_dir=adapter_dir,
+                        rank=rank,
+                        scaling=scaling,
+                        layer_weights=layer_weights,
+                    )
+                    if not loaded_ok:
+                        raise RuntimeError(
+                            f"Failed to load adapter_id={adapter_id} ({adapter_dir}) into memory pool"
+                        )
+                    pool_load_t1 = time.perf_counter()
+                    total_ms = (pool_load_t1 - preload_start_t) * 1000.0
+                    pool_load_ms = (pool_load_t1 - pool_load_t0) * 1000.0
+
+                    self.logger.info(
+                        "[LoRA Backend][StartupTiming] pid=%s rank=%s adapter_id=%s "
+                        "total_ms=%.2f pool_load_ms=%.2f adapter_dir=%s",
+                        os.getpid(),
+                        self.global_rank,
+                        adapter_id,
+                        total_ms,
+                        pool_load_ms,
+                        adapter_dir,
+                    )
+                    self.logger.info(f"[LoRA Backend] Loaded adapter {adapter_id} from {adapter_dir}")
+                except Exception as e:
+                    self.logger.error(f"[LoRA Backend] Failed to load adapter {adapter_id} from {adapter_dir}: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    raise
 
         # Create dispatcher for each layer
         self.lora_dispatchers = []
@@ -1403,10 +1534,15 @@ class ModeBackend:
         # LoRA memory pool uses 0-based adapter indices.
         req_bins_list: List[int] = []
         active_adapter_ids = set()
+        no_adapter_reqs = []
         for req in batch.reqs:
             adapter_id = normalize_req_adapter_id(getattr(req, "adapter_id", 0))
             if adapter_id <= 0:
                 adapter_bin = -1
+                no_adapter_reqs.append(
+                    f"req_id={getattr(req, 'req_id', '?')} req_idx={getattr(req, 'req_idx', '?')} "
+                    f"adapter_id={getattr(req, 'adapter_id', 'MISSING')}"
+                )
             else:
                 adapter_dir = self.lora_adapter_dirs.get(adapter_id) if hasattr(self, "lora_adapter_dirs") else None
                 if adapter_dir is None:
@@ -1421,6 +1557,12 @@ class ModeBackend:
             req_bins_list.append(adapter_bin)
             if adapter_id > 0:
                 active_adapter_ids.add(adapter_id)
+
+        if no_adapter_reqs:
+            self.logger.warning(
+                f"[LoRA Backend] Batch contains {len(no_adapter_reqs)} requests without adapters:\n"
+                + "\n".join(no_adapter_reqs)
+            )
 
         self.logger.debug(
             f"[LoRA Backend] Preparing batch: batch_size={len(batch.reqs)}, active_adapters={sorted(active_adapter_ids)}"

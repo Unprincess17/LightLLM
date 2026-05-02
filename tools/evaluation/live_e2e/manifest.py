@@ -43,6 +43,7 @@ class LiveE2ERun:
     server_port: Optional[int] = None
     adapter_ids: Optional[str] = None
     lora_dirs: Optional[str] = None
+    lora_clone_count: Optional[int] = None
     output_root: Path = Path("artifacts/evaluation/live_e2e")
     nsys_enabled: bool = False
     nsys_output_prefix: Optional[str] = None
@@ -50,8 +51,10 @@ class LiveE2ERun:
     nsys_trace: Optional[str] = None  # e.g. "cuda,nvtx" or "cuda,nvtx,osrt"; default if omitted
     nsys_force_overwrite: bool = True
     nsys_delay_seconds: Optional[int] = None  # nsys --delay=N (seconds before capture)
-    warmup_requests: int = 0
+    warmup_requests: Optional[int] = None
     measurement_requests: Optional[int] = None
+    max_concurrent_requests: Optional[int] = None
+    rps: Optional[float] = None
 
     def to_metadata(self) -> Dict[str, Any]:
         """Convert to metadata dict for snapshotting."""
@@ -91,6 +94,7 @@ class LiveE2ERun:
             "server_port": self.server_port,
             "adapter_ids": self.adapter_ids,
             "lora_dirs": self.lora_dirs,
+            "lora_clone_count": self.lora_clone_count,
             "output_root": str(self.output_root),
             "nsys_enabled": self.nsys_enabled,
             "nsys_output_prefix": self.nsys_output_prefix,
@@ -99,6 +103,8 @@ class LiveE2ERun:
             "nsys_delay_seconds": self.nsys_delay_seconds,
             "warmup_requests": self.warmup_requests,
             "measurement_requests": self.measurement_requests,
+            "max_concurrent_requests": self.max_concurrent_requests,
+            "rps": self.rps,
         }
 
 

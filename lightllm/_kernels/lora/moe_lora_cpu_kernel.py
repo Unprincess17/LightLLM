@@ -83,20 +83,21 @@ def moe_batch_lora_avx(
 
     Args:
         x: Input tensor [N, H] where N is number of tokens
-        A: LoRA down projection matrix [R, H]
-        B: LoRA up projection matrix [R, H]
+        A: LoRA projection matrix A [R, H]
+        B: LoRA projection matrix B [R, out_dim]
         scaling: Scaling factor for the LoRA output
 
     Returns:
-        LoRA output [N, H]
+        LoRA output [N, out_dim]
     """
     ensure_kernel_loaded()
     if _moe_lora_cpu_kernel is None:
         raise RuntimeError("moe_lora_cpu_kernel extension failed to load")
-    output = torch.zeros_like(x)
+    out_H = B.shape[1]  # Output dimension (intermediate_dim for gate/up, hidden_size for down)
+    output = torch.zeros(x.shape[0], out_H, dtype=x.dtype, device=x.device)
     _moe_lora_cpu_kernel.moe_batch_lora_avx(
         x, A, B, output,
-        x.shape[0], x.shape[1], A.shape[0], scaling
+        x.shape[0], x.shape[1], A.shape[0], out_H, scaling
     )
     return output
 

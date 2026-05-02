@@ -15,6 +15,16 @@ from lightllm.utils.shm_utils import create_or_link_shm, destroy_shared_memory
 logger = init_logger(__name__)
 
 
+class _NoOpLockItem:
+    """No-op lock context used when ShmReqManager has already been cleaned up (e.g. during process shutdown)."""
+
+    def __enter__(self):
+        pass
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        pass
+
+
 class ShmReqManager:
     def __init__(self):
         self.req_class: Req.__class__ = self.get_req_class_type()
@@ -62,6 +72,9 @@ class ShmReqManager:
         return
 
     def get_req_lock_by_index(self, req_index_in_mem: int) -> AtomicLockItem:
+        if self.reqs_lock is None:
+            # Already cleaned up (e.g. process shutdown raced ahead of infer_loop threads)
+            return _NoOpLockItem()
         return self.reqs_lock.get_lock_context(req_index_in_mem)
 
     def init_manager_lock(self):

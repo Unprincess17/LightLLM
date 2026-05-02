@@ -285,10 +285,15 @@ class LoRAModulePool:
 
         if a_weight is not None:
             # A weight matrix: [rank, hidden]
-            # Case 1: Perfect match (TP=1 or pre-sharded weights)
+            # Case 1: Perfect match (TP=1 or pre-sharded weights exactly match buffer size)
             if self.a_buffer.shape[-1] == a_weight.shape[-1]:
                 self.a_buffer[loc, :rank] = a_weight.to(self.a_buffer.dtype)
-            # Case 2: TP sharding needed - validate math is consistent
+            # Case 2: Weight is pre-sharded (exactly buffer_size // tp_world_size)
+            # Accept pre-sharded weights directly without slicing
+            elif (tp_world_size > 1 and
+                  a_weight.shape[-1] == self.a_buffer.shape[-1] // tp_world_size):
+                self.a_buffer[loc, :rank, :a_weight.shape[-1]] = a_weight.to(self.a_buffer.dtype)
+            # Case 3: Full unsharded weight - slice it for this rank
             elif (self.a_buffer.shape[-1] < a_weight.shape[-1] and
                   a_weight.shape[-1] == self.a_buffer.shape[-1] * tp_world_size):
                 split_size = self.a_buffer.shape[-1]
@@ -301,7 +306,7 @@ class LoRAModulePool:
                 else:
                     logger.error(f"TP slicing out of bounds! rank={tp_rank}, size={split_size}, w_shape={a_weight.shape}")
                     return False
-            # Case 3: Invalid mismatch
+            # Case 4: Invalid mismatch
             else:
                 logger.error(
                     f"Shape Mismatch Error: Buffer {self.a_buffer.shape[-1]} vs Weight {a_weight.shape[-1]}. "
@@ -310,11 +315,17 @@ class LoRAModulePool:
                 return False
 
         if b_weight is not None:
-            # B weight matrix: [rank, hidden]
-            # Case 1: Perfect match (TP=1 or pre-sharded weights)
+            # B weight matrix: [rank, hidden] (same orientation as A after loader processing)
+            # The LoRAAdapterLoader keeps B as [rank, out_features] from safetensors.
+            # Case 1: Perfect match (TP=1 or pre-sharded weights exactly match buffer size)
             if self.b_buffer.shape[-1] == b_weight.shape[-1]:
                 self.b_buffer[loc, :rank] = b_weight.to(self.b_buffer.dtype)
-            # Case 2: TP sharding needed - validate math is consistent
+            # Case 2: Weight is pre-sharded (exactly buffer_size // tp_world_size)
+            # Accept pre-sharded weights directly without slicing
+            elif (tp_world_size > 1 and
+                  b_weight.shape[-1] == self.b_buffer.shape[-1] // tp_world_size):
+                self.b_buffer[loc, :rank, :b_weight.shape[-1]] = b_weight.to(self.b_buffer.dtype)
+            # Case 3: Full unsharded weight - slice it for this rank along hidden dimension
             elif (self.b_buffer.shape[-1] < b_weight.shape[-1] and
                   b_weight.shape[-1] == self.b_buffer.shape[-1] * tp_world_size):
                 split_size = self.b_buffer.shape[-1]
@@ -327,7 +338,7 @@ class LoRAModulePool:
                 else:
                     logger.error(f"TP slicing out of bounds! rank={tp_rank}, size={split_size}, w_shape={b_weight.shape}")
                     return False
-            # Case 3: Invalid mismatch
+            # Case 4: Invalid mismatch
             else:
                 logger.error(
                     f"Shape Mismatch Error: Buffer {self.b_buffer.shape[-1]} vs Weight {b_weight.shape[-1]}. "
@@ -383,8 +394,11 @@ class LoRAModulePool:
             return False
 
         first_layer_content = layer_weights[first_layer_id]
-        first_val = next(iter(first_layer_content.values())) if first_layer_content else None
-        is_moe_structure = isinstance(first_val, dict) and "A" in first_val
+        if not first_layer_content:
+            first_val = None
+        else:
+            first_val = next(iter(first_layer_content.values()))
+        is_moe_structure = isinstance(first_val, dict) and ("A" in first_val)
 
         # Count valid layers for metadata
         valid_layers = 0
@@ -468,7 +482,9 @@ class LoRAModulePool:
 
                         # Calculate flattened index: layer * num_experts + local_expert_id
                         loc = loc_start + buffer_layer_id * self.num_experts + local_expert_id
-                        self._write_weights(loc, rank, scaling, weights, tp_rank, tp_world_size)
+                        if not self._write_weights(loc, rank, scaling, weights, tp_rank, tp_world_size):
+                            logger.error(f"Failed to write weights for layer {layer_id}, expert {expert_id}")
+                            return False
             else:
                 # Flat structure: {layer_id: {"A": ..., "B": ...}}
                 for layer_id, weights in layer_weights.items():
@@ -485,7 +501,9 @@ class LoRAModulePool:
                         continue
 
                     loc = loc_start + buffer_layer_id
-                    self._write_weights(loc, rank, scaling, weights, tp_rank, tp_world_size)
+                    if not self._write_weights(loc, rank, scaling, weights, tp_rank, tp_world_size):
+                        logger.error(f"Failed to write weights for layer {layer_id}")
+                        return False
         except Exception as e:
             logger.error(f"Error loading adapter weights: {e}")
             return False
@@ -857,6 +875,9 @@ class LoRAMemPool:
             # Handle vision layer offset (10000+) - strip offset for buffer indexing
             if layer_id >= 10000:
                 buffer_layer_id = layer_id - 10000
+            elif layer_id == -1:
+                # lm_head uses layer_id = -1, map to buffer index 0 (only has 1 layer)
+                buffer_layer_id = 0
             else:
                 buffer_layer_id = layer_id
 
@@ -872,9 +893,7 @@ class LoRAMemPool:
                 if target_type not in pool_weights:
                     pool_weights[target_type] = {}
 
-                # Strip module_name level - pool expects {layer_id: {"A": tensor, "B": tensor}}
-                # module_weights is {module_name: {"A": tensor, "B": tensor}}, take first value
-                weight_dict = next(iter(module_weights.values())) if module_weights else {}
+                weight_dict = module_weights
 
                 # Add to pool's weight collection
                 pool_weights[target_type][buffer_layer_id] = weight_dict
@@ -882,19 +901,26 @@ class LoRAMemPool:
         # Now load all weights for each pool in a single call
         for target_type, weights_by_layer in pool_weights.items():
             pool = self.get_pool(target_type)
-            if pool is not None:
-                pool.load_adapter(
-                    adapter_idx=adapter_idx,
-                    rank=rank,
-                    scaling=scaling,
-                    layer_weights=weights_by_layer,
-                    tp_rank=self.tp_rank_,
-                    tp_world_size=self.tp_world_size_,
-                    ep_rank=self.ep_rank_,
-                    ep_world_size=self.ep_world_size_,
-                    total_experts=self.num_experts
-                )
-                logger.debug(f"[LoRA]   Loaded {target_type} with {len(weights_by_layer)} layers")
+            if pool is None:
+                continue
+            # Skip empty weights (adapter may not have this target type, e.g. no lm_head)
+            if not weights_by_layer:
+                continue
+            ok = pool.load_adapter(
+                adapter_idx=adapter_idx,
+                rank=rank,
+                scaling=scaling,
+                layer_weights=weights_by_layer,
+                tp_rank=self.tp_rank_,
+                tp_world_size=self.tp_world_size_,
+                ep_rank=self.ep_rank_,
+                ep_world_size=self.ep_world_size_,
+                total_experts=self.num_experts
+            )
+            if not ok:
+                logger.error(f"[LoRA]   Failed to load {target_type}")
+                return False
+            logger.debug(f"[LoRA]   Loaded {target_type} with {len(weights_by_layer)} layers")
 
         self.adapter_dirs.append(adapter_dir)
         self.idx_map[adapter_dir] = adapter_idx
@@ -1089,6 +1115,13 @@ class LoRAAdapterLoader:
             if layer_id is not None and target_type is not None:
                 if layer_id not in result:
                     result[layer_id] = {}
+
+                # Fix: PEFT LoRA weight shapes:
+                #   lora_A.weight: shape [in_features, rank] = [h, r] -> WRONG! Need last dim = h
+                #   lora_B.weight: shape [rank, out_features] = [r, h] -> already correct (last dim = h)
+                # Transpose A matrix so last dim = hidden_dim (not rank)
+                if matrix_type == "A":
+                    tensor = tensor.transpose(0, 1)
 
                 # Handle Experts separately if expert_id exists
                 if expert_id is not None:

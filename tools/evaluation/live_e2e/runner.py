@@ -1,15 +1,122 @@
 import shlex
 import subprocess
 import sys
+import re
 from pathlib import Path
 from datetime import datetime
 import json
 import threading
 from typing import Any, Dict, List, Optional
+import yaml
 
 from tools.case_study.common import ensure_dir, write_json
 from tools.evaluation.live_e2e.manifest import LiveE2EManifest, LiveE2ERun
 from tools.evaluation.live_e2e.manifest import load_manifest
+
+
+def _save_git_info(output_dir: Path) -> None:
+    """Save git commit hash and dirty-status to the run output directory."""
+    try:
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True
+        ).strip()
+        (output_dir / "git_commit.txt").write_text(commit + "\n", encoding="utf-8")
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+    try:
+        status = subprocess.check_output(
+            ["git", "status", "--short"], stderr=subprocess.DEVNULL, text=True
+        ).strip()
+        if status:
+            (output_dir / "git_status.txt").write_text(status + "\n", encoding="utf-8")
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+
+
+def _save_manifest_yaml(output_dir: Path, run: LiveE2ERun) -> None:
+    """Save the resolved run config as manifest.yaml."""
+    meta = run.to_metadata()
+    with (output_dir / "manifest.yaml").open("w", encoding="utf-8") as f:
+        yaml.dump(meta, f, default_flow_style=False, sort_keys=False)
+
+
+_COLORA_LINE_RE = re.compile(r"\[COLoRA\]\s+layer=.*")
+_KV_RE = re.compile(r"([a-zA-Z0-9_]+)=([^\s]+)")
+
+
+def _extract_colora_stats_from_log(stdout_log_path: Path) -> Dict[str, Any]:
+    """Parse [COLoRA] lines from server stdout log and aggregate stats.
+
+    Returns a dict with aggregated (sum or last) values across all layers.
+    If no [COLoRA] lines found, returns an empty dict.
+    """
+    if not stdout_log_path.exists():
+        return {}
+
+    # Collect per-key values across all layers
+    per_key: Dict[str, List[float]] = {}
+    with stdout_log_path.open("r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not _COLORA_LINE_RE.search(line):
+                continue
+            for k, v in _KV_RE.findall(line):
+                try:
+                    fv = float(v.rstrip(","))
+                except ValueError:
+                    continue
+                per_key.setdefault(k, []).append(fv)
+
+    if not per_key:
+        return {}
+
+    # Aggregate: sum for counters, last for gauges/config
+    counter_keys = {
+        "colora_hit_tokens", "colora_miss_tokens",
+        "cpu_compute_time", "gpu_compute_time",
+        "cpu_queue_wait_time", "cpu_join_stall_time",
+        "d2h_bytes", "h2d_bytes",
+        "weight_h2d_bytes", "weight_h2d_time",
+        "d2h_activation_time", "h2d_residual_time",
+        "pack_time", "merge_time", "admit_time",
+        "fallback_degrade_count",
+        "promotion_drop_total", "promotion_admitted",
+        "promotion_reject_delta", "promotion_reject_no_ema",
+        "tracker_queue_drop",
+        "prefetch_submitted", "prefetch_ready_hits",
+        "prefetch_not_ready", "prefetch_stale",
+        "prefetch_false_positives", "prefetch_slot_overwrite",
+        "moe_kernel_calls", "moe_kernel_tokens",
+        "attempted_bind", "successful_bind",
+        "cpu_async_submitted", "cpu_inline_executed",
+        "blocking_promotion_count",
+        "cache_evictions_total",
+    }
+    gauge_keys = {
+        "cpu_queue_depth", "promotion_drop_queue_high_watermark",
+        "cache_capacity_slots", "cache_resident_slots", "cache_free_slots",
+        "overlap_ratio",
+    }
+
+    result: Dict[str, Any] = {}
+    for k, vs in per_key.items():
+        if k in counter_keys:
+            result[k] = sum(vs)
+        elif k in gauge_keys:
+            result[k] = vs[-1] if vs else 0
+        else:
+            # Default: take the last value for unknown keys
+            result[k] = vs[-1] if vs else 0
+
+    # Compute derived fields
+    hit = result.get("colora_hit_tokens", 0)
+    miss = result.get("colora_miss_tokens", 0)
+    total = hit + miss
+    if total > 0:
+        result["cache_hit_rate"] = hit / total
+        result["cache_miss_rate"] = miss / total
+
+    return result
 
 
 def build_benchmark_command(run: LiveE2ERun, benchmark_script: str) -> str:
@@ -25,11 +132,15 @@ def build_benchmark_command(run: LiveE2ERun, benchmark_script: str) -> str:
         parts.append(f"--adapter_ids {run.adapter_ids}")
     if run.lora_dirs is not None:
         parts.append(f"--lora_dirs {run.lora_dirs}")
+    if run.lora_clone_count is not None:
+        parts.append(f"--lora_clone_count {run.lora_clone_count}")
     if run.server_host is not None:
         parts.append(f"--server_host {run.server_host}")
     if run.server_port is not None:
         parts.append(f"--server_port {run.server_port}")
 
+    if run.mode_label is not None:
+        parts.append(f"--mode_label {run.mode_label}")
     if run.miss_handling_mode is not None:
         parts.append(f"--colora_miss_policy {run.miss_handling_mode}")
     if run.overlap_mode is not None:
@@ -92,6 +203,10 @@ def build_benchmark_command(run: LiveE2ERun, benchmark_script: str) -> str:
         parts.append(f"--warmup_adapter_trace_path {run.warmup_adapter_trace_path}")
     if run.measurement_adapter_trace_path is not None:
         parts.append(f"--measure_adapter_trace_path {run.measurement_adapter_trace_path}")
+    if run.max_concurrent_requests is not None:
+        parts.append(f"--max_concurrent_requests {run.max_concurrent_requests}")
+    if run.rps is not None:
+        parts.append(f"--rps {run.rps}")
 
     # The per-request log path will be determined at runtime in the run directory
     return " ".join(parts)
@@ -182,11 +297,21 @@ def run_single(manifest: LiveE2EManifest, run: LiveE2ERun, capture_stdout: bool 
     config_snapshot_path = output_dir / "config_snapshot.json"
     write_json(config_snapshot_path, run.to_metadata())
 
+    # Save resolved manifest, git info
+    _save_manifest_yaml(output_dir, run)
+    _save_git_info(output_dir)
+
     # Build the command
     base_cmd = build_benchmark_command(run, manifest.benchmark_script)
     # Append the per-request log path to our output directory
     per_request_log_path = output_dir / "per_request_metrics.jsonl"
     base_cmd += f" --per_request_log_path {per_request_log_path}"
+    # Append colora stats dump path
+    colora_stats_path = output_dir / "colora_stats.json"
+    base_cmd += f" --colora_stats_path {colora_stats_path}"
+
+    # Save the full benchmark command for reproducibility
+    (output_dir / "benchmark_command.txt").write_text(base_cmd + "\n", encoding="utf-8")
 
     if run.nsys_enabled:
         cmd = build_nsys_command(base_cmd, output_dir, run)
@@ -250,7 +375,15 @@ def run_single(manifest: LiveE2EManifest, run: LiveE2ERun, capture_stdout: bool 
 
     end_time = datetime.now()
 
-    # Validate result
+    # Extract colora_stats: prefer the file created by the benchmark's curl of /colora_stats;
+    # if missing/empty, fall back to parsing [COLoRA] lines from the server stdout log.
+    if not colora_stats_path.exists() or colora_stats_path.stat().st_size <= 2:
+        log_stats = _extract_colora_stats_from_log(stdout_path)
+        if log_stats:
+            write_json(colora_stats_path, log_stats)
+            print(f"  colora_stats.json: extracted from server log ({len(log_stats)} fields)")
+
+    # colora_stats.json is optional for load_then_run but expected for cpu_first
     valid = True
     failure_reason = None
 
@@ -261,6 +394,9 @@ def run_single(manifest: LiveE2EManifest, run: LiveE2ERun, capture_stdout: bool 
     if not per_request_log_path.exists():
         valid = False
         failure_reason = "per-request log file not created"
+
+    # colora_stats.json is optional for load_then_run but expected for cpu_first
+    colora_stats_exists = colora_stats_path.exists()
 
     if run.nsys_enabled:
         # Check that at least one nsys file was created
@@ -280,6 +416,8 @@ def run_single(manifest: LiveE2EManifest, run: LiveE2ERun, capture_stdout: bool 
         "command": cmd,
         "output_dir": str(output_dir),
         "per_request_log_path": str(per_request_log_path),
+        "colora_stats_path": str(colora_stats_path),
+        "colora_stats_exists": colora_stats_exists,
         "start_time": start_time.isoformat(),
         "nsys_enabled": run.nsys_enabled,
     }

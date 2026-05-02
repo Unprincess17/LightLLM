@@ -20,6 +20,8 @@ Core options:
   --measure_adapter_trace_path PATH
   --warmup_num_requests N
   --measure_num_requests N
+  --max_concurrent_requests N        Max concurrent requests per phase (passed to client)
+  --rps F                            Target requests per second (default: 3.0; 0 = burst)
   --phase_gap_s SEC
   --poisson_lambda F
   --poisson_seed N
@@ -27,6 +29,9 @@ Core options:
   --top_k_slowest N
   --print_per_request | --no_print_per_request
   --per_request_log_path PATH | --no_per_request_log
+  --phase STR
+  --mode_label STR           # colora_min | colora_full | load_then_run
+  --colora_stats_path PATH
 
 Server pass-through options:
   --model_dir PATH
@@ -89,14 +94,19 @@ WARMUP_ADAPTER_TRACE_PATH=""
 MEASURE_ADAPTER_TRACE_PATH=""
 WARMUP_NUM_REQUESTS=""
 MEASURE_NUM_REQUESTS=""
+MAX_CONCURRENT_REQUESTS=""
+RPS=""
 PHASE_GAP_S="10"
 ADAPTER_EXPERT_PROFILE=0
 ADAPTER_EXPERT_LOG_PATH="/tmp/moe_adapter_expert_profile.log"
 PRINT_PER_REQUEST=0
 TOP_K_SLOWEST=10
 PER_REQUEST_LOG_PATH="/tmp/moe_per_request_metrics_$(date +%Y%m%d_%H%M%S).jsonl"
+PHASE=""
+COLORA_STATS_PATH=""
 MODEL_DIR=""
 LORA_DIRS=""
+LORA_CLONE_COUNT=""
 TP=""
 COMPUTE_DEVICE=""
 FORCE_SLOW_LORA_PATH="1"
@@ -210,6 +220,9 @@ build_phase_args() {
     local per_request_log_path="$6"
     local print_per_request="$7"
     local prompt_namespace="$8"
+    local phase_name="$9"
+    local max_concurrent_requests="${10}"
+    local rps="${11}"
 
     out_arr=(
         --url "$SERVER_URL"
@@ -220,6 +233,9 @@ build_phase_args() {
         --top_k_slowest "$top_k_slowest"
         --prompt_namespace "$prompt_namespace"
     )
+    if [[ -n "$max_concurrent_requests" ]]; then
+        out_arr+=(--max_concurrent_requests "$max_concurrent_requests")
+    fi
     if [[ -n "$decode_target_tokens" ]]; then
         out_arr+=(--decode_target_tokens "$decode_target_tokens")
     fi
@@ -239,6 +255,12 @@ build_phase_args() {
     fi
     if [[ -n "$num_requests" ]]; then
         out_arr+=(--num_requests "$num_requests")
+    fi
+    if [[ -n "$phase_name" ]]; then
+        out_arr+=(--phase "$phase_name")
+    fi
+    if [[ -n "$rps" ]]; then
+        out_arr+=(--rps "$rps")
     fi
 }
 
@@ -274,6 +296,8 @@ while [[ $# -gt 0 ]]; do
         --measure_adapter_trace_path) MEASURE_ADAPTER_TRACE_PATH="$2"; shift 2 ;;
         --warmup_num_requests) WARMUP_NUM_REQUESTS="$2"; shift 2 ;;
         --measure_num_requests) MEASURE_NUM_REQUESTS="$2"; shift 2 ;;
+        --max_concurrent_requests) MAX_CONCURRENT_REQUESTS="$2"; shift 2 ;;
+        --rps) RPS="$2"; shift 2 ;;
         --phase_gap_s) PHASE_GAP_S="$2"; shift 2 ;;
         --poisson_lambda) POISSON_LAMBDA="$2"; shift 2 ;;
         --poisson_seed) POISSON_SEED="$2"; shift 2 ;;
@@ -290,6 +314,7 @@ while [[ $# -gt 0 ]]; do
         --adapter_expert_log_path) ADAPTER_EXPERT_LOG_PATH="$2"; shift 2 ;;
         --model_dir) MODEL_DIR="$2"; shift 2 ;;
         --lora_dirs) LORA_DIRS="$2"; shift 2 ;;
+        --lora_clone_count) LORA_CLONE_COUNT="$2"; shift 2 ;;
         --tp) TP="$2"; shift 2 ;;
         --compute_device) COMPUTE_DEVICE="$2"; shift 2 ;;
         --force_slow_lora_path) FORCE_SLOW_LORA_PATH="1"; shift ;;
@@ -338,6 +363,9 @@ while [[ $# -gt 0 ]]; do
         --top_k_slowest) TOP_K_SLOWEST="$2"; shift 2 ;;
         --per_request_log_path) PER_REQUEST_LOG_PATH="$2"; shift 2 ;;
         --no_per_request_log) PER_REQUEST_LOG_PATH=""; shift ;;
+        --phase) PHASE="$2"; shift 2 ;;
+        --mode_label) MODE_LABEL="$2"; shift 2 ;;
+        --colora_stats_path) COLORA_STATS_PATH="$2"; shift 2 ;;
         --help|-h) usage; exit 0 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
@@ -389,6 +417,14 @@ if [[ -n "$LORA_DIRS" && "$ADAPTER_IDS_SET" != "1" ]]; then
     if (( ${#DERIVED_ADAPTER_IDS[@]} > 0 )); then
         ADAPTER_IDS="$(IFS=,; echo "${DERIVED_ADAPTER_IDS[*]}")"
     fi
+fi
+
+if [[ -n "$LORA_CLONE_COUNT" && "$LORA_CLONE_COUNT" -gt 1 && "$ADAPTER_IDS_SET" != "1" ]]; then
+    CLONE_IDS=()
+    for i in $(seq 1 "$LORA_CLONE_COUNT"); do
+        CLONE_IDS+=("$i")
+    done
+    ADAPTER_IDS="$(IFS=,; echo "${CLONE_IDS[*]}")"
 fi
 
 # Cleanup function
@@ -447,12 +483,15 @@ echo "Warmup prompt namespace: Warmup-Req"
 [[ -n "$WARMUP_NUM_REQUESTS" ]] && echo "Warmup num requests override: $WARMUP_NUM_REQUESTS"
 [[ -n "$MEASURE_NUM_REQUESTS" ]] && echo "Measurement num requests override: $MEASURE_NUM_REQUESTS"
 echo "Phase gap (s): $PHASE_GAP_S"
+[[ -n "$MAX_CONCURRENT_REQUESTS" ]] && echo "Max concurrent requests: $MAX_CONCURRENT_REQUESTS"
+[[ -n "$RPS" ]] && echo "Target RPS: $RPS"
 echo "Adapter expert profile: $ADAPTER_EXPERT_PROFILE"
 echo "Adapter expert profile log: $ADAPTER_EXPERT_LOG_PATH"
 echo "Top-K slowest requests: $TOP_K_SLOWEST"
 echo "Print per-request lines: $PRINT_PER_REQUEST"
 [[ -n "$MODEL_DIR" ]] && echo "Server model_dir override: $MODEL_DIR"
 [[ -n "$LORA_DIRS" ]] && echo "Server lora_dirs override: $LORA_DIRS"
+[[ -n "$LORA_CLONE_COUNT" ]] && echo "Server lora_clone_count override: $LORA_CLONE_COUNT"
 [[ -n "$TP" ]] && echo "Server TP override: $TP"
 [[ -n "$COMPUTE_DEVICE" ]] && echo "Server compute_device override: $COMPUTE_DEVICE"
 [[ -n "$FORCE_SLOW_LORA_PATH" ]] && echo "Server force_slow_lora_path override: $FORCE_SLOW_LORA_PATH"
@@ -476,6 +515,9 @@ if [[ -n "$PER_REQUEST_LOG_PATH" ]]; then
 else
     echo "Per-request metrics log: disabled"
 fi
+if [[ -n "$COLORA_STATS_PATH" ]]; then
+    echo "CoLoRA stats output: $COLORA_STATS_PATH"
+fi
 
 WARMUP_ENABLED=0
 if [[ -n "$WARMUP_ADAPTER_TRACE_PATH" || -n "$WARMUP_NUM_REQUESTS" ]]; then
@@ -491,7 +533,10 @@ build_phase_args \
     "0" \
     "" \
     "0" \
-    "Warmup-Req"
+    "Warmup-Req" \
+    "warmup" \
+    "$MAX_CONCURRENT_REQUESTS" \
+    "$RPS"
 
 MEASURE_TEST_ARGS=()
 MEASURE_PROMPT_NAMESPACE="Req"
@@ -507,7 +552,10 @@ build_phase_args \
     "$TOP_K_SLOWEST" \
     "$PER_REQUEST_LOG_PATH" \
     "$PRINT_PER_REQUEST" \
-    "$MEASURE_PROMPT_NAMESPACE"
+    "$MEASURE_PROMPT_NAMESPACE" \
+    "measurement" \
+    "$MAX_CONCURRENT_REQUESTS" \
+    "$RPS"
 
 # Step 1: Start nsys profiling with server
 echo "[1/5] Launching server"
@@ -520,6 +568,9 @@ if [[ -n "$MODEL_DIR" ]]; then
 fi
 if [[ -n "$LORA_DIRS" ]]; then
     SERVER_ARGS+=(--lora_dirs "$LORA_DIRS")
+fi
+if [[ -n "$LORA_CLONE_COUNT" ]]; then
+    SERVER_ARGS+=(--lora_clone_count "$LORA_CLONE_COUNT")
 fi
 if [[ -n "$TP" ]]; then
     SERVER_ARGS+=(--tp "$TP")
@@ -694,6 +745,55 @@ echo "[3/5] Sending benchmark traffic..."
 echo > benchmark_lora.log
 if [[ "$WARMUP_ENABLED" == "1" ]]; then
     run_client_phase "Warmup (excluded from measurement)" "${WARMUP_TEST_ARGS[@]}"
+    # Reset cumulative CoLoRA stats so measurement phase starts clean
+    if curl -sf "http://$SERVER_HOST:$SERVER_PORT/colora_stats" -o /dev/null 2>/dev/null; then
+        echo "CoLoRA stats reset after warmup"
+    fi
+
+    # Warm cache: block-promote all adapters used in warmup (only for colora_min)
+    if [[ -n "$WARMUP_ADAPTER_TRACE_PATH" && -f "$WARMUP_ADAPTER_TRACE_PATH" && "${MODE_LABEL:-}" == "colora_min" ]]; then
+        echo "Warming cache from warmup adapters..."
+        WARMUP_ADAPTER_IDS=$(python3 -c "
+import json, sys, re
+seen = set()
+with open('$WARMUP_ADAPTER_TRACE_PATH') as f:
+    for line in f:
+        aid = json.loads(line).get('adapter_id')
+        if aid and str(aid).lower() not in ('none', 'null', 'base', ''):
+            # Handle both numeric IDs and lora_dummy_XX format
+            m = re.match(r'lora_dummy_(\d+)', str(aid))
+            if m:
+                seen.add(m.group(1))
+            else:
+                seen.add(str(aid))
+print(json.dumps(list(seen)))
+")
+        if [[ "$WARMUP_ADAPTER_IDS" != "[]" ]]; then
+            echo "Promoting adapter IDs: $WARMUP_ADAPTER_IDS"
+            if curl -sf -X POST "http://$SERVER_HOST:$SERVER_PORT/colora_promote_adapters" \
+                 -H "Content-Type: application/json" \
+                 -d "{\"adapter_ids\": $WARMUP_ADAPTER_IDS}" \
+                 -o /tmp/colora_warm.json 2>/dev/null; then
+                cat /tmp/colora_warm.json
+                echo ""
+                echo "Cache warm complete"
+            else
+                echo "WARNING: /colora_promote_adapters failed or endpoint unavailable"
+            fi
+        fi
+    fi
+
+    # Freeze promotion (and prefetch) for measurement so cache residency stays fixed.
+    # Only needed for colora_min; colora_full keeps promoting, load_then_run does not use promotion.
+    if [[ "${MODE_LABEL:-}" == "colora_min" ]]; then
+        if curl -sf -X POST "http://$SERVER_HOST:$SERVER_PORT/colora_config" \
+             -H "Content-Type: application/json" \
+             -d '{"deferred_promotion_delta_steps":0,"temporal_prefetch":false}' \
+             -o /dev/null 2>/dev/null; then
+            echo "CoLoRA promotion/prefetch frozen for measurement"
+        fi
+    fi
+
     if [[ "$PHASE_GAP_S" != "0" ]]; then
         echo "Sleeping ${PHASE_GAP_S}s between warmup and measurement..." | tee -a benchmark_lora.log
         sleep "$PHASE_GAP_S"
@@ -711,6 +811,17 @@ else
             sleep 5
         fi
     done
+fi
+
+# Fetch CoLoRA stats from server before shutdown
+if [[ -n "$COLORA_STATS_PATH" ]]; then
+    echo "[3.5/5] Fetching CoLoRA stats from server..."
+    if curl -sf "http://$SERVER_HOST:$SERVER_PORT/colora_stats" -o "$COLORA_STATS_PATH" 2>/dev/null; then
+        echo "CoLoRA stats saved to: $COLORA_STATS_PATH"
+    else
+        echo "WARNING: Failed to fetch /colora_stats (endpoint may not exist for this policy); writing empty JSON"
+        echo '{}' > "$COLORA_STATS_PATH"
+    fi
 fi
 
 echo "[4/5] Stopping server before exit..."

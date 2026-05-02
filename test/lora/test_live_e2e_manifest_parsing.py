@@ -554,3 +554,55 @@ def test_benchmark_startup_cleanup_uses_non_fatal_pkill_guards():
     assert 'if pgrep -f "lightllm.server|lightllm::|gunicorn|multiprocessing.resource_tracker|multiprocessing.spawn" >/dev/null; then' in content
     assert 'pkill -9 -f "lightllm.server|lightllm::|gunicorn" 2>/dev/null || true' in content
     assert 'pkill -9 -f "multiprocessing.resource_tracker|multiprocessing.spawn" 2>/dev/null || true' in content
+
+
+def test_manifest_lora_clone_count_parses_and_builds_command():
+    from tools.evaluation.live_e2e.manifest import load_manifest
+    from tools.evaluation.live_e2e.runner import build_benchmark_command
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        content = """
+run_id: clone_test
+runs:
+  - run_label: colora_with_clones
+    suite_kind: paper
+    mode_label: execution_first
+    compute_device: "all:gpu"
+    lora_dirs: /tmp/lora_dummy_0
+    lora_clone_count: 10
+"""
+        manifest_path = _write_temp_manifest(tmp_path, content)
+        manifest = load_manifest(manifest_path)
+        assert len(manifest.runs) == 1
+        assert manifest.runs[0].lora_clone_count == 10
+
+        cmd = build_benchmark_command(manifest.runs[0], "test/lora/benchmark_lora.sh")
+        assert "--lora_clone_count 10" in cmd
+        assert "--lora_dirs /tmp/lora_dummy_0" in cmd
+
+
+def test_manifest_max_concurrent_requests_parses_and_builds_command():
+    from tools.evaluation.live_e2e.manifest import load_manifest
+    from tools.evaluation.live_e2e.runner import build_benchmark_command
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        content = """
+run_id: concurrency_test
+runs:
+  - run_label: colora_with_concurrency_limit
+    suite_kind: paper
+    mode_label: colora_min
+    compute_device: "all:gpu"
+    max_concurrent_requests: 32
+    warmup_requests: 512
+"""
+        manifest_path = _write_temp_manifest(tmp_path, content)
+        manifest = load_manifest(manifest_path)
+        assert len(manifest.runs) == 1
+        assert manifest.runs[0].max_concurrent_requests == 32
+
+        cmd = build_benchmark_command(manifest.runs[0], "test/lora/benchmark_lora.sh")
+        assert "--max_concurrent_requests 32" in cmd
+        assert "--warmup_num_requests 512" in cmd

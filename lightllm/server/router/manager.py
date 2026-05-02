@@ -422,6 +422,29 @@ class RouterManager:
                     if adapter_id in lora_manager._adapters:
                         lora_manager._evict_adapter(adapter_id)
                     response = {"message": f"Adapter {adapter_id} unloaded successfully"}
+            elif action == "colora_stats":
+                try:
+                    stats = await self.model_rpc_client.get_colora_stats()
+                    response = stats if stats else {}
+                except Exception as e:
+                    logger.error(f"[colora_stats] Failed to get stats: {e}")
+                    response = {"error": str(e)}
+            elif action == "colora_config":
+                try:
+                    config = request.get("config", {})
+                    ret = await self.model_rpc_client.set_colora_config(config)
+                    response = ret if ret else {"status": "ok"}
+                except Exception as e:
+                    logger.error(f"[colora_config] Failed to set config: {e}")
+                    response = {"error": str(e)}
+            elif action == "colora_promote_adapters":
+                try:
+                    adapter_ids = request.get("adapter_ids", [])
+                    ret = await self.model_rpc_client.promote_adapters(adapter_ids)
+                    response = ret if ret else {"status": "ok"}
+                except Exception as e:
+                    logger.error(f"[colora_promote_adapters] Failed: {e}")
+                    response = {"error": str(e)}
             else:
                 response = {"error": f"Unknown action: {action}"}
 

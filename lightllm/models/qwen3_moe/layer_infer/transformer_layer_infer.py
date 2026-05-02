@@ -97,6 +97,9 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
         self.use_detached_lora_: bool = False
         self.req_bins_: Optional[torch.Tensor] = None  # Per-request adapter indices for batched LoRA
 
+        # Persistent cumulative colora stats for /colora_stats endpoint
+        self._cumulative_colora_stats: Dict[str, float] = {}
+
         return
 
     def set_req_bins(self, req_bins: torch.Tensor):
@@ -350,6 +353,11 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
             "stale": 0,
             "not_ready": 0,
             "fallback": 0,
+            # Lock contention metrics (nanoseconds)
+            "infer_state_lock_count": 0,
+            "infer_state_lock_wait_ns": 0,
+            "infer_state_lock_hold_ns": 0,
+            "infer_state_lock_max_wait_ns": 0,
         }
 
     def _merge_colora_stats(self, agg_stats: Dict[str, float]) -> None:
@@ -401,6 +409,39 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
             agg_stats["overlap_ratio_count"] += 1
         agg_stats["promotion_queue_depth"] = int(stats.get("promotion_queue_depth", agg_stats["promotion_queue_depth"]))
         agg_stats["cache_hit_rate"] = float(stats.get("cache_hit_rate", agg_stats["cache_hit_rate"]))
+
+        # Also accumulate into persistent stats for /colora_stats endpoint.
+        # Gauge keys (current state) use last-value semantics;
+        # counter keys use cumulative sum.
+        gauge_keys = {
+            "promotion_queue_depth",
+            "promotion_drop_queue_high_watermark",
+            "cache_capacity_slots", "cache_resident_slots", "cache_free_slots",
+            "gate_capacity_slots", "gate_resident_slots", "gate_free_slots",
+            "up_capacity_slots", "up_resident_slots", "up_free_slots",
+            "down_capacity_slots", "down_resident_slots", "down_free_slots",
+            "overlap_ratio",
+            "cache_hit_rate", "cache_miss_rate",
+            "cpu_queue_depth",
+        }
+        for key, value in stats.items():
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                continue
+            if key in gauge_keys:
+                self._cumulative_colora_stats[key] = float(value)
+            else:
+                if key in self._cumulative_colora_stats:
+                    self._cumulative_colora_stats[key] += float(value)
+                else:
+                    self._cumulative_colora_stats[key] = float(value)
+
+    def get_cumulative_colora_stats(self) -> Dict[str, float]:
+        """Return a copy of the persistent cumulative colora stats."""
+        return dict(self._cumulative_colora_stats)
+
+    def reset_cumulative_colora_stats(self) -> None:
+        """Reset the persistent cumulative colora stats."""
+        self._cumulative_colora_stats.clear()
 
     def _get_study2_profile_prefix(self, expert_id: int, step_idx: int, token_count: int) -> Optional[str]:
         """Build Study2 NVTX prefix for real-model profiling when enabled via env."""
@@ -1483,7 +1524,7 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
             overlap_ratio_avg = 0.0
             if colora_stats["overlap_ratio_count"] > 0:
                 overlap_ratio_avg = colora_stats["overlap_ratio_sum"] / float(colora_stats["overlap_ratio_count"])
-            logger.debug(
+            logger.info(
                 "[COLoRA] layer=%s hit_tokens=%s miss_tokens=%s queue_depth=%s hit_rate=%.4f "
                 "cpu_compute_time=%.6f gpu_compute_time=%.6f cpu_queue_wait=%.6f "
                 "d2h_bytes=%.0f h2d_bytes=%.0f overlap_ratio=%.4f fallback_degrade_count=%s cpu_queue_depth=%s "

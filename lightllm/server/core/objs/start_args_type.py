@@ -25,6 +25,7 @@ class StartArgs:
     model_name: str = field(default="default_model_name")
     model_dir: Optional[str] = field(default=None)
     lora_dir: Optional[str] = field(default=None)
+    lora_clone_count: int = field(default=1)
     lora_max_size: int = field(default=1024)  # Max LoRA adapters in memory
     tokenizer_mode: str = field(default="slow")
     load_way: str = field(default="HF")

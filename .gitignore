@@ -41,3 +41,4 @@ configs/live_e2e/*.yaml
 
 results/
 autoresearch-results.tsv
+.claude/plans

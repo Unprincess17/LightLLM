@@ -149,13 +149,24 @@ class HttpServerManager:
 
     def _build_lora_name_to_id_map(self, lora_dir_arg: Optional[str]) -> Dict[str, int]:
         mapping: Dict[str, int] = {}
-        for adapter_id, adapter_dir in enumerate(self._split_lora_dirs(lora_dir_arg), start=1):
+        dirs = self._split_lora_dirs(lora_dir_arg)
+        clone_count = getattr(self.args, "lora_clone_count", 1)
+        for adapter_id, adapter_dir in enumerate(dirs, start=1):
             abs_dir = os.path.abspath(adapter_dir)
             base_name = os.path.basename(os.path.normpath(abs_dir))
             mapping[str(adapter_id)] = adapter_id
             mapping[abs_dir] = adapter_id
             if base_name:
                 mapping[base_name] = adapter_id
+        if clone_count > 1 and dirs:
+            first_base_name = os.path.basename(os.path.normpath(os.path.abspath(dirs[0])))
+            for i in range(2, clone_count + 1):
+                mapping[str(i)] = i
+                if first_base_name.endswith("_0") and len(first_base_name) > 2:
+                    clone_base = first_base_name[:-2]
+                    mapping[f"{clone_base}_{i - 1}"] = i
+                else:
+                    mapping[f"{first_base_name}_clone_{i - 1}"] = i
         if mapping:
             logger.info(
                 "[LoRA] Request adapter mapping initialized: "
