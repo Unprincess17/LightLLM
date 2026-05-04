@@ -921,6 +921,18 @@ class ModeBackend:
                         f"{pause_duration:.1f}s (timeout: {colora_timeout}s), "
                         f"clearing pause state. Request may have incomplete state."
                     )
+                    # CRITICAL FIX: Decrement ref_count to prevent stuck requests
+                    # The ref_count was incremented by InferReq._init_all_state() but
+                    # never decremented for paused requests that timeout without finishing
+                    if not (req_obj.shm_req.can_released_mark or req_obj.shm_req.is_aborted):
+                        # Request isn't finished - release ref_count and mark as aborted
+                        # to prevent the request from being stuck forever
+                        g_infer_context.shm_req_manager.put_back_req_obj(req_obj.shm_req)
+                        req_obj.shm_req.is_aborted = True
+                        logger.warning(
+                            f"[COLoRA] Aborting timed-out request {req_obj.req_id} due to "
+                            f"unfinished pause state"
+                        )
                     # Clear the pause state to unblock the request
                     req_obj.colora_paused = False
                     req_obj.colora_pause_time = 0.0

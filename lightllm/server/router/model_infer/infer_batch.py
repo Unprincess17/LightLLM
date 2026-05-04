@@ -299,6 +299,9 @@ class InferenceContext:
                         f"can_released={req_obj.shm_req.can_released_mark}, "
                         f"is_aborted={req_obj.shm_req.is_aborted}"
                     )
+                    # CRITICAL FIX: Decrement ref_count that was incremented in _init_all_state
+                    # This prevents requests from being stuck with refcount > 1
+                    g_infer_context.shm_req_manager.put_back_req_obj(req_obj.shm_req)
                     # Clear the pause state and continuation to unblock the request
                     req_obj.colora_paused = False
                     req_obj.colora_pause_time = 0.0
