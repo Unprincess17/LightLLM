@@ -468,7 +468,7 @@ We implement residency management as a background service, separate from foregro
 \label{sec:evaluation}
 
 \subsection{Experiment Setup}
-\label{setup}
+\label{subsec:setup}
 
 \paragraph{Testbed and model.}
 We evaluate CoLoRA on a server with 2 NVIDIA A100 GPUs, an Intel Xeon Gold 5520+ CPU, and 376~GiB host memory. Unless otherwise stated, all experiments use a single inference server instance. The base model remains resident on GPU, while expert--LoRA objects are stored in host memory and cached in GPU memory on demand. CPU cold-path workers are pinned to physical cores and use pinned host buffers for activation and residual transfers. We use Qwen3-VL-MoE-30B-A3B as the sparse MoE backbone, with LoRA modules attached to expert FFN layers. The runtime manages residency at expert--LoRA granularity, keyed by projection, layer, expert, and adapter identity.
@@ -607,40 +607,28 @@ Taken together, these controlled-pressure results demonstrate that execution-fir
   \includegraphics[width=\linewidth]{figures/fig_cold_recovery_singlecol.pdf}
   \caption{
   Single-miss recovery at one MoE layer.
-  (a) Latency breakdown for a representative decode configuration
-  (rank 16, batch 8). Promotion-first is dominated by H2D transfer of the
-  full expert--LoRA object, while execution-first replaces this foreground
-  weight transfer with activation/residual movement and CPU LoRA compute.
+  (a) Standalone service-time breakdown for rank 16 and batch size 8.
+  Promotion-first is dominated by H2D transfer of the full expert--LoRA
+  object, while execution-first replaces full-object movement with
+  activation/residual movement and CPU residual computation.
   (b) Speedup of execution-first over promotion-first across ranks and
-  batch sizes. Execution-first is faster in all 16 configurations, with a
-  2.48$\times$ geometric-mean speedup.
+  decode batch sizes. Execution-first is faster in all 16 configurations,
+  with a 2.48$\times$ geometric-mean speedup.
   }
-\label{fig:microbreakdown}
+  \label{fig:microbreakdown}
 \end{figure}
 
-We first isolate a single GPU-cold expert--LoRA miss at one MoE layer. This microbenchmark removes scheduling, cache replacement, queueing, and overlap, leaving only the recovery cost paid by the current decode step. The goal is to validate the local mechanism behind CoLoRA: on a cold miss, execution-first recovery should reduce foreground latency by avoiding immediate full-object promotion.
+We first isolate a single GPU-cold expert--LoRA miss at one MoE layer. Section~\ref{subsec:feasibility} predicts that promotion-first and execution-first differ in the synchronous payload placed on the decode path: promotion-first moves the full expert--LoRA object, while execution-first moves only activation- and residual-sized state. This microbenchmark tests whether that payload asymmetry translates into lower standalone miss-recovery service time.
 
-We compare two recovery policies. Promotion-first transfers the missing expert--LoRA object to GPU memory before computing the LoRA residual on GPU. Execution-first instead sends the current activation to the host, computes the missing LoRA residual on CPU from host-resident weights, and returns only the residual to the GPU. Thus, the key difference is the synchronous payload on the critical path: promotion-first moves a full weight object, while execution-first moves only activation- and residual-sized state.
+The experiment removes scheduling, cache replacement, queueing, and cross-request overlap. It therefore does not measure end-to-end exposed latency; it measures the local service time of one miss before any overlap provided by the full runtime. Promotion-first transfers the missing expert--LoRA object to GPU memory before computing the LoRA residual on GPU. Execution-first sends the current activation to the host, computes the missing residual on CPU from host-resident weights, and returns only the residual to the GPU.
 
-Following Section~\ref{subsec:feasibility}, we decompose execution-first recovery as
-\[
-T_{\mathrm{cold}} =
-T_{\mathrm{pack}} + T_{\mathrm{D2H}} + T_{\mathrm{cpu}} +
-T_{\mathrm{H2D}} + T_{\mathrm{merge}},
-\]
-where the terms denote activation packing, D2H activation transfer, CPU LoRA computation, H2D residual transfer, and merge. We decompose promotion-first recovery as
-\[
-T_{\mathrm{promote}} =
-T_{\mathrm{admit}} + T_{\mathrm{H2D\text{-}weights}} + T_{\mathrm{gpu}},
-\]
-where the dominant foreground cost is H2D transfer of the missing expert--LoRA weights. We sweep LoRA rank $\{8,16,32,64\}$ and decode batch size $\{1,2,4,8\}$, covering the small-batch decode regime where per-token stalls are most visible.
+We instrument the corresponding components of each path. For promotion-first, we report admission, H2D expert--LoRA weight transfer, and GPU LoRA computation. For execution-first, we report activation packing, D2H activation transfer, CPU residual computation, H2D residual transfer, and merge. We sweep LoRA rank $\{8,16,32,64\}$ and decode batch size $\{1,2,4,8\}$, covering the small-batch decode regime where per-token stalls are most visible.
 
+Figure~\ref{fig:microbreakdown} reports the standalone service time of one cold miss. In the representative rank-16, batch-8 configuration, promotion-first takes 321~$\mu$s, while execution-first takes 161~$\mu$s. The breakdown attributes the gap to payload size: promotion-first waits for full expert--LoRA weight transfer before execution can resume, whereas execution-first avoids this transfer and instead pays CPU residual computation plus small activation/residual transfers.
 
-Figure~\ref{fig:microbreakdown} reports the service time of one cold miss. In the representative configuration, promotion-first takes 321~$\mu$s, while execution-first takes 161~$\mu$s. The breakdown shows the source of the gap: promotion-first waits for full-object H2D transfer before execution can resume, whereas execution-first avoids this transfer and pays only CPU residual computation plus small activation/residual transfers.
+Across the sweep, execution-first is faster in all 16 configurations, with speedups from 1.2$\times$ to 5.2$\times$ and a 2.48$\times$ geometric mean. The speedups are configuration-dependent rather than monotonic in rank or batch size, because the two paths scale with different quantities: promotion-first scales with full-object transfer size, while execution-first scales with CPU computation and staging overhead.
 
-Across the full sweep, execution-first is faster in every configuration, with speedups from 1.2$\times$ to 5.2$\times$ and a 2.48$\times$ geometric mean. The gains are configuration-dependent rather than monotonic in rank or batch size: promotion-first becomes more expensive as the transferred object grows, while execution-first also pays increasing CPU compute and staging overhead.
-
-This result supports the systems premise of CoLoRA: the cost of a cold miss is determined not only by where the residual is computed, but by what recovery work is placed on the decode critical path. Execution-first changes the miss from a foreground residency-restoration event into a bounded residual-computation event. This is a deliberately narrow mechanism. It is beneficial when the missed object has weak near-term reuse and full-object promotion is unlikely to amortize, but promotion-first can be preferable when reuse is strong or the cold-path computation becomes large.
+These results validate the predicted payload asymmetry: for a cold expert--LoRA miss, the critical cost is not only where computation runs, but what state must be moved before the current decode step can proceed. Execution-first is effective when the current token needs only a residual and near-term reuse is too weak to justify immediate full-object promotion. Conversely, when reuse is strong enough to amortize weight transfer, or when CPU-side residual computation dominates, promotion-first can be competitive.
 
 \subsection{Ablation Study}
 % Note:
