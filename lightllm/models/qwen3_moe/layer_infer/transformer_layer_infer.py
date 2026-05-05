@@ -96,6 +96,7 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
         self.lora_dispatcher_: Optional[Any] = None
         self.use_detached_lora_: bool = False
         self.req_bins_: Optional[torch.Tensor] = None  # Per-request adapter indices for batched LoRA
+        self.trace_expert_injection_: Optional[Any] = None  # TraceExpertInjection for forcing expert selection
 
         # Persistent cumulative colora stats for /colora_stats endpoint
         self._cumulative_colora_stats: Dict[str, float] = {}
@@ -109,6 +110,14 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
             req_bins: Tensor of shape [batch_size] containing per-request adapter indices
         """
         self.req_bins_ = req_bins
+
+    def set_trace_expert_injection(self, injection):
+        """Set the TraceExpertInjection object for forcing expert selection from trace.
+
+        Args:
+            injection: TraceExpertInjection instance or None to disable
+        """
+        self.trace_expert_injection_ = injection
 
     def _validate_decode_colora_metadata(self, infer_state: LlamaInferStateInfo, num_tokens: int) -> None:
         if not _colora_phase1_metadata_validation_enabled():
@@ -913,6 +922,20 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
         # ----------------------------------------------------------------
         if not use_per_expert_lora:
             router_logits = layer_weight.moe_gate.mm(hidden_states)
+
+            # Trace Expert Injection: bias router_logits to force trace-specified experts
+            trace_injection = getattr(self, 'trace_expert_injection_', None)
+            if trace_injection is not None:
+                req_indices = self._expand_req_indices_for_trace(infer_state, num_tokens)
+                token_positions = self._extract_token_positions_for_trace(infer_state, num_tokens)
+                router_logits = trace_injection.bias_router_logits(
+                    router_logits=router_logits,
+                    layer_id=self.layer_num_,
+                    req_indices=req_indices,
+                    token_positions=token_positions,
+                    top_k=self.num_experts_per_tok,
+                )
+
             adapter_profile_enabled = (
                 os.environ.get("MOE_ADAPTER_EXPERT_PROFILING", "0") == "1"
                 and self.req_bins_ is not None
@@ -965,6 +988,19 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
         # 1. Router computation
         with NvtxAnnotate("MoE_SlowPath_RouterComputation"):
             router_logits = layer_weight.moe_gate.mm(hidden_states)
+
+        # Trace Expert Injection: bias router_logits to force trace-specified experts
+        trace_injection = getattr(self, 'trace_expert_injection_', None)
+        if trace_injection is not None:
+            req_indices = self._expand_req_indices_for_trace(infer_state, num_tokens)
+            token_positions = self._extract_token_positions_for_trace(infer_state, num_tokens)
+            router_logits = trace_injection.bias_router_logits(
+                router_logits=router_logits,
+                layer_id=self.layer_num_,
+                req_indices=req_indices,
+                token_positions=token_positions,
+                top_k=self.num_experts_per_tok,
+            )
 
         # 2. Explicit routing
         with NvtxAnnotate("MoE_SlowPath_TopKRouting"):

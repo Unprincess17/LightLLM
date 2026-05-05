@@ -548,6 +548,9 @@ fi
 if [[ -n "$COLORA_MAX_CONTINUATIONS" ]]; then
     CMD="$CMD --colora_max_continuations $COLORA_MAX_CONTINUATIONS"
 fi
+if [[ -n "$MOE_ROUTER_TRACE_PATH" && -f "$MOE_ROUTER_TRACE_PATH" ]]; then
+    CMD="$CMD --router_trace_path $MOE_ROUTER_TRACE_PATH"
+fi
 
 # Export environment variables
 export LOADWORKER=$LOADWORKER

@@ -286,6 +286,14 @@ def make_argument_parser() -> argparse.ArgumentParser:
         This enables per-expert LoRA but significantly reduces throughput.
         Used for baseline performance testing.""",
     )
+    parser.add_argument(
+        "--router_trace_path",
+        type=str,
+        default=None,
+        help="Path to router trace for expert injection (.jsonl). "
+        "When set, TraceExpertInjection will load the trace and force "
+        "expert selection per (req_idx, layer_id, token_pos).",
+    )
 
     parser.add_argument(
         "--tokenizer_mode",

@@ -106,11 +106,12 @@ class Autotuner:
 
         self.configs_gen_func = configs_gen_func
         self.kernel_name = kernel_name
+        device_name = get_current_device_name() or "unknown_device"
         self.cache_dir = os.path.join(
             Path(__file__).parent,
             "autotune_kernel_configs",
             get_triton_version(),
-            get_current_device_name(),
+            device_name,
             self.kernel_name,
         )
         os.makedirs(self.cache_dir, exist_ok=True)

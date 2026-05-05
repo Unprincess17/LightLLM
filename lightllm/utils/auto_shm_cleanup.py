@@ -27,6 +27,7 @@ class AutoShmCleanup:
         self.registered_posix_shm_names = []
         self.cleanup_callbacks: list[Callable[[], None]] = []
         self.signal_handlers_registered = False
+        self._cleaned_up = False
         self._register_handlers_for_cleanup()
 
     def _init_libc(self):
@@ -42,12 +43,14 @@ class AutoShmCleanup:
 
     def _register_handlers_for_cleanup(self):
         atexit.register(self._cleanup)
-        self.register_signal_handlers()
 
     def register_signal_handlers(self):
         if self.signal_handlers_registered or not threading.current_thread() is threading.main_thread():
             return
         for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            existing = signal.getsignal(sig)
+            if existing is not None and existing != signal.SIG_DFL:
+                continue
             signal.signal(sig, self._signal_cleanup_handler)
         self.signal_handlers_registered = True
 
@@ -69,6 +72,9 @@ class AutoShmCleanup:
 
     def _cleanup(self):
         """清理：System V 执行 IPC_RMID，POSIX 执行 unlink。"""
+        if self._cleaned_up:
+            return
+        self._cleaned_up = True
         for callback in self.cleanup_callbacks:
             try:
                 callback()

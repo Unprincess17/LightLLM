@@ -299,10 +299,21 @@ class InferenceContext:
                         f"can_released={req_obj.shm_req.can_released_mark}, "
                         f"is_aborted={req_obj.shm_req.is_aborted}"
                     )
-                    # CRITICAL FIX: Decrement ref_count that was incremented in _init_all_state
-                    # This prevents requests from being stuck with refcount > 1
+                    # CRITICAL FIX: Always release ref_count for both finished and aborted requests
+                    # Aborted requests (e.g., from client disconnect) might not have can_released_mark set
+                    # We need to ensure the ref_count is decremented to prevent reference leaks
+                    if not req_obj.shm_req.can_released_mark:
+                        # Aborted request - set can_released_mark to ensure proper cleanup
+                        req_obj.shm_req.can_released_mark = True
+                    # Release the ref_count that was incremented in _init_all_state()
+                    # but never decremented for paused requests
                     g_infer_context.shm_req_manager.put_back_req_obj(req_obj.shm_req)
-                    # Clear the pause state and continuation to unblock the request
+                    # Add idempotency check to prevent double-free
+                    if not req_obj.colora_paused:
+                        # Only release if still paused (to prevent double-free if timeout handler
+                        # already released it)
+                        g_infer_context.shm_req_manager.put_back_req_obj(req_obj.shm_req)
+                    # Clear pause state and continuation to unblock the request Clear pause state and continuation to unblock the request
                     req_obj.colora_paused = False
                     req_obj.colora_pause_time = 0.0
                     req_obj.colora_continuation = None

@@ -69,6 +69,7 @@ Server pass-through options:
   --server_stdout_log PATH
   --server_host HOST          Bind / health-check host (default: localhost)
   --server_port PORT          Bind port for server and client URL (default: 8040)
+  --router_trace_path PATH    Path to router trace for expert injection (.jsonl)
 USAGE
 }
 
@@ -139,6 +140,7 @@ COLORA_SPEC_LAYER_WHITELIST=""
 COLORA_REQUEST_SKIP=""
 COLORA_MAX_CONTINUATIONS=""
 COLORA_HIT_INDEXING=""
+ROUTER_TRACE_PATH=""
 SERVER_LOG_PATH=""
 SERVER_PID=""
 SERVER_STDOUT_LOG=""
@@ -354,6 +356,7 @@ while [[ $# -gt 0 ]]; do
 		--colora_request_skip) COLORA_REQUEST_SKIP="$2"; shift 2 ;;
 		--colora_max_continuations) COLORA_MAX_CONTINUATIONS="$2"; shift 2 ;;
 		--colora_hit_indexing) COLORA_HIT_INDEXING="$2"; shift 2 ;;
+        --router_trace_path) ROUTER_TRACE_PATH="$2"; shift 2 ;;
         --server_log_path) SERVER_LOG_PATH="$2"; shift 2 ;;
         --server_stdout_log) SERVER_STDOUT_LOG="$2"; shift 2 ;;
         --server_host) SERVER_HOST="$2"; shift 2 ;;
@@ -678,6 +681,9 @@ fi
 if [[ -n "$COLORA_HIT_INDEXING" ]]; then
     SERVER_ARGS+=(--colora_hit_indexing "$COLORA_HIT_INDEXING")
 fi
+if [[ -n "$ROUTER_TRACE_PATH" ]]; then
+    SERVER_ARGS+=(--router_trace_path "$ROUTER_TRACE_PATH")
+fi
 # Redirect server output
 if [[ -n "$SERVER_STDOUT_LOG" ]]; then
     # User specified explicit output location for stdout/stderr.
@@ -784,13 +790,13 @@ print(json.dumps(list(seen)))
     fi
 
     # Freeze promotion (and prefetch) for measurement so cache residency stays fixed.
-    # Only needed for colora_min; colora_full keeps promoting, load_then_run does not use promotion.
+    # Only needed for colora_min; colora_full and load_then_run keeps promoting.
     if [[ "${MODE_LABEL:-}" == "colora_min" ]]; then
         if curl -sf -X POST "http://$SERVER_HOST:$SERVER_PORT/colora_config" \
              -H "Content-Type: application/json" \
-             -d '{"deferred_promotion_delta_steps":0,"temporal_prefetch":false}' \
+             -d '{"deferred_promotion_delta_steps":10000,"temporal_prefetch":false}' \
              -o /dev/null 2>/dev/null; then
-            echo "CoLoRA promotion/prefetch frozen for measurement"
+            echo "CoLoRA promotion frozen for measurement (deferred_promotion_delta_steps=10000)"
         fi
     fi
 

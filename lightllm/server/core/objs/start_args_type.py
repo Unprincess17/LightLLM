@@ -160,6 +160,11 @@ class StartArgs:
     colora_max_continuations: int = field(default=8)
     # Force slow path for LoRA (per-expert baseline)
     force_slow_lora_path: bool = field(default=False)
+    # Router trace for expert injection (forces expert selection per request/layer/token)
+    router_trace_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to router trace for expert injection (.jsonl)"}
+    )
     # multi_modal
     enable_multimodal: bool = field(default=False)
     enable_multimodal_audio: bool = field(default=False)

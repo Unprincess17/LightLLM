@@ -237,6 +237,7 @@ class RouterManager:
             "lora_adapter_id": self.args.lora_adapter_id,
             "lora_port": self.args.lora_port,
             "compute_device": self.args.compute_device,
+            "router_trace_path": self.args.router_trace_path,
         }
 
         await self.model_rpc_client.init_model(kvargs=kvargs)

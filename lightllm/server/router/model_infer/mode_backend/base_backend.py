@@ -1,12 +1,13 @@
 import os
 import json
+from pathlib import Path
 import numpy as np
 import torch
 import time
 import threading
 from dataclasses import replace
 import torch.distributed as dist
-from typing import List, Tuple, Callable, Optional, Dict, Set
+from typing import Any, List, Tuple, Callable, Optional, Dict, Set
 from transformers.configuration_utils import PretrainedConfig
 from lightllm.utils.infer_utils import set_random_seed
 from lightllm.utils.log_utils import init_logger
@@ -49,9 +50,11 @@ from lightllm.server.pd_io_struct import NIXLChunckedTransTaskRet
 from .multi_level_kv_cache import MultiLevelKvCacheModule
 from lightllm.server.embed_cache.embed_cache_client import CpuEmbedCacheClient
 
+
 class ModeBackend:
     def __init__(self) -> None:
         self.shm_req_manager = ShmReqManager()
+        self._shutdown_event = threading.Event()
 
         self.overlap_event_manager = OverlapEventManager()
         # 标识是否支持 overlap 功能，很多子类模式如 xgrammar 和 outlines 当前不支持 overlap 高性能模式
@@ -79,6 +82,9 @@ class ModeBackend:
         self._enable_radix_tree_timer_merge: bool = enable_radix_tree_timer_merge()
         self._radix_tree_merge_update_delta: int = get_radix_tree_merge_update_delta()
         self._decode_step_id: int = 0
+
+        # Router trace for expert injection
+        self.trace_expert_injection_: Optional[Any] = None
         pass
 
     def _alloc_decode_step_id(self) -> int:
@@ -400,6 +406,11 @@ class ModeBackend:
             )
             self.init_batched_lora_adapters(lora_adapter_dirs)
 
+        # Load router trace for expert injection
+        router_trace_path = kvargs.get("router_trace_path", None)
+        if router_trace_path:
+            self.trace_expert_injection_ = self._load_trace_expert_injection(router_trace_path)
+
         self.radix_cache = (
             RadixCache(
                 get_unique_server_name(),
@@ -578,7 +589,15 @@ class ModeBackend:
         )
         return next_token_ids_cpu, next_token_logprobs_cpu
 
+    def request_shutdown(self):
+        self._shutdown_event.set()
+        for t in [getattr(self, "infer_loop_thread", None), getattr(self, "infer_loop_thread1", None)]:
+            if t is not None and t.is_alive():
+                t.join(timeout=5)
+
     def _try_read_new_reqs(self):
+        if self._shutdown_event.is_set():
+            raise SystemExit("shutdown requested")
         if self.is_multinode_tp:
             self._try_read_new_reqs_multinode_tp()
         else:
@@ -839,6 +858,8 @@ class ModeBackend:
                     continue
 
                 # Track colora_paused requests for timeout detection
+                # Only track if not already marked as released/aborted
+                # to prevent double-processing of timed-out requests
                 colora_paused_reqs.append(req_obj)
                 continue
 
@@ -906,9 +927,8 @@ class ModeBackend:
             )
 
         # Handle stuck COLoRA paused requests (timeout detection)
-        # If a request has been paused for too long, clear the pause state
-        # to allow recovery. This prevents requests from being stuck forever
-        # if the CPU completion worker crashes or hangs.
+        # If a request has been paused for too long, abort it immediately
+        # to prevent reference leaks and race conditions.
         if colora_paused_reqs:
             current_time = time.time()
             colora_timeout = 30.0  # 30 seconds timeout for CPU completion
@@ -919,30 +939,44 @@ class ModeBackend:
                     logger.warning(
                         f"[COLoRA] Request {req_obj.req_id} has been paused for "
                         f"{pause_duration:.1f}s (timeout: {colora_timeout}s), "
-                        f"clearing pause state. Request may have incomplete state."
+                        f"aborting timed-out paused request."
                     )
-                    # CRITICAL FIX: Decrement ref_count to prevent stuck requests
-                    # The ref_count was incremented by InferReq._init_all_state() but
-                    # never decremented for paused requests that timeout without finishing
-                    if not (req_obj.shm_req.can_released_mark or req_obj.shm_req.is_aborted):
-                        # Request isn't finished - release ref_count and mark as aborted
-                        # to prevent the request from being stuck forever
+                    # CRITICAL FIX: Release reference and cleanup immediately here
+                    # to prevent race conditions and reference leaks.
+                    # This is done atomically in the timeout handler
+                    # instead of clearing pause state and letting it be processed
+                    # in the next iteration (which could cause double-free).
+                    g_infer_state_lock.acquire()
+                    try:
+                        # Ensure can_released_mark is set for cleanup
+                        if not req_obj.shm_req.can_released_mark:
+                            req_obj.shm_req.can_released_mark = True
+
+                        # Abort request (this will be seen by filter_reqs())
+                        if not req_obj.shm_req.is_aborted:
+                            req_obj.shm_req.is_aborted = True
+
+                        # Release the ref_count that was incremented in _init_all_state()
+                        # This ensures reference is decremented exactly once
                         g_infer_context.shm_req_manager.put_back_req_obj(req_obj.shm_req)
-                        req_obj.shm_req.is_aborted = True
-                        logger.warning(
-                            f"[COLoRA] Aborting timed-out request {req_obj.req_id} due to "
-                            f"unfinished pause state"
+
+                        # Clear all pause/continuation state
+                        req_obj.colora_paused = False
+                        req_obj.colora_pause_time = 0.0
+                        req_obj.colora_continuation = None
+
+                        logger.info(
+                            f"[COLoRA] Timed-out request {req_obj.req_id} "
+                            f"aborted and reference released"
                         )
-                    # Clear the pause state to unblock the request
-                    req_obj.colora_paused = False
-                    req_obj.colora_pause_time = 0.0
-                    req_obj.colora_continuation = None
+                    finally:
+                        g_infer_state_lock.release()
                     colora_timeout_reqs.append(req_obj)
 
-            # If we timed out any requests, they will be re-processed in next iteration
-            # They may have incomplete state but at least won't be stuck forever
-            if colora_timeout_reqs:
-                g_infer_context.recover_colora_paused_reqs(colora_timeout_reqs)
+            # Note: We do NOT call recover_colora_paused_reqs() here
+            # because we've already handled reference release atomically in this loop.
+            # Timed-out requests will be filtered normally in the next iteration
+            # since is_aborted=True is set and colora_paused is cleared.
 
         return prefill_reqs, decode_reqs
 
@@ -1213,6 +1247,28 @@ class ModeBackend:
             self.lora_support = False
             self.logger.warning("LoRA modules not available, detached LoRA serving disabled")  # 0 means no adapter
 
+    def _load_trace_expert_injection(self, router_trace_path: str) -> Optional[Any]:
+        """Load TraceExpertInjection from router trace file."""
+        if not router_trace_path or not Path(router_trace_path).exists():
+            return None
+
+        from lightllm.server.lora.trace_expert_injection import TraceExpertInjection
+
+        num_experts = getattr(self.args, 'num_experts', 32)
+        injection = TraceExpertInjection(num_experts=num_experts)
+
+        try:
+            event_count = injection.load_router_trace(router_trace_path)
+            self.logger.info(
+                "[Router Trace] Loaded %d router events from %s",
+                event_count,
+                router_trace_path,
+            )
+            return injection
+        except Exception as e:
+            self.logger.error("[Router Trace] Failed to load from %s: %s", router_trace_path, e)
+            return None
+
     # =====================================================================
     # S-LoRA Batched LoRA Mode Support
     # =====================================================================
@@ -1313,9 +1369,10 @@ class ModeBackend:
                     )
 
             # - Memory per slot: ~(rank * (hiddenA + hiddenB)) * 2 bytes
-            num_experts = getattr(self.model.config, 'num_local_experts', 1)
+            num_experts = getattr(self.model.config, 'num_experts',
+                           getattr(self.model.config, 'num_local_experts', 1))
             estimated_slots_per_adapter = num_layers * num_experts
-            target_adapters = 256  # Support up to 64 concurrent adapters
+            target_adapters = 64  # Support up to 64 concurrent adapters
             pool_size = max(1024, target_adapters * estimated_slots_per_adapter)
 
             self.lora_mem_pool = create_lora_mem_pool(
@@ -1665,6 +1722,9 @@ class ModeBackend:
         for layer_infer in self.model.layers_infer:
             layer_infer.use_detached_lora_ = True
             layer_infer.force_slow_lora_path = getattr(self, 'force_slow_lora_path', False)
+            trace_injection = getattr(self, 'trace_expert_injection_', None)
+            if trace_injection is not None and hasattr(layer_infer, 'set_trace_expert_injection'):
+                layer_infer.set_trace_expert_injection(trace_injection)
 
         # Run the actual inference
         # The actual inference logic is in the subclass implementations

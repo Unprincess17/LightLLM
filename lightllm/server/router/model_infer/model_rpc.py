@@ -55,6 +55,7 @@ class ModelRpcServer:
         self.info_queue = info_queue
         self.rpc_event = rpc_event
         self.rpc_finished_event = rpc_finished_event
+        self._shutdown_event = threading.Event()
 
         self.rpc_shm_params = RpcShmParams()
         self.rpc_shm_params.create_or_link_shm()
@@ -74,9 +75,13 @@ class ModelRpcServer:
 
     def rpc_loop(self):
         error_count = 0
-        while True:
+        while not self._shutdown_event.is_set():
             try:
-                self.rpc_event.wait()
+                self.rpc_event.wait(timeout=1.0)
+                if self._shutdown_event.is_set():
+                    break
+                if not self.rpc_event.is_set():
+                    continue
                 func_name, args = self.rpc_shm_params.read_func_params()
 
                 ans = getattr(self, func_name)(*args)
@@ -86,12 +91,16 @@ class ModelRpcServer:
                 # 下面得执行顺序不可随意交换, 否则容易出现同步或者死锁问题。
                 self.rpc_shm_sync_status.add_mark(self.rank_in_node)
                 while not self.rpc_shm_sync_status.run_finished():
+                    if self._shutdown_event.is_set():
+                        return
                     pass
 
                 self.rpc_event.clear()
 
                 self.rpc_shm_sync_status.add_mark1(self.rank_in_node)
                 while not self.rpc_shm_sync_status.run_finished1():
+                    if self._shutdown_event.is_set():
+                        return
                     pass
 
                 if self.rank_in_node == 0:
@@ -301,7 +310,10 @@ class ModelRpcServer:
         }
 
     def cleanup_shared_memory(self):
+        self._shutdown_event.set()
         if hasattr(self, "backend") and self.backend is not None:
+            if hasattr(self.backend, "request_shutdown"):
+                self.backend.request_shutdown()
             backend_model = getattr(self.backend, "model", None)
             if backend_model is not None and getattr(backend_model, "mem_manager", None) is not None:
                 backend_model.mem_manager.cleanup_shared_memory()
