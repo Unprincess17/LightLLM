@@ -1,5 +1,7 @@
 \documentclass[sigplan,anonymous,review,10pt]{acmart}
 \usepackage{subcaption}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
 
 \AtBeginDocument{%
   \providecommand\BibTeX{{%
@@ -414,11 +416,41 @@ With the cold path realized as a bounded execution substrate, the remaining chal
 \subsection{Decoupled Miss-Recovery Scheduler}
 \label{subsec:scheduler}
 
-The execution-first architecture requires a scheduler that explicitly decouples cold-miss recovery from the main GPU execution stream. This scheduler integrates heterogeneous miss handling with continuous batching: rather than treating batch membership as fixed within each decode step, it allows temporary miss-induced peel-off and later reinsertion. 
-The faulting request absorbs the cold-path cost, while unrelated ready requests continue making forward progress on the GPU hot path.
+CoLoRA extends continuous batching from token-level request admission to layer-level miss recovery. Conventional continuous batching allows requests to enter or leave across decode iterations, but typically executes the active batch as a synchronized group within each model step. CoLoRA relaxes this assumption for expert--LoRA computation. When a request encounters a GPU-cold expert--LoRA object at layer $L$, the scheduler peels off only the faulting request into the cold path, while the remaining GPU-ready requests continue on the hot path. After the missing LoRA residual is computed and merged into the layer-$L$ activation state, the request is reinserted at its next valid execution point.
+
+This layer-level skip-and-reinsert policy realizes execution-first recovery at the scheduler level. A cold miss no longer requires synchronous promotion of the missing weight object before the batch can proceed. Instead, CoLoRA keeps ready work moving: requests may temporarily diverge within a decode step and later reconverge, while each request still preserves strict layer order.
 
 \noindent {\bf Scheduler state model.}
-Each request cycles through three states: \textit{GPU-Ready} (eligible for hot-path execution), \textit{Cold-Path} (offloaded to the CPU after a miss), and \textit{Awaiting Reinsertion} (completed on the host and pending GPU-side merge). The scheduler maintains separate lock-free queues for these states and tracks a per-request layer counter to preserve strict intra-request ordering across decoupled execution phases. This per-request phase tracking allows requests to diverge temporarily without breaking decode correctness.
+Each request cycles through three states: \textit{GPU-Ready} (eligible for hot-path execution), \textit{Cold-Path} (peeled off after a miss for CPU-side LoRA residual computation), and \textit{Awaiting Reinsertion} (completed on the host and pending GPU-side merge). The scheduler maintains separate queues for these states and tracks a per-request layer counter to preserve strict intra-request ordering across decoupled execution phases. This per-request phase tracking allows requests to diverge temporarily without breaking decode correctness.
+
+Algorithm~\ref{alg:skip-reinsert} summarizes the scheduler logic. The key distinction from promotion-first recovery is that a miss changes the state of only the faulting request: ready requests remain eligible for GPU execution, while the faulting request rejoins only after its layer-$L$ residual becomes device-visible.
+
+\begin{algorithm}[t]
+\small
+\caption{Layer-level skip-and-reinsert scheduling}
+\label{alg:skip-reinsert}
+\begin{algorithmic}[1]
+\Require Ready queue $Q_R$, cold queue $Q_C$, reinsertion queue $Q_I$, cold-path limit $K$
+
+\While{serving}
+    \State \Call{ReinsertReady}{$Q_I, Q_R$}
+    \State \Call{LaunchColdJobs}{$Q_C, K$}
+    \State $B \gets$ \Call{FormSubBatch}{$Q_R$}
+
+    \ForAll{$r \in B$}
+        \State $L \gets r.L$, \quad $o \gets$ \Call{RequiredObject}{$r,L$}
+        \If{\Call{GPUResident}{$o$}}
+            \State \Call{RunHotPath}{$r,o,L$}
+            \State $r.L \gets L+1$; \Call{Push}{$Q_R,r$}
+        \Else
+            \State \Call{PeelOff}{$r,o,L,Q_C$}
+        \EndIf
+    \EndFor
+
+    \State \Call{ReturnColdResults}{$Q_I$}
+\EndWhile
+\end{algorithmic}
+\end{algorithm}
 
 \noindent {\bf Miss handling workflow.}
 When a miss is detected at layer $L$, the scheduler atomically removes the faulting request from the GPU-Ready queue, stages the required activations into a pinned buffer, and enqueues a cold-path job. The GPU dispatch loop then continues issuing kernels for the remaining ready requests without introducing a synchronization point. Crucially, the skipped request's KV-cache pointers and attention metadata remain resident on the device; only the missing LoRA contribution is deferred. Once CPU execution completes, a host-side callback triggers an asynchronous H2D transfer of the computed residual. After the returned result lands in device memory, the request enters the Awaiting Reinsertion queue. The scheduler then splices the residual into the GPU-side activation state at layer $L$ and returns the request to the GPU-Ready queue. Reinsertion is guarded by per-layer CUDA events so that the merged state is visible before the request participates in subsequent computations, without requiring a global barrier.
