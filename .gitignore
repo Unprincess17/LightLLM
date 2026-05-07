@@ -40,3 +40,7 @@ tools/common/nsys/run_layer_moe_from_timings.sh
 results/
 autoresearch-results.tsv
 .claude/plans
+
+figures/evaluation
+.mcp.json
+tools/evaluation/plot_p3_oracle_figures.py
