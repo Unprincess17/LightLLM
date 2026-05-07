@@ -8,7 +8,6 @@ dist
 tmp/
 S-LoRA
 
-figures
 
 test/lora/awkprof.out
 test/lora/avx/benchmark_roundtrip.py
