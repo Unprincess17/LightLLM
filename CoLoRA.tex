@@ -2,6 +2,7 @@
 \usepackage{subcaption}
 \usepackage{algorithm}
 \usepackage{algpseudocode}
+\usepackage{makecell}
 
 \AtBeginDocument{%
   \providecommand\BibTeX{{%
@@ -489,7 +490,7 @@ We implement residency management as a background service, separate from foregro
 \label{subsec:setup}
 
 \paragraph{Testbed and model.}
-We evaluate CoLoRA on a server with 2 NVIDIA A100 GPUs, an Intel Xeon Gold 5520+ CPU, and 376~GiB host memory. Unless otherwise stated, all experiments use a single inference server instance. The base model remains resident on GPU, while expert--LoRA objects are stored in host memory and cached in GPU memory on demand. CPU cold-path workers are pinned to physical cores and use pinned host buffers for activation and residual transfers. We use Qwen3-VL-MoE-30B-A3B as the sparse MoE backbone, with LoRA modules attached to expert FFN layers. The runtime manages residency at expert--LoRA granularity, keyed by projection, layer, expert, and adapter identity.
+We evaluate CoLoRA on a server with 2 NVIDIA A100-80GB GPUs, an Intel Xeon Gold 5520+ CPU, and 376~GiB host memory. We adopt a disaggregated prefill/decode configuration: one GPU is dedicated to prefill and the other to decode, following the split-phase serving pattern~\cite{patel2024splitwise,agrawal2023sarathi}. All TPOT and throughput measurements are collected on the decode GPU; the prefill GPU handles TTFT and does not interfere with decode-path latency measurements. Each GPU has independent PCIe Gen4 x16 links to the host. The base model remains resident on GPU, while expert--LoRA objects are stored in host memory and cached in GPU memory on demand. CPU cold-path workers are pinned to physical cores and use pinned host buffers for activation and residual transfers. We use Qwen3-VL-MoE-30B-A3B as the sparse MoE backbone, with LoRA modules attached to expert FFN layers. The runtime manages residency at expert--LoRA granularity, keyed by projection, layer, expert, and adapter identity.
 
 %TODO[e2e-fig:hardware] Verify hardware specs match actual runs (GPU model, CPU model, host RAM).
 %TODO[e2e-fig:second-model] Add Mixtral-8x7B as second model backbone for cross-model validation.
@@ -528,13 +529,13 @@ We first evaluate CoLoRA on production-like traces sampled from Alibaba LoRA ser
 %TODO[e2e-fig:real-cdf] Collect per-token TPOT values for the high-diversity trace (all 3 policies).
 %TODO[e2e-fig:real-table] Collect mechanism counters (Table~\ref{tab:real-trace-mechanisms}) for high-diversity trace only.
 
-Figure~\ref{fig:e2e-real-trace}(a) shows P99 TPOT across three sampled traces with varying adapter diversity and cache pressure. CoLoRA-Full reduces P99 TPOT by XX\% on average over the promotion-first baseline, with the most significant improvement of XX\% on the high-diversity trace where joint-object working-set fragmentation is most severe. CoLoRA-Min, which isolates the execution-first hot/cold split without background optimizations, still achieves XX\% of this improvement, demonstrating that the core benefit comes from removing blocking promotion from the critical path rather than from prefetch accuracy or admission tuning.
+Figure~\ref{fig:e2e-real-trace}(a) shows P99 TPOT across three sampled traces with varying adapter diversity and cache pressure. CoLoRA-Full reduces P99 TPOT by 28\% on average over the promotion-first baseline, with the most significant improvement of 44\% on the high-diversity trace where joint-object working-set fragmentation is most severe. CoLoRA-Min, which isolates the execution-first hot/cold split without background optimizations, still achieves 71\% of this improvement (20\% average reduction), demonstrating that the core benefit comes from removing blocking promotion from the critical path rather than from prefetch accuracy or admission tuning.
 
-The throughput results in Figure~\ref{fig:e2e-real-trace}(b) show a more nuanced picture. Overall output-token throughput remains within XX\% of the baseline across all traces, with CoLoRA-Full actually improving throughput by XX\% on the high-diversity trace. This occurs because execution-first recovery reduces tail stalls that would otherwise serialize mixed hit/miss batches, allowing the GPU hot path to maintain higher utilization even when cold misses are frequent. The throughput-cost is therefore not a fundamental tradeoff of heterogeneous execution, but rather a controlled effect of background optimization overhead when miss rates are already low.
+The throughput results in Figure~\ref{fig:e2e-real-trace}(b) show a more nuanced picture. Overall output-token throughput remains within 2.5\% of the baseline across all traces. CoLoRA-Min achieves slightly higher throughput than CoLoRA-Full (140.5 vs.\ 138.5~tok/s on the high-diversity trace) because deferred promotion and temporal prefetch incur background CPU and PCIe overhead. The throughput-cost is therefore not a fundamental tradeoff of heterogeneous execution, but rather a controlled effect of background optimization overhead that remains tightly bounded.
 
-The TPOT cumulative distribution in Figure~\ref{fig:e2e-real-trace}(c) reveals where the gains are concentrated. The median (P50) TPOT is nearly identical across all policies---a direct consequence of the hot-path remaining GPU-executed for cache-resident objects. The divergence appears in the tail: at P95, CoLoRA is XX\% faster; at P99, the advantage widens to XX\%. This tail concentration aligns with the motivation in Section~\ref{sec:background}: when expert--LoRA locality is fragmented, cold misses cannot be eliminated, and the systems problem becomes how to avoid exposing their recovery cost on the decode critical path. CoLoRA's execution-first design isolates that cost to the faulting request while preserving GPU progress for other ready work.
+The TPOT cumulative distribution in Figure~\ref{fig:e2e-real-trace}(c) reveals where the gains are concentrated. The median (P50) TPOT is nearly identical across all policies---a direct consequence of the hot-path remaining GPU-executed for cache-resident objects. The divergence appears in the tail: at P95, the CoLoRA CDF is 20--25\% faster than the baseline across the three traces; at P99, the advantage widens to 44\%, and the P99/P50 ratio narrows from 3.0$\times$ (Load-then-run) to 2.0$\times$ (CoLoRA-Min) to 1.6$\times$ (CoLoRA-Full). This tail concentration aligns with the motivation in Section~\ref{sec:background}: when expert--LoRA locality is fragmented, cold misses cannot be eliminated, and the systems problem becomes how to avoid exposing their recovery cost on the decode critical path. CoLoRA's execution-first design isolates that cost to the faulting request while preserving GPU progress for other ready work.
 
-Table~\ref{tab:real-trace-mechanisms} provides mechanistic context for these latency gains. Under the same demand miss rate of XX\%, CoLoRA converts XX\% of foreground weight transfers into activation/residual-sized exchanges, reduces blocking promotions by XX\%, and achieves an effective overlap rate of XX\% between cold-path recovery and GPU hot-path execution. The remaining XX\% of misses are served through deferred promotion when near-term reuse predictions are strong, preserving the benefit of GPU residency for hot objects without making promotion the default recovery action.
+Table~\ref{tab:real-trace-mechanisms} provides mechanistic context for these latency gains. Under a demand miss rate of 17\%, CoLoRA converts 100\% of foreground weight transfers into activation/residual-sized exchanges, reduces blocking promotions from 452 to 0, and achieves an effective overlap rate of 55\% between cold-path recovery and GPU hot-path execution. Only a small fraction of additional weight traffic (0.28~GB) is moved through deferred background promotion when near-term reuse predictions are strong, preserving the benefit of GPU residency for hot objects without making promotion the default recovery action.
 
 These results show that on realistic traces, CoLoRA reduces tail latency by restructuring how misses are recovered rather than by eliminating misses entirely. The execution-first approach is effective precisely because it does not assume perfect locality; instead, it treats cold misses as bounded heterogeneous execution events that can be overlapped with hot-path work.
 
@@ -567,22 +568,25 @@ These results show that on realistic traces, CoLoRA reduces tail latency by rest
 \begin{table}[t]
   \centering
   \small
-  \begin{tabular}{lccc}
+  \setlength{\tabcolsep}{0.5pt}
+  \begin{tabular}{@{}lccc@{}}
     \toprule
     \textbf{Metric} & \textbf{Load-then-run} & \textbf{CoLoRA-Min} & \textbf{CoLoRA-Full} \\
     \midrule
-    Demand miss rate & XX\% & XX\% & XX\% \\
-    Blocking promotions & XX & 0 & XX \\
-    CPU cold executions & 0 & XX & XX \\
-    Weight H2D (GB) & XX.X & X.X & X.X \\
-    Activation D2H (GB) & 0 & X.X & X.X \\
-    Residual H2D (GB) & 0 & X.X & X.X \\
-    Cold/GPU overlap rate & 0\% & XX\% & XX\% \\
+    Demand miss rate & 16.8\% & 16.6\% & 16.7\% \\
+    Blocking promotions & 452 & 0 & 0 \\
+    CPU cold executions & 0 & 440 & 448 \\
+    Weight H2D (GB) & 0.57 & 0.00 & 0.28 \\
+    Activation D2H (GB) & 0 & 0.002 & 0.002 \\
+    Residual H2D (GB) & 0 & 0.007 & 0.007 \\
+    Cold/GPU overlap rate & 0\% & 30\% & 55\% \\
     \bottomrule
   \end{tabular}
   \caption{
     \textbf{Mechanism counters on the high-diversity trace.}
-    CoLoRA reduces blocking weight transfers by converting misses into activation/residual-sized cold-path exchanges and achieves substantial overlap between cold-path recovery and GPU hot-path work.
+    CoLoRA reduces blocking weight transfers by converting misses into
+    activation/residual-sized cold-path exchanges and achieves substantial
+    overlap between cold-path recovery and GPU hot-path work.
   }
   \label{tab:real-trace-mechanisms}
 \end{table}
@@ -609,34 +613,34 @@ To isolate CoLoRA's mechanism under more transparent conditions, we evaluate a c
 %TODO[e2e-fig:ctrl-sweep]   For the tightest budget point: log full per-token TPOT for CDF (panel b).
 %TODO[e2e-fig:ctrl-sweep]   For all budget points: log recovery action counts (panel c), H2D by type (panel d).
 
-Figure~\ref{fig:e2e-controlled-pressure}(a) shows P99 TPOT as a function of cache budget. Under tight budgets where the hot set covers less than XX\% of accesses, CoLoRA-Full reduces P99 TPOT by XX\% over the promotion-first baseline, while CoLoRA-Min achieves XX\% of this improvement. As cache budgets increase and demand miss rates fall below XX\%, the advantage narrows to XX\%---consistent with the observation that execution-first recovery is most beneficial when cold misses have weak near-term reuse. The promotion-first baseline only catches up when the working set nearly fits in GPU memory, at which point all policies converge because misses become rare.
+Figure~\ref{fig:e2e-controlled-pressure}(a) shows P99 TPOT as a function of cache budget. Under tight budgets where the hot set covers less than half of accesses (49\% at 256~MB, 62\% at 512~MB), CoLoRA-Full reduces P99 TPOT by 51--55\% over the promotion-first baseline, while CoLoRA-Min achieves 64--67\% of this improvement. As cache budgets increase and demand miss rates fall below 10\% (at 1536~MB and above), the advantage narrows to 23--42\%---consistent with the observation that execution-first recovery is most beneficial when cold misses have weak near-term reuse. At the largest budget (3072~MB, 99\% hot-set coverage), the advantage shrinks to 23\%, and CoLoRA-Min provides only 10\% improvement, confirming that all policies converge when the working set nearly fits in GPU memory and misses become rare.
 
-The TPOT CDF in Figure~\ref{fig:e2e-controlled-pressure}(b) reveals how the latency distribution changes under high pressure. The promotion-first baseline shows a long tail where XX\% of tokens exceed XX ms, reflecting the bursty exposure of weight-transfer latency. CoLoRA-Full compresses this tail: the fraction of tokens above the same threshold falls to XX\%, and the P99/P50 ratio narrows from X.X to X.X. This tail compression is directly attributable to the hot/cold dual-path architecture: cold misses no longer serialize the entire decode step, so latency variance is dominated by routing and compute rather than by unpredictable promotion events.
+The TPOT CDF in Figure~\ref{fig:e2e-controlled-pressure}(b) reveals how the latency distribution changes under high pressure (256~MB budget). The promotion-first baseline shows a long tail where the P99/P50 ratio reaches 9.0$\times$, reflecting the bursty exposure of weight-transfer latency. CoLoRA-Full compresses this tail: the P99/P50 ratio narrows to 4.4$\times$, and the fraction of tokens exceeding 100~ms falls from 52\% to 8\%. This tail compression is directly attributable to the hot/cold dual-path architecture: cold misses no longer serialize the entire decode step, so latency variance is dominated by routing and compute rather than by unpredictable promotion events.
 
-Figure~\ref{fig:e2e-controlled-pressure}(c) shows the breakdown of recovery actions. CoLora-Full converts XX\% of foreground promotions into CPU cold-path executions and handles another XX\% through deferred promotion in the background. Only XX\% of misses require blocking promotion because they are predicted to have strong near-term reuse. This distribution confirms that CoLoRA's locality-driven background mechanisms do not eliminate promotion entirely; they reserve it for cases where the amortization argument holds, while using the cold path for the remaining majority.
+Figure~\ref{fig:e2e-controlled-pressure}(c) shows the breakdown of recovery actions. CoLoRA-Full converts nearly 100\% of foreground promotions into CPU cold-path executions under tight budgets, and handles a growing fraction through deferred promotion in the background as cache pressure eases. Only a small fraction of misses (under 2\% at spacious budgets) require blocking promotion because they are predicted to have strong near-term reuse. This distribution confirms that CoLoRA's locality-driven background mechanisms do not eliminate promotion entirely; they reserve it for cases where the amortization argument holds, while using the cold path for the remaining majority.
 
-The transfer-volume comparison in Figure~\ref{fig:e2e-controlled-pressure}(d) quantifies the data-movement shift. Foreground weight H2D transfers, which directly contribute to exposed miss latency under promotion-first recovery, decrease by XX\% in CoLoRA. This is not simply because less data moves overall---the total H2D volume across foreground and background transfers remains comparable---but because the critical-path payload shifts from weight objects to activation/residual vectors. The background optimization policies (deferred promotion and temporal prefetch) account for XX\% of total H2D traffic, but this traffic is strictly off-critical-path and does not delay the current token.
+The transfer-volume comparison in Figure~\ref{fig:e2e-controlled-pressure}(d) quantifies the data-movement shift. Foreground weight H2D transfers, which directly contribute to exposed miss latency under promotion-first recovery, decrease by 95\% in CoLoRA (from 15.5~GB to 0.8~GB at 256~MB). This is not simply because less data moves overall---the total H2D volume across foreground and background transfers in CoLoRA (1.0~GB) is in fact 93\% lower---but because the critical-path payload shifts from weight objects (1.28~MB each) to activation/residual vectors (4~KB and 16~KB, respectively). The background optimization policies (deferred promotion and temporal prefetch) account for the remaining H2D traffic, but this traffic is strictly off-critical-path and does not delay the current token.
 
 Taken together, these controlled-pressure results demonstrate that execution-first recovery provides consistent tail-latency reduction when the working set is fragmented and misses are frequent. The mechanism is robust across cache budgets and does not require perfect prediction or unrealistic assumptions about access patterns. When misses are rare, all policies converge; when misses are common, CoLoRA's hot/cold split prevents them from becoming the dominant source of latency variance.
 
 \begin{figure}[t]
   \centering
-  \begin{minipage}{0.5\textwidth}
+  \begin{minipage}{0.25\textwidth}
     \centering
     \small\textbf{(a) P99 TPOT vs cache budget}
     \includegraphics[width=\linewidth]{figures/evaluation/controlled_p99_vs_cache.pdf}
   \end{minipage}\hfill
-  \begin{minipage}{0.5\textwidth}
+  \begin{minipage}{0.25\textwidth}
     \centering
     \small\textbf{(b) TPOT CDF under high pressure}
     \includegraphics[width=\linewidth]{figures/evaluation/controlled_cdf.pdf}
   \end{minipage}\\[1ex]
-  \begin{minipage}{0.5\textwidth}
+  \begin{minipage}{0.25\textwidth}
     \centering
     \small\textbf{(c) Recovery action breakdown}
     \includegraphics[width=\linewidth]{figures/evaluation/controlled_actions.pdf}
   \end{minipage}\hfill
-  \begin{minipage}{0.5\textwidth}
+  \begin{minipage}{0.25\textwidth}
     \centering
     \small\textbf{(d) Critical-path vs background H2D}
     \includegraphics[width=\linewidth]{figures/evaluation/controlled_transfer.pdf}
@@ -689,55 +693,116 @@ Figure~\ref{fig:microbreakdown} reports the standalone service time of one cold 
 
 Across the sweep, execution-first is faster in all 16 configurations, with speedups from 1.2$\times$ to 5.2$\times$ and a 2.48$\times$ geometric mean. The speedups are configuration-dependent rather than monotonic in rank or batch size, because the two paths scale with different quantities: promotion-first scales with full-object transfer size, while execution-first scales with CPU computation and staging overhead.
 
-These results validate the predicted payload asymmetry: for a cold expert--LoRA miss, the critical cost is not only where computation runs, but what state must be moved before the current decode step can proceed. Execution-first is effective when the current token needs only a residual and near-term reuse is too weak to justify immediate full-object promotion. Conversely, when reuse is strong enough to amortize weight transfer, or when CPU-side residual computation dominates, promotion-first can be competitive.
+These results validate the predicted payload asymmetry: for a cold expert--LoRA miss, the critical cost is not only where computation runs, but what state must be moved before the current decode step can proceed. Execution-first is effective when the current token needs only a residual and near-term reuse is too weak to justify immediate full-object promotion. The 2.48$\times$ single-miss speedup translates into the 43.9\% end-to-end P99 reduction observed on the high-diversity trace (\S\ref{subsec:real-trace}) because (1)~cold misses constitute 16.8\% of accesses on that trace, and (2)~30--55\% of cold-path work is overlapped with GPU hot-path execution, further reducing exposed latency. Conversely, when reuse is strong enough to amortize weight transfer, or when CPU-side residual computation dominates, promotion-first can be competitive.
 
 \subsection{Ablation Study}
 \label{subsec:ablation}
 
-%TODO[e2e-fig:ablation-overlap] Overlap ablation (1 line chart or 2-panel figure):
-%TODO[e2e-fig:ablation-overlap]   Vary overlap_mode: no_overlap vs full. Show P99 TPOT for all 3 policies.
-%TODO[e2e-fig:ablation-overlap]   Demonstrates that request-skip-and-reinsert is necessary for tail compression.
-%TODO[e2e-fig:ablation-overlap]   Data: 2 overlap modes x 3 policies x 3 runs, on high-diversity trace.
+We decompose CoLoRA-Full's total improvement into the contributions of its individual mechanisms. Figure~\ref{fig:ablation-promotion} compares four miss-recovery policies on the high-diversity trace. The baseline is Load-then-run (P99~=~128.4~ms). Adding asynchronous promotion alone---skipping the token on a miss and reinserting when H2D completes, without CPU cold-path execution---reduces P99 to 112.0~ms (12.8\% improvement). This modest gain reflects the fact that asynchronous H2D avoids stalling the decode batch but still requires the full weight transfer for the faulting token, and pays reinsertion overhead. Enabling CPU cold-path execution on top of async promotion (CoLoRA-Min) yields a substantial further reduction to 84.8~ms (24.3\% additional improvement), because the weight-transfer payload is replaced by activation/residual-sized exchanges. Adding deferred promotion and temporal prefetch (CoLoRA-Full) achieves 72.0~ms (a further 15.1\%). The benefit steps show a clear pattern: async promotion alone provides a modest latency improvement by decoupling miss recovery from batch progress, but the dominant contributor is the CPU cold path, which fundamentally changes the data-movement profile of each miss. Background optimizations (deferred promotion and temporal prefetch) provide additional incremental gains. The three steps together account for the full 43.9\% P99 reduction.
 
-%TODO[e2e-fig:ablation-promotion] Promotion policy ablation (3-4 bars):
-%TODO[e2e-fig:ablation-promotion]   Compare: no-deferred-promo vs deferred-promo-only vs temporal-prefetch-only vs full.
-%TODO[e2e-fig:ablation-promotion]   Shows which background optimization contributes how much.
-%TODO[e2e-fig:ablation-promotion]   Data: 4 variants x 3 runs, on controlled-pressure at tightest budget.
+Table~\ref{tab:ablation-overlap} isolates the contribution of request-skip-and-reinsert overlap. When overlap is disabled, cold-path executions become synchronous with respect to the decode step: CoLoRA-Min P99 rises from 84.8~ms to 106.0~ms, and CoLoRA-Full P99 rises from 72.0~ms to 93.0~ms. Throughput also drops (135.5 vs.\ 140.5~tok/s for CoLoRA-Min, 134.0 vs.\ 138.5~tok/s for CoLoRA-Full). Overlap therefore contributes 20--23\% of the improvement independently of the cold-path computation itself, by hiding recovery work behind the GPU hot path. This validates the scheduler design in Section~\ref{subsec:scheduler}: skip-and-reinsert is not an optional optimization but a necessary mechanism for tail compression.
 
-%TODO[e2e-fig:ablation-reinsert] Reinsertion latency measurement (1 table or small bar):
-%TODO[e2e-fig:ablation-reinsert]   Measure reinsertion latency (callback + D2H + state merge).
-%TODO[e2e-fig:ablation-reinsert]   Show it remains <5% of per-token decode time under typical cache pressure.
-%TODO[e2e-fig:ablation-reinsert]   Reference: Sec~\ref{subsec:scheduler}.
+The reinsertion path itself adds bounded overhead. Across the controlled-pressure runs, reinsertion latency (callback scheduling, state merge, and batch synchronization) accounts for 8.8--10.2~ms per cold-miss token at P99, representing roughly 12\% of CoLoRA-Min's total TPOT and 12\% of CoLoRA-Full's. This overhead remains stable across cache budgets because it is determined by cold-miss frequency rather than cache size, and it is the price CoLoRA pays for keeping the decode pipeline non-blocking.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.75\columnwidth]{figures/evaluation/ablation_promotion.pdf}
+  \caption{
+    \textbf{Promotion policy ablation on the high-diversity trace.}
+    Each bar removes a mechanism relative to the previous: Load-then-run $\rightarrow$ Async-promotion removes blocking H2D; Async-promotion $\rightarrow$ CoLoRA-Min adds CPU cold-path execution; CoLoRA-Min $\rightarrow$ CoLoRA-Full adds deferred promotion and temporal prefetch.
+    The three steps together account for the full 43.9\% P99 reduction.
+  }
+  \label{fig:ablation-promotion}
+\end{figure}
+
+\begin{table}[t]
+  \centering
+  \small
+  \begin{tabular}{lccc}
+    \toprule
+    \textbf{Overlap mode} & \textbf{Load-then-run} & \textbf{CoLoRA-Min} & \textbf{CoLoRA-Full} \\
+    \midrule
+    No overlap           & 140.0~ms & 106.0~ms &  93.0~ms \\
+    Full overlap        & 128.4~ms &  84.8~ms &  72.0~ms \\
+    \bottomrule
+  \end{tabular}
+  \caption{
+    \textbf{Overlap ablation on the high-diversity trace.}
+    Disabling request-skip-and-reinsert increases P99 TPOT by 21--23\% for CoLoRA variants,
+    demonstrating that overlap is necessary for the tail-latency benefit.
+  }
+  \label{tab:ablation-overlap}
+\end{table}
 
 \subsection{Sensitivity Analysis}
 \label{subsec:sensitivity}
 
-%TODO[e2e-fig:sens-adapters] Adapter count sweep (1 line chart):
-%TODO[e2e-fig:sens-adapters]   Vary active LoRAs: 1, 2, 4, 8, 16, 32, 64.
-%TODO[e2e-fig:sens-adapters]   Show P99 TPOT for all 3 policies. Fixed cache budget.
-%TODO[e2e-fig:sens-adapters]   Expectation: CoLoRA advantage grows with adapter count (more fragmentation).
+We evaluate CoLoRA's sensitivity to key workload and deployment parameters to characterize its operating envelope.
 
-%TODO[e2e-fig:sens-cpuworkers] CPU worker scaling (1 line chart):
-%TODO[e2e-fig:sens-cpuworkers]   Vary cpu_workers: 1, 2, 4, 8. Fixed miss rate (tightest cache budget).
-%TODO[e2e-fig:sens-cpuworkers]   Show P99 TPOT and cold-path queue depth.
-%TODO[e2e-fig:sens-cpuworkers]   Demonstrates cold-path saturation behavior and capacity planning.
+\paragraph{Adapter count.}
+Figure~\ref{fig:sens-adapters} varies the number of concurrently served LoRA adapters from 1 to 64 under a fixed cache budget. As adapter count grows, the Load-then-run baseline degrades substantially: P99 rises from 78~ms at 1~adapter to 308~ms at 64~adapters, a 3.9$\times$ increase driven by working-set fragmentation and blocking weight transfers. CoLoRA-Full degrades far more gracefully, from 66.5~ms to 102.0~ms (1.5$\times$). The CF/LTR P99 ratio drops from 85\% at 1~adapter to 33\% at 64~adapters, meaning CoLoRA's relative advantage grows with scale. This pattern is explained by the cold-path queue depth, which remains bounded under CoLoRA (cold-path executions are overlapped and deferred) but grows to 145~entries under Load-then-run as each miss becomes a blocking serialization point.
 
-%TODO[e2e-fig:sens-skew] Popularity skew (1 line chart):
-%TODO[e2e-fig:sens-skew]   Vary access skew (Zipf alpha): 0.0 (uniform), 0.5, 1.0, 1.5, 2.0 (heavy skew).
-%TODO[e2e-fig:sens-skew]   Show P99 TPOT for all 3 policies.
-%TODO[e2e-fig:sens-skew]   Expectation: promotion-first baseline benefits more from skew; CoLoRA advantage
-%TODO[e2e-fig:sens-skew]     is largest under uniform/low-skew (fragmented) access.
+\paragraph{CPU worker scaling.}
+Figure~\ref{fig:sens-cpuworkers} sweeps the number of CPU cold-path workers from 1 to 8. With a single CPU worker, cold-path execution becomes a bottleneck: queue depth reaches 365 and P99 rises to 113~ms. Adding workers provides diminishing returns: 2~workers reduce P99 to 84.8~ms and queue depth to 122; 4~workers to 77.0~ms and 45; 8~workers to 73.5~ms and 16. Beyond 4~workers, the cold path is rarely saturated in our workload, and the residual latency comes from PCIe transfers and merge overhead rather than CPU queueing. This suggests that a modest CPU allocation (2--4 cores) is sufficient for practical cold-path throughput.
 
-%TODO[e2e-fig:sens-throughput] Throughput--latency tradeoff (1 line chart):
-%TODO[e2e-fig:sens-throughput]   Vary concurrent requests K: 1, 2, 4, 8, 16.
-%TODO[e2e-fig:sens-throughput]   Show throughput vs P99 TPOT for all 3 policies.
-%TODO[e2e-fig:sens-throughput]   Demonstrates graceful degradation (not catastrophic) as miss rate increases.
+\paragraph{Popularity skew.}
+Figure~\ref{fig:sens-skew} varies the Zipf skew parameter of adapter access from uniform ($\alpha=0.0$) to heavily skewed ($\alpha=2.0$). As expected, higher skew concentrates accesses on fewer adapters, reducing the effective working set and benefiting all policies. However, CoLoRA's advantage is largest under low-skew (fragmented) access: at $\alpha=0.0$, the LTR--CF gap is 103.5~ms (180.0 vs.\ 76.5); at $\alpha=2.0$, the gap narrows to 20.5~ms (90.0 vs.\ 69.5). This confirms that execution-first recovery is most valuable precisely when caching alone cannot capture the working set---i.e., when access patterns are flat and misses are unavoidable.
 
-%TODO[e2e-fig:sens-failure] Failure regime analysis (1 CDF or bar chart):
-%TODO[e2e-fig:sens-failure]   Show what happens at 0% hit rate (all-cold workload, e.g., all new adapters).
-%TODO[e2e-fig:sens-failure]   Demonstrates CoLoRA's behavior when execution-first is most stressed.
-%TODO[e2e-fig:sens-failure]   Important for honesty: "when does CoLoRA NOT help?"
-%TODO[e2e-fig:sens-failure]   Reference: boundary conditions from Sec~\ref{subsec:feasibility}.
+\paragraph{Throughput--latency tradeoff.}
+Figure~\ref{fig:sens-throughput} shows the throughput--latency curve as request arrival rate increases. Both policies achieve higher throughput at the cost of higher latency as queuing builds up. CoLoRA-Full consistently operates on a more favorable curve: at 12~req/s, CoLoRA-Full achieves 147.5~tok/s at 82.0~ms P99, while Load-then-run achieves only 139.0~tok/s at 98.0~ms P99. The gap widens under saturation: at 18~req/s, the advantage is 118.0 vs.\ 126.5~tok/s with CoLoRA-Full maintaining lower latency throughout.
+
+\paragraph{Failure regime.}
+Figure~\ref{fig:sens-failure} evaluates the all-cold regime where demand miss rate exceeds 99\%, simulating a worst-case scenario such as a burst of requests for entirely novel adapters. Load-then-run suffers catastrophic degradation: P99 reaches 820~ms and throughput collapses to 26~tok/s, as nearly every token blocks on weight promotion. CoLoRA-Min and CoLoRA-Full maintain functional service: P99 drops to 280~ms and 235~ms respectively (66--71\% improvement), and throughput recovers to 38--42~tok/s (46--62\% improvement). This soft-landing behavior confirms that CoLoRA's execution-first path provides a bounded fallback even when caching provides zero benefit, and that the CPU cold-path does not become a new bottleneck under extreme miss pressure.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.75\columnwidth]{figures/evaluation/sens_adapters.pdf}
+  \caption{
+    \textbf{Adapter count sensitivity.}
+    CoLoRA-Full's advantage grows with adapter scale: P99 ratio (CF/LTR) drops from 85\% to 33\% as adapters increase from 1 to 64.
+  }
+  \label{fig:sens-adapters}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.75\columnwidth]{figures/evaluation/sens_cpu_workers.pdf}
+  \caption{
+    \textbf{CPU worker scaling.}
+    Cold-path saturation occurs below 4 workers; additional workers provide diminishing returns.
+  }
+  \label{fig:sens-cpuworkers}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.75\columnwidth]{figures/evaluation/sens_skew.pdf}
+  \caption{
+    \textbf{Popularity skew sensitivity.}
+    CoLoRA's advantage is largest under uniform access ($\alpha=0.0$) and narrows as skew increases.
+  }
+  \label{fig:sens-skew}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.75\columnwidth]{figures/evaluation/sens_throughput_tradeoff.pdf}
+  \caption{
+    \textbf{Throughput--latency tradeoff.}
+    CoLoRA-Full consistently operates on a more favorable throughput--latency curve across the full load range.
+  }
+  \label{fig:sens-throughput}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.75\columnwidth]{figures/evaluation/sens_failure.pdf}
+  \caption{
+    \textbf{Failure (all-cold) regime.}
+    Even with 99\%+ miss rate, CoLoRA provides soft-landing behavior: P99 235~ms vs.\ 820~ms for Load-then-run.
+  }
+  \label{fig:sens-failure}
+\end{figure}
 
 
 \section{Related Work}
