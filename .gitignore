@@ -43,4 +43,3 @@ autoresearch-results.tsv
 
 figures/evaluation
 .mcp.json
-tools/evaluation/plot_p3_oracle_figures.py

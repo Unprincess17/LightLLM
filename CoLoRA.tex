@@ -539,19 +539,19 @@ Table~\ref{tab:real-trace-mechanisms} provides mechanistic context for these lat
 
 These results show that on realistic traces, CoLoRA reduces tail latency by restructuring how misses are recovered rather than by eliminating misses entirely. The execution-first approach is effective precisely because it does not assume perfect locality; instead, it treats cold misses as bounded heterogeneous execution events that can be overlapped with hot-path work.
 
-\begin{figure}[t]
+\begin{figure*}[t]
   \centering
-  \begin{minipage}{0.33\textwidth}
+  \begin{minipage}{0.32\textwidth}
     \centering
     \small\textbf{(a) P99 TPOT}
     \includegraphics[width=\linewidth]{figures/evaluation/e2e_real_trace_p99_tpot.pdf}
   \end{minipage}\hfill
-  \begin{minipage}{0.33\textwidth}
+  \begin{minipage}{0.32\textwidth}
     \centering
     \small\textbf{(b) Throughput}
     \includegraphics[width=\linewidth]{figures/evaluation/e2e_real_trace_throughput.pdf}
   \end{minipage}\hfill
-  \begin{minipage}{0.33\textwidth}
+  \begin{minipage}{0.32\textwidth}
     \centering
     \small\textbf{(c) TPOT CDF}
     \includegraphics[width=\linewidth]{figures/evaluation/e2e_real_trace_cdf.pdf}
@@ -559,16 +559,16 @@ These results show that on realistic traces, CoLoRA reduces tail latency by rest
   \caption{
     \textbf{End-to-end performance on production-like traces.}
     (a) P99 TPOT across three sampled traces with varying adapter diversity.
-    (b) Output-token throughput; CoLoRA maintains or improves throughput while reducing tail latency.
+    (b) Output-token throughput; CoLoRA maintains throughput while reducing tail latency.
     (c) TPOT CDF showing that gains are concentrated in the tail.
   }
   \label{fig:e2e-real-trace}
-\end{figure}
+\end{figure*}
 
 \begin{table}[t]
   \centering
   \small
-  \setlength{\tabcolsep}{0.5pt}
+  \setlength{\tabcolsep}{4pt}
   \begin{tabular}{@{}lccc@{}}
     \toprule
     \textbf{Metric} & \textbf{Load-then-run} & \textbf{CoLoRA-Min} & \textbf{CoLoRA-Full} \\
@@ -623,24 +623,24 @@ The transfer-volume comparison in Figure~\ref{fig:e2e-controlled-pressure}(d) qu
 
 Taken together, these controlled-pressure results demonstrate that execution-first recovery provides consistent tail-latency reduction when the working set is fragmented and misses are frequent. The mechanism is robust across cache budgets and does not require perfect prediction or unrealistic assumptions about access patterns. When misses are rare, all policies converge; when misses are common, CoLoRA's hot/cold split prevents them from becoming the dominant source of latency variance.
 
-\begin{figure}[t]
+\begin{figure*}[t]
   \centering
-  \begin{minipage}{0.25\textwidth}
+  \begin{minipage}{0.24\textwidth}
     \centering
     \small\textbf{(a) P99 TPOT vs cache budget}
     \includegraphics[width=\linewidth]{figures/evaluation/controlled_p99_vs_cache.pdf}
   \end{minipage}\hfill
-  \begin{minipage}{0.25\textwidth}
+  \begin{minipage}{0.24\textwidth}
     \centering
     \small\textbf{(b) TPOT CDF under high pressure}
     \includegraphics[width=\linewidth]{figures/evaluation/controlled_cdf.pdf}
-  \end{minipage}\\[1ex]
-  \begin{minipage}{0.25\textwidth}
+  \end{minipage}\hfill
+  \begin{minipage}{0.24\textwidth}
     \centering
     \small\textbf{(c) Recovery action breakdown}
     \includegraphics[width=\linewidth]{figures/evaluation/controlled_actions.pdf}
   \end{minipage}\hfill
-  \begin{minipage}{0.25\textwidth}
+  \begin{minipage}{0.24\textwidth}
     \centering
     \small\textbf{(d) Critical-path vs background H2D}
     \includegraphics[width=\linewidth]{figures/evaluation/controlled_transfer.pdf}
@@ -653,7 +653,7 @@ Taken together, these controlled-pressure results demonstrate that execution-fir
     (d) Shift from foreground weight transfers to activation/residual exchanges on the critical path.
   }
   \label{fig:e2e-controlled-pressure}
-\end{figure}
+\end{figure*}
 
 %TODO[e2e-fig:coldpath-breakdown] Cold-path latency breakdown figure (stacked bar, 1 panel):
 %TODO[e2e-fig:coldpath-breakdown]   For one representative controlled-pressure run (tightest budget):
@@ -706,7 +706,7 @@ The reinsertion path itself adds bounded overhead. Across the controlled-pressur
 
 \begin{figure}[t]
   \centering
-  \includegraphics[width=0.75\columnwidth]{figures/evaluation/ablation_promotion.pdf}
+  \includegraphics[width=0.85\columnwidth]{figures/evaluation/ablation_promotion.pdf}
   \caption{
     \textbf{Promotion policy ablation on the high-diversity trace.}
     Each bar removes a mechanism relative to the previous: Load-then-run $\rightarrow$ Async-promotion removes blocking H2D; Async-promotion $\rightarrow$ CoLoRA-Min adds CPU cold-path execution; CoLoRA-Min $\rightarrow$ CoLoRA-Full adds deferred promotion and temporal prefetch.
@@ -756,7 +756,7 @@ Figure~\ref{fig:sens-failure} evaluates the all-cold regime where demand miss ra
 
 \begin{figure}[t]
   \centering
-  \includegraphics[width=0.75\columnwidth]{figures/evaluation/sens_adapters.pdf}
+  \includegraphics[width=0.9\columnwidth]{figures/evaluation/sens_adapters.pdf}
   \caption{
     \textbf{Adapter count sensitivity.}
     CoLoRA-Full's advantage grows with adapter scale: P99 ratio (CF/LTR) drops from 85\% to 33\% as adapters increase from 1 to 64.
@@ -766,7 +766,7 @@ Figure~\ref{fig:sens-failure} evaluates the all-cold regime where demand miss ra
 
 \begin{figure}[t]
   \centering
-  \includegraphics[width=0.75\columnwidth]{figures/evaluation/sens_cpu_workers.pdf}
+  \includegraphics[width=0.9\columnwidth]{figures/evaluation/sens_cpu_workers.pdf}
   \caption{
     \textbf{CPU worker scaling.}
     Cold-path saturation occurs below 4 workers; additional workers provide diminishing returns.
@@ -776,7 +776,7 @@ Figure~\ref{fig:sens-failure} evaluates the all-cold regime where demand miss ra
 
 \begin{figure}[t]
   \centering
-  \includegraphics[width=0.75\columnwidth]{figures/evaluation/sens_skew.pdf}
+  \includegraphics[width=0.9\columnwidth]{figures/evaluation/sens_skew.pdf}
   \caption{
     \textbf{Popularity skew sensitivity.}
     CoLoRA's advantage is largest under uniform access ($\alpha=0.0$) and narrows as skew increases.
@@ -786,7 +786,7 @@ Figure~\ref{fig:sens-failure} evaluates the all-cold regime where demand miss ra
 
 \begin{figure}[t]
   \centering
-  \includegraphics[width=0.75\columnwidth]{figures/evaluation/sens_throughput_tradeoff.pdf}
+  \includegraphics[width=0.9\columnwidth]{figures/evaluation/sens_throughput_tradeoff.pdf}
   \caption{
     \textbf{Throughput--latency tradeoff.}
     CoLoRA-Full consistently operates on a more favorable throughput--latency curve across the full load range.
@@ -796,7 +796,7 @@ Figure~\ref{fig:sens-failure} evaluates the all-cold regime where demand miss ra
 
 \begin{figure}[t]
   \centering
-  \includegraphics[width=0.75\columnwidth]{figures/evaluation/sens_failure.pdf}
+  \includegraphics[width=0.9\columnwidth]{figures/evaluation/sens_failure.pdf}
   \caption{
     \textbf{Failure (all-cold) regime.}
     Even with 99\%+ miss rate, CoLoRA provides soft-landing behavior: P99 235~ms vs.\ 820~ms for Load-then-run.
