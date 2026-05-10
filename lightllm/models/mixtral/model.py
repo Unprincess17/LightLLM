@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+from typing import Optional, Any
 from lightllm.models.registry import ModelRegistry
 from lightllm.common.basemodel.basemodel import TpPartBaseModel
 from lightllm.common.kv_cache_mem_manager import MemoryManager
@@ -31,6 +32,8 @@ class MixtralTpPartModel(TpPartBaseModel):
 
     def __init__(self, kvargs):
         super().__init__(kvargs)
+        self.lora_dispatcher_: Optional[Any] = None
+        self.use_detached_lora_: bool = False
         return
 
     def _init_config(self):
@@ -84,3 +87,17 @@ class MixtralTpPartModel(TpPartBaseModel):
         self._cos_cached = torch.cos(freqs).to(self.data_type).cuda()
         self._sin_cached = torch.sin(freqs).to(self.data_type).cuda()
         return
+
+    def set_lora_dispatcher(self, dispatcher: Any, use_detached_lora: bool = True):
+        self.lora_dispatcher_ = dispatcher
+        self.use_detached_lora_ = use_detached_lora
+        for layer_infer in self.layer_infers:
+            if hasattr(layer_infer, 'set_lora_dispatcher'):
+                layer_infer.set_lora_dispatcher(dispatcher, use_detached_lora)
+
+    def clear_lora_dispatcher(self):
+        self.lora_dispatcher_ = None
+        self.use_detached_lora_ = False
+        for layer_infer in self.layer_infers:
+            if hasattr(layer_infer, 'clear_lora_dispatcher'):
+                layer_infer.clear_lora_dispatcher()

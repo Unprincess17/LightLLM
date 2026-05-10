@@ -1220,6 +1220,9 @@ class ModeBackend:
             ('qwen3_vl',
              'lightllm.models.qwen3_vl.lora_dispatch',
              'load_lora_adapter', 'create_lora_dispatcher'),
+            ('mixtral',
+             'lightllm.models.mixtral.lora_dispatch',
+             'load_lora_adapter', 'create_mixtral_lora_dispatcher'),
         ]
 
         for model_pattern, module_path, load_fn_name, create_fn_name in lora_imports:

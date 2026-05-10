@@ -1015,16 +1015,19 @@ class LoRAAdapterLoader:
         # 1. Language Model Layers (e.g. model.language_model.layers.9...)
         re_llm_layer = re.compile(r"model\.language_model\.layers\.(\d+)\.(.+)")
 
-        # 2. LM Head (e.g. model.language_model.lm_head...)
+        # 2. Mixtral-style Model Layers (e.g. model.layers.9...)
+        re_mixtral_layer = re.compile(r"model\.layers\.(\d+)\.(.+)")
+
+        # 3. LM Head (e.g. model.language_model.lm_head...)
         re_lm_head = re.compile(r"model\.language_model\.lm_head")
 
-        # 3. Vision Blocks (e.g. model.visual.blocks.0...)
+        # 4. Vision Blocks (e.g. model.visual.blocks.0...)
         re_vis_block = re.compile(r"model\.visual\.blocks\.(\d+)\.(.+)")
 
-        # 4. Deepstack Merger (e.g. model.visual.deepstack_merger_list.0...)
+        # 5. Deepstack Merger (e.g. model.visual.deepstack_merger_list.0...)
         re_vis_deepstack = re.compile(r"model\.visual\.deepstack_merger_list\.(\d+)\.(.+)")
 
-        # 5. Simple Merger (e.g. model.visual.merger...)
+        # 6. Simple Merger (e.g. model.visual.merger...)
         re_vis_merger = re.compile(r"model\.visual\.merger\.(.+)")
 
         # Expert ID Pattern (nested inside layer suffix)
@@ -1039,7 +1042,7 @@ class LoRAAdapterLoader:
             target_type = None
             expert_id = None
 
-            # 1. Language Model Layers
+            # 1. Language Model Layers (Qwen-style)
             match = re_llm_layer.search(key)
             if match:
                 layer_id = int(match.group(1))
@@ -1068,48 +1071,88 @@ class LoRAAdapterLoader:
                         elif "down_proj" in suffix:
                             target_type = LoRATargetType.MOE_EXPERT_DOWN
 
-            # 2. LM Head (Special Layer -1)
-            elif re_lm_head.search(key):
+            # 2. Mixtral-style Model Layers (e.g. model.layers.9...)
+            if layer_id is None:
+                match = re_mixtral_layer.search(key)
+                if match:
+                    layer_id = int(match.group(1))
+                    suffix = match.group(2)
+
+                    # Attention
+                    if "self_attn.q_proj" in suffix:
+                        target_type = LoRATargetType.ATTN_Q_PROJ
+                    elif "self_attn.k_proj" in suffix:
+                        target_type = LoRATargetType.ATTN_K_PROJ
+                    elif "self_attn.v_proj" in suffix:
+                        target_type = LoRATargetType.ATTN_V_PROJ
+                    elif "self_attn.o_proj" in suffix:
+                        target_type = LoRATargetType.ATTN_O_PROJ
+
+                    # MoE Experts (e.g. block_sparse_moe.experts.0.w1)
+                    elif "block_sparse_moe.experts" in suffix:
+                        expert_match = re_expert_id.search(suffix)
+                        if expert_match:
+                            expert_id = int(expert_match.group(1))
+
+                            if "w1" in suffix:
+                                target_type = LoRATargetType.MOE_EXPERT_GATE
+                            elif "w3" in suffix:
+                                target_type = LoRATargetType.MOE_EXPERT_UP
+                            elif "w2" in suffix:
+                                target_type = LoRATargetType.MOE_EXPERT_DOWN
+
+                    # MoE Gate (e.g. block_sparse_moe.gate)
+                    elif "block_sparse_moe.gate" in suffix:
+                        target_type = LoRATargetType.MOE_EXPERT_GATE
+
+            # 3. LM Head (Special Layer -1)
+            if layer_id is None and re_lm_head.search(key):
                 layer_id = -1
                 target_type = LoRATargetType.LM_HEAD
 
-            # 3. Vision Blocks (Offset +10000)
-            elif (match := re_vis_block.search(key)):
-                layer_id = 10000 + int(match.group(1))
-                suffix = match.group(2)
+            # 4. Vision Blocks (Offset +10000)
+            if layer_id is None:
+                match = re_vis_block.search(key)
+                if match:
+                    layer_id = 10000 + int(match.group(1))
+                    suffix = match.group(2)
 
-                if "attn.q_proj" in suffix:
-                    target_type = LoRATargetType.VL_Q_PROJ
-                elif "attn.k_proj" in suffix:
-                    target_type = LoRATargetType.VL_K_PROJ
-                elif "attn.v_proj" in suffix:
-                    target_type = LoRATargetType.VL_V_PROJ
-                elif "attn.o_proj" in suffix:
-                    target_type = LoRATargetType.VL_O_PROJ
-                elif "mlp.linear_fc1" in suffix:
-                    target_type = LoRATargetType.VL_FC1
-                elif "mlp.linear_fc2" in suffix:
-                    target_type = LoRATargetType.VL_FC2
+                    if "attn.q_proj" in suffix:
+                        target_type = LoRATargetType.VL_Q_PROJ
+                    elif "attn.k_proj" in suffix:
+                        target_type = LoRATargetType.VL_K_PROJ
+                    elif "attn.v_proj" in suffix:
+                        target_type = LoRATargetType.VL_V_PROJ
+                    elif "attn.o_proj" in suffix:
+                        target_type = LoRATargetType.VL_O_PROJ
+                    elif "mlp.linear_fc1" in suffix:
+                        target_type = LoRATargetType.VL_FC1
+                    elif "mlp.linear_fc2" in suffix:
+                        target_type = LoRATargetType.VL_FC2
 
-            # 4. Deepstack Mergers (Offset +20000)
-            elif (match := re_vis_deepstack.search(key)):
-                layer_id = 20000 + int(match.group(1))
-                suffix = match.group(2)
+            # 5. Deepstack Mergers (Offset +20000)
+            if layer_id is None:
+                match = re_vis_deepstack.search(key)
+                if match:
+                    layer_id = 20000 + int(match.group(1))
+                    suffix = match.group(2)
 
-                if "linear_fc1" in suffix:
-                    target_type = LoRATargetType.VL_FC1
-                elif "linear_fc2" in suffix:
-                    target_type = LoRATargetType.VL_FC2
+                    if "linear_fc1" in suffix:
+                        target_type = LoRATargetType.VL_FC1
+                    elif "linear_fc2" in suffix:
+                        target_type = LoRATargetType.VL_FC2
 
-            # 5. Simple Merger (Offset +29999)
-            elif (match := re_vis_merger.search(key)):
-                layer_id = 29999
-                suffix = match.group(1)
+            # 6. Simple Merger (Offset +29999)
+            if layer_id is None:
+                match = re_vis_merger.search(key)
+                if match:
+                    layer_id = 29999
+                    suffix = match.group(1)
 
-                if "linear_fc1" in suffix:
-                    target_type = LoRATargetType.VL_FC1
-                elif "linear_fc2" in suffix:
-                    target_type = LoRATargetType.VL_FC2
+                    if "linear_fc1" in suffix:
+                        target_type = LoRATargetType.VL_FC1
+                    elif "linear_fc2" in suffix:
+                        target_type = LoRATargetType.VL_FC2
 
             # Storage Logic
             if layer_id is not None and target_type is not None:
