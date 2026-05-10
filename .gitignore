@@ -43,3 +43,5 @@ autoresearch-results.tsv
 
 figures/evaluation
 .mcp.json
+CoLoRA.log
+.trae

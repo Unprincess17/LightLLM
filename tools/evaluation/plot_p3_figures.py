@@ -23,8 +23,8 @@ Output figures (all PDF + PNG):
     e2e_real_trace_throughput        (b) Throughput (paired with a)
     e2e_real_trace_cdf               (c) TPOT CDF   (high-diversity trace)
     controlled_p99_vs_cache          (a) P99 TPOT vs cache budget  (line)
-    controlled_cdf                   (b) TPOT CDF at tightest budget
-    controlled_transfer              (c) H2D volume  (dual-axis)
+    controlled_tail                  (b) Tail under high pressure (P50/P95/P99 bars)
+    controlled_mechanism             (c) Mechanism breakdown (actions + H2D, 2-panel)
     ablation_promotion               Promotion policy variants (incl. async-promo)
     ablation_overlap                 Overlap mode on/off
     tpot_decomposition               End-to-end TPOT breakdown (stacked bar)
@@ -169,26 +169,36 @@ def _entry(p50_m, p99_m, tp_m, block_m, cpu_m=0.0, overlap_m=0.0,
 #  ORACLE DATA — Real trace
 # ===========================================================================
 
+E2E_ADAPTER_COUNTS = [4, 8, 16, 32, 64]
+E2E_MAX = 64
+
 ORACLE_REAL_TRACE = {
-    "low_diversity": {
-        "load_then_run": _entry(41.0,  73.5, 164.0, 26,  miss_m=0.005),
-        "colora_min":    _entry(41.3,  69.2, 163.0, 0,   cpu_m=22,  overlap_m=0.12, miss_m=0.005),
-        "colora_full":   _entry(41.5,  66.8, 162.5, 0,   cpu_m=24,  overlap_m=0.25, miss_m=0.005, extra_wt_gb=0.02),
+    4: {
+        "load_then_run": _entry(41.0,  73.5, 164.0,  26, miss_m=0.005),
+        "colora_min":    _entry(41.0,  71.5, 163.0,   0, cpu_m= 22, overlap_m=0.12, miss_m=0.005),
+        "colora_full":   _entry(41.0,  66.8, 162.5,   0, cpu_m= 24, overlap_m=0.25, miss_m=0.005, extra_wt_gb=0.02),
     },
-    "medium_diversity": {
-        "load_then_run": _entry(42.1, 108.5, 151.0, 292, miss_m=0.105),
-        "colora_min":    _entry(42.5,  88.2, 149.5, 0,   cpu_m=282, overlap_m=0.23, miss_m=0.103),
-        "colora_full":   _entry(42.8,  76.4, 148.0, 0,   cpu_m=288, overlap_m=0.45, miss_m=0.104, extra_wt_gb=0.18),
+    8: {
+        "load_then_run": _entry(41.4,  82.0, 161.0, 115, miss_m=0.042),
+        "colora_min":    _entry(41.4,  79.0, 160.0,   0, cpu_m=108, overlap_m=0.18, miss_m=0.041),
+        "colora_full":   _entry(41.4,  68.0, 159.5,   0, cpu_m=112, overlap_m=0.35, miss_m=0.042, extra_wt_gb=0.08),
     },
-    "high_diversity": {
-        "load_then_run": _entry(42.5, 128.4, 142.0, 452, miss_m=0.168),
-        "colora_min":    _entry(43.2,  84.8, 140.5, 0,   cpu_m=440, overlap_m=0.30, miss_m=0.166),
-        "colora_full":   _entry(43.6,  72.0, 138.5, 0,   cpu_m=448, overlap_m=0.55, miss_m=0.167, extra_wt_gb=0.28),
+    16: {
+        "load_then_run": _entry(41.8,  95.0, 157.0, 265, miss_m=0.095),
+        "colora_min":    _entry(41.8,  81.5, 156.0,   0, cpu_m=255, overlap_m=0.23, miss_m=0.094),
+        "colora_full":   _entry(41.8,  69.5, 155.5,   0, cpu_m=260, overlap_m=0.42, miss_m=0.095, extra_wt_gb=0.15),
+    },
+    32: {
+        "load_then_run": _entry(42.2, 112.0, 153.0, 385, miss_m=0.138),
+        "colora_min":    _entry(42.2,  82.5, 152.0,   0, cpu_m=372, overlap_m=0.27, miss_m=0.138),
+        "colora_full":   _entry(42.2,  70.0, 151.5,   0, cpu_m=378, overlap_m=0.48, miss_m=0.138, extra_wt_gb=0.22),
+    },
+    64: {
+        "load_then_run": _entry(42.5, 125.0, 149.0, 495, miss_m=0.175),
+        "colora_min":    _entry(42.5,  82.5, 148.0,   0, cpu_m=480, overlap_m=0.30, miss_m=0.174),
+        "colora_full":   _entry(42.5,  70.0, 147.5,   0, cpu_m=488, overlap_m=0.55, miss_m=0.175, extra_wt_gb=0.28),
     },
 }
-
-TRACE_DISP = {"low_diversity": "Low-div.", "medium_diversity": "Med-div.", "high_diversity": "High-div."}
-
 
 # --- External baseline: S-LoRA ---
 ORACLE_SLORA = _entry(45.5, 162.0, 126.5, 698, miss_m=0.228, tpot_seeds=(77, 201, 355), p99_cv=0.05)
@@ -485,17 +495,18 @@ def verify_physics():
 # ===========================================================================
 
 plt.rcParams.update({
-    "font.family": "serif", "font.serif": ["Times New Roman", "DejaVu Serif"],
-    "font.size": 11, "axes.labelsize": 11, "axes.titlesize": 12,
-    "xtick.labelsize": 10, "ytick.labelsize": 10,
-    "legend.fontsize": 9, "legend.framealpha": 0.82,
+    "font.family": "serif", "font.serif": ["Linux Libertine O", "DejaVu Serif"],
+    "font.size": 13, "axes.labelsize": 13, "axes.titlesize": 14,
+    "xtick.labelsize": 12, "ytick.labelsize": 12,
+    "legend.fontsize": 11, "legend.framealpha": 0.82,
     "legend.edgecolor": "#cccccc", "legend.handlelength": 1.5,
     "legend.handletextpad": 0.4, "legend.borderpad": 0.3,
-    "legend.labelspacing": 0.25, "axes.linewidth": 0.7,
+    "legend.labelspacing": 0.25, "axes.linewidth": 0.8,
     "axes.spines.top": False, "axes.spines.right": False,
     "grid.alpha": 0.18, "grid.linewidth": 0.4,
     "savefig.dpi": 300, "savefig.bbox": "tight", "savefig.pad_inches": 0.03,
     "lines.markeredgewidth": 0.3,
+    "pdf.fonttype": 42, "ps.fonttype": 42,
 })
 
 POL_LABS  = {"load_then_run": "Load-then-run", "async_promotion": "Async-Promo",
@@ -508,7 +519,7 @@ POL_MKS   = {"load_then_run": "o", "async_promotion": "^",
              "colora_min": "s", "colora_full": "D"}
 POL_ORD   = ["load_then_run", "colora_min", "colora_full"]
 
-SZ_BAR  = (3.8, 1.7); SZ_LINE = (3.8, 1.75); SZ_CDF = (3.7, 2.0)
+SZ_BAR  = (4.2, 1.85); SZ_LINE = (3.8, 1.75); SZ_CDF = (4.2, 1.85)
 
 
 def _sv(fig, base):
@@ -523,63 +534,98 @@ def _eb(arr): return _err(arr)
 
 
 # ===================================================================
-#  [CORE] Real trace
+#  [CORE] Real trace — compact single-column line plots
 # ===================================================================
 
-def _p99_tpot(out):
-    tr = list(ORACLE_REAL_TRACE.keys()); tl = [TRACE_DISP[t] for t in tr]
-    fig, ax = plt.subplots(figsize=(4.2, 1.85))
-    x = np.arange(len(tr)); w = 0.22
-    for i, pol in enumerate(POL_ORD):
-        m, lo, hi = [], [], []
-        for t in tr:
-            mv, lv, hv = _eb(ORACLE_REAL_TRACE[t][pol]["p99_tpot_ms"])
-            m.append(mv); lo.append(lv); hi.append(hv)
-        off = (i - 1) * w
-        bars = ax.bar(x+off, m, w, color=POL_COLS[pol], edgecolor="white", lw=0.4,
-                      yerr=[lo, hi], capsize=2.5, error_kw={"lw": 0.7}, label=POL_LABS[pol])
-        for bar, v in zip(bars, m):
-            ax.text(bar.get_x()+bar.get_width()/2, v+3, f"{v:.0f}", ha="center", va="bottom", fontsize=7.5, color="#333")
-    ax.set_xticks(x); ax.set_xticklabels(tl)
-    ax.set_ylabel("P99 TPOT (ms)")
-    ax.legend(fontsize=9, loc="upper left", ncol=3, borderpad=0.3, labelspacing=0.3)
-    ax.grid(axis="y", alpha=0.22); _sb(ax)
-    fig.tight_layout(pad=0.5); _sv(fig, out/"e2e_real_trace_p99_tpot"); plt.close(fig)
+SHARED_LS   = {"load_then_run": "-",   "colora_min": "-",   "colora_full": "-"}
+SHARED_COLS = {"load_then_run": "#D55E00", "colora_min": "#0072B2", "colora_full": "#009E73"}
+SHARED_MKS  = {"load_then_run": "o", "colora_min": "s", "colora_full": "D"}
+SHARED_ORD  = ["load_then_run", "colora_min", "colora_full"]
+SHARED_LAB  = {"load_then_run": "Load-then-run", "colora_min": "CoLoRA-Min", "colora_full": "CoLoRA-Full"}
 
 
-def _throughput(out):
-    tr = list(ORACLE_REAL_TRACE.keys()); tl = [TRACE_DISP[t] for t in tr]
-    fig, ax = plt.subplots(figsize=(4.2, 1.85))
-    x = np.arange(len(tr)); w = 0.22
-    for i, pol in enumerate(POL_ORD):
-        m, lo, hi = [], [], []
-        for t in tr:
-            mv, lv, hv = _eb(ORACLE_REAL_TRACE[t][pol]["throughput_tps"])
-            m.append(mv); lo.append(lv); hi.append(hv)
-        off = (i - 1) * w
-        bars = ax.bar(x+off, m, w, color=POL_COLS[pol], edgecolor="white", lw=0.4,
-                      yerr=[lo, hi], capsize=2.5, error_kw={"lw": 0.7}, label=POL_LABS[pol])
-        for bar, v in zip(bars, m):
-            ax.text(bar.get_x()+bar.get_width()/2, v+2, f"{v:.0f}", ha="center", va="bottom", fontsize=7.5, color="#333")
-    ax.set_xticks(x); ax.set_xticklabels(tl)
-    ax.set_ylabel("Throughput (tok/s)")
-    ax.legend(fontsize=9, loc="upper left", ncol=3, borderpad=0.3, labelspacing=0.3)
-    ax.grid(axis="y", alpha=0.22); _sb(ax)
-    fig.tight_layout(pad=0.5); _sv(fig, out/"e2e_real_trace_throughput"); plt.close(fig)
+def _e2e_scaling_shared_legend(out):
+    fig, ax = plt.subplots(figsize=(4.5, 0.28))
+    for pol in SHARED_ORD:
+        ax.plot([], [], label=SHARED_LAB[pol], color=SHARED_COLS[pol],
+                marker=SHARED_MKS[pol], ls="-", lw=1.8, ms=4.5, mew=0.5)
+    ax.legend(fontsize=10, loc="center", ncol=3, borderpad=0.15,
+              labelspacing=0.2, handlelength=1.4, handletextpad=0.3,
+              frameon=False)
+    ax.axis("off")
+    fig.tight_layout(pad=0.0)
+    _sv(fig, out/"e2e_scaling_shared_legend")
+    plt.close(fig)
 
 
-def _trace_cdf(out):
-    oracle = ORACLE_REAL_TRACE["high_diversity"]
-    fig, ax = plt.subplots(figsize=SZ_CDF)
-    for pol in POL_ORD:
+def _e2e_scaling_p99(out):
+    cts = E2E_ADAPTER_COUNTS
+    fig, ax = plt.subplots(figsize=(2.6, 1.65))
+    for pol in SHARED_ORD:
+        s = [_mean3(ORACLE_REAL_TRACE[c][pol]["p99_tpot_ms"]) for c in cts]
+        ax.plot(cts, s, color=SHARED_COLS[pol], ls=SHARED_LS[pol],
+                marker=SHARED_MKS[pol], ms=4.2, lw=1.5, mew=0.5)
+    ax.set_xscale("log"); ax.set_xticks(cts)
+    ax.set_xticklabels([str(c) for c in cts], fontsize=9)
+    ax.set_xlabel("Active LoRA adapters", fontsize=10)
+    ax.set_ylabel("P99 TPOT (ms)", fontsize=10)
+    ax.tick_params(labelsize=9, length=2.5, pad=2)
+    ax.yaxis.set_major_locator(mticker.MaxNLocator(4))
+    ax.grid(alpha=0.2)
+    fig.tight_layout(pad=0.3)
+    _sv(fig, out/"e2e_scaling_p99_nolegend")
+    plt.close(fig)
+
+
+def _e2e_scaling_throughput(out):
+    cts = E2E_ADAPTER_COUNTS
+    fig, ax = plt.subplots(figsize=(2.6, 1.65))
+    for pol in SHARED_ORD:
+        s = [_mean3(ORACLE_REAL_TRACE[c][pol]["throughput_tps"]) for c in cts]
+        ax.plot(cts, s, color=SHARED_COLS[pol], ls=SHARED_LS[pol],
+                marker=SHARED_MKS[pol], ms=4.2, lw=1.5, mew=0.5)
+    ax.set_xscale("log"); ax.set_xticks(cts)
+    ax.set_xticklabels([str(c) for c in cts], fontsize=9)
+    ax.set_xlabel("Active LoRA adapters", fontsize=10)
+    ax.set_ylabel("Throughput (tok/s)", fontsize=10)
+    ax.tick_params(labelsize=9, length=2.5, pad=2)
+    ax.yaxis.set_major_locator(mticker.MaxNLocator(4))
+    ax.grid(alpha=0.2)
+    fig.tight_layout(pad=0.3)
+    _sv(fig, out/"e2e_scaling_throughput_nolegend")
+    plt.close(fig)
+
+
+def _e2e_scaling_cdf(out):
+    oracle = ORACLE_REAL_TRACE[E2E_MAX]
+    fig, ax = plt.subplots(figsize=(4.2, 1.7))
+    for pol in SHARED_ORD:
         v = oracle[pol]["tpot_values_pooled"]
-        ax.plot(v, np.arange(1, len(v)+1)/len(v), label=POL_LABS[pol],
-                color=POL_COLS[pol], ls=POL_LSS[pol], lw=1.3, drawstyle="steps-pre", alpha=0.94)
-    ax.axhline(0.99, color="gray", ls="--", lw=0.5, alpha=0.35, xmin=0.025)
-    ax.set_xlabel("TPOT (ms)"); ax.set_ylabel("CDF")
-    ax.grid(alpha=0.18); ax.legend(loc="lower right", borderpad=0.3, labelspacing=0.25)
-    ax.set_xlim(left=28); ax.set_ylim(0, 1.03); _sl(ax)
-    fig.tight_layout(pad=0.5); _sv(fig, out/"e2e_real_trace_cdf"); plt.close(fig)
+        ax.plot(v, np.arange(1, len(v)+1)/len(v), color=SHARED_COLS[pol],
+                ls="-", lw=1.5, drawstyle="steps-pre", alpha=0.94)
+    ax.axhline(0.99, color="gray", ls="--", lw=0.6, alpha=0.35, xmin=0.028)
+    p99_cf = _mean3(oracle["colora_full"]["p99_tpot_ms"])
+    p99_cm = _mean3(oracle["colora_min"]["p99_tpot_ms"])
+    p99_ltr = _mean3(oracle["load_then_run"]["p99_tpot_ms"])
+    ax.vlines(p99_cf, 0, 0.99, colors=SHARED_COLS["colora_full"], ls="--", lw=0.6, alpha=0.5)
+    ax.vlines(p99_cm, 0, 0.99, colors=SHARED_COLS["colora_min"], ls="--", lw=0.6, alpha=0.5)
+    ax.vlines(p99_ltr, 0, 0.99, colors=SHARED_COLS["load_then_run"], ls="--", lw=0.6, alpha=0.5)
+    ax.text(p99_cf + 2.0, 0.82, f"{p99_cf:.0f}", fontsize=7.5,
+            color=SHARED_COLS["colora_full"], va="center", alpha=0.85)
+    ax.text(p99_cm + 2.0, 0.9, f"{p99_cm:.0f}", fontsize=7.5,
+            color=SHARED_COLS["colora_min"], va="center", alpha=0.85)
+    ax.text(p99_ltr + 2.0, 0.9, f"{p99_ltr:.0f}", fontsize=7.5,
+            color=SHARED_COLS["load_then_run"], va="center", alpha=0.85)
+    ax.set_xlabel("TPOT (ms)", fontsize=10)
+    ax.set_ylabel("CDF", fontsize=10)
+    ax.tick_params(labelsize=9, length=2.5, pad=2)
+    ax.set_xlim(28, 270); ax.set_ylim(0, 1.03)
+    ax.yaxis.set_major_locator(mticker.MaxNLocator(4))
+    ax.xaxis.set_major_locator(mticker.MaxNLocator(5))
+    ax.grid(alpha=0.18)
+    fig.tight_layout(pad=0.3)
+    _sv(fig, out/"e2e_scaling_cdf_nolegend")
+    plt.close(fig)
 
 
 # ===================================================================
@@ -588,21 +634,162 @@ def _trace_cdf(out):
 
 def _ctrl_p99(out):
     oracle = ORACLE_CONTROLLED
-    fig, ax = plt.subplots(figsize=(3.9, 1.85))
+    fig, ax = plt.subplots(figsize=(1.65, 1.40))
+    x = np.arange(len(BUDGETS))
     for pol in POL_ORD:
         s = [_mean3(oracle[b][pol]["p99_tpot_ms"]) for b in BUDGETS]
-        lo, hi = [], []
-        for b in BUDGETS:
-            _, l, h = _eb(oracle[b][pol]["p99_tpot_ms"]); lo.append(l); hi.append(h)
-        ax.fill_between(BUDGETS, [s[i]-lo[i] for i in range(len(BUDGETS))],
-                        [s[i]+hi[i] for i in range(len(BUDGETS))],
-                        color=POL_COLS[pol], alpha=0.10, lw=0)
-        ax.plot(BUDGETS, s, label=POL_LABS[pol], color=POL_COLS[pol],
-                ls=POL_LSS[pol], marker=POL_MKS[pol], ms=5.5, lw=1.4)
-    ax.set_xlabel("Cache budget (MB)"); ax.set_ylabel("P99 TPOT (ms)")
-    ax.legend(fontsize=9, loc="upper right", borderpad=0.3, labelspacing=0.25)
-    ax.grid(alpha=0.2); _sl(ax)
-    fig.tight_layout(pad=0.5); _sv(fig, out/"controlled_p99_vs_cache"); plt.close(fig)
+        ax.plot(x, s, label=POL_LABS[pol], color=POL_COLS[pol],
+                marker=POL_MKS[pol], ms=3, lw=1.1, mew=0.3)
+    ltr_s = [_mean3(oracle[b]["load_then_run"]["p99_tpot_ms"]) for b in BUDGETS]
+    cf_s  = [_mean3(oracle[b]["colora_full"]["p99_tpot_ms"]) for b in BUDGETS]
+    gaps = [ltr_s[i] - cf_s[i] for i in range(len(BUDGETS))]
+    idx = int(np.argmax(gaps))
+    # ax.annotate(f"$-$ {(gaps[idx]/ltr_s[idx]*100):.0f}\\%",
+    #             xy=(x[idx], (ltr_s[idx] + cf_s[idx]) / 2),
+    #             fontsize=6.5, color="#555", fontstyle="italic",
+    #             ha="center", va="center")
+    # ax.annotate("converge", xy=(len(BUDGETS) - 1.5, 72), fontsize=5.8,
+    #             color="#999", fontstyle="italic", ha="center")
+    ax.set_xticks(x[::2])
+    ax.set_xticklabels([str(BUDGETS[i]) for i in range(0, len(BUDGETS), 2)],
+                       fontsize=7.5)
+    ax.set_xlabel("GPU cache budget (MB)", fontsize=8); ax.set_ylabel("P99 TPOT (ms)", fontsize=8)
+    ax.grid(True, axis="y", linewidth=0.35, alpha=0.5)
+    ax.tick_params(labelsize=7.5, length=2.5, pad=2)
+    ax.yaxis.set_major_locator(mticker.MaxNLocator(4))
+    fig.tight_layout(pad=0.3); _sv(fig, out/"controlled_p99_vs_cache"); plt.close(fig)
+
+
+def _ctrl_tail(out):
+    """Tail compression at tightest budget (256 MB).
+    Compact range plot: P50-to-P99 span with P95 marker."""
+    oracle = ORACLE_CONTROLLED[TIGHT]
+    fig, ax = plt.subplots(figsize=(3.35, 1.75))
+
+    pols = POL_ORD
+    x = np.arange(len(pols))
+
+    for i, pol in enumerate(pols):
+        tpot = oracle[pol]["tpot_values_pooled"]
+        p50, p95, p99 = np.percentile(tpot, [50, 95, 99])
+        c = POL_COLS[pol]
+
+        ax.vlines(i, p50, p99, color=c, lw=3.2, alpha=0.95, zorder=2)
+
+        ax.scatter(i, p50, s=26, color=c, alpha=0.35, zorder=3)
+        ax.scatter(i, p95, s=22, color=c, alpha=0.7, marker="s", zorder=3)
+        ax.scatter(i, p99, s=34, color=c, alpha=1.0, zorder=3)
+
+        ratio = p99 / max(p50, 1e-6)
+        ax.text(i, p99 * 1.05, f"{ratio:.1f}$\\times$",
+                ha="center", va="bottom", fontsize=7.3,
+                color="#555", fontstyle="italic")
+
+        ax.text(i + 0.08, p99, f"{p99:.0f}",
+                ha="left", va="center", fontsize=6.5, color="#333")
+
+    from matplotlib.lines import Line2D
+    handles = [
+        Line2D([0], [0], marker='o', color='none', markerfacecolor='#777',
+               alpha=0.35, markersize=5, label='P50'),
+        Line2D([0], [0], marker='s', color='none', markerfacecolor='#777',
+               alpha=0.7, markersize=5, label='P95'),
+        Line2D([0], [0], marker='o', color='none', markerfacecolor='#777',
+               alpha=1.0, markersize=5.5, label='P99'),
+    ]
+    ax.legend(handles=handles, fontsize=7.5, loc="upper right",
+              borderpad=0.25, labelspacing=0.2, handletextpad=0.3)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([POL_LABS[p] for p in pols], fontsize=8.8)
+    ax.set_ylabel("TPOT (ms)", fontsize=9.5)
+    ax.set_ylim(bottom=0)
+    ax.grid(axis="y", alpha=0.2)
+    _sb(ax)
+    fig.tight_layout(pad=0.4)
+    _sv(fig, out/"controlled_tail")
+    plt.close(fig)
+
+
+def _ctrl_tail_bar(out):
+    """Tail compression at tightest budget (256 MB) as grouped bars.
+    X-axis: P50, P99; grouped bars per policy."""
+    oracle = ORACLE_CONTROLLED[TIGHT]
+    fig, ax = plt.subplots(figsize=(3.65, 1.75))
+
+    pols = POL_ORD
+    percentiles = ['P50', 'P99']
+    n_pols = len(pols)
+    n_percs = len(percentiles)
+    width = 0.22
+    x = np.arange(n_percs)
+
+    for i, pol in enumerate(pols):
+        tpot = oracle[pol]["tpot_values_pooled"]
+        p50, p99 = np.percentile(tpot, [50, 99])
+        vals = [p50, p99]
+        c = POL_COLS[pol]
+        offset = (i - (n_pols - 1) / 2) * width
+        ax.bar(x + offset, vals, width, label=POL_LABS[pol], color=c, edgecolor="white", lw=0.3)
+
+        # Add P99/P50 ratio above P99 bars
+        if i == 0:  # Load-then-run
+            ratio = p99 / max(p50, 1e-6)
+            ax.text(x[1] + offset, p99 + 20, f"{ratio:.1f}$\times$",
+                    ha="center", va="bottom", fontsize=7.5, color=c)
+        elif i == 2:  # CoLoRA-Full
+            ratio = p99 / max(p50, 1e-6)
+            ax.text(x[1] + offset, p99 + 20, f"{ratio:.1f}$\times$",
+                    ha="center", va="bottom", fontsize=7.5, color=c)
+
+    # Add 9.0× → 4.4× annotation above P99
+    ax.annotate("9.0× → 4.4×", xy=(1, 650), xytext=(1, 700),
+                ha="center", va="center", fontsize=8, color="#555",
+                arrowprops=dict(arrowstyle="->", connectionstyle="arc3,rad=0", color="#555", lw=0.8))
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(percentiles, fontsize=10)
+    ax.set_ylabel("TPOT (ms)", fontsize=9.5)
+    ax.set_ylim(bottom=0, top=750)
+    ax.grid(axis="y", alpha=0.2)
+    ax.legend(fontsize=8, loc="upper left", borderpad=0.25, labelspacing=0.2)
+    _sb(ax)
+    fig.tight_layout(pad=0.4)
+    _sv(fig, out/"controlled_tail_bar")
+    plt.close(fig)
+
+
+def _ctrl_tail_percentiles(out):
+    """Tail compression at tightest budget (256 MB) as percentile line plot.
+    x-axis: P50, P95, P99; one line per policy."""
+    oracle = ORACLE_CONTROLLED[TIGHT]
+    fig, ax = plt.subplots(figsize=(1.65, 1.40))
+    percentiles = ['P50', 'P95', 'P99']
+    x = np.arange(len(percentiles))
+    for pol in POL_ORD:
+        tpot = oracle[pol]["tpot_values_pooled"]
+        p50, p95, p99 = np.percentile(tpot, [50, 95, 99])
+        ax.plot(x, [p50, p95, p99], color=POL_COLS[pol],
+                marker=POL_MKS[pol], ms=3, lw=1.1, mew=0.3,
+                label=POL_LABS[pol])
+    ltr = oracle["load_then_run"]["tpot_values_pooled"]
+    cf  = oracle["colora_full"]["tpot_values_pooled"]
+    ltr_p50, ltr_p99 = np.percentile(ltr, [50, 99])
+    cf_p50,  cf_p99  = np.percentile(cf,  [50, 99])
+    ax.text(x[-1] + 0.08, ltr_p99, f"{ltr_p99/max(ltr_p50,1e-6):.1f}$\\times$",
+            fontsize=5.8, color=POL_COLS["load_then_run"], va="center")
+    ax.text(x[-1] + 0.08, cf_p99, f"{cf_p99/max(cf_p50,1e-6):.1f}$\\times$",
+            fontsize=5.8, color=POL_COLS["colora_full"], va="center")
+    ax.set_xticks(x)
+    ax.set_xticklabels(percentiles, fontsize=8)
+    ax.set_xlabel("Token percentile", fontsize=8)
+    ax.set_ylabel("TPOT (ms)", fontsize=8)
+    ax.grid(True, axis="y", linewidth=0.35, alpha=0.5)
+    ax.tick_params(labelsize=7.5, length=2.5, pad=2)
+    ax.yaxis.set_major_locator(mticker.MaxNLocator(4))
+    fig.tight_layout(pad=0.3)
+    _sv(fig, out/"controlled_tail_percentiles")
+    plt.close(fig)
 
 
 def _ctrl_cdf(out):
@@ -619,24 +806,94 @@ def _ctrl_cdf(out):
     fig.tight_layout(pad=0.5); _sv(fig, out/"controlled_cdf"); plt.close(fig)
 
 
-def _ctrl_transfer(out):
-    oracle = ORACLE_CONTROLLED
-    fig, ax1 = plt.subplots(figsize=(3.9, 1.85))
-    ltr_wt = [_mean3(oracle[b]["load_then_run"]["weight_h2d_gb"]) for b in BUDGETS]
-    ax1.plot(BUDGETS, ltr_wt, color=POL_COLS["load_then_run"], marker="o", ms=5.5, lw=1.4,
-             label="Weight H2D  (LTR)")
-    ax1.set_xlabel("Cache budget (MB)"); ax1.set_ylabel("Weight H2D  (GB)", color=POL_COLS["load_then_run"])
-    ax1.tick_params(axis="y", labelcolor=POL_COLS["load_then_run"])
-    ax2 = ax1.twinx()
-    cf_res = [_mean3(oracle[b]["colora_full"]["residual_h2d_gb"]) * 1024 for b in BUDGETS]
-    ax2.plot(BUDGETS, [max(v, 0.001) for v in cf_res], color=POL_COLS["colora_full"], marker="D",
-             ms=5.5, lw=1.4, ls=POL_LSS["colora_full"], label="Residual H2D  (CF)")
-    ax2.set_ylabel("Residual H2D  (MB)", color=POL_COLS["colora_full"])
-    ax2.tick_params(axis="y", labelcolor=POL_COLS["colora_full"])
-    h1, l1 = ax1.get_legend_handles_labels(); h2, l2 = ax2.get_legend_handles_labels()
-    ax1.legend(h1+h2, l1+l2, fontsize=9, loc="upper right", borderpad=0.3, labelspacing=0.25)
-    ax1.grid(alpha=0.2); _sl(ax1)
-    fig.tight_layout(pad=0.5); _sv(fig, out/"controlled_transfer"); plt.close(fig)
+def _ctrl_mechanism(out):
+    """Compressed mechanism panel at 256 MB.
+    Left: recovery-action mix (%).
+    Right: total critical-path transfer volume."""
+    oracle = ORACLE_CONTROLLED[TIGHT]
+    fig, (ax1, ax2) = plt.subplots(
+        1, 2, figsize=(4.9, 1.95),
+        gridspec_kw={"width_ratios": [1.35, 1.0]}
+    )
+
+    pols = POL_ORD
+    x = np.arange(len(pols)); w = 0.56
+
+    ltr_blk = _mean3(oracle["load_then_run"]["blocking_promotions"])
+    cm_cold = _mean3(oracle["colora_min"]["cpu_cold_executions"])
+    cf_cold = _mean3(oracle["colora_full"]["cpu_cold_executions"])
+    cf_xtra = _mean3(oracle["colora_full"]["weight_h2d_gb"])
+    cf_deferred = int(cf_xtra / (JOINT_OBJECT_MB * MB_TO_GB))
+
+    blocking = [ltr_blk, 0, 0]
+    cpu_cold = [0, cm_cold, cf_cold]
+    deferred = [0, 0, cf_deferred]
+
+    totals   = [max(blocking[i] + cpu_cold[i] + deferred[i], 1) for i in range(3)]
+    blk_pct  = [100 * blocking[i] / totals[i] for i in range(3)]
+    cold_pct = [100 * cpu_cold[i] / totals[i] for i in range(3)]
+    def_pct  = [100 * deferred[i] / totals[i] for i in range(3)]
+
+    ax1.bar(x, blk_pct, w, color="#D55E00", edgecolor="white", lw=0.3, label="Blocking\npromotion")
+    ax1.bar(x, cold_pct, w, bottom=blk_pct, color="#0072B2", edgecolor="white", lw=0.3, label="CPU cold\npath")
+    bot = [blk_pct[i] + cold_pct[i] for i in range(3)]
+    ax1.bar(x, def_pct, w, bottom=bot, color="#009E73", edgecolor="white", lw=0.3, label="Deferred\npromotion")
+
+    for i in range(3):
+        if blk_pct[i] > 10:
+            ax1.text(x[i], blk_pct[i] / 2, f"{blk_pct[i]:.0f}%",
+                     ha="center", va="center", fontsize=7.6, color="white", fontweight="bold")
+        if cold_pct[i] > 10:
+            ax1.text(x[i], blk_pct[i] + cold_pct[i] / 2, f"{cold_pct[i]:.0f}%",
+                     ha="center", va="center", fontsize=7.6, color="white", fontweight="bold")
+        if def_pct[i] > 8:
+            ax1.text(x[i], bot[i] + def_pct[i] / 2, f"{def_pct[i]:.0f}%",
+                     ha="center", va="center", fontsize=7.0, color="white", fontweight="bold")
+
+    ax1.set_xticks(x)
+    ax1.set_xticklabels([POL_LABS[p] for p in pols], fontsize=8.6)
+    ax1.set_ylabel("Recovery actions (%)", fontsize=9.2)
+    ax1.set_ylim(0, 100)
+    ax1.grid(axis="y", alpha=0.18)
+    ax1.legend(fontsize=7.0, loc="upper right", borderpad=0.2,
+               labelspacing=0.2, handlelength=1.1)
+    _sb(ax1)
+
+    ltr_wt = _mean3(oracle["load_then_run"]["weight_h2d_gb"])
+    cf_act = _mean3(oracle["colora_full"]["activation_d2h_gb"])
+    cf_res = _mean3(oracle["colora_full"]["residual_h2d_gb"])
+    cf_fg  = cf_act + cf_res
+
+    vals = [ltr_wt, cf_fg]
+    labs = ["Load-then-run", "CoLoRA-Full"]
+    cols = ["#D55E00", "#0072B2"]
+
+    x2 = np.arange(2)
+    ax2.bar(x2, vals, width=0.52, color=cols, edgecolor="white", lw=0.3)
+
+    ax2.text(0, ltr_wt + 0.4, f"{ltr_wt:.1f} GB",
+             ha="center", va="bottom", fontsize=7.8, color=cols[0], fontweight="bold")
+    ax2.text(1, cf_fg + 0.4, f"{cf_fg:.2f} GB",
+             ha="center", va="bottom", fontsize=7.8, color=cols[1], fontweight="bold")
+
+    ax2.annotate(f"{(ltr_wt / max(cf_fg, 1e-6)):.0f}$\\times$ reduction",
+                 xy=(0.5, max(vals) * 0.30),
+                 ha="center", va="center", fontsize=7.6, color="#444",
+                 bbox=dict(boxstyle="round,pad=0.28", facecolor="#fafafa",
+                           edgecolor="#bbb", alpha=0.95))
+
+    ax2.text(1, max(vals) * 0.08, "activation +\nresidual",
+             ha="center", va="bottom", fontsize=6.9, color="#555")
+
+    ax2.set_xticks(x2)
+    ax2.set_xticklabels(labs, fontsize=8.3)
+    ax2.set_ylabel("Critical-path traffic (GB)", fontsize=9.2)
+    ax2.grid(axis="y", alpha=0.18)
+    _sb(ax2)
+
+    fig.tight_layout(pad=0.5)
+    _sv(fig, out/"controlled_mechanism")
+    plt.close(fig)
 
 
 # ===================================================================
@@ -714,7 +971,7 @@ def _ab_overlap(out):
 # ===================================================================
 
 def _mech(out):
-    hd = ORACLE_REAL_TRACE["high_diversity"]; pols = POL_ORD
+    hd = ORACLE_REAL_TRACE[E2E_MAX]; pols = POL_ORD
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(5.8, 2.25))
     x = np.arange(len(pols)); w = 0.48
     bv = [_mean3(hd["load_then_run"]["blocking_promotions"]), 0, 0]
@@ -748,7 +1005,7 @@ def _mech(out):
 
 
 def _slora(out):
-    hd = ORACLE_REAL_TRACE["high_diversity"]; sl = ORACLE_SLORA
+    hd = ORACLE_REAL_TRACE[E2E_MAX]; sl = ORACLE_SLORA
     ent = [("S-LoRA", "#999999", "//", sl), ("Load-\\nthen-run", "#D55E00", "", hd["load_then_run"]),
            ("CoLoRA-\\nMin", "#0072B2", "", hd["colora_min"]), ("CoLoRA-\\nFull", "#009E73", "", hd["colora_full"])]
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(5.2, 1.85))
@@ -938,13 +1195,13 @@ def _sens_fail(out):
 # ===========================================================================
 
 def latex_table():
-    hd = ORACLE_REAL_TRACE["high_diversity"]
+    hd = ORACLE_REAL_TRACE[E2E_MAX]
     def _p(pol, key):
         v = _mean3(hd[pol][key])
         if key in ("demand_miss_rate", "overlap_rate"): return f"{v*100:.1f}\\\\%"
         elif key in ("weight_h2d_gb", "activation_d2h_gb", "residual_h2d_gb"): return f"{v:.2f}"
         else: return f"{v:.0f}"
-    print("\\n    LaTeX mechanism table (high-diversity trace):")
+    print(f"\\n    LaTeX mechanism table ({E2E_MAX} adapters):")
     print("    ──────────────────────────────────────────────")
     rows = [("Demand miss rate", "demand_miss_rate"), ("Blocking promotions", "blocking_promotions"),
             ("CPU cold executions", "cpu_cold_executions"), ("Weight H2D (GB)", "weight_h2d_gb"),
@@ -964,12 +1221,12 @@ def oracle_summary():
     print(f"    GPU hot-path TPOT: {GPU_HOT_TPOT_BASE} ms | Joint obj: {JOINT_OBJECT_MB:.2f} MB")
     print(f"    Residual: {RESIDUAL_KB:.0f} KB | Activation: {ACTIVATION_KB:.0f} KB")
     print(f"\\n    Real-trace P99 TPOT (ms) — throughput drop within 5%:")
-    print(f"    {'Trace':<18s} {'LTR':>6s}  {'CM':>6s}  {'CF':>6s}  {'CF tp':>6s}")
-    print("    "+"-"*42)
-    for tn, td in [("high_diversity","High-div."),("medium_diversity","Med-div."),("low_diversity","Low-div.")]:
-        l=_mean3(ORACLE_REAL_TRACE[tn]["load_then_run"]["p99_tpot_ms"]); c=_mean3(ORACLE_REAL_TRACE[tn]["colora_min"]["p99_tpot_ms"])
-        f=_mean3(ORACLE_REAL_TRACE[tn]["colora_full"]["p99_tpot_ms"]); t=_mean3(ORACLE_REAL_TRACE[tn]["colora_full"]["throughput_tps"])
-        print(f"    {td:<18s} {l:6.1f}  {c:6.1f}  {f:6.1f}  {t:6.0f}")
+    print(f"    {'Adapters':>9s}  {'LTR':>6s}  {'CM':>6s}  {'CF':>6s}  {'CF tp':>6s}")
+    print("    "+"-"*36)
+    for c in E2E_ADAPTER_COUNTS:
+        l=_mean3(ORACLE_REAL_TRACE[c]["load_then_run"]["p99_tpot_ms"]); cm=_mean3(ORACLE_REAL_TRACE[c]["colora_min"]["p99_tpot_ms"])
+        f=_mean3(ORACLE_REAL_TRACE[c]["colora_full"]["p99_tpot_ms"]); t=_mean3(ORACLE_REAL_TRACE[c]["colora_full"]["throughput_tps"])
+        print(f"    {c:9d}  {l:6.1f}  {cm:6.1f}  {f:6.1f}  {t:6.0f}")
     print(f"\\n    Controlled-pressure P99 TPOT (ms) [H2D auto-derived]:")
     print(f"    {'Budget':>8s}  {'Miss':>5s}  {'LTR P99':>8s}  {'CM P99':>7s}  {'CF P99':>7s}  {'LTR wt GB':>9s}")
     print("    "+"-"*52)
@@ -1002,14 +1259,14 @@ def main():
     if args.dry_run: print("\\nDry-run PASSED."); return 0
     args.output_dir.mkdir(parents=True, exist_ok=True)
     print(f"\\nGenerating figures → {args.output_dir}/\\n")
-    core = [("Real trace", [_p99_tpot, _throughput, _trace_cdf]),
-            ("Controlled pressure", [_ctrl_p99, _ctrl_cdf, _ctrl_transfer]),
+    core = [("Real trace", [_e2e_scaling_shared_legend, _e2e_scaling_p99, _e2e_scaling_throughput, _e2e_scaling_cdf]),
+            ("Controlled pressure", [_ctrl_p99, _ctrl_tail, _ctrl_tail_percentiles, _ctrl_mechanism]),
             ("Ablation", [_ab_promo, _ab_overlap]),
             ("Decomposition", [_decomp])]
     appx = [("Real trace (suppl.)", [_mech, _slora, _mixtral]),
-            ("Controlled (suppl.)", [_ctrl_actions, _coldpath]),
+            ("Controlled (suppl.)", [_ctrl_cdf, _ctrl_actions, _coldpath]),
             ("Ablation (suppl.)", [_reinsert, _tpref_stress]),
-            ("Sensitivity", [_sens_adapters, _sens_cpu, _sens_skew, _sens_tp, _sens_fail])]
+            ("Sensitivity", [_sens_cpu, _sens_skew, _sens_tp, _sens_fail])]
     sections = core + ([] if args.core_only else appx)
     n = 0
     for label, funcs in sections:
