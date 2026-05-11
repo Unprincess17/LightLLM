@@ -173,8 +173,8 @@ def plot_single_breakdown(
         ("gpu_compute", prom_data["gpu_compute"]),
     ]
 
-    y_positions = [1, 0]
-    bar_height = 0.42
+    y_positions = [0.5, 0]
+    bar_height = 0.25
 
     # Execution-first (bottom bar, y=0)
     left = 0.0
@@ -203,7 +203,7 @@ def plot_single_breakdown(
                            fill=False, edgecolor="black", linewidth=0.8, zorder=3))
 
     ax.set_yticks(y_positions)
-    ax.set_yticklabels(["Promotion-first", "Execution-first"], fontsize=8)
+    ax.set_yticklabels(["Promotion\nfirst", "Execution\nfirst"], fontsize=8)
     ax.set_xlim(0, x_max)
     ax.set_xlabel("Recovery time ($\\mu$s)", fontsize=8, labelpad=5)
     ax.set_title("(a) Single-miss recovery time", fontsize=9, loc="left", pad=8)
