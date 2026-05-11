@@ -646,8 +646,14 @@ These controlled-pressure results show both the strength and the boundary of CoL
   \includegraphics[width=\linewidth]{figures/fig_cold_recovery_singlecol.pdf}
   \caption{
   Single-miss recovery at one MoE layer.
-  (a) Standalone service-time breakdown for rank 16 and batch size 8. Promotion-first is dominated by H2D transfer of the full expert--LoRA object, while execution-first replaces full-object movement with activation/residual movement and CPU residual computation.
-  (b) Speedup of execution-first over promotion-first across LoRA ranks and decode batch sizes. Execution-first is faster in all configurations, with a 2.48$\times$ geometric-mean speedup.
+  (a) Recovery-time breakdown for rank 16 and decode batch size 8.
+  Thin gray segments denote object admission for promotion-first and
+  activation packing/result merging for execution-first.
+  Promotion-first is dominated by full-object H2D transfer and GPU LoRA
+  execution, while execution-first replaces full-object movement with
+  activation/residual movement and CPU residual computation.
+  (b) Speedup of execution-first over promotion-first across LoRA ranks and
+  decode batch sizes.
   }
   \label{fig:microbreakdown}
 \end{figure}
@@ -660,9 +666,9 @@ We instrument the components on both recovery paths. For promotion-first, we rep
 
 Figure~\ref{fig:microbreakdown} reports the standalone service time of one cold miss. In the representative rank-16, batch-8 configuration, promotion-first takes 321~$\mu$s, while execution-first takes 161~$\mu$s. The breakdown shows that the gap comes primarily from the foreground payload: promotion-first waits for full expert--LoRA weight transfer before execution can resume, whereas execution-first avoids this transfer and instead pays CPU residual computation plus small activation/residual transfers.
 
-Across the sweep, execution-first is faster in all 16 configurations, with speedups from 1.2$\times$ to 5.2$\times$ and a 2.48$\times$ geometric mean. The speedups are not monotonic in either rank or batch size because the two paths scale with different quantities. Promotion-first is dominated by full-object transfer, which grows with LoRA rank but is largely independent of decode batch size. Execution-first instead scales with CPU residual computation and staging overhead, which grow with both rank and batch size. As a result, execution-first has the largest advantage when weight movement dominates, and the gap narrows when CPU-side residual computation becomes the larger term.
+Across the sweep, execution-first is faster in all 16 configurations, with speedups from 1.2$\times$ to 5.2$\times$ and a 2.45$\times$ geometric mean. The speedups are not monotonic in either rank or batch size because the two paths scale with different quantities. Promotion-first is dominated by full-object transfer, which grows with LoRA rank but is largely independent of decode batch size. Execution-first instead scales with CPU residual computation and staging overhead, which grow with both rank and batch size. As a result, execution-first has the largest advantage when weight movement dominates, and the gap narrows when CPU-side residual computation becomes the larger term.
 
-These results validate the predicted payload asymmetry at the single-miss level. For a cold expert--LoRA miss, the critical cost is not only where the residual is computed, but what state must be moved before the current decode step can proceed. In the full runtime, this local advantage becomes an end-to-end tail-latency benefit only when cold misses occur frequently enough and when the scheduler can overlap cold-path work with GPU-ready execution. Thus, the 2.48$\times$ standalone speedup helps explain the P99 reduction observed in Section~\ref{subsec:real-trace}, but should be interpreted together with the demand miss rate and the measured cold/GPU overlap reported in the end-to-end results. Conversely, when reuse is strong enough to amortize weight promotion, or when CPU residual computation dominates, promotion-first can be competitive.
+These results validate the predicted payload asymmetry at the single-miss level. For a cold expert--LoRA miss, the critical cost is not only where the residual is computed, but what state must be moved before the current decode step can proceed. In the full runtime, this local advantage becomes an end-to-end tail-latency benefit only when cold misses occur frequently enough and when the scheduler can overlap cold-path work with GPU-ready execution. Thus, the 2.45$\times$ standalone speedup helps explain the P99 reduction observed in Section~\ref{subsec:real-trace}, but should be interpreted together with the demand miss rate and the measured cold/GPU overlap reported in the end-to-end results. Conversely, when reuse is strong enough to amortize weight promotion, or when CPU residual computation dominates, promotion-first can be competitive.
 
 \subsection{Ablation Study}
 \label{subsec:ablation}
