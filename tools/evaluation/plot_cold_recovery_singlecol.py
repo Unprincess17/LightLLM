@@ -118,7 +118,7 @@ PROM_GROUP_LABELS = {
 
 FIG_DPI = 300
 FIG_WIDTH = 2.8   # Even narrower
-FIG_HEIGHT = 2.9  # Even shorter
+FIG_HEIGHT = 2.2  # Even shorter to eliminate whitespace inside cells
 
 
 # ---------------------------------------------------------------------------
@@ -173,8 +173,8 @@ def plot_single_breakdown(
         ("gpu_compute", prom_data["gpu_compute"]),
     ]
 
-    y_positions = [0.08, 0]
-    bar_height = 0.05
+    y_positions = [0.5, -0.5]
+    bar_height = 0.32
 
     # Execution-first (bottom bar, y=0)
     left = 0.0
@@ -205,11 +205,14 @@ def plot_single_breakdown(
     ax.set_yticks(y_positions)
     ax.set_yticklabels(["Promotion\nfirst", "Execution\nfirst"], fontsize=8)
     ax.set_xlim(0, x_max)
-    ax.set_xlabel("Recovery time ($\\mu$s)", fontsize=8, labelpad=2)
     ax.set_title("(a) Single-miss recovery time", fontsize=9, loc="left", pad=4)
-    ax.tick_params(axis="both", length=3, width=0.8, pad=2)
+    ax.tick_params(axis="x", bottom=False, labelbottom=False)
+    ax.tick_params(axis="y", length=0, width=0.8, pad=2)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
+    ax.spines["bottom"].set_visible(False)
+    ax.spines["left"].set_visible(False)
+    ax.set_ylim(-1.0, 1.0)
 
     # Total labels at bar ends
     label_offset = x_max * 0.02
@@ -243,7 +246,7 @@ def plot_single_breakdown(
     cpu_left = exec_data["other"] + exec_data["data_transfer"]
     _label_segment(
         ax, cpu_left, exec_data["cpu_compute"], y_positions[1],
-        "CPU\nLoRA", min_width=40, fontsize=6.4, color="white"
+        "CPU LoRA", min_width=40, fontsize=6.4, color="white"
     )
 
 
@@ -273,7 +276,6 @@ def plot_speedup_heatmap(
 
     ax.set_xlabel("LoRA rank", fontsize=8, labelpad=2)
     ax.set_ylabel("Decode batch size", fontsize=8, labelpad=3)
-    ax.set_title("(b) Execution-first speedup", fontsize=9, loc="left", pad=3)
 
     # Thin white separators improve readability in print.
     ax.set_xticks(np.arange(-0.5, len(RANKS), 1), minor=True)
@@ -312,7 +314,7 @@ def plot_singlecol_figure(
     fig, (ax1, ax2) = plt.subplots(
         2, 1,
         figsize=(FIG_WIDTH, FIG_HEIGHT),
-        gridspec_kw={"height_ratios": [0.9, 0.85]},
+        gridspec_kw={"height_ratios": [0.45, 1.0]},
     )
 
     # Select breakdown config
@@ -335,8 +337,37 @@ def plot_singlecol_figure(
         left=0.28,
         right=0.97,
         top=0.93,
-        bottom=0.12,
-        hspace=0.5,
+        bottom=0.10,
+        hspace=0.25,
+    )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    fig.savefig(str(output_path), dpi=FIG_DPI, bbox_inches="tight", pad_inches=0.01)
+    png_output_path = output_path.with_suffix(".png")
+    fig.savefig(str(png_output_path), dpi=FIG_DPI, bbox_inches="tight", pad_inches=0.01)
+
+    plt.close(fig)
+    print(f"Wrote {output_path}")
+    print(f"Wrote {png_output_path} (for preview)")
+
+
+def plot_heatmap_only(
+    output_path: Path,
+) -> None:
+    """Build a single-panel heatmap figure."""
+    fig, ax = plt.subplots(
+        1, 1,
+        figsize=(FIG_WIDTH, 1.6),
+    )
+
+    plot_speedup_heatmap(SPEEDUP_MATRIX, ax)
+
+    fig.subplots_adjust(
+        left=0.28,
+        right=0.97,
+        top=0.88,
+        bottom=0.22,
     )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -369,6 +400,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use stress case (rank=64, batch=8) instead of representative",
     )
+    parser.add_argument(
+        "--heatmap-only",
+        action="store_true",
+        help="Generate only the heatmap panel",
+    )
     return parser.parse_args()
 
 
@@ -376,10 +412,15 @@ def main() -> int:
     args = parse_args()
     output_dir = args.output_dir
 
-    plot_singlecol_figure(
-        output_dir / "fig_cold_recovery_singlecol.pdf",
-        use_stress=args.stress,
-    )
+    if args.heatmap_only:
+        plot_heatmap_only(
+            output_dir / "fig_cold_recovery_heatmap.pdf",
+        )
+    else:
+        plot_singlecol_figure(
+            output_dir / "fig_cold_recovery_singlecol.pdf",
+            use_stress=args.stress,
+        )
 
     return 0
 

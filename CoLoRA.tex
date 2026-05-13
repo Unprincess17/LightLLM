@@ -45,12 +45,6 @@
 %% of the event, and this ID should be used as the parameter to this command.
 \acmSubmissionID{146}
 
-
-% Tighten figure spacing
-\setlength{\textfloatsep}{6pt plus 2pt minus 2pt}
-\setlength{\floatsep}{6pt plus 2pt minus 2pt}
-\setlength{\intextsep}{6pt plus 2pt minus 2pt}
-
 %%
 %% For managing citations, it is recommended to use bibliography
 %% files in BibTeX format.
@@ -103,7 +97,7 @@
 \begin{abstract}
 Multi-LoRA MoE decode serving creates a new memory-management regime for LLM inference. Once tenant-specific LoRA modules are attached to sparsely activated expert layers, the effective unit of access and reuse becomes a joint expert--LoRA object rather than an expert or adapter alone. Our analysis shows that this shift breaks conventional cache locality assumptions: hot-set concentration collapses, cache scaling exhibits sharply diminishing returns, and the remaining performance loss moves into the latency tail.
 
-We present CoLoRA, a multi-LoRA MoE serving runtime that treats GPU-cold misses as an execution-first recovery problem rather than a promotion-first caching problem. CoLoRA adopts a residency-aware hot/cold dual-path design: GPU-resident objects execute on the hot path, while GPU-cold objects trigger a CPU cold path that computes only the LoRA residual from host-resident weights and merges it back for the current token. CoLoRA further incorporates deferred promotion and selective temporal predispatch to improve future reuse and partially overlap cold-path latency. By decoupling cold-object execution from GPU residency management, CoLoRA avoids pipeline stalls during cache misses while preserving efficient GPU execution for hot objects and base-model computation. Compared with promotion-first multi-LoRA serving baselines, CoLoRA reduces P99 Time-Per-Output-Token (TPOT) by up to 44\% while maintaining high throughput.
+We present CoLoRA, a multi-LoRA MoE serving runtime that treats GPU-cold misses as an execution-first recovery problem rather than a promotion-first caching problem. CoLoRA adopts a residency-aware hot/cold dual-path design: GPU-resident objects execute on the hot path, while GPU-cold objects trigger a CPU cold path that computes only the LoRA residual from host-resident weights and merges it back for the current token. CoLoRA further incorporates deferred promotion and selective temporal predispatch to improve future reuse and partially overlap cold-path latency. By decoupling cold-object execution from GPU residency management, CoLoRA avoids turning cold misses into foreground promotion barriers, while preserving efficient GPU execution for hot objects and base-model computation. Compared with a promotion-first multi-LoRA MoE baseline, CoLoRA reduces P99 TPOT by up to 44\% while maintaining comparable output-token throughput.
 \end{abstract}
 
 %%
@@ -152,7 +146,7 @@ We present CoLoRA, a multi-LoRA MoE serving runtime that treats GPU-cold misses 
 \section{Introduction}
 \label{sec:introduction}
 
-Large-scale LLM serving is increasingly shaped by the convergence of two trends: MoE base models~\cite{jiang2024mixtral} and LoRA-based multi-tenant adaptation~\cite{hu2022lora,sheng2024slora}. In practice, these trends meet in \emph{multi-LoRA MoE serving}. While existing multi-LoRA systems target dense modules such as attention layers and shared FFNs, they do not address adaptation on sparsely activated MoE expert layers~\cite{chen2024punica,sheng2024slora}. This gap is critical: MoE expert FFN blocks comprise the majority of model capacity, making them the natural target for tenant-specific specialization~\cite{fedus2022switch,schulman2025lora}. This combination couples the compute efficiency of MoE with the parameter efficiency of LoRA. However, it creates a new serving regime in which request-time sparse routing and tenant-specific adapter selection jointly shape the active weights. This significantly enlarges and diversifies the inference working set, rendering it difficult to manage with existing caching strategies.
+Large-scale LLM serving is increasingly shaped by the convergence of two trends: MoE base models~\cite{jiang2024mixtral} and LoRA-based multi-tenant adaptation~\cite{hu2022lora,sheng2024slora}. In practice, these trends meet in \emph{multi-LoRA MoE serving}. While existing multi-LoRA systems target dense modules such as attention layers and shared FFNs, they do not address adaptation on sparsely activated MoE expert layers~\cite{chen2024punica,sheng2024slora}. This gap is critical: MoE expert FFN blocks comprise the majority of model capacity~\cite{qwen3technicalreport}, making them the natural target for tenant-specific specialization~\cite{fedus2022switch,schulman2025lora}. This combination couples the compute efficiency of MoE with the parameter efficiency of LoRA. However, it creates a new serving regime in which request-time sparse routing and tenant-specific adapter selection jointly shape the active weights. This significantly enlarges and diversifies the inference working set, rendering it difficult to manage with existing caching strategies.
 % v2: Large-scale LLM serving is increasingly shaped by the convergence of two trends that are individually effective but jointly nontrivial to serve: sparse Mixture-of-Experts (MoE) base models~\cite{jiang2024mixtral} and LoRA-based multi-tenant adaptation~\cite{hu2022lora,sheng2024slora}. In practice, these trends naturally meet in \emph{multi-LoRA MoE serving}. Existing multi-LoRA serving systems, however, are primarily designed for dense backbones and do not directly address adaptation on sparsely activated MoE expert layers~\cite{chen2024punica,sheng2024slora}. Such adaptation is both natural and important: MoE expert FFN blocks comprise a large fraction of model capacity and are a natural target for tenant-specific specialization~\cite{fedus2022switch, schulman2025lora}. The resulting combination is attractive because it couples the compute efficiency of MoE with the parameter efficiency of LoRA. At the same time, it creates a new serving regime in which request-time sparse routing and tenant-specific adapter selection jointly shape the active weight set, making the inference working set larger, more diverse, and harder to manage efficiently.
 %
 %Note: In this version, \cite{gale2023megablocks} to be moved to Related Work if not cited elsewhere.
@@ -163,7 +157,7 @@ This enlarged and more diverse working set becomes especially problematic during
 
 In multi-LoRA MoE decode, however, a request only needs the LoRA residuals for the selected experts, so the effective unit of access and reuse is neither an expert alone nor an adapter alone, but a joint expert--LoRA object. These objects are larger than the attention-side LoRA units emphasized in prior systems, because expert-layer LoRA scales with the wide FFN dimensions rather than the narrower attention projections~\cite{shazeer2017outrageously}. At the same time, the base MoE model already occupies most device memory, leaving only limited residual VRAM for caching such objects~\cite{zhu2024deepseek}. The result is a larger and more fragmented working set that breaks the locality assumptions of prior caches and makes decode latency increasingly unpredictable.
 
-To quantify this locality regime, we conduct a trace-driven study using Alibaba LoRA serving traces augmented with realistic MoE expert routing patterns~\cite{lin2025understanding}. The study shows that once access is modeled at the granularity of joint expert--LoRA objects, the hot set becomes far less concentrated. Under a 2K-object cache budget, expert-only modeling covers 98.4\% of accesses, while realistic joint-object modeling covers only 21.8\% and 13.9\% under correlated (C2) and independent (C1) adapter--expert assignment, respectively (Figure~\ref{fig:motivation-breakdown}(a)). As a result, cache scaling becomes markedly less effective: expert-only modeling reaches its target P99 TPOT with a small cache, whereas realistic joint-object workloads still fail to reach that same target even with much larger capacity (Figure~\ref{fig:motivation-breakdown}(b)). Under practical budgets, the penalty appears mainly in the tail rather than the median: median TPOT remains near 1.2\,ms, while P99 TPOT rises to 6.70\,ms, a 5.6$\times$ slowdown (Figure~\ref{fig:motivation-breakdown}(c)). Together, these results show that in multi-LoRA MoE decode, GPU-cold misses are not transient anomalies removable through modest cache growth; they are persistent tail events on the decode critical path.
+To quantify this locality regime, we conduct a trace-driven study using Alibaba LoRA serving traces augmented with realistic MoE expert routing patterns~\cite{yan2026FlexPipe,gentd26}. The study shows that once access is modeled at the granularity of joint expert--LoRA objects, the hot set becomes far less concentrated. Under a 2K-object cache budget, expert-only modeling covers 98.4\% of accesses, while realistic joint-object modeling covers only 21.8\% and 13.9\% under correlated (C2) and independent (C1) adapter--expert assignment, respectively (Figure~\ref{fig:motivation-breakdown}(a)). As a result, cache scaling becomes markedly less effective: expert-only modeling reaches its target P99 TPOT with a small cache, whereas realistic joint-object workloads still fail to reach that same target even with much larger capacity (Figure~\ref{fig:motivation-breakdown}(b)). Under practical budgets, the penalty appears mainly in the tail rather than the median: median TPOT remains near 1.2\,ms, while P99 TPOT rises to 6.70\,ms, a 5.6$\times$ slowdown (Figure~\ref{fig:motivation-breakdown}(c)). Together, these results show that in multi-LoRA MoE decode, GPU-cold misses are not transient anomalies removable through modest cache growth; they are persistent tail events on the decode critical path.
 
 Once accesses to GPU-non-resident expert--LoRA objects become unavoidable, the central problem shifts from \emph{how to avoid misses} to \emph{how to serve them on the decode critical path}. Existing GPU-centric systems typically handle such misses with a promotion-first policy: required weights are first promoted from host memory to GPU memory, and execution resumes only after that promotion completes~\cite{sheng2023flexgen}. This works when misses are infrequent and future reuse is sufficient to amortize migration cost. In multi-LoRA MoE decode, however, a miss may correspond to only a small amount of LoRA-side computation for a single token, with limited computation to amortize PCIe transfer latency and no guarantee of near-term reuse. In this regime, promotion-first recovery becomes a blocking synchronization point that directly stalls token generation. The resulting systems question is therefore: when a joint expert--LoRA object is not resident on the GPU, should the current token stall for synchronous promotion, or should the miss be served through a different execution path?
 
@@ -182,7 +176,7 @@ Our contributions are threefold:
 
 \end{itemize}
 
-We implement CoLoRA in a VaLoRA-based prototype. Compared with a promotion-first multi-LoRA MoE baseline, CoLoRA reduces P99 TPOT by up to $1.8{\times}$ while maintaining comparable output-token throughput, showing improved tail robustness without sacrificing GPU efficiency.
+We implement CoLoRA in a VaLoRA-based prototype. Compared with a promotion-first multi-LoRA MoE baseline, CoLoRA reduces P99 TPOT by up to 44\% while maintaining comparable output-token throughput, showing improved tail robustness without sacrificing GPU efficiency.
 
 %We demonstrate that CoLoRA makes multi-LoRA MoE decode serving more resilient under realistic cache pressure by removing blocking promotion from the critical path of GPU-cold misses, preserving the GPU as the primary engine for hot objects and base-model execution, and reducing tail-latency inflation.
 
@@ -243,7 +237,7 @@ Reasoning at coarser granularity obscures this access pattern. Adapter-level man
 \label{subsec:case-study}
 
 To examine whether this finer-grained access view matters in practice, we conduct a trace-driven case study under three workload conditions. \texttt{C0} uses expert-only keys. 
-\texttt{C1} uses expert--LoRA joint keys under independent assignment, where adapter identity is sampled independently of expert routing. \texttt{C2} uses the same joint keys under correlated assignment, where certain adapters are more likely to co-occur with specific experts. This setup separates the effect of finer-grained keying itself from the extent to which structured adapter--expert affinity can partially preserve locality. We use Alibaba LoRA serving traces~\cite{lin2025understanding} to model request arrivals and LoRA invocations, and replay the resulting decode access streams under these three conditions. As illustrated inFigure~\ref{fig:motivation-breakdown}, modeling accesses as joint expert--LoRA objects triggers a cascade of locality and performance degradations.
+\texttt{C1} uses expert--LoRA joint keys under independent assignment, where adapter identity is sampled independently of expert routing. \texttt{C2} uses the same joint keys under correlated assignment, where certain adapters are more likely to co-occur with specific experts. This setup separates the effect of finer-grained keying itself from the extent to which structured adapter--expert affinity can partially preserve locality. We use Alibaba LoRA serving traces~\cite{yan2026FlexPipe} to model request arrivals and LoRA invocations, and replay the resulting decode access streams under these three conditions. As illustrated in Figure~\ref{fig:motivation-breakdown}, modeling accesses as joint expert--LoRA objects triggers a cascade of locality and performance degradations.
 
 %As illustrated in Figure \ref{fig:motivation-breakdown}, modeling accesses as joint objects triggers a cascade of system-level degradations, demonstrating that traditional caching strategies are insufficient for this workload.
 
@@ -418,7 +412,7 @@ Each request cycles through three states: \textit{GPU-Ready}, \textit{Cold-Path}
 When a miss is detected at layer $L$, the scheduler removes the faulting request from the GPU-ready queue, stages the required activation state, and enqueues a cold-path job for the missing residual. The GPU dispatch loop can continue issuing work for remaining ready requests without introducing a foreground promotion barrier. The skipped request's device-side decode state, including KV-cache handles and layer metadata, remains valid; only the missing LoRA contribution is deferred. Once the CPU cold path returns the residual, the scheduler places the request into the reinsertion queue. After the residual is merged into the request's layer-$L$ activation state, the request is returned to the GPU-ready queue.
 
 \noindent\textbf{Bounded cold-path concurrency.}
-Decoupling miss recovery introduces a resource-management problem: too many simultaneous misses can make host execution or PCIe transfers a new queueing bottleneck. CoLoRA caps the number of in-flight cold-path jobs at $K$, tuned to available host cores and copy capacity. Excess misses are queued rather than dispatched immediately. This bound is not a correctness condition; it is a backpressure mechanism that keeps the cold path from becoming an unbounded source of latency variance. Within this bound, per-request layer order is preserved, requests may temporarily diverge to create overlap, and GPU forward progress continues whenever the GPU-ready queue is non-empty.
+Decoupling miss recovery introduces a resource-management problem: too many simultaneous misses can make host execution or PCIe transfers a new queueing bottleneck. CoLoRA therefore caps in-flight cold-path jobs at $K$, tuned to available host cores and copy capacity; excess misses wait in a bounded queue rather than dispatching immediately. This cap is a backpressure mechanism, not a correctness condition. Cold-path jobs are served in queue order, so a faulting request may wait behind earlier misses but cannot be bypassed indefinitely by later ones. Thus, per-request layer order is preserved, requests may temporarily diverge to create overlap, and GPU forward progress continues whenever the GPU-ready queue is non-empty.
 
 The scheduler does not eliminate the per-request cost of a cold miss. It changes how the cost is exposed: a miss becomes a request-local side-path recovery event rather than a batch-visible foreground weight-migration barrier. Decoupled scheduling handles the current miss, but does not by itself improve future residency or reuse. CoLoRA therefore complements it with background future-reuse policies that improve later hot-path hits without becoming prerequisites for current-token progress.
 
@@ -439,7 +433,7 @@ This policy preserves CoLoRA's execution-first semantics. Admission decisions af
 %In the current design, $\delta$ is implemented as a static hyperparameter; adapting it online using observed reuse, PCIe queue depth, or device-memory pressure is left to future work.
 
 \noindent\textbf{Selective temporal predispatch.}
-The second background mechanism exploits short-horizon temporal locality in decode. Although long-horizon reuse of expert--LoRA objects can be weak under multi-tenant serving, consecutive decode tokens often preserve partial routing continuity. Our router traces show strong but layer-dependent expert-set continuity: the mean expert-set hit rate is 72.2\% overall, with early layers exceeding 95\%, middle layers dipping to 56.8\%, and late layers recovering to 87\% (Appendix~\ref{app:temporal-locality}, Figure~\ref{fig:temporal_locality_hit_rate}). This pattern suggests that short-horizon prediction can still be useful even when global cache locality is fragmented.
+The second background mechanism exploits short-horizon temporal locality in decode. Although long-horizon reuse of expert--LoRA objects can be weak under multi-tenant serving, consecutive decode tokens often preserve partial routing continuity. Our router traces show strong but layer-dependent expert-set continuity: the mean expert-set hit rate is 72.2\% overall, with early layers exceeding 95\%, middle layers dipping to 56.8\%, and late layers recovering to 87\%. This pattern suggests that short-horizon prediction can still be useful even when global cache locality is fragmented.
 
 CoLoRA leverages this signal with selective temporal predispatch. A lightweight predictor identifies expert candidates likely to be accessed in the next few decode steps and opportunistically predispatches the corresponding host-resident weights. Predispatch is treated strictly as a background action rather than a dependency for forward progress. A request never waits for predispatch to complete: if the required object is still unavailable when accessed, execution-first cold-path recovery remains the fallback.
 
@@ -451,16 +445,16 @@ Together, deferred promotion and selective temporal predispatch preserve CoLoRA'
 \section{Implementation}
 \label{sec:implementation}
 
-We implement CoLoRA by extending VaLoRA~\cite{mi2025empower}. CoLoRA reuses VaLoRA's KV-cache manager, continuous batching scheduler, and token-level memory manager, and adds expert--LoRA residency lookup, cold-path residual execution, and background residency management in C++/CUDA and Python. In total, CoLoRA adds execution-first miss recovery while preserving VaLoRA's continuous-batching serving substrate for hot-path execution.
+We implement CoLoRA by extending VaLoRA~\cite{mi2025empower}. CoLoRA reuses VaLoRA's KV-cache manager, continuous batching scheduler, and token-level memory manager, while adding expert--LoRA residency lookup, cold-path residual execution, and background residency management in C++/CUDA and Python. In total, CoLoRA adds execution-first miss recovery while preserving VaLoRA's continuous-batching serving substrate for hot-path execution.
 
 \textbf{Residency-aware dispatch.}
-CoLoRA replaces adapter-centric cache entries with expert--LoRA joint objects, keyed by \texttt{(projection, layer, expert, adapter)}. A rank-$r$ joint object is charged $r$ cache slots in VaLoRA's allocator. Before each expert FFN LoRA computation, CoLoRA checks GPU residency: hits use the existing GPU LoRA path, while misses enter the CPU cold path.
+CoLoRA replaces adapter-centric cache entries with expert--LoRA joint objects, keyed by \texttt{(projection, layer, expert, adapter)}; a rank-$r$ object consumes $r$ cache slots in VaLoRA's allocator. Before each expert FFN LoRA computation, residency lookup sends hits to the existing GPU LoRA path and misses to the CPU cold path.
 
 \textbf{Cold-path execution and scheduling.}
-The cold path computes only the missing LoRA residual; base MoE expert computation remains on the GPU. Cold-path jobs run on a bounded worker pool using vectorized AVX-512 kernels over host-resident expert--LoRA weights. Activations and residuals are transferred asynchronously through pinned staging buffers, and in-flight cold-path jobs are capped to avoid CPU or PCIe queue buildup. We extend VaLoRA's batching loop with per-request layer counters and three states: \textit{GPU-Ready}, \textit{Cold-Path}, and \textit{Awaiting Reinsertion}. On a miss at layer~$L$, only the faulting request leaves the GPU-ready batch; after its residual is returned and merged into the layer-$L$ state, the request is reinserted at its next valid layer boundary.
+The cold path computes only the missing LoRA residual and leaves base MoE expert computation on the GPU. Jobs run on a bounded worker pool using vectorized AVX-512 kernels over the same host-resident expert--LoRA weights as the GPU hot path, changing only where the residual is computed. Activations and residuals are transferred asynchronously through pinned staging buffers, and in-flight jobs are capped to avoid CPU or PCIe queue buildup. We extend VaLoRA's batching loop with per-request layer counters and three states: \textit{GPU-Ready}, \textit{Cold-Path}, and \textit{Awaiting Reinsertion}. On a miss at layer~$L$, only the faulting request leaves the GPU-ready batch; after its residual returns and is merged into the layer-$L$ state, the request is reinserted at its next valid layer boundary.
 
 \textbf{Background residency management.}
-Promotion, eviction, and temporal predispatch run in the background. Promotion is gated by a reuse threshold and a transfer budget, so current-token recovery never waits for promotion. Eviction uses a Chameleon-style frequency, recency, and size score~\cite{iliakopoulou2025chameleon}. The temporal predispatch uses recent per-request, per-layer routing history to issue low-priority H2D transfers only when PCIe capacity is available.
+Promotion, eviction, and temporal predispatch run in the background. Promotion is gated by a reuse threshold and transfer budget, so current-token recovery never waits for promotion. Eviction uses a Chameleon-style frequency, recency, and size score~\cite{iliakopoulou2025chameleon}. Temporal predispatch uses recent per-request, per-layer routing history to issue low-priority H2D transfers only when PCIe capacity is available.
 
 
 \section{Evaluation}
@@ -470,48 +464,45 @@ Promotion, eviction, and temporal predispatch run in the background. Promotion i
 \label{subsec:setup}
 
 \noindent {\bf Testbed and model.}
-We evaluate CoLoRA on an A100-80GB server with an Intel Xeon Gold 5520+ CPU and 376~GiB host memory. Unless otherwise noted, we use a disaggregated prefill/decode deployment with one A100 for prefill and one for decode, following split-phase serving~\cite{patel2024splitwise,agrawal2023sarathi}. 
+We evaluate CoLoRA on an A100-80GB server with an Intel Xeon Gold 5520+ CPU and 376~GiB host memory. Unless otherwise noted, we use a disaggregated prefill/decode deployment with one A100 for prefill and one for decode, following split-phase serving~\cite{patel2024splitwise}. 
 
 We report TPOT and output-token throughput on the decode GPU only; prompt processing runs on the prefill GPU and does not contend with decode-path latency. Each GPU connects to the host through an independent PCIe Gen4 x16 link. CPU cold-path workers are pinned to physical cores and use pinned host buffers for activation and residual transfers.
 
-Our main evaluation uses Qwen3-VL-MoE-30B-A3B as the sparse MoE backbone, with base weights resident on the decode GPU and expert--LoRA objects stored in host memory and cached on demand. To test cross-model generality, we also evaluate Mixtral-8$\times$7B in a sensitivity study. Because its unquantized weights do not fit on a single A100-80GB, we run it with tensor parallelism degree~2, using two A100s for prefill and two for decode. For both backbones, LoRA modules are attached to expert FFN layers, and CoLoRA manages residency at expert--LoRA granularity, keyed by projection, layer, expert, and adapter identity.
+Our main evaluation uses Qwen3-VL-MoE-30B-A3B~\cite{qwen3technicalreport} as the sparse MoE backbone, with base weights resident on the decode GPU and expert--LoRA objects stored in host memory and cached on demand. For cross-model generality, we also evaluate Mixtral-8$\times$7B~\cite{jiang2024mixtral} in a sensitivity study. Because its unquantized weights do not fit on a single A100-80GB, we run it with tensor parallelism degree~2, using two A100s for prefill and two for decode. For both backbones, LoRA modules are attached to expert FFN layers, and CoLoRA manages residency at expert--LoRA granularity, keyed by projection, layer, expert, and adapter identity.
 
 \noindent {\bf Baselines and variants.}
-We compare three miss-recovery policies within the same VaLoRA-based runtime. All use the same expert--LoRA cache object definition and differ only in demand-miss handling. {\em S-LoRA-Expert} is our promotion-first baseline: it follows load-then-run recovery semantics~\cite{sheng2024slora}, but at expert--LoRA granularity, synchronously promoting the required object before continuing the current token. {\em CoLoRA-Min} isolates execution-first recovery by disabling deferred promotion and temporal predispatch, so GPU-resident objects use the hot path while cold objects use the CPU cold path. {\em CoLoRA-Full} adds deferred promotion and temporal predispatch. We use intermediate variants for ablation.
+We compare three miss-recovery policies within the same VaLoRA-based runtime. All use the same expert--LoRA cache object definition and differ only in demand-miss handling. {\em S-LoRA-Expert} is our promotion-first baseline: it follows load-then-run recovery semantics~\cite{sheng2024slora}, but at expert--LoRA granularity. {\em CoLoRA-Min} isolates execution-first recovery by disabling deferred promotion and temporal predispatch. {\em CoLoRA-Full} enables both. We use intermediate variants for ablation.
+%We compare three miss-recovery policies within the same VaLoRA-based runtime. All use the same expert--LoRA cache object definition and differ only in demand-miss handling. {\em S-LoRA-Expert} is our promotion-first baseline: it follows load-then-run recovery semantics~\cite{sheng2024slora}, but at expert--LoRA granularity, synchronously promoting the required object before continuing the current token. {\em CoLoRA-Min} isolates execution-first recovery by disabling deferred promotion and temporal predispatch, so GPU-resident objects use the hot path while cold objects use the CPU cold path. {\em CoLoRA-Full} adds deferred promotion and temporal predispatch. We use intermediate variants for ablation.
 
 \noindent {\bf Workloads and datasets.}
-We evaluate CoLoRA on Alibaba-trace-driven workloads and use controlled workloads to study boundary conditions. For the trace-driven workloads, we sample request arrivals and LoRA adapter IDs from Alibaba serving traces~\cite{lin2025understanding} at varying rates to fit our testbed capacity, following prior LoRA-serving trace-sampling methodology~\cite{mi2025empower}. Controlled workloads vary request arrival rate, adapter diversity, cache budget, and warmup/measurement configuration to stress high-miss regimes. In both settings, prompt and output lengths are drawn from LMSYS-CHAT-1M~\cite{zheng2023lmsyschat1m} and QMSum~\cite{zhong2021qmsum,tan2024lloco}, and expert--LoRA accesses are generated during replay by the MoE router.
+We evaluate CoLoRA on Alibaba trace-driven workloads and on controlled workloads for boundary conditions. For trace-driven workloads, we sample request arrivals and LoRA adapter IDs from Alibaba serving traces~\cite{yan2026FlexPipe} at varying rates to fit our testbed capacity, following prior LoRA-serving trace-sampling methodology~\cite{mi2025empower}. Controlled workloads vary request arrival rate, adapter diversity, cache budget, and warmup/measurement configuration to stress high-miss regimes. In both settings, prompt and output lengths are drawn from LMSYS-CHAT-1M~\cite{zheng2023lmsyschat1m} and QMSum~\cite{zhong2021qmsum}, and expert--LoRA accesses are generated during replay by the MoE router.
 
 \noindent {\bf Metrics.}
-We focus on decode-path performance. Our primary latency metric is time per output token (TPOT), measured on the decode GPU and reported at tail percentiles when needed, especially P99. Throughput denotes output-token throughput on the decode GPU; prompt processing runs on the separate prefill GPU and is therefore excluded from these decode metrics. For cache-pressure analysis, we report \emph{lookup miss rate}, defined as the fraction of expert--LoRA accesses whose joint object is not GPU-resident when first requested. This lookup-time definition avoids hiding promotion-first stalls that make an object resident before GPU execution.
+We focus on decode-path performance. Our primary latency metric is TPOT, reported at tail percentiles, especially P99. Throughput denotes output-token throughput on the decode GPU. For cache-pressure analysis, we report \emph{lookup miss rate}, defined as the fraction of expert--LoRA accesses whose joint object is not GPU-resident when first requested. This lookup-time definition avoids hiding promotion-first stalls that make an object resident before GPU execution.
+%We focus on decode-path performance. Our primary latency metric is time per output token (TPOT), measured on the decode GPU and reported at tail percentiles when needed, especially P99. Throughput denotes output-token throughput on the decode GPU; prompt processing runs on the separate prefill GPU and is therefore excluded from these decode metrics. For cache-pressure analysis, we report \emph{lookup miss rate}, defined as the fraction of expert--LoRA accesses whose joint object is not GPU-resident when first requested. This lookup-time definition avoids hiding promotion-first stalls that make an object resident before GPU execution.
 
 \subsection{End-to-End Performance}
 \label{subsec:e2e}
 
 \subsubsection{Real Trace Performance}
-\label{subsec:real-trace}
+\label{subsubsec:real-trace}
+
+We first evaluate how CoLoRA scales with adapter diversity, the main axis along which expert--LoRA working sets fragment. Using the Alibaba trace-derived workload, we vary the number of concurrently active LoRA adapters from 4 to 64 while replaying the same arrival pattern at each point. As adapter diversity increases, the number of distinct expert--LoRA joint keys grows substantially, driving the lookup miss rate from 0.5\% to 17.5\% under a fixed 16~GB GPU cache budget.
 
 \begin{figure}[t]
   \centering
-  \vspace{-0.35em}
-
   \includegraphics[width=\columnwidth]{figures/evaluation/e2e_scaling_shared_legend.pdf}
-
-  \vspace{-0.45em}
-
-  \begin{minipage}{0.485\columnwidth}
+  \begin{minipage}{0.48\columnwidth}
     \centering
     \small\textbf{(a) P99 TPOT}\\[-0.25em]
     \includegraphics[width=\linewidth]{figures/evaluation/e2e_scaling_p99_nolegend.pdf}
   \end{minipage}
   \hfill
-  \begin{minipage}{0.485\columnwidth}
+  \begin{minipage}{0.48\columnwidth}
     \centering
     \small\textbf{(b) Output-token throughput}\\[-0.25em]
     \includegraphics[width=\linewidth]{figures/evaluation/e2e_scaling_throughput_nolegend.pdf}
   \end{minipage}
-
-  \vspace{-0.20em}
 
   \begin{minipage}{0.96\columnwidth}
     \centering
@@ -519,30 +510,23 @@ We focus on decode-path performance. Our primary latency metric is time per outp
     \includegraphics[width=\linewidth]{figures/evaluation/e2e_scaling_cdf_nolegend.pdf}
   \end{minipage}
 
-  \vspace{-0.45em}
   \caption{
     \textbf{End-to-end scaling with adapter diversity.}
-    As active adapters increase, \textsc{S-LoRA-Expert} becomes increasingly
-    tail-sensitive, while CoLoRA keeps P99 TPOT nearly flat. Output-token
-    throughput remains comparable across policies, and CoLoRA-Full becomes
-    slightly higher at high adapter diversity by reducing foreground blocking
-    promotions. The 64-adapter CDF shows similar median TPOT but sharply
-    separated tails.
+(a) \textsc{S-LoRA-Expert} becomes increasingly tail-sensitive as adapter diversity grows, while CoLoRA keeps P99 TPOT nearly flat.
+(b) Output-token throughput remains comparable across policies.
+(c) At 64 adapters, median TPOT stays similar, but the tail separates sharply.
   }
   \label{fig:e2e-scaling}
-  \vspace{-0.75em}
 \end{figure}
 
-We first evaluate how CoLoRA's tail latency scales with adapter diversity, the main axis along which expert--LoRA working sets fragment (Section~\ref{subsec:motivation}). Using the trace-derived workload described above, we vary the number of concurrently active LoRA adapters from 4 to 64 while replaying the same arrival pattern at each point. As adapter diversity increases, the number of distinct expert--LoRA joint keys grows substantially, driving the demand miss rate from 0.5\% to 17.5\% under a fixed 16~GB GPU cache budget.
+Figure~\ref{fig:e2e-scaling}(a) reports P99 TPOT as adapter diversity increases. \textsc{S-LoRA-Expert} becomes increasingly tail-sensitive, rising from 73.5~ms at 4 adapters to 125.0~ms at 64, as foreground promotion enters the tail. In contrast, CoLoRA-Full stays nearly flat, from 66.8 to 70.0~ms. CoLoRA-Min stays close once misses become frequent, indicating that most of the gain comes from replacing blocking promotion with cold-path execution; deferred promotion and temporal predispatch add the remaining benefit under high miss pressure.
 
-Figure~\ref{fig:e2e-scaling}(a) reports P99 TPOT as a function of active adapters. \textsc{S-LoRA-Expert} becomes increasingly sensitive to adapter diversity: its P99 TPOT grows from 73.5\,ms at 4 adapters to 125.0\,ms at 64 adapters ($1.7{\times}$), with the sharpest increase between 16 and 32 adapters as foreground weight promotion becomes more exposed in the tail. In contrast, CoLoRA-Full remains nearly flat across the sweep, increasing from 66.8\,ms to 70.0\,ms ($1.05{\times}$). CoLoRA-Min, which isolates the execution-first hot/cold split, stays within 16--18\% of CoLoRA-Full from 8 adapters onward, and within 7\% at 4 adapters where misses are rare. This shows that the primary benefit comes from removing blocking promotion from foreground miss recovery; background optimization further reduces the exposed cost under higher miss pressure. The relative advantage therefore grows with adapter diversity: CoLoRA-Full is 9\% lower than \textsc{S-LoRA-Expert} at 4 adapters and 44\% lower at 64 adapters.
+Figure~\ref{fig:e2e-scaling}(b) shows that this tail-latency gain does not come from throttling execution. Throughput remains comparable because cache-resident objects still use the GPU hot path and base-model computation is unchanged. At high adapter diversity, CoLoRA-Full slightly exceeds \textsc{S-LoRA-Expert} by reducing foreground-promotion stalls. The small CoLoRA-Min/Full gap reflects optional background optimization's overhead--benefit trade-off, not an inherent cost of execution-first recovery.
 
-Figure~\ref{fig:e2e-scaling}(b) reports output-token throughput across the adapter-diversity sweep. All policies remain comparable, indicating that CoLoRA's tail-latency improvement does not come from reducing decode throughput. At low adapter diversity, throughput is nearly identical because misses are rare. At high adapter diversity, CoLoRA-Full becomes slightly higher than \textsc{S-LoRA-Expert}; at 64 adapters, throughput increases from 147.5 to 151.0~tok/s. By removing blocking foreground promotions and shifting useful weight movement to deferred background promotion, CoLoRA-Full reduces decode-path stalls while preserving GPU hot-path progress.
-
-Figure~\ref{fig:e2e-scaling}(c) isolates the distributional effect at 64 adapters, the highest-pressure configuration in this sweep. The median TPOT is nearly identical across all policies because cache-resident objects still execute on the GPU hot path. The difference is concentrated in the tail: the P99/P50 ratio drops from $2.9{\times}$ under \textsc{S-LoRA-Expert} to $1.9{\times}$ under CoLoRA-Min and $1.6{\times}$ under CoLoRA-Full. At P95, CoLoRA-Full is 20--25\% faster than the baseline; at P99, the advantage widens to 44\%. This confirms that CoLoRA targets miss-induced tail events rather than changing the common hot-path case.
-
+Figure~\ref{fig:e2e-scaling}(c) isolates the distributional effect at 64 adapters. The median TPOT remains similar across policies, confirming that CoLoRA does not change the common hot-path case. The improvement is concentrated in the tail: \textsc{S-LoRA-Expert} develops a long tail from synchronous promotion, while CoLoRA-Min and CoLoRA-Full sharply separate at high percentiles. This matches CoLoRA's design goal: it does not try to accelerate every token, but prevents unavoidable cold misses from becoming large foreground stalls.
 
 \begin{table}[t]
+\begin{small}
   \centering
   % \footnotesize
   \setlength{\tabcolsep}{3.2pt}
@@ -559,26 +543,33 @@ Figure~\ref{fig:e2e-scaling}(c) isolates the distributional effect at 64 adapter
     Cold/GPU overlap rate   & 0\%    & 30\%   & 55\%   \\
     \bottomrule
   \end{tabular}
+\end{small}
   \caption{
     \textbf{Mechanism counters at 64 adapters.}
-    SLE denotes \textsc{S-LoRA-Expert}. C-Min denotes CoLoRA-Min, and C-Full denotes CoLoRA-Full. Counters are aggregated over the same measurement window. The miss rate is measured at lookup time, before recovery. CoLoRA eliminates foreground blocking weight promotion from demand miss recovery and replaces foreground recovery with activation/residual-sized cold-path exchanges. Weight H2D under CoLoRA-Full is deferred background promotion traffic for future reuse, not foreground demand-miss recovery.
+ SLE denotes \textsc{S-LoRA-Expert}, C-Min denotes CoLoRA-Min, and C-Full denotes CoLoRA-Full. Counters are aggregated over the same measurement window. Miss rate is measured at lookup time.
+ %SLE denotes \textsc{S-LoRA-Expert}, C-Min denotes CoLoRA-Min, and C-Full denotes CoLoRA-Full. Counters are aggregated over the same measurement window, and miss rate is measured at lookup time before recovery. Weight H2D under CoLoRA-Full reflects deferred background promotion rather than foreground demand-miss recovery.
+ %    SLE denotes \textsc{S-LoRA-Expert}. C-Min denotes CoLoRA-Min, and C-Full denotes CoLoRA-Full. Counters are aggregated over the same measurement window. The miss rate is measured at lookup time, before recovery. CoLoRA eliminates foreground blocking weight promotion from demand miss recovery and replaces foreground recovery with activation/residual-sized cold-path exchanges. Weight H2D under CoLoRA-Full is deferred background promotion traffic for future reuse, not foreground demand-miss recovery.
   }
   \label{tab:real-trace-mechanisms}
-  \vspace{-2.7 em}
 \end{table}
 
-Table~\ref{tab:real-trace-mechanisms} explains the mechanism behind the 64-adapter result. All policies see the same 17.5\% lookup miss rate, so the latency reduction does not come from eliminating demand misses. Instead, CoLoRA changes how those misses are recovered. \textsc{S-LoRA-Expert} turns 495 misses into foreground blocking promotions and transfers 0.62\,GB of weights on the decode path. CoLoRA-Min replaces these foreground promotions one-to-one with 495 CPU cold executions, while CoLoRA-Full eliminates foreground blocking promotions and serves 488 cold-path executions, with the remaining weight movement shifted to background promotion for future reuse. In both CoLoRA variants, demand recovery exchanges only activation/residual-sized state on the foreground path. CoLoRA-Full further overlaps 55\% of cold-path recovery time with GPU hot-path execution; its 0.28\,GB of weight H2D traffic comes from deferred background promotion, not foreground miss recovery. 
+Table~\ref{tab:real-trace-mechanisms} explains the 64-adapter result. All policies observe nearly the same lookup miss pressure, so CoLoRA improves latency by changing how misses are recovered rather than by eliminating them. \textsc{S-LoRA-Expert} turns demand misses into blocking foreground promotions and transfers full expert--LoRA objects on the decode path. CoLoRA-Min replaces these with CPU cold-path executions, moving only activation and residual state on the critical path. CoLoRA-Full further shifts weight H2D traffic into deferred background promotion and overlaps 55\% of cold-path recovery with GPU hot-path execution. Thus, CoLoRA does not win by improving cache hit rate or reducing useful GPU work; it wins by changing where miss-recovery cost is paid.
 
-Taken together, these results show that CoLoRA improves tail latency by changing how misses are recovered, not by eliminating misses. Execution-first recovery is effective because it treats cold misses as bounded heterogeneous execution events whose exposed cost grows more slowly with adapter diversity than synchronous weight promotion.
+Taken together, these results show that execution-first recovery matters most when adapter diversity weakens joint-object locality. When misses are rare, all policies behave similarly because most accesses are GPU-resident. As misses become frequent, \textsc{S-LoRA-Expert} exposes weight-transfer latency in the tail, while CoLoRA keeps the current-token recovery payload small and pushes reuse-oriented promotion off the critical path.
+
+%Table~\ref{tab:real-trace-mechanisms} explains the 64-adapter result. All policies observe nearly the same lookup miss pressure, so CoLoRA improves latency by changing how misses are recovered rather than by simply eliminating them. \textsc{S-LoRA-Expert} turns demand misses into blocking foreground promotions and transfers full expert--LoRA objects on the decode path. CoLoRA-Min replaces these foreground promotions with CPU cold-path executions, moving only activation and residual state on the critical path. CoLoRA-Full further moves weight H2D traffic into deferred background promotion and overlaps 55\% of cold-path recovery with GPU hot-path execution. Thus, CoLoRA converts demand miss recovery from full-object foreground movement into bounded foreground execution plus background residency optimization. 
+
+%This mechanism view also rules out two alternative explanations. CoLoRA does not win by improving cache hit rate, since the lookup miss rates are nearly identical across policies. Nor does it win by reducing useful GPU work, since output-token throughput remains comparable. The difference is where miss-recovery cost is paid: \textsc{S-LoRA-Expert} pays it synchronously through foreground weight movement, whereas CoLoRA pays only activation/residual-sized recovery on the foreground path and moves reuse-oriented promotion out of the current-token critical path.
+
+%Taken together, these results show that execution-first recovery is more valuable exactly when adapter diversity weakens joint-object locality. When misses are rare, all policies behave similarly because most accesses are GPU-resident. As misses become frequent, \textsc{S-LoRA-Expert}'s promotion-first policy exposes weight-transfer latency in the tail, while CoLoRA keeps current-token recovery payload small and lets future residency optimization proceed separately.
 
 \subsubsection{Controlled Pressure Performance}
-\label{subsec:controlled-pressure}
+\label{subsubsec:controlled-pressure}
 
 \begin{figure}[t]
   \centering
   \includegraphics[width=\columnwidth]{figures/evaluation/e2e_scaling_shared_legend.pdf}
 
-  \vspace{-0.45em}
 
   \begin{subfigure}[t]{0.48\columnwidth}
     \centering
@@ -592,76 +583,60 @@ Taken together, these results show that CoLoRA improves tail latency by changing
     \includegraphics[width=\linewidth]{figures/evaluation/controlled_tail_percentiles.pdf}
   \end{subfigure}
 
-  \vspace{-0.45em}
   \caption{\textbf{Controlled-pressure performance.}
-  (a) Under tight cache budgets, promotion-first recovery exposes weight-transfer
-  stalls, while CoLoRA reduces P99 TPOT by serving cold misses through execution-first
-  recovery. As the cache budget increases and objects become resident, all policies converge.
-  (b) At the tightest budget, all policies have similar median TPOT, but CoLoRA sharply
-  compresses the tail: the P99/P50 ratio drops from $9.0{\times}$ under load-then-run to
-  $4.4{\times}$ under CoLoRA-Full.}
+(a) Under tight cache budgets, CoLoRA reduces P99 TPOT by serving cold misses through execution-first recovery; as cache capacity increases and objects become resident, all policies converge.
+(b) At the tightest budget, median TPOT remains similar, but CoLoRA sharply compresses the tail, reducing the P99/P50 ratio from $9.0{\times}$ to $4.4{\times}$.}
   \label{fig:controlled-pressure}
-  \vspace{-0.75em}
 \end{figure}
 
-To isolate CoLoRA's miss-recovery mechanism from production-trace skew, we next evaluate a controlled-pressure workload that stresses the high-miss regime identified in Section~\ref{sec:background}. This workload is a stress setting rather than a direct production model: it creates frequent expert--LoRA misses while preserving a stable GPU hot set, allowing us to study when execution-first recovery helps and when its advantage naturally diminishes. We use 4 LoRA adapters, which can all fit into the 16GB GPU cache at the largest budget.
+We next isolate CoLoRA's miss-recovery mechanism from trace skew using a controlled-pressure workload. This workload is not intended to model production traffic directly. Instead, it creates a transparent high-miss setting where expert--LoRA misses are frequent while a stable GPU hot set still exists, allowing us to study when execution-first recovery helps and when its advantage naturally diminishes.
 
-Figure~\ref{fig:controlled-pressure}(a) shows P99 TPOT as a function of cache budget. Under tight budgets, where hot-set coverage remains limited, CoLoRA-Full reduces P99 TPOT by 51--55\% over \textsc{S-LoRA-Expert}. CoLoRA-Min, which disables deferred promotion and temporal predispatch, captures 64--67\% of this improvement, confirming that the main benefit comes from replacing foreground promotion with execution-first cold-path recovery. As cache capacity increases and demand misses become rare, the gap narrows. At the largest budget, where the working set nearly fits in GPU memory, all policies begin to converge because miss recovery is no longer the main source of tail latency.
+Figure~\ref{fig:controlled-pressure}(a) shows P99 TPOT as a function of cache budget. Under tight budgets, where hot-set coverage remains limited, CoLoRA-Full reduces P99 TPOT by 51--55\% over \textsc{S-LoRA-Expert}. CoLoRA-Min captures most of this reduction, confirming that foreground cold-path execution is the primary mechanism. CoLoRA-Full adds further improvement by using deferred promotion and temporal predispatch to reduce the cost of future misses without making those optimizations prerequisites for current-token progress.
 
-Figure~\ref{fig:controlled-pressure}(b) examines the tightest-budget case in more detail. \textsc{S-LoRA-Expert} exhibits a long latency tail because weight promotion is exposed on the decode critical path. CoLoRA-Full compresses this tail: the P99/P50 ratio drops from $9.0{\times}$ to $4.4{\times}$, and the fraction of tokens exceeding 100\,ms falls from 52\% to 8\%. Mechanism counters confirm that the improvement comes from replacing foreground blocking weight promotion with CPU cold-path recovery, reducing critical-path transfer volume from 15.5\,GB to 0.19\,GB.
+As cache capacity increases, all policies converge. This convergence is important: it shows that CoLoRA is not relying on a faster common path or on artificial throttling. When most objects fit in GPU memory, the recovery policy is rarely exercised, and the systems behave similarly. CoLoRA's benefit appears when the working set is fragmented enough that cold misses remain on the decode critical path.
 
-These controlled-pressure results show both the strength and the boundary of CoLoRA's design. When misses are frequent and near-term reuse is weak, execution-first recovery prevents cold misses from becoming dominant promotion stalls. When the working set nearly fits in GPU memory, the policies converge because miss recovery is no longer the main source of latency variance.
+Figure~\ref{fig:controlled-pressure}(b) shows the tightest-budget case in more detail. All policies have similar median TPOT, but the tails differ sharply. CoLoRA-Full lowers the P99/P50 ratio from 9.0$\times$ to 4.4$\times$ and reduces the fraction of tokens above 100~ms from 52\% to 8\%. This confirms that execution-first recovery primarily compresses miss-induced latency variance rather than changing the latency of ordinary cache-hit tokens.
 
 \subsection{Single-Miss Recovery Microbenchmark}
 \label{subsec:microbenchmark}
 
-We next isolate the local cost of recovering one GPU-cold expert--LoRA object at a single MoE layer. This microbenchmark evaluates the cost model in Section~\ref{subsec:feasibility} before scheduler overlap is introduced. A promotion-first miss must restore GPU residency by transferring the full expert--LoRA object before the current token can resume. In contrast, execution-first recovery completes the current access by sending activation state to the host, computing the missing LoRA residual from host-resident weights, and returning only the residual to the GPU. The goal is not to show that CPU execution is generally faster than GPU execution, but to test whether replacing full-object migration with activation/residual-sized exchange reduces the synchronous cost of one cold recovery.
+We next isolate the local cost of recovering one GPU-cold expert--LoRA object at a single MoE layer. Promotion-first moves the full expert--LoRA object before execution can resume. Execution-first exchanges only activation- and residual-sized state. The key difference is the synchronous payload placed on the decode path. This microbenchmark tests whether that payload asymmetry reduces standalone cold-miss recovery service time.
 
-To keep the measurement local, we disable cache replacement, request scheduling, queueing, deferred promotion, temporal predispatching, and cross-request overlap. The reported time therefore measures the standalone service time of the recovery path, not the end-to-end latency exposed by the full runtime. Here, decode batch size denotes the number of activations served by the isolated recovery path for the same missing expert--LoRA object. Promotion-first transfers the missing object to GPU memory and then computes the LoRA residual on the GPU. Execution-first transfers the current activations to the host, computes the residual on the CPU, and returns the residuals to the GPU.
+%We next isolate the local cost of recovering one GPU-cold expert--LoRA object at a single MoE layer. The key difference between promotion-first and execution-first recovery is the synchronous payload placed on the decode path: promotion-first moves the full expert--LoRA object before execution can resume, whereas execution-first exchanges only activation- and residual-sized state. This microbenchmark tests whether that payload asymmetry reduces standalone recovery service time.
 
-We instrument the components on both recovery paths. For promotion-first, we report cache-admission overhead, H2D expert--LoRA weight transfer, and GPU LoRA computation. For execution-first, we report activation packing, D2H activation transfer, CPU residual computation, H2D residual transfer, and merge. We sweep LoRA rank $\{8,16,32,64\}$ and decode batch size $\{1,2,4,8\}$, covering the small-batch decode regime where per-token stalls are most visible.
-
-Figure~\ref{fig:microbreakdown} reports the standalone service time of one cold recovery. In the representative rank-16, batch-8 configuration, promotion-first takes 321~$\mu$s, while execution-first takes 161~$\mu$s. The breakdown shows that the gap comes primarily from the critical-path payload: promotion-first waits for full expert--LoRA weight transfer before execution can resume, whereas execution-first avoids this transfer and instead pays CPU residual computation plus small activation/residual transfers.
-
-Across the sweep, execution-first is faster in all 16 configurations, with speedups from 1.1$\times$ to 2.2$\times$ and a 1.4$\times$ geometric mean. The speedups are not monotonic in either rank or batch size because the two recovery paths scale with different quantities. Promotion-first is dominated by full-object transfer, which grows with LoRA rank and is largely insensitive to decode batch size. Execution-first instead scales with CPU residual computation and staging overhead, which grow with both rank and batch size. As a result, execution-first has the largest advantage when weight movement dominates, while the gap narrows when CPU-side residual computation becomes the larger term.
+To keep the measurement local, we disable cache replacement, request scheduling, queueing, deferred promotion, temporal predispatch, and cross-request overlap. The reported time therefore measures a single recovery path before any overlap from the full runtime. Promotion-first transfers the missing object to GPU memory and then computes the LoRA residual on the GPU. Execution-first sends the current activation to the host, computes the missing residual on the CPU from host-resident weights, and returns only the residual to the GPU. We sweep LoRA rank and decode batch size to cover the small-batch decode regime where per-token stalls are most visible.
 
 \begin{figure}[t]
   \centering
-  \includegraphics[width=\linewidth]{figures/fig_cold_recovery_singlecol.pdf}
+  \includegraphics[width=0.72\linewidth]{figures/fig_cold_recovery_heatmap.pdf}
   \caption{
-  \textbf{Single-miss recovery at one MoE layer.}
-  (a) Standalone recovery-time breakdown for one cold expert--LoRA
-  object at rank 16 and decode batch size 8.
-  Thin gray segments denote object admission for promotion-first and
-  activation packing/result merging for execution-first.
-  Promotion-first pays full-object H2D transfer before GPU LoRA execution,
-  while execution-first exchanges activation/residual-sized state and
-  computes the missing residual on the CPU.
-  (b) Speedup of execution-first over promotion-first across LoRA ranks and
-  decode batch sizes.
+  \textbf{Single-miss recovery speedup at one MoE layer.}
+  Cells show execution-first speedup over promotion-first across LoRA ranks and batch sizes.
   }
-  \vspace{-4pt}
   \label{fig:microbreakdown}
 \end{figure}
 
-These results validate the predicted payload asymmetry at the single-miss level. For a cold expert--LoRA object, the critical cost is not only where the residual is computed, but what state must be moved before the current decode step can proceed. In the full runtime, this local service-time advantage becomes an end-to-end tail-latency benefit when demand misses are frequent enough and when the scheduler can overlap cold-path work with GPU-ready execution. Thus, the 1.4$\times$ standalone speedup helps explain the P99 reduction observed in Section~\ref{subsec:real-trace}, but should be interpreted together with the measured demand miss rate and cold/GPU overlap. When reuse is strong enough to amortize promotion, or when CPU residual computation dominates, promotion-first can remain competitive.
+
+Figure~\ref{fig:microbreakdown} reports the speedup of execution-first recovery over promotion-first. In the representative rank-16, decode-batch-8 case, execution-first reduces standalone recovery from 1020 to 786~$\mu$s by avoiding full-object H2D transfer. Across all 16 rank/batch configurations, execution-first is faster, with speedups from 1.1$\times$ to 2.2$\times$ and a 1.4$\times$ geometric mean. The speedup is not monotonic because the two paths scale with different quantities: promotion-first is dominated by full-object transfer, while execution-first scales with CPU residual computation and staging overhead.
+
+These results validate the payload asymmetry behind CoLoRA. For a cold expert--LoRA object, the critical cost is not only where the residual is computed, but what state must be moved before the current decode step can proceed. In the full runtime, this local service-time advantage becomes a tail-latency benefit when demand misses are frequent and the scheduler can overlap cold-path work with GPU-ready execution. Conversely, when reuse is strong enough to amortize promotion or CPU residual computation dominates, promotion-first can become competitive; this is why CoLoRA keeps promotion as a background future-reuse mechanism rather than eliminating it.
 
 \subsection{Ablation Study}
 \label{subsec:ablation}
 
-\noindent {\bf Incremental ablation.} We decompose CoLoRA-Full's improvement using an ordered build-up of its mechanisms. Figure~\ref{fig:ablation-promotion} compares four miss-recovery policies at 64 adapters. We use this controlled setting because it creates enough demand misses to expose differences among recovery policies while keeping the workload fixed across variants. Starting from \textsc{S-LoRA-Expert} (125.0~ms P99 TPOT), asynchronous promotion peels off the faulting request on a miss and reinserts it after H2D transfer completes, without CPU cold-path execution. This reduces P99 to 109.0~ms, a 12.8\% improvement relative to \textsc{S-LoRA-Expert}. The gain is modest because the faulting request still waits for the full expert--LoRA object to be transferred before it can resume, and reinsertion itself introduces overhead.
+\noindent {\bf Incremental ablation.}
+Figure~\ref{fig:ablation-promotion} decomposes CoLoRA-Full using an ordered build-up at 64 adapters. Starting from \textsc{S-LoRA-Expert}, asynchronous promotion reduces P99 TPOT from 125.0 to 109.0~ms by peeling off the faulting request and reinserting it after H2D transfer completes. This gain is modest because the faulting request still waits for the full expert--LoRA object to be promoted before it can resume. Adding CPU cold-path execution gives the largest step, reducing P99 to 82.5~ms, because foreground recovery now uses activation/residual-sized exchange and host-side residual computation instead of full-object weight movement. CoLoRA-Full further reduces P99 to 70.0~ms through deferred promotion and temporal predispatch. Together, the mechanisms explain CoLoRA-Full's 44.0\% P99 reduction over \textsc{S-LoRA-Expert}.
 
-Adding CPU cold-path execution on top of asynchronous promotion (CoLoRA-Min) further reduces P99 to 82.5~ms, a 24.3\% improvement over asynchronous promotion. This is the largest incremental gain because foreground recovery replaces full-object weight movement with activation/residual-sized exchanges and host-side residual computation. Finally, adding deferred promotion and temporal predispatch (CoLoRA-Full) reduces P99 to 70.0~ms, a further 15.2\% improvement. Thus, in this ordered build-up, the CPU cold path provides the largest incremental gain, while asynchronous promotion and background reuse policies provide complementary improvements. Together, the mechanisms explain CoLoRA-Full's 44.0\% P99 reduction over \textsc{S-LoRA-Expert}.
 
-\noindent {\bf Overlap effectiveness.} We next isolate whether the scheduler can overlap recovery work with GPU-ready execution while holding each recovery policy fixed. In the no-overlap variant, a request that enters promotion or CPU cold-path recovery prevents the decode step from advancing until the recovery result is available; all cache decisions and recovery mechanisms are unchanged. Disabling this overlap makes miss recovery synchronous with respect to the decode step. P99 rises from 82.5 to 106.0~ms for CoLoRA-Min and from 70.0 to 93.0~ms for CoLoRA-Full; throughput drops from 148.0 to 135.5~tok/s and from 147.5 to 134.0~tok/s, respectively. Thus, overlap reduces P99 by 22--25\% relative to the no-overlap variants by hiding recovery work behind GPU hot-path execution. This validates the scheduler design in Section~\ref{subsec:scheduler}: skip-and-reinsert is necessary for converting cold-path service-time reduction into end-to-end tail-latency reduction.
+\noindent {\bf Overlap effectiveness.}
+We next isolate whether the scheduler can translate local cold-path savings into system-level end-to-end latency reduction. In the no-overlap variant, a request that enters promotion or CPU cold-path recovery prevents the decode step from advancing until the recovery result is available; all cache decisions and recovery mechanisms are unchanged. Disabling overlap raises P99 from 82.5 to 106.0~ms for CoLoRA-Min and from 70.0 to 93.0~ms for CoLoRA-Full. Throughput also drops from 148.0 to 135.5~tok/s and from 147.5 to 134.0~tok/s, respectively. Thus, skip-and-reinsert is not only an implementation detail: it is the scheduler mechanism that prevents per-request miss recovery from becoming a batch-wide stall while preserving GPU hot-path forward progress.
 
-\noindent {\bf Reinsertion overhead.} The overlap benefit above comes from peeling off faulting requests and later reinserting them, so we also quantify the cost of this reinsertion path. We measure reinsertion latency from cold-path completion callback to the request becoming eligible for its next GPU execution point, including callback scheduling, state merge, and batch synchronization. Across the controlled-pressure runs, this cost is 8.8--10.2~ms per token that triggers cold-path recovery at P99, about one-tenth of the corresponding P99 TPOT. The cost remains stable across cache budgets because the amount of work per reinsertion is fixed once a miss occurs; cache capacity changes how often reinsertion happens, not the cost of handling one completed cold-path result.
+\noindent {\bf Reinsertion overhead.}
+The overlap benefit above comes from temporarily removing faulting requests and later reinserting them, so we also quantify the cost of this path. We measure reinsertion latency from the cold-path completion callback to the request becoming eligible for its next GPU execution point, including callback scheduling, state merge, and batch synchronization. Across controlled-pressure runs, this cost is 8.8--10.2~ms per cold-miss token at P99, about one-tenth of the corresponding P99 TPOT. The cost remains stable across cache budgets because cache size changes how often reinsertion happens, not the work required to handle one completed cold-path result.
 
 \begin{figure}[t]
   \centering
-
   \begin{minipage}[t]{0.48\columnwidth}
-    \vspace{0pt}
     \centering
     \includegraphics[width=\linewidth]{figures/evaluation/ablation_promotion.pdf}
     \caption{
@@ -673,10 +648,8 @@ Adding CPU cold-path execution on top of asynchronous promotion (CoLoRA-Min) fur
   \end{minipage}
   \hfill
   \begin{minipage}[t]{0.48\columnwidth}
-    \vspace{0pt}
     \centering
     \includegraphics[width=\linewidth]{figures/evaluation/sens_skew.pdf}
-    \vspace{-24pt}
     \caption{
     \textbf{Sensitivity to access skew.}
       CoLoRA gives the largest tail-latency gain under low skew; the gap
@@ -684,81 +657,69 @@ Adding CPU cold-path execution on top of asynchronous promotion (CoLoRA-Min) fur
     }
     \label{fig:sens-skew}
   \end{minipage}
-
 \end{figure}
 
-
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\columnwidth]{figures/evaluation/sens_workers_mixtral.pdf}
+  \caption{\textbf{Deployment sensitivity.} (a) CPU worker scaling. (b) Cross-model evaluation on Mixtral-8$\times$7B.}
+  \label{fig:sens-deployment}
+\end{figure}
 
 \subsection{Sensitivity Analysis}
 \label{subsec:sensitivity}
 
-We evaluate CoLoRA beyond the main adapter-count sweep, varying CPU capacity, MoE backbone, adapter-access skew, and extreme cache pressure.
-
-\begin{figure}[t]
-  \centering
-  \vspace{-0.35em}
-  \includegraphics[width=\columnwidth]{figures/evaluation/sens_workers_mixtral.pdf}
-  \caption{\textbf{Deployment sensitivity.} (a) CPU worker scaling. (b) Cross-model evaluation on Mixtral-8$\times$7B.}
-  \label{fig:sens-deployment}
-  \vspace{-0.75em}
-\end{figure}
-
-% \begin{figure}[t]
-%   \centering
-%   \vspace{-0.35em}
-%   \includegraphics[width=\columnwidth]{figures/evaluation/sens_skew_failure.pdf}
-%   \caption{\textbf{Workload sensitivity.} (a) Adapter-access skew. (b) All-cold stress regime.}
-%   \label{fig:sens-workload}
-%   \vspace{-0.75em}
-% \end{figure}
-
-\noindent {\bf Deployment sensitivity.}
-Figure~\ref{fig:sens-deployment}(a) shows that CoLoRA needs only a modest CPU worker pool. Increasing workers from 1 to 4 reduces P99 TPOT from 113 to 77.0~ms and the maximum cold-path queue depth from 365 to 45; increasing to 8 workers gives only a small additional gain (73.5~ms, queue depth 16), indicating that residual latency is no longer CPU-queue dominated. Figure~\ref{fig:sens-deployment}(b) evaluates Mixtral-8$\times$7B. CoLoRA-Full lowers P99 TPOT from 145 to 120~ms over \textsc{S-LoRA-Expert}, while CoLoRA-Min reaches 132~ms. The gain is smaller than on Qwen because Mixtral has fewer experts and a higher activated-expert ratio, making misses less dominant, but the result still shows that execution-first recovery generalizes across MoE backbones.
+We evaluate CoLoRA beyond the main adapter-count sweep by varying adapter-access skew, CPU capacity, and MoE backbone. These experiments characterize the operating envelope of execution-first recovery: required CPU capacity, generality beyond the main Qwen backbone, and when workload locality makes promotion-first recovery competitive.
 
 \noindent {\bf Workload sensitivity.}
-Figure~\ref{fig:sens-skew} sweeps adapter-access skew to vary cache reuse. CoLoRA is most beneficial under fragmented access: at uniform access ($\alpha=0$), CoLoRA-Full reduces P99 TPOT from 180.0 to 76.5~ms over \textsc{S-LoRA-Expert}. As skew increases, reuse improves and all policies converge, reaching around 44~ms at $\alpha=4.0$. This shows that CoLoRA primarily improves the cache-pressured regime where cold misses remain on the decode critical path, while adding little overhead when workload locality already makes promotion-first recovery effective.
+Figure~\ref{fig:sens-skew} sweeps adapter-access skew to vary cache reuse. CoLoRA helps most under fragmented access: at uniform access ($\alpha=0$), CoLoRA-Full reduces P99 TPOT from 180.0 to 76.5~ms over \textsc{S-LoRA-Expert}. As skew increases, reuse improves, the hot set becomes easier to retain, and all policies converge around 44~ms at $\alpha=4.0$. This result is the expected boundary of CoLoRA: when caching already removes most cold misses, execution-first recovery has little work to do; when reuse is weak and misses remain on the critical path, decoupling recovery from promotion substantially improves tail robustness.
+
+\noindent {\bf Deployment sensitivity.}
+Figure~\ref{fig:sens-deployment}(a) shows that CoLoRA needs only a modest CPU worker pool. With one worker, cold-path queueing becomes visible in the tail: P99 TPOT reaches 113~ms and maximum queue depth reaches 365. Increasing to 4 workers reduces P99 to 77.0~ms and queue depth to 45; increasing to 8 workers gives only a small additional gain, reaching 73.5~ms and queue depth 16. This indicates that beyond four workers, residual latency is no longer dominated by CPU queue buildup but by transfer, merge, and scheduling overhead.
+
+Figure~\ref{fig:sens-deployment}(b) evaluates Mixtral-8$\times$7B to test whether execution-first recovery depends on the main Qwen MoE backbone. CoLoRA-Full lowers P99 TPOT from 145 to 120~ms over \textsc{S-LoRA-Expert}, while CoLoRA-Min reaches 132~ms. The gain is smaller than on Qwen because Mixtral has fewer experts and a higher activated-expert ratio, making miss fragmentation less dominant. Nevertheless, the improvement shows that CoLoRA's benefit comes from the recovery abstraction rather than a Qwen-specific routing pattern.
 
 
 \section{Related Work}
 \label{sec:related}
 
 \noindent {\bf LoRA and multi-tenant adapter serving.}
-LoRA enables parameter-efficient specialization of a shared foundation model using small task-specific low-rank updates~\cite{hu2022lora}. This has motivated systems for serving many concurrent LoRA tenants, including heterogeneous batching, adapter paging, CPU-assisted loading, and SLO-aware scheduling~\cite{chen2024punica,sheng2024slora,wu2024dlora,li2025toppings,bruel2024compress}. These systems are the closest prior work on multi-adapter serving. However, they primarily target dense backbones, where active adaptation state is naturally organized around adapters. In multi-LoRA MoE decode, a request only needs the LoRA states associated with the experts routed by the current token. The relevant unit of access is therefore not an adapter alone, but an expert--LoRA joint object.
+Parameter-efficient fine-tuning specializes foundation models through small task-specific components such as adapters, prefixes, and low-rank updates~\cite{houlsby2019parameter,li2021prefix,hu2022lora}; later LoRA variants further reduce adaptation cost through quantization and adaptive rank allocation~\cite{dettmers2023qlora,zhang2023adaptive}. This has motivated systems for serving many concurrent LoRA tenants, including heterogeneous batching, adapter paging, CPU-assisted loading, mode switching, compression, and SLO-aware scheduling~\cite{chen2024punica,sheng2024slora,wu2024dlora,li2025toppings,bruel2024compress}. These systems are the closest prior work on multi-adapter serving. However, they primarily target dense backbones, where active adaptation state is naturally organized around adapters. In multi-LoRA MoE decode, a request only needs the LoRA states associated with the experts routed by the current token. The relevant unit of access is therefore not an adapter alone, but an expert--LoRA joint object.
 
 \noindent {\bf Sparse MoE models and serving.}
-Sparse MoE architectures activate only a small subset of experts per token, making expert routing, placement, and caching central to efficient inference~\cite{shazeer2017outrageously,fedus2022switch,jiang2024mixtral,zhu2024deepseek}. Recent MoE-serving systems study expert placement, offloading, caching, and CPU/GPU co-execution under memory pressure~\cite{xue2024moe,kamahori2024fiddler,yu2025fmoe,zhong2025hybrimoe}. These works are directly relevant to sparse-model serving, but they reason primarily at expert granularity. CoLoRA targets a different regime where expert routing and tenant-specific LoRA selection jointly determine the active weights. This interaction fragments reuse across a much larger space of expert--LoRA combinations, so cold accesses that would otherwise appear infrequent can still surface on the decode critical path and disproportionately affect tail latency.
+Sparse MoE architectures activate only a small subset of experts per token, making routing, placement, communication, and caching central to efficient inference~\cite{shazeer2017outrageously,fedus2022switch,zoph2022st,zhou2022mixture,jiang2024mixtral,zhu2024deepseek}. System support for MoE has studied scalable expert dispatch, block-sparse expert computation, expert placement, offloading, caching, and CPU/GPU co-execution under memory pressure~\cite{hwang2023tutel,gale2023megablocks,rajbhandari2022deepspeedmoe,xue2024moe,kamahori2024fiddler,yu2025fmoe,zhong2025hybrimoe,cao2025moe}. These works are relevant to sparse-model serving, but they primarily reason at expert granularity. CoLoRA instead targets a regime where expert routing and tenant-specific LoRA selection jointly determine the active weights, fragmenting reuse across a larger space of expert--LoRA combinations and making cold accesses more likely to surface on the decode critical path.
 
 \noindent {\bf LLM serving runtimes and hierarchical memory management.}
-A complementary line of work improves the runtime substrate for LLM inference, including iteration-level scheduling, continuous batching, KV-cache management, prefill/decode separation, and hierarchical use of host and device memory~\cite{yu2022orca,kwon2023efficient,agrawal2023sarathi,patel2024splitwise,aminabadi2022deepspeed,sheng2023flexgen,na2025flexinfer}. CoLoRA builds on this systems context, but differs in how it handles cold adaptation weights during decode. Existing runtime designs generally restore required weights to accelerator memory before normal execution proceeds. CoLoRA instead targets cache-pressured multi-LoRA MoE decode, where many misses have weak near-term reuse and synchronous promotion becomes a blocking point. Overall, prior work has separately advanced adapter-centric LoRA serving, expert-centric MoE serving, and high-performance LLM runtime design. CoLoRA combines these perspectives by making the expert--LoRA joint object the unit of control and decoupling current-token miss recovery from future residency restoration.
+A complementary line of work improves the runtime substrate for LLM inference through efficient kernels~\cite{pope2023efficiently,dao2022flashattention,dao2024flashattention2}, scheduling and batching~\cite{yu2022orca,wu2026fastserve}, KV-cache and context reuse~\cite{kwon2023efficient,zheng2024sglang,prabhu2025vattention,liu2024cachegen,jin2025ragcache}, prefill/decode coordination ~\cite{agrawal2023sarathi,patel2024splitwise,zhong2024distserve}, and model placement, offloading, or heterogeneous execution across GPU, CPU, and storage hierarchies~\cite{li2023alpaserve,aminabadi2022deepspeed,sheng2023flexgen,na2025flexinfer,he2024fastdecode}. CoLoRA builds on this broader runtime context, but differs in how it handles cold adaptation weights during decode. Existing runtime designs generally optimize kernels, batching, scheduling, KV state, context reuse, or model-weight residency. CoLoRA instead targets cache-pressured multi-LoRA MoE decode, where many expert--LoRA misses have weak near-term reuse, so synchronous promotion becomes a blocking point. It makes the expert--LoRA joint object the unit of control and decouples current-token miss recovery from future residency restoration.
+
 
 \section{Conclusion}
 
-Across trace-driven and end-to-end evaluations, CoLoRA shows that execution-first cold-miss handling improves the robustness of multi-LoRA MoE decode serving under realistic cache pressure. By removing blocking promotion from the critical path of GPU-cold misses, CoLoRA reduces tail-latency inflation while preserving efficient GPU execution for hot objects and base-model computation. 
+In this paper, we show that in multi-LoRA MoE decode, the main problem is no longer only how to cache better, but how to recover unavoidable GPU-cold misses without stalling token generation. By combining execution-first hot/cold recovery, decoupled miss scheduling, and background reuse optimization, CoLoRA turns cold misses from blocking promotion events into bounded recovery events. Our results show that this design reduces tail latency under realistic cache pressure while preserving efficient GPU execution for hot-path and base-model computation.
 
-% \section{Conclusion}
-\clearpage
+
+%\clearpage
 \bibliographystyle{plain}
 \bibliography{CoLoRA-reference}
 
-\clearpage
-\appendix
-\section{Per-Layer Temporal Routing Locality}
-\label{app:temporal-locality}
+%\clearpage
+%\appendix
+%\section{Per-Layer Temporal Routing Locality}
+%\label{app:temporal-locality}
 
-Figure~\ref{fig:temporal_locality_hit_rate} reports the per-layer consecutive-token routing locality measured from the Qwen3--VL--MoE router on the ShareGPT--V3 trace. For each request and MoE layer, we compare the routed expert set at decode step $t$ against the previous decode step $t-1$ using the hit-rate metric $|E(L,t) \cap E(L,t-1)| / |E(L,t)|$. The resulting curve is distinctly U-shaped: early layers show very high temporal continuity, middle layers are weaker, and late layers recover. This observation motivates temporal predispatch as a useful but non-uniform optimization across depth.
+%Figure~\ref{fig:temporal_locality_hit_rate} reports the per-layer consecutive-token routing locality measured from the Qwen3--VL--MoE router on the ShareGPT--V3 trace. For each request and MoE layer, we compare the routed expert set at decode step $t$ against the previous decode step $t-1$ using the hit-rate metric $|E(L,t) \cap E(L,t-1)| / |E(L,t)|$. The resulting curve is distinctly U-shaped: early layers show very high temporal continuity, middle layers are weaker, and late layers recover. This observation motivates temporal predispatch as a useful but non-uniform optimization across depth.
 
-\begin{figure}[t]
-  \centering
-  \includegraphics[width=\columnwidth]{figures/motivation/temporal_locality_hit_rate.pdf}
-  \caption{
-  Per-layer consecutive-token routing locality during decode.
-  The plotted quantity is the mean expert-set hit rate $|E(L,t) \cap E(L,t-1)| / |E(L,t)|$.
-  The curve is U-shaped: early and late layers exhibit stronger temporal continuity, while middle layers are weaker.
-  This pattern supports an opportunistic, potentially layer-selective temporal predispatch policy rather than a uniform always-on rule.
-  }
-  \label{fig:temporal_locality_hit_rate}
-\end{figure}
-
+%\begin{figure}[t]
+%  \centering
+%  \includegraphics[width=\columnwidth]{figures/motivation/temporal_locality_hit_rate.pdf}
+%  \caption{
+%  Per-layer consecutive-token routing locality during decode.
+%  The plotted quantity is the mean expert-set hit rate $|E(L,t) \cap E(L,t-1)| / |E(L,t)|$.
+%  The curve is U-shaped: early and late layers exhibit stronger temporal continuity, while middle layers are weaker.
+%  This pattern supports an opportunistic, potentially layer-selective temporal predispatch policy rather than a uniform always-on rule.
+%  }
+%  \label{fig:temporal_locality_hit_rate}
+%\end{figure}
 
 \end{document}
 \endinput

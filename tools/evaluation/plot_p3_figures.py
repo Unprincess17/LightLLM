@@ -532,9 +532,9 @@ plt.rcParams.update({
 POL_LABS  = {"s_lora_expert": "S-LoRA-Expert", "load_then_run": "Load-then-run",
              "async_promotion": "Async-Promo",
              "colora_min": "CoLoRA-Min", "colora_full": "CoLoRA-Full"}
-POL_COLS  = {"s_lora_expert": "#D55E00", "load_then_run": "#D55E00",
-             "async_promotion": "#E69F00",
-             "colora_min": "#0072B2", "colora_full": "#009E73"}
+POL_COLS  = {"s_lora_expert": "#2d4059", "load_then_run": "#2d4059",
+             "async_promotion": "#9dbdff",
+             "colora_min": "#E69F00", "colora_full": "#ea5455"}
 POL_LSS   = {"s_lora_expert": "-", "load_then_run": "-",
              "async_promotion": (0, (3, 2)),
              "colora_min": (0, (4.5, 1.8)), "colora_full": (0, (2.8, 1.4))}
@@ -562,7 +562,7 @@ def _eb(arr): return _err(arr)
 # ===================================================================
 
 SHARED_LS   = {"load_then_run": "-",   "colora_min": "-",   "colora_full": "-"}
-SHARED_COLS = {"load_then_run": "#D55E00", "colora_min": "#0072B2", "colora_full": "#009E73"}
+SHARED_COLS = {"load_then_run": "#2d4059", "colora_min": "#E69F00", "colora_full": "#ea5455"}
 SHARED_MKS  = {"load_then_run": "o", "colora_min": "s", "colora_full": "D"}
 SHARED_ORD  = ["load_then_run", "colora_min", "colora_full"]
 SHARED_LAB  = {"load_then_run": "S-LoRA-Expert", "colora_min": "CoLoRA-Min", "colora_full": "CoLoRA-Full"}
@@ -858,10 +858,10 @@ def _ctrl_mechanism(out):
     cold_pct = [100 * cpu_cold[i] / totals[i] for i in range(3)]
     def_pct  = [100 * deferred[i] / totals[i] for i in range(3)]
 
-    ax1.bar(x, blk_pct, w, color="#D55E00", edgecolor="white", lw=0.3, label="Blocking\npromotion")
-    ax1.bar(x, cold_pct, w, bottom=blk_pct, color="#0072B2", edgecolor="white", lw=0.3, label="CPU cold\npath")
+    ax1.bar(x, blk_pct, w, color="#2d4059", edgecolor="white", lw=0.3, label="Blocking\npromotion")
+    ax1.bar(x, cold_pct, w, bottom=blk_pct, color="#E69F00", edgecolor="white", lw=0.3, label="CPU cold\npath")
     bot = [blk_pct[i] + cold_pct[i] for i in range(3)]
-    ax1.bar(x, def_pct, w, bottom=bot, color="#009E73", edgecolor="white", lw=0.3, label="Deferred\npromotion")
+    ax1.bar(x, def_pct, w, bottom=bot, color="#ea5455", edgecolor="white", lw=0.3, label="Deferred\npromotion")
 
     for i in range(3):
         if blk_pct[i] > 10:
@@ -890,7 +890,7 @@ def _ctrl_mechanism(out):
 
     vals = [ltr_wt, cf_fg]
     labs = ["Load-then-run", "CoLoRA-Full"]
-    cols = ["#D55E00", "#0072B2"]
+    cols = ["#2d4059", "#E69F00"]
 
     x2 = np.arange(2)
     ax2.bar(x2, vals, width=0.52, color=cols, edgecolor="white", lw=0.3)
@@ -955,7 +955,7 @@ def _ab_promo(out):
     oracle = ORACLE_ABLATION_PROMOTION
     vars_ = ["s_lora_expert", "async_promotion", "colora_min", "colora_full"]
     vl = ["SLE", "Async", "C-Min", "C-Full"]
-    vc = ["#D55E00", "#E69F00", "#0072B2", "#009E73"]
+    vc = ["#2d4059", "#9dbdff", "#E69F00", "#ea5455"]
     fig, ax = plt.subplots(figsize=(2.4, 1.8))
     x = np.arange(len(vars_))
     m = [_mean3(oracle[v]["p99_tpot_ms"]) for v in vars_]
@@ -1004,13 +1004,13 @@ def _mech(out):
     cv = [0, _mean3(hd["colora_min"]["cpu_cold_executions"]), _mean3(hd["colora_full"]["cpu_cold_executions"])]
     dv = [0, 0, int(_mean3(hd["colora_full"]["cpu_cold_executions"]) * 0.20)]
     pv = [0, 0, int(_mean3(hd["colora_full"]["cpu_cold_executions"]) * _mean3(hd["colora_full"]["overlap_rate"]) * 0.55)]
-    ax1.bar(x, bv, w, color="#D55E00", label="Blocking", edgecolor="white", lw=0.3)
+    ax1.bar(x, bv, w, color="#2d4059", label="Blocking", edgecolor="white", lw=0.3)
     bot = np.array(bv)
-    ax1.bar(x, cv, w, bottom=bot, color="#0072B2", label="CPU cold", edgecolor="white", lw=0.3)
+    ax1.bar(x, cv, w, bottom=bot, color="#E69F00", label="CPU cold", edgecolor="white", lw=0.3)
     bot += np.array(cv)
     ax1.bar(x, dv, w, bottom=bot, color="#56B4E9", label="Deferred", edgecolor="white", lw=0.3)
     bot += np.array(dv)
-    ax1.bar(x, pv, w, bottom=bot, color="#009E73", label="Prefetch", edgecolor="white", lw=0.3)
+    ax1.bar(x, pv, w, bottom=bot, color="#ea5455", label="Prefetch", edgecolor="white", lw=0.3)
     ax1.set_xticks(x); ax1.set_xticklabels([POL_LABS[p] for p in pols], fontsize=9)
     ax1.set_ylabel("Event count")
     ax1.legend(fontsize=8, ncol=2, borderpad=0.2, labelspacing=0.2); ax1.grid(axis="y", alpha=0.18)
@@ -1018,11 +1018,11 @@ def _mech(out):
     ac = [_mean3(hd[p]["activation_d2h_gb"]) for p in pols]
     rs = [_mean3(hd[p]["residual_h2d_gb"]) for p in pols]
     off = np.zeros(len(pols))
-    ax2.bar(x, wt, w, color="#D55E00", label="Weight H2D", edgecolor="white", lw=0.3)
+    ax2.bar(x, wt, w, color="#2d4059", label="Weight H2D", edgecolor="white", lw=0.3)
     off += np.array(wt)
     ax2.bar(x, ac, w, bottom=off, color="#E69F00", label="Act. D2H", edgecolor="white", lw=0.3)
     off += np.array(ac)
-    ax2.bar(x, rs, w, bottom=off, color="#0072B2", label="Resid. H2D", edgecolor="white", lw=0.3)
+    ax2.bar(x, rs, w, bottom=off, color="#E69F00", label="Resid. H2D", edgecolor="white", lw=0.3)
     ax2.set_xticks(x); ax2.set_xticklabels([POL_LABS[p] for p in pols], fontsize=9)
     ax2.set_ylabel("Data moved (GB)")
     ax2.legend(fontsize=8, ncol=1, borderpad=0.2, labelspacing=0.2); ax2.grid(axis="y", alpha=0.18)
@@ -1032,8 +1032,8 @@ def _mech(out):
 
 def _slora(out):
     hd = ORACLE_REAL_TRACE[E2E_MAX]; sl = ORACLE_SLORA
-    ent = [("S-LoRA", "#999999", "//", sl), ("Load-\\nthen-run", "#D55E00", "", hd["load_then_run"]),
-           ("CoLoRA-\\nMin", "#0072B2", "", hd["colora_min"]), ("CoLoRA-\\nFull", "#009E73", "", hd["colora_full"])]
+    ent = [("S-LoRA", "#999999", "//", sl), ("Load-\\nthen-run", "#2d4059", "", hd["load_then_run"]),
+           ("CoLoRA-\\nMin", "#E69F00", "", hd["colora_min"]), ("CoLoRA-\\nFull", "#ea5455", "", hd["colora_full"])]
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(5.2, 1.85))
     x = np.arange(len(ent)); w = 0.5
     pv = [_mean3(e[-1]["p99_tpot_ms"]) for e in ent]; pe = [[], []]
@@ -1082,9 +1082,9 @@ def _ctrl_actions(out):
     oracle = ORACLE_CONTROLLED
     fig, ax = plt.subplots(figsize=SZ_LINE)
     blk = [_mean3(oracle[b]["load_then_run"]["blocking_promotions"]) for b in BUDGETS]
-    ax.plot(BUDGETS, blk, label="Blocking (LTR)", color="#D55E00", marker="o", ms=5.5, lw=1.4)
+    ax.plot(BUDGETS, blk, label="Blocking (LTR)", color="#2d4059", marker="o", ms=5.5, lw=1.4)
     cpu = [_mean3(oracle[b]["colora_full"]["cpu_cold_executions"]) for b in BUDGETS]
-    ax.plot(BUDGETS, cpu, label="CPU cold (CoLoRA-Full)", color="#009E73", marker="D", ms=5.5, lw=1.4, ls=POL_LSS["colora_full"])
+    ax.plot(BUDGETS, cpu, label="CPU cold (CoLoRA-Full)", color="#ea5455", marker="D", ms=5.5, lw=1.4, ls=POL_LSS["colora_full"])
     ax.set_xlabel("Cache budget (GB)"); ax.set_ylabel("Event count")
     ax.legend(fontsize=9, loc="upper right", borderpad=0.3, labelspacing=0.25); ax.grid(alpha=0.2); _sl(ax)
     fig.tight_layout(pad=0.5); _sv(fig, out/"controlled_actions"); plt.close(fig)
@@ -1125,7 +1125,7 @@ def _reinsert(out):
 
 def _tpref_stress(out):
     oracle = ORACLE_ABLATION_TEMPREFETCH_STRESS
-    vars_ = ["colora_min", "colora_min_tpref"]; vl = ["CoLoRA-Min", "CoLoRA-Min\\n+ temporal\\nprefetch"]; vc = ["#0072B2", "#009E73"]
+    vars_ = ["colora_min", "colora_min_tpref"]; vl = ["CoLoRA-Min", "CoLoRA-Min\\n+ temporal\\nprefetch"]; vc = ["#2d4059", "#ea5455"]
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(4.8, 1.75))
     x = np.arange(2); w = 0.5
     pv = [_mean3(oracle[v]["p99_tpot_ms"]) for v in vars_]; pe = [[], []]
@@ -1156,9 +1156,9 @@ _SENS_LAB = {
     "colora_full": "CoLoRA-Full",
 }
 _SENS_COL = {
-    "load_then_run": "#D55E00",
-    "colora_min": "#0072B2",
-    "colora_full": "#009E73",
+    "load_then_run": "#2d4059",
+    "colora_min": "#E69F00",
+    "colora_full": "#ea5455",
 }
 _SENS_LS = {
     "load_then_run": "-",
@@ -1185,18 +1185,37 @@ def _sens_composite(out):
     p99 = [oracle_cpu[w]["p99"] for w in ws]
     qd = [oracle_cpu[w]["queue_d"] for w in ws]
 
-    ax_cpu.plot(ws, p99, color="#0072B2", marker="s", ms=7.5, lw=2.2,
-                mew=0.6, label="P99 TPOT")
-    ax_cpu.set_xlabel("CPU workers", fontsize=11)
-    ax_cpu.set_ylabel("P99 TPOT (ms)", color="#0072B2", fontsize=10.5)
-    ax_cpu.tick_params(axis="y", labelcolor="#0072B2", labelsize=9)
+    ax_cpu.plot(ws, p99, color="#2d4059", marker="o", markerfacecolor="#2d4059", markeredgecolor="#2d4059",  linewidth=1.2, markersize=3.5,
+                mew=0.6, zorder=3)
     ax_cpu.set_xticks(ws)
 
     ax_cpu2 = ax_cpu.twinx()
-    ax_cpu2.plot(ws, qd, color="#D55E00", marker="o", ms=7.5, lw=2.2,
-                 mew=0.6, ls="--", label="Queue depth")
-    ax_cpu2.set_ylabel("Cold-path\nqueue depth", color="#D55E00", fontsize=10.5)
-    ax_cpu2.tick_params(axis="y", labelcolor="#D55E00", labelsize=9)
+    # ax_cpu2.plot(ws, qd, color="#D55E00", marker="o", ms=7.5, lw=2.2,
+    #              mew=0.6, ls="--", label="Queue depth")
+    ax_cpu2.bar(ws, qd, width=0.55, color="white", edgecolor="#ea5455", hatch="//", linewidth=0.8, alpha=0.8, zorder=1)
+    
+    ax_cpu.set_xlabel("CPU workers", fontsize=10.5, labelpad=2)
+    ax_cpu.set_ylabel("P99 TPOT (ms)", fontsize=10.5, labelpad=2)
+    ax_cpu2.set_ylabel("Queue depth", fontsize=10.5, labelpad=2)
+    ax_cpu.tick_params(axis="both", labelsize=9)
+    ax_cpu2.tick_params(axis="y", labelsize=9)
+    
+    ax_cpu.set_ylim(65,120)
+    ax_cpu2.set_ylim(0, 420)
+    
+    from matplotlib.patches import Patch
+    from matplotlib.lines import Line2D
+    ax_cpu_handles = [
+        Line2D([0], [0], color="#2d4059", marker="o", linewidth=1.2,
+            markersize=3.5, label="P99 TPOT"),
+        Patch(facecolor="white", edgecolor="#ea5455", hatch="//",
+            label="Queue depth"),
+    ]
+
+    ax_cpu.legend(handles=ax_cpu_handles, loc="upper right",
+            frameon=False, fontsize=8,
+            handlelength=1.4, handletextpad=0.4,
+            borderpad=0.1, labelspacing=0.2)
 
     h1, l1 = ax_cpu.get_legend_handles_labels()
     h2, l2 = ax_cpu2.get_legend_handles_labels()
@@ -1221,14 +1240,33 @@ def _sens_composite(out):
 
     ax_mix.set_xticks(x_mix)
     ax_mix.set_xticklabels(["SLE", "C-Min", "C-Full"], fontsize=10.5)
-    ax_mix.set_ylabel("P99 TPOT (ms)", fontsize=10.5)
+    ax_mix.set_ylabel("P99 TPOT (ms)", fontsize=10.5, labelpad=2)
     ax_mix.tick_params(labelsize=9, length=3, pad=2)
     ax_mix.yaxis.set_major_locator(mticker.MaxNLocator(5))
     ax_mix.grid(axis="y", alpha=0.22)
-    ax_mix.set_title("Mixtral-8$\\times$7B", fontsize=11,
-                     fontweight="bold", color="#444", pad=12)
+    # ax_mix.set_title("Mixtral-8$\\times$7B", fontsize=11,
+    #                  fontweight="bold", color="#444", pad=12)
 
-    fig_a.tight_layout(pad=0.6, w_pad=2.0)
+    # # 改成图内 title
+    # ax_mix.text(
+    #     0.5, 0.98, "Mixtral-8$\\times$7B",
+    #     transform=ax_mix.transAxes,
+    #     ha="center", va="top",
+    #     fontsize=10.5, fontweight="bold", color="#444"
+    # )
+
+    # # 给数值标签留一点空间即可
+    # ax_mix.set_ylim(0, 152)
+
+    # fig_a.tight_layout(pad=0.6, w_pad=2.0)
+    # 固定整体边界，让两个 axes 对齐
+    fig_a.subplots_adjust(
+        left=0.105,
+        right=0.965,
+        bottom=0.23,
+        top=0.94,
+        wspace=0.72
+    )
     _sv(fig_a, out / "sens_workers_mixtral")
     plt.close(fig_a)
 
@@ -1324,12 +1362,12 @@ def _sens_cpu(out):
     oracle = ORACLE_SENS_CPU_WORKERS; ws = CPU_WORKER_COUNTS
     fig, ax1 = plt.subplots(figsize=SZ_LINE)
     p99 = [oracle[w]["p99"] for w in ws]
-    ax1.plot(ws, p99, color="#0072B2", marker="s", ms=5.5, lw=1.4, label="P99 TPOT")
-    ax1.set_xlabel("CPU workers"); ax1.set_ylabel("P99 TPOT (ms)", color="#0072B2"); ax1.tick_params(axis="y", labelcolor="#0072B2")
+    ax1.plot(ws, p99, color="#E69F00", marker="s", ms=5.5, lw=1.4, label="P99 TPOT")
+    ax1.set_xlabel("CPU workers"); ax1.set_ylabel("P99 TPOT (ms)", color="#E69F00"); ax1.tick_params(axis="y", labelcolor="#E69F00")
     ax2 = ax1.twinx()
     qd = [oracle[w]["queue_d"] for w in ws]
-    ax2.plot(ws, qd, color="#D55E00", marker="o", ms=5.5, lw=1.4, ls="--", label="Queue depth")
-    ax2.set_ylabel("Cold-path queue depth", color="#D55E00"); ax2.tick_params(axis="y", labelcolor="#D55E00")
+    ax2.plot(ws, qd, color="#2d4059", marker="o", ms=5.5, lw=1.4, ls="--", label="Queue depth")
+    ax2.set_ylabel("Cold-path queue depth", color="#2d4059"); ax2.tick_params(axis="y", labelcolor="#2d4059")
     h1, l1 = ax1.get_legend_handles_labels(); h2, l2 = ax2.get_legend_handles_labels()
     ax1.legend(h1+h2, l1+l2, fontsize=9, loc="upper right", borderpad=0.3, labelspacing=0.25)
     ax1.grid(alpha=0.2); _sl(ax1); fig.tight_layout(pad=0.5); _sv(fig, out/"sens_cpu_workers"); plt.close(fig)
