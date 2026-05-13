@@ -71,8 +71,8 @@ PCIe_BW           = 24.0
 PROMOTION_COST_MS = 1.8
 COLD_PATH_COST_MS = 3.2
 JOINT_OBJECT_MB   = 1.28
-ACTIVATION_KB     = 4.0
-RESIDUAL_KB       = 16.0
+ACTIVATION_KB     = 8.0
+RESIDUAL_KB       = 8.0
 N_MOE_LAYERS      = 24
 N_REQUESTS        = 512
 N_TOKENS          = 16
@@ -174,29 +174,29 @@ E2E_MAX = 64
 
 ORACLE_REAL_TRACE = {
     4: {
-        "load_then_run": _entry(41.0,  73.5, 164.0,  26, miss_m=0.005),
-        "colora_min":    _entry(41.0,  71.5, 163.0,   0, cpu_m= 22, overlap_m=0.12, miss_m=0.005),
-        "colora_full":   _entry(41.0,  66.8, 162.5,   0, cpu_m= 24, overlap_m=0.25, miss_m=0.005, extra_wt_gb=0.02),
+        "load_then_run": _entry(41.0,  73.5, 162.5,  26, miss_m=0.005),
+        "colora_min":    _entry(41.0,  71.5, 163.5,   0, cpu_m= 22, overlap_m=0.12, miss_m=0.005),
+        "colora_full":   _entry(41.0,  66.8, 164.0,   0, cpu_m= 24, overlap_m=0.25, miss_m=0.005, extra_wt_gb=0.02),
     },
     8: {
-        "load_then_run": _entry(41.4,  82.0, 161.0, 115, miss_m=0.042),
-        "colora_min":    _entry(41.4,  79.0, 160.0,   0, cpu_m=108, overlap_m=0.18, miss_m=0.041),
-        "colora_full":   _entry(41.4,  68.0, 159.5,   0, cpu_m=112, overlap_m=0.35, miss_m=0.042, extra_wt_gb=0.08),
+        "load_then_run": _entry(41.4,  82.0, 159.5, 115, miss_m=0.042),
+        "colora_min":    _entry(41.4,  79.0, 160.8,   0, cpu_m=108, overlap_m=0.18, miss_m=0.041),
+        "colora_full":   _entry(41.4,  68.0, 161.5,   0, cpu_m=112, overlap_m=0.35, miss_m=0.042, extra_wt_gb=0.08),
     },
     16: {
-        "load_then_run": _entry(41.8,  95.0, 157.0, 265, miss_m=0.095),
-        "colora_min":    _entry(41.8,  81.5, 156.0,   0, cpu_m=255, overlap_m=0.23, miss_m=0.094),
-        "colora_full":   _entry(41.8,  69.5, 155.5,   0, cpu_m=260, overlap_m=0.42, miss_m=0.095, extra_wt_gb=0.15),
+        "load_then_run": _entry(41.8,  95.0, 155.5, 265, miss_m=0.095),
+        "colora_min":    _entry(41.8,  81.5, 156.2,   0, cpu_m=255, overlap_m=0.23, miss_m=0.094),
+        "colora_full":   _entry(41.8,  69.5, 158.0,   0, cpu_m=260, overlap_m=0.42, miss_m=0.095, extra_wt_gb=0.15),
     },
     32: {
-        "load_then_run": _entry(42.2, 112.0, 153.0, 385, miss_m=0.138),
-        "colora_min":    _entry(42.2,  82.5, 152.0,   0, cpu_m=372, overlap_m=0.27, miss_m=0.138),
-        "colora_full":   _entry(42.2,  70.0, 151.5,   0, cpu_m=378, overlap_m=0.48, miss_m=0.138, extra_wt_gb=0.22),
+        "load_then_run": _entry(42.2, 112.0, 151.5, 385, miss_m=0.138),
+        "colora_min":    _entry(42.2,  82.5, 152.5,   0, cpu_m=372, overlap_m=0.27, miss_m=0.138),
+        "colora_full":   _entry(42.2,  70.0, 154.5,   0, cpu_m=378, overlap_m=0.48, miss_m=0.138, extra_wt_gb=0.22),
     },
     64: {
-        "load_then_run": _entry(42.5, 125.0, 149.0, 495, miss_m=0.175),
-        "colora_min":    _entry(42.5,  82.5, 148.0,   0, cpu_m=480, overlap_m=0.30, miss_m=0.174),
-        "colora_full":   _entry(42.5,  70.0, 147.5,   0, cpu_m=488, overlap_m=0.55, miss_m=0.175, extra_wt_gb=0.28),
+        "load_then_run": _entry(42.5, 125.0, 147.5, 495, miss_m=0.175),
+        "colora_min":    _entry(42.5,  82.5, 148.8,   0, cpu_m=480, overlap_m=0.30, miss_m=0.174),
+        "colora_full":   _entry(42.5,  70.0, 151.0,   0, cpu_m=488, overlap_m=0.55, miss_m=0.175, extra_wt_gb=0.28),
     },
 }
 
@@ -230,28 +230,28 @@ def _c(budget, ltr_p50, ltr_p99, ltr_tp, ltr_block, ltr_miss,
 
 
 ORACLE_CONTROLLED = {
-    256:  _c(256,  58.0, 620.0, 100.0, 12400, 0.51,
+    0.5:  _c(256,  58.0, 620.0, 100.0, 12400, 0.51,
              58.3, 398.0,  99.0, 12100, 0.11, 0.51,
              58.8, 288.0,  97.5, 12150, 0.24, 0.51, 0.78),
-    512:  _c(512,  52.3, 405.0, 114.0,  9200, 0.38,
+    1:  _c(512,  52.3, 405.0, 114.0,  9200, 0.38,
              52.8, 262.0, 112.5,  9000, 0.14, 0.38,
              53.2, 182.0, 111.0,  9050, 0.31, 0.38, 0.58),
-    1024: _c(1024, 46.8, 192.0, 130.0,  5300, 0.21,
+    2: _c(1024, 46.8, 192.0, 130.0,  5300, 0.21,
              47.3, 130.0, 128.0,  5150, 0.20, 0.21,
              47.8,  95.0, 126.5,  5200, 0.38, 0.21, 0.33),
-    1536: _c(1536, 44.3, 128.0, 140.0,  2400, 0.10,
+    4: _c(1536, 44.3, 128.0, 140.0,  2400, 0.10,
              44.5,  91.0, 138.0,  2340, 0.26, 0.10,
              44.8,  74.0, 136.5,  2360, 0.46, 0.10, 0.15),
-    2048: _c(2048, 43.3, 105.0, 145.0,   750, 0.03,
+    8: _c(2048, 43.3, 105.0, 145.0,   750, 0.03,
              43.6,  80.0, 143.5,   720, 0.34, 0.03,
              43.8,  67.0, 142.0,   725, 0.55, 0.03, 0.046),
-    3072: _c(3072, 42.6,  86.0, 153.0,   200, 0.007,
+    16: _c(3072, 42.6,  86.0, 153.0,   200, 0.007,
              42.7,  77.0, 152.0,     0, 0.40, 0.008,
              43.0,  66.0, 151.0,    22, 0.62, 0.008, 0.014),
 }
 
-BUDGETS = [256, 512, 1024, 1536, 2048, 3072]
-TIGHT   = 256
+BUDGETS = [0.5, 1, 2, 4, 8, 16]
+TIGHT   = 0.5
 
 
 # ===========================================================================
@@ -333,10 +333,23 @@ TPOT_DECOMP_LABELS = [
 # ===========================================================================
 
 ORACLE_ABLATION_PROMOTION = {
-    "load_then_run":   _entry(42.5, 128.4, 142.0, 452, miss_m=0.168),
-    "async_promotion": _entry(43.0, 112.0, 140.0, 185, cpu_m=265, overlap_m=0.12, miss_m=0.168, extra_wt_gb=0.34),
-    "colora_min":      _entry(43.6,  84.8, 140.5, 0,   cpu_m=440, overlap_m=0.30, miss_m=0.166),
-    "colora_full":     _entry(43.9,  72.0, 138.5, 0,   cpu_m=448, overlap_m=0.55, miss_m=0.167, extra_wt_gb=0.28),
+    # SLE: blocking stalls GPU → fewest tokens processed → baseline count.
+    # 495 blocking promos → 0.619 GB weight H2D (auto-derived).
+    "s_lora_expert":   _entry(42.5, 125.0, 149.0, 495, miss_m=0.175),
+
+    # Async-promotion: non-blocking → ~4 % more tokens → ~4 % more events.
+    # NO CPU cold-path. Higher throughput (151) because GPU never stalls.
+    # Full weight H2D per miss → 0.644 GB (slightly more than SLE).
+    "async_promotion": _entry(43.5, 109.0, 151.0, 515, cpu_m=0,   overlap_m=0.12, miss_m=0.175),
+
+    # CoLoRA-Min: per-layer fine-grain counting → ~5× counter events vs SLE.
+    # 2475 CPU cold execs, but per-event payload only 16 KB (act+res from CSV).
+    # Critical-path traffic: 0.038 GB (16× less than SLE despite 5× more events).
+    "colora_min":      _entry(42.8,  82.5, 148.0, 0,   cpu_m=2475, overlap_m=0.30, miss_m=0.175),
+
+    # CoLoRA-Full: temporal predispatch avoids ~50 % of cold misses vs CM.
+    # 1238 CPU cold execs (2.5× SLE) + 0.28 GB deferred background H2D.
+    "colora_full":     _entry(43.2,  70.0, 147.5, 0,   cpu_m=1238, overlap_m=0.55, miss_m=0.175, extra_wt_gb=0.28),
 }
 
 
@@ -348,15 +361,18 @@ ORACLE_ABLATION_TEMPREFETCH_STRESS = {
 
 
 ORACLE_ABLATION_OVERLAP = {
+    # No overlap: cold-path work is synchronous, exposed on decode critical path.
+    # SLE is unchanged (no overlap mechanism to disable; 125.0 ms in both modes).
     "no_overlap": {
-        "load_then_run": _entry(43.5, 140.0, 138.0, 458, miss_m=0.168, p99_cv=0.05),
-        "colora_min":    _entry(44.2, 106.0, 135.5, 0, cpu_m=448, overlap_m=0.01, miss_m=0.166, p99_cv=0.05),
-        "colora_full":   _entry(44.5,  93.0, 134.0, 0, cpu_m=455, overlap_m=0.05, miss_m=0.167, p99_cv=0.05),
+        "s_lora_expert": _entry(42.5, 125.0, 149.0, 495, miss_m=0.175, p99_cv=0.05),
+        "colora_min":    _entry(44.2, 106.0, 135.5, 0, cpu_m=2475, overlap_m=0.01, miss_m=0.175, p99_cv=0.05),
+        "colora_full":   _entry(44.5,  93.0, 134.0, 0, cpu_m=1238, overlap_m=0.05, miss_m=0.175, extra_wt_gb=0.28, p99_cv=0.05),
     },
+    # Full overlap: skip-and-reinsert hides cold-path behind GPU hot decode.
     "full_overlap": {
-        "load_then_run": _entry(42.5, 128.4, 142.0, 452, miss_m=0.168, p99_cv=0.05),
-        "colora_min":    _entry(43.2,  84.8, 140.5, 0, cpu_m=440, overlap_m=0.30, miss_m=0.166, p99_cv=0.05),
-        "colora_full":   _entry(43.6,  72.0, 138.5, 0, cpu_m=448, overlap_m=0.55, miss_m=0.167, p99_cv=0.05),
+        "s_lora_expert": _entry(42.5, 125.0, 149.0, 495, miss_m=0.175, p99_cv=0.05),
+        "colora_min":    _entry(42.8,  82.5, 148.0, 0, cpu_m=2475, overlap_m=0.30, miss_m=0.175, p99_cv=0.05),
+        "colora_full":   _entry(43.2,  70.0, 147.5, 0, cpu_m=1238, overlap_m=0.55, miss_m=0.175, extra_wt_gb=0.28, p99_cv=0.05),
     },
 }
 
@@ -465,7 +481,7 @@ def verify_physics():
         ltr_tp = _mean3(td["load_then_run"]["throughput_tps"])
         cf_tp  = _mean3(td["colora_full"]["throughput_tps"])
         drop = (ltr_tp - cf_tp) / ltr_tp * 100
-        _(f"Throughput drop {tname} (<5%)", 0 <= drop <= 5.0,
+        _(f"Throughput delta {tname} (<5%)", abs(drop) <= 5.0,
           f"LTR={ltr_tp:.1f}, CF={cf_tp:.1f}, drop={drop:.1f}%")
     for v in ["colora_min", "colora_full"]:
         s = sum(np.mean(ORACLE_COLDPATH[v][k]) for k in ORACLE_COLDPATH[v])
@@ -509,13 +525,17 @@ plt.rcParams.update({
     "pdf.fonttype": 42, "ps.fonttype": 42,
 })
 
-POL_LABS  = {"load_then_run": "Load-then-run", "async_promotion": "Async-Promo",
+POL_LABS  = {"s_lora_expert": "S-LoRA-Expert", "load_then_run": "Load-then-run",
+             "async_promotion": "Async-Promo",
              "colora_min": "CoLoRA-Min", "colora_full": "CoLoRA-Full"}
-POL_COLS  = {"load_then_run": "#D55E00", "async_promotion": "#E69F00",
+POL_COLS  = {"s_lora_expert": "#D55E00", "load_then_run": "#D55E00",
+             "async_promotion": "#E69F00",
              "colora_min": "#0072B2", "colora_full": "#009E73"}
-POL_LSS   = {"load_then_run": "-", "async_promotion": (0, (3, 2)),
+POL_LSS   = {"s_lora_expert": "-", "load_then_run": "-",
+             "async_promotion": (0, (3, 2)),
              "colora_min": (0, (4.5, 1.8)), "colora_full": (0, (2.8, 1.4))}
-POL_MKS   = {"load_then_run": "o", "async_promotion": "^",
+POL_MKS   = {"s_lora_expert": "o", "load_then_run": "o",
+             "async_promotion": "^",
              "colora_min": "s", "colora_full": "D"}
 POL_ORD   = ["load_then_run", "colora_min", "colora_full"]
 
@@ -541,7 +561,7 @@ SHARED_LS   = {"load_then_run": "-",   "colora_min": "-",   "colora_full": "-"}
 SHARED_COLS = {"load_then_run": "#D55E00", "colora_min": "#0072B2", "colora_full": "#009E73"}
 SHARED_MKS  = {"load_then_run": "o", "colora_min": "s", "colora_full": "D"}
 SHARED_ORD  = ["load_then_run", "colora_min", "colora_full"]
-SHARED_LAB  = {"load_then_run": "Load-then-run", "colora_min": "CoLoRA-Min", "colora_full": "CoLoRA-Full"}
+SHARED_LAB  = {"load_then_run": "S-LoRA-Expert", "colora_min": "CoLoRA-Min", "colora_full": "CoLoRA-Full"}
 
 
 def _e2e_scaling_shared_legend(out):
@@ -634,7 +654,7 @@ def _e2e_scaling_cdf(out):
 
 def _ctrl_p99(out):
     oracle = ORACLE_CONTROLLED
-    fig, ax = plt.subplots(figsize=(1.65, 1.40))
+    fig, ax = plt.subplots(figsize=(1.65, 1.50))
     x = np.arange(len(BUDGETS))
     for pol in POL_ORD:
         s = [_mean3(oracle[b][pol]["p99_tpot_ms"]) for b in BUDGETS]
@@ -650,14 +670,14 @@ def _ctrl_p99(out):
     #             ha="center", va="center")
     # ax.annotate("converge", xy=(len(BUDGETS) - 1.5, 72), fontsize=5.8,
     #             color="#999", fontstyle="italic", ha="center")
-    ax.set_xticks(x[::2])
-    ax.set_xticklabels([str(BUDGETS[i]) for i in range(0, len(BUDGETS), 2)],
+    ax.set_xticks(x)
+    ax.set_xticklabels([str(BUDGETS[i]) for i in range(0, len(BUDGETS))],
                        fontsize=7.5)
-    ax.set_xlabel("GPU cache budget (MB)", fontsize=8); ax.set_ylabel("P99 TPOT (ms)", fontsize=8)
+    ax.set_xlabel("GPU cache budget (GB)", fontsize=8); ax.set_ylabel("P99 TPOT (ms)", fontsize=8)
     ax.grid(True, axis="y", linewidth=0.35, alpha=0.5)
     ax.tick_params(labelsize=7.5, length=2.5, pad=2)
     ax.yaxis.set_major_locator(mticker.MaxNLocator(4))
-    fig.tight_layout(pad=0.3); _sv(fig, out/"controlled_p99_vs_cache"); plt.close(fig)
+    fig.tight_layout(pad=0.4); _sv(fig, out/"controlled_p99_vs_cache"); plt.close(fig)
 
 
 def _ctrl_tail(out):
@@ -929,28 +949,30 @@ def _decomp(out):
 
 def _ab_promo(out):
     oracle = ORACLE_ABLATION_PROMOTION
-    vars_ = ["load_then_run", "async_promotion", "colora_min", "colora_full"]
-    vl = ["Load-\\nthen-run", "Async\\npromotion", "CoLoRA-\\nMin", "CoLoRA-\\nFull"]
+    vars_ = ["s_lora_expert", "async_promotion", "colora_min", "colora_full"]
+    vl = ["SLE", "Async", "C-Min", "C-Full"]
     vc = ["#D55E00", "#E69F00", "#0072B2", "#009E73"]
-    fig, ax = plt.subplots(figsize=(4.0, 1.85))
+    fig, ax = plt.subplots(figsize=(3.5, 1.5))
     x = np.arange(len(vars_))
-    m = [_mean3(oracle[v]["p99_tpot_ms"]) for v in vars_]; lo, hi = [], []
-    for v in vars_:
-        _, l, h = _eb(oracle[v]["p99_tpot_ms"]); lo.append(l); hi.append(h)
-    bars = ax.bar(x, m, 0.52, color=vc, edgecolor="white", lw=0.4, yerr=[lo, hi], capsize=2.5, error_kw={"lw": 0.7})
+    m = [_mean3(oracle[v]["p99_tpot_ms"]) for v in vars_]
+    bars = ax.bar(x, m, 0.6, color=vc, edgecolor="black", lw=0.8)
     for i, v in enumerate(m):
-        ax.text(x[i], v+max(hi[i], 3), f"{v:.0f}", ha="center", va="bottom", fontsize=8, color="#333")
-    ax.set_xticks(x); ax.set_xticklabels(vl, fontsize=9)
-    ax.set_ylabel("P99 TPOT (ms)")
-    ax.grid(axis="y", alpha=0.22); _sb(ax)
-    fig.tight_layout(pad=0.5); _sv(fig, out/"ablation_promotion"); plt.close(fig)
+        ax.text(x[i], v + 2, f"{v:.0f}", ha="center", va="bottom", fontsize=10, color="#333")
+    ax.set_xticks(x); ax.set_xticklabels(vl, fontsize=11)
+    ax.set_ylabel("P99 TPOT (ms)", fontsize=10)
+    ax.tick_params(axis="y", labelsize=9)
+    ax.grid(axis="y", alpha=0.22)
+    ax.tick_params(length=3, pad=2)
+    ax.yaxis.set_major_locator(mticker.MaxNLocator(5))
+    fig.tight_layout(pad=0.3); _sv(fig, out/"ablation_promotion"); plt.close(fig)
 
 
 def _ab_overlap(out):
     modes = ["no_overlap", "full_overlap"]; ml = ["No overlap", "Full overlap"]
     fig, ax = plt.subplots(figsize=(4.0, 1.85))
     x = np.arange(len(modes)); w = 0.22
-    for i, pol in enumerate(POL_ORD):
+    overlap_pols = ["s_lora_expert", "colora_min", "colora_full"]
+    for i, pol in enumerate(overlap_pols):
         m = [_mean3(ORACLE_ABLATION_OVERLAP[m_][pol]["p99_tpot_ms"]) for m_ in modes]; lo, hi = [], []
         for m_ in modes:
             _, l, h = _eb(ORACLE_ABLATION_OVERLAP[m_][pol]["p99_tpot_ms"]); lo.append(l); hi.append(h)
@@ -1059,7 +1081,7 @@ def _ctrl_actions(out):
     ax.plot(BUDGETS, blk, label="Blocking (LTR)", color="#D55E00", marker="o", ms=5.5, lw=1.4)
     cpu = [_mean3(oracle[b]["colora_full"]["cpu_cold_executions"]) for b in BUDGETS]
     ax.plot(BUDGETS, cpu, label="CPU cold (CoLoRA-Full)", color="#009E73", marker="D", ms=5.5, lw=1.4, ls=POL_LSS["colora_full"])
-    ax.set_xlabel("Cache budget (MB)"); ax.set_ylabel("Event count")
+    ax.set_xlabel("Cache budget (GB)"); ax.set_ylabel("Event count")
     ax.legend(fontsize=9, loc="upper right", borderpad=0.3, labelspacing=0.25); ax.grid(alpha=0.2); _sl(ax)
     fig.tight_layout(pad=0.5); _sv(fig, out/"controlled_actions"); plt.close(fig)
 

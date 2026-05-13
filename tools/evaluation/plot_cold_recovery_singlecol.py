@@ -117,8 +117,8 @@ PROM_GROUP_LABELS = {
 }
 
 FIG_DPI = 300
-FIG_WIDTH = 3.5   # Single column width
-FIG_HEIGHT = 4.25  # More vertical space for panel (a) + heatmap
+FIG_WIDTH = 2.8   # Even narrower
+FIG_HEIGHT = 2.9  # Even shorter
 
 
 # ---------------------------------------------------------------------------
@@ -173,8 +173,8 @@ def plot_single_breakdown(
         ("gpu_compute", prom_data["gpu_compute"]),
     ]
 
-    y_positions = [0.5, 0]
-    bar_height = 0.25
+    y_positions = [0.08, 0]
+    bar_height = 0.05
 
     # Execution-first (bottom bar, y=0)
     left = 0.0
@@ -194,7 +194,7 @@ def plot_single_breakdown(
         left += val
     prom_total = sum(prom_data.values())
 
-    x_max = max(exec_total, prom_total) * 1.18  # More right space for total labels
+    x_max = max(exec_total, prom_total) * 1.12  # Tighter right space for total labels
 
     # Black border around each full bar
     ax.add_patch(Rectangle((0, y_positions[0] - bar_height / 2), prom_total, bar_height,
@@ -205,8 +205,8 @@ def plot_single_breakdown(
     ax.set_yticks(y_positions)
     ax.set_yticklabels(["Promotion\nfirst", "Execution\nfirst"], fontsize=8)
     ax.set_xlim(0, x_max)
-    ax.set_xlabel("Recovery time ($\\mu$s)", fontsize=8, labelpad=5)
-    ax.set_title("(a) Single-miss recovery time", fontsize=9, loc="left", pad=8)
+    ax.set_xlabel("Recovery time ($\\mu$s)", fontsize=8, labelpad=2)
+    ax.set_title("(a) Single-miss recovery time", fontsize=9, loc="left", pad=4)
     ax.tick_params(axis="both", length=3, width=0.8, pad=2)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
@@ -271,9 +271,9 @@ def plot_speedup_heatmap(
     ax.set_yticks(np.arange(len(BATCHES)))
     ax.set_yticklabels([str(b) for b in BATCHES])
 
-    ax.set_xlabel("LoRA rank", fontsize=8, labelpad=5)
-    ax.set_ylabel("Decode batch size", fontsize=8, labelpad=5)
-    ax.set_title("(b) Execution-first speedup", fontsize=9, loc="left", pad=8)
+    ax.set_xlabel("LoRA rank", fontsize=8, labelpad=2)
+    ax.set_ylabel("Decode batch size", fontsize=8, labelpad=3)
+    ax.set_title("(b) Execution-first speedup", fontsize=9, loc="left", pad=4)
 
     # Thin white separators improve readability in print.
     ax.set_xticks(np.arange(-0.5, len(RANKS), 1), minor=True)
@@ -312,7 +312,7 @@ def plot_singlecol_figure(
     fig, (ax1, ax2) = plt.subplots(
         2, 1,
         figsize=(FIG_WIDTH, FIG_HEIGHT),
-        gridspec_kw={"height_ratios": [1.05, 1.0]},
+        gridspec_kw={"height_ratios": [0.9, 0.85]},
     )
 
     # Select breakdown config
@@ -332,11 +332,11 @@ def plot_singlecol_figure(
     plot_speedup_heatmap(SPEEDUP_MATRIX, ax2)
 
     fig.subplots_adjust(
-        left=0.34,
-        right=0.98,
-        top=0.96,
-        bottom=0.11,
-        hspace=0.58,
+        left=0.28,
+        right=0.97,
+        top=0.93,
+        bottom=0.12,
+        hspace=0.5,
     )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
