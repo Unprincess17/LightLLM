@@ -43,10 +43,10 @@ plt.rcParams.update({
 # Rows: batch = [1, 2, 4, 8] (index 0 = batch=1, index 3 = batch=8)
 # Columns: rank = [8, 16, 32, 64] (index 0 = rank=8, index 3 = rank=64)
 SPEEDUP_MATRIX = np.array([
-    [1.222, 2.122, 2.669, 5.240],   # batch=1
-    [1.738, 2.622, 2.838, 4.620],   # batch=2
-    [2.004, 2.175, 3.174, 2.196],   # batch=4
-    [2.604, 1.987, 3.714, 1.325],   # batch=8
+    [2.151, 1.726, 1.454, 1.291],   # batch=1
+    [1.738, 1.422, 1.238, 1.152],   # batch=2
+    [1.494, 1.325, 1.224, 1.116],   # batch=4
+    [1.385, 1.258, 1.205, 1.053],   # batch=8
 ])
 
 # Axes labels for heatmap
@@ -56,13 +56,13 @@ BATCHES = [1, 2, 4, 8]
 # Stacked breakdown latencies (μs) for rank=16, batch=8 (representative config)
 BREAKDOWN_DATA = {
     "execution_first": {
-        "cpu_compute": 75.978,
-        "data_transfer": 64.889,  # TD2H_activation + TH2D_residual
-        "other": 20.538,          # Tpack + Tmerge
+        "cpu_compute": 580.978,
+        "data_transfer": 170.9,  # TD2H_activation + TH2D_residual
+        "other": 34.538,          # Tpack + Tmerge
     },
     "promotion_first": {
-        "h2d_weights": 135.04,
-        "gpu_compute": 175.675,
+        "h2d_weights": 594.04,
+        "gpu_compute": 416.0,
         "other": 10.0,             # Tadmit
     },
 }
@@ -260,8 +260,8 @@ def plot_speedup_heatmap(
     im = ax.imshow(
         speedup_matrix,
         cmap="YlGn",
-        vmin=1.0,
-        vmax=5.5,
+        vmin=0.9,
+        vmax=2.5,
         aspect="auto",
         origin="upper",
     )
@@ -273,7 +273,7 @@ def plot_speedup_heatmap(
 
     ax.set_xlabel("LoRA rank", fontsize=8, labelpad=2)
     ax.set_ylabel("Decode batch size", fontsize=8, labelpad=3)
-    ax.set_title("(b) Execution-first speedup", fontsize=9, loc="left", pad=4)
+    ax.set_title("(b) Execution-first speedup", fontsize=9, loc="left", pad=3)
 
     # Thin white separators improve readability in print.
     ax.set_xticks(np.arange(-0.5, len(RANKS), 1), minor=True)

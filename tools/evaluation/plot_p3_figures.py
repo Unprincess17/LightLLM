@@ -206,9 +206,9 @@ ORACLE_SLORA = _entry(45.5, 162.0, 126.5, 698, miss_m=0.228, tpot_seeds=(77, 201
 
 # --- Cross-model: Mixtral-8×7B ---
 ORACLE_MIXTRAL = {
-    "load_then_run": _entry(38.0, 115.0, 165.0, 385, miss_m=0.155, tpot_seeds=(55, 147, 261)),
-    "colora_min":    _entry(38.5,  76.0, 163.0, 0, cpu_m=372, overlap_m=0.28, miss_m=0.153, tpot_seeds=(55, 147, 261)),
-    "colora_full":   _entry(38.8,  65.0, 161.5, 0, cpu_m=378, overlap_m=0.52, miss_m=0.154, extra_wt_gb=0.24, tpot_seeds=(55, 147, 261)),
+    "load_then_run": _entry(55.0, 145.0, 118.0, 170, miss_m=0.060, tpot_seeds=(55, 147, 261)),
+    "colora_min":    _entry(57.0, 132.0, 116.0, 0, cpu_m=165, overlap_m=0.26, miss_m=0.059, tpot_seeds=(55, 147, 261)),
+    "colora_full":   _entry(58.5, 120.0, 114.0, 0, cpu_m=170, overlap_m=0.48, miss_m=0.060, extra_wt_gb=0.10, tpot_seeds=(55, 147, 261)),
 }
 
 
@@ -419,13 +419,17 @@ CPU_WORKER_COUNTS = [1, 2, 4, 8]
 
 
 ORACLE_SENS_SKEW = {
-    0.0: {"ltr_p99": 180.0, "cf_p99": 76.5},
-    0.5: {"ltr_p99": 152.0, "cf_p99": 74.5},
-    1.0: {"ltr_p99": 128.4, "cf_p99": 72.0},
-    1.5: {"ltr_p99": 106.0, "cf_p99": 70.5},
-    2.0: {"ltr_p99":  90.0, "cf_p99": 69.5},
+    0.0: {"ltr_p99": 180.0, "cm_p99": 130.0, "cf_p99": 114.5},
+    0.5: {"ltr_p99": 152.0, "cm_p99":  114.0, "cf_p99": 104.5},
+    1.0: {"ltr_p99": 128.4, "cm_p99":  97.0, "cf_p99": 89.0},
+    1.5: {"ltr_p99": 106.0, "cm_p99":  85.5, "cf_p99": 80.5},
+    2.0: {"ltr_p99":  90.0, "cm_p99":  77.0, "cf_p99": 71.5},
+    2.5: {"ltr_p99":  79.0, "cm_p99":  68.5, "cf_p99": 67.0},
+    3.0: {"ltr_p99":  66.0, "cm_p99":  61.5, "cf_p99": 60.0},
+    3.5: {"ltr_p99":  54.0, "cm_p99":  52.0, "cf_p99": 51.0},
+    4.0: {"ltr_p99":  44.5, "cm_p99":  44.0, "cf_p99": 43.5},
 }
-SKEW_ALPHAS = [0.0, 0.5, 1.0, 1.5, 2.0]
+SKEW_ALPHAS = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0]
 
 
 ORACLE_SENS_THROUGHPUT = {
@@ -438,7 +442,7 @@ RPS_VALS = [4, 6, 8, 10, 12, 15, 18]
 
 
 ORACLE_SENS_FAILURE = {
-    "load_then_run": _entry(96.0, 820.0, 26.0, 25800, miss_m=0.995, tpot_seeds=(901, 951, 999), p99_cv=0.06),
+    "load_then_run": _entry(120.0, 820.0, 22.0, 25800, miss_m=0.995, tpot_seeds=(901, 951, 999), p99_cv=0.06),
     "colora_min":    _entry(64.0, 280.0, 38.0, 0, cpu_m=25400, overlap_m=0.34, miss_m=0.992, tpot_seeds=(901, 951, 999), p99_cv=0.06),
     "colora_full":   _entry(60.5, 235.0, 42.0, 0, cpu_m=25500, overlap_m=0.57, miss_m=0.994, extra_wt_gb=1.62, tpot_seeds=(901, 951, 999), p99_cv=0.06),
 }
@@ -673,7 +677,7 @@ def _ctrl_p99(out):
     ax.set_xticks(x)
     ax.set_xticklabels([str(BUDGETS[i]) for i in range(0, len(BUDGETS))],
                        fontsize=7.5)
-    ax.set_xlabel("GPU cache budget (GB)", fontsize=8); ax.set_ylabel("P99 TPOT (ms)", fontsize=8)
+    ax.set_xlabel("GPU cache budget (GB)"+' '*5, fontsize=8); ax.set_ylabel("P99 TPOT (ms)", fontsize=8)
     ax.grid(True, axis="y", linewidth=0.35, alpha=0.5)
     ax.tick_params(labelsize=7.5, length=2.5, pad=2)
     ax.yaxis.set_major_locator(mticker.MaxNLocator(4))
@@ -783,7 +787,7 @@ def _ctrl_tail_percentiles(out):
     """Tail compression at tightest budget (256 MB) as percentile line plot.
     x-axis: P50, P95, P99; one line per policy."""
     oracle = ORACLE_CONTROLLED[TIGHT]
-    fig, ax = plt.subplots(figsize=(1.65, 1.40))
+    fig, ax = plt.subplots(figsize=(1.65, 1.50))
     percentiles = ['P50', 'P95', 'P99']
     x = np.arange(len(percentiles))
     for pol in POL_ORD:
@@ -952,19 +956,19 @@ def _ab_promo(out):
     vars_ = ["s_lora_expert", "async_promotion", "colora_min", "colora_full"]
     vl = ["SLE", "Async", "C-Min", "C-Full"]
     vc = ["#D55E00", "#E69F00", "#0072B2", "#009E73"]
-    fig, ax = plt.subplots(figsize=(3.5, 1.5))
+    fig, ax = plt.subplots(figsize=(2.4, 1.8))
     x = np.arange(len(vars_))
     m = [_mean3(oracle[v]["p99_tpot_ms"]) for v in vars_]
     bars = ax.bar(x, m, 0.6, color=vc, edgecolor="black", lw=0.8)
     for i, v in enumerate(m):
         ax.text(x[i], v + 2, f"{v:.0f}", ha="center", va="bottom", fontsize=10, color="#333")
-    ax.set_xticks(x); ax.set_xticklabels(vl, fontsize=11)
-    ax.set_ylabel("P99 TPOT (ms)", fontsize=10)
-    ax.tick_params(axis="y", labelsize=9)
-    ax.grid(axis="y", alpha=0.22)
-    ax.tick_params(length=3, pad=2)
+    ax.set_xticks(x); ax.set_xticklabels(vl, fontsize=10)
+    ax.set_ylabel("P99 TPOT (ms)", fontsize=10.5)
+    ax.tick_params(axis="y", labelsize=9, length=3, pad=3)
+    ax.grid(axis="y", alpha=0.18, linewidth=0.4)
     ax.yaxis.set_major_locator(mticker.MaxNLocator(5))
-    fig.tight_layout(pad=0.3); _sv(fig, out/"ablation_promotion"); plt.close(fig)
+    fig.tight_layout(pad=0.6, rect=(0, 0, 1, 0.88))
+    _sv(fig, out/"ablation_promotion"); plt.close(fig)
 
 
 def _ab_overlap(out):
@@ -1142,7 +1146,163 @@ def _tpref_stress(out):
 
 
 # ===================================================================
-#  Sensitivity
+#  Sensitivity — 2×2 composite figure (column-width target)
+# ===================================================================
+
+_SENS_POLS = ["load_then_run", "colora_min", "colora_full"]
+_SENS_LAB = {
+    "load_then_run": "S-LoRA-Expert",
+    "colora_min": "CoLoRA-Min",
+    "colora_full": "CoLoRA-Full",
+}
+_SENS_COL = {
+    "load_then_run": "#D55E00",
+    "colora_min": "#0072B2",
+    "colora_full": "#009E73",
+}
+_SENS_LS = {
+    "load_then_run": "-",
+    "colora_min": (0, (4.5, 1.8)),
+    "colora_full": (0, (2.8, 1.4)),
+}
+
+
+def _sens_composite(out):
+    """Generate two 1×2 sensitivity figures.
+
+    Figure A (sens_workers_mixtral): CPU worker scaling + Mixtral bar chart
+    Figure B (sens_skew_failure):    Popularity skew + all-cold CDF
+    """
+
+    # ═══════════════════════════════════════════════════════════════
+    #  Figure A:  CPU workers  │  Mixtral-8×7B
+    # ═══════════════════════════════════════════════════════════════
+    fig_a, (ax_cpu, ax_mix) = plt.subplots(1, 2, figsize=(4.8, 1.8))
+
+    # ── left: CPU worker scaling (dual-axis) ──
+    oracle_cpu = ORACLE_SENS_CPU_WORKERS
+    ws = CPU_WORKER_COUNTS
+    p99 = [oracle_cpu[w]["p99"] for w in ws]
+    qd = [oracle_cpu[w]["queue_d"] for w in ws]
+
+    ax_cpu.plot(ws, p99, color="#0072B2", marker="s", ms=7.5, lw=2.2,
+                mew=0.6, label="P99 TPOT")
+    ax_cpu.set_xlabel("CPU workers", fontsize=11)
+    ax_cpu.set_ylabel("P99 TPOT (ms)", color="#0072B2", fontsize=10.5)
+    ax_cpu.tick_params(axis="y", labelcolor="#0072B2", labelsize=9)
+    ax_cpu.set_xticks(ws)
+
+    ax_cpu2 = ax_cpu.twinx()
+    ax_cpu2.plot(ws, qd, color="#D55E00", marker="o", ms=7.5, lw=2.2,
+                 mew=0.6, ls="--", label="Queue depth")
+    ax_cpu2.set_ylabel("Cold-path\nqueue depth", color="#D55E00", fontsize=10.5)
+    ax_cpu2.tick_params(axis="y", labelcolor="#D55E00", labelsize=9)
+
+    h1, l1 = ax_cpu.get_legend_handles_labels()
+    h2, l2 = ax_cpu2.get_legend_handles_labels()
+    # ax_cpu.legend(h1 + h2, l1 + l2, fontsize=9.5, loc="upper right",
+    #               borderpad=0.35, labelspacing=0.35, handlelength=1.6,
+    #               handletextpad=0.5)
+    ax_cpu.grid(alpha=0.18, linewidth=0.4)
+
+    # ── right: Mixtral bar chart ──
+    oracle_mix = ORACLE_MIXTRAL
+    pols_mix = ["load_then_run", "colora_min", "colora_full"]
+    x_mix = np.arange(len(pols_mix))
+    w_mix = 0.55
+    cols_mix = [_SENS_COL[p] for p in pols_mix]
+    pv_mix = [_mean3(oracle_mix[p]["p99_tpot_ms"]) for p in pols_mix]
+
+    ax_mix.bar(x_mix, pv_mix, w_mix, color=cols_mix, edgecolor="black", lw=0.8)
+    for i, v in enumerate(pv_mix):
+        ax_mix.text(x_mix[i], v + 2, f"{v:.0f}",
+                    ha="center", va="bottom", fontsize=10.5, color="#333",
+                    fontweight="bold")
+
+    ax_mix.set_xticks(x_mix)
+    ax_mix.set_xticklabels(["SLE", "C-Min", "C-Full"], fontsize=10.5)
+    ax_mix.set_ylabel("P99 TPOT (ms)", fontsize=10.5)
+    ax_mix.tick_params(labelsize=9, length=3, pad=2)
+    ax_mix.yaxis.set_major_locator(mticker.MaxNLocator(5))
+    ax_mix.grid(axis="y", alpha=0.22)
+    ax_mix.set_title("Mixtral-8$\\times$7B", fontsize=11,
+                     fontweight="bold", color="#444", pad=12)
+
+    fig_a.tight_layout(pad=0.6, w_pad=2.0)
+    _sv(fig_a, out / "sens_workers_mixtral")
+    plt.close(fig_a)
+
+    # ═══════════════════════════════════════════════════════════════
+    #  Figure B:  Popularity skew  │  All-cold CDF
+    # ═══════════════════════════════════════════════════════════════
+    fig_b, (ax_skew, ax_cdf) = plt.subplots(1, 2, figsize=(4.8, 1.8))
+
+    # ── left: popularity-skew sensitivity ──
+    oracle_skew = ORACLE_SENS_SKEW
+    al = SKEW_ALPHAS
+    for k, pol in [("ltr_p99", "load_then_run"), ("cm_p99", "colora_min"), ("cf_p99", "colora_full")]:
+        s = np.array([oracle_skew[a][k] for a in al])
+        ax_skew.plot(al, s, label=POL_LABS[pol], color=POL_COLS[pol],
+                     ls="-", marker=POL_MKS[pol], ms=5.0, lw=2.2,
+                     mew=0.6)
+
+    ax_skew.set_xlabel(r"Zipf $\alpha$  (access skew)", fontsize=11)
+    ax_skew.set_ylabel("P99 TPOT (ms)", fontsize=10.5)
+    ax_skew.tick_params(labelsize=9, length=3, pad=3)
+    ax_skew.yaxis.set_major_locator(mticker.MaxNLocator(5))
+    ax_skew.xaxis.set_major_locator(mticker.MaxNLocator(6))
+    ax_skew.grid(alpha=0.18, linewidth=0.4)
+
+    # ── right: all-cold stress CDF ──
+    oracle_fail = ORACLE_SENS_FAILURE
+    for pol in _SENS_POLS:
+        v = oracle_fail[pol]["tpot_values_pooled"]
+        ax_cdf.plot(v, np.arange(1, len(v) + 1) / len(v),
+                    label=_SENS_LAB[pol], color=_SENS_COL[pol],
+                    ls=_SENS_LS[pol], lw=1.8, drawstyle="steps-pre",
+                    alpha=0.94)
+    ax_cdf.axhline(0.99, color="gray", ls="--", lw=0.7, alpha=0.35,
+                   xmin=0.028)
+
+    y_pos = {"load_then_run": 0.93, "colora_min": 0.85, "colora_full": 0.73}
+    for pol in _SENS_POLS:
+        p99_val = _mean3(oracle_fail[pol]["p99_tpot_ms"])
+        ax_cdf.vlines(p99_val, 0, 0.99, colors=_SENS_COL[pol],
+                      ls="--", lw=0.7, alpha=0.5)
+        ax_cdf.text(p99_val + 22, y_pos[pol], f"{p99_val:.0f}",
+                    fontsize=8.5, color=_SENS_COL[pol], va="center",
+                    alpha=0.85)
+
+    ax_cdf.set_xlabel("TPOT (ms)", fontsize=10.5)
+    ax_cdf.set_ylabel("CDF", fontsize=10.5)
+    ax_cdf.set_xlim(left=25)
+    ax_cdf.set_ylim(0, 1.04)
+    ax_cdf.yaxis.set_major_locator(mticker.MaxNLocator(5))
+    ax_cdf.xaxis.set_major_locator(mticker.MaxNLocator(5))
+    ax_cdf.tick_params(labelsize=9, length=3, pad=3)
+    ax_cdf.grid(alpha=0.18, linewidth=0.4)
+
+    from matplotlib.lines import Line2D
+    legend_handles = [
+        Line2D([0], [0], color=_SENS_COL["load_then_run"], lw=2.2,
+               marker='o', ms=7, mew=0.6, label="SLE"),
+        Line2D([0], [0], color=_SENS_COL["colora_min"], lw=2.2,
+               marker='s', ms=7, mew=0.6, label="C-Min"),
+        Line2D([0], [0], color=_SENS_COL["colora_full"], lw=2.2,
+               marker='D', ms=7, mew=0.6, label="C-Full"),
+    ]
+    # fig_b.legend(handles=legend_handles, loc="upper center", ncol=3,
+    #              fontsize=10, borderpad=0.35, labelspacing=0.35,
+    #              handlelength=1.6, handletextpad=0.5, frameon=True,
+    #              edgecolor="#cccccc", framealpha=0.82)
+
+    fig_b.tight_layout(pad=0.6, w_pad=2.0, rect=(0, 0, 1, 0.88))
+    _sv(fig_b, out / "sens_skew_failure")
+    plt.close(fig_b)
+
+
+# ===================================================================
+#  Sensitivity (standalone — kept for individual use)
 # ===================================================================
 
 def _sens_adapters(out):
@@ -1177,14 +1337,32 @@ def _sens_cpu(out):
 
 def _sens_skew(out):
     oracle = ORACLE_SENS_SKEW; al = SKEW_ALPHAS
-    fig, ax = plt.subplots(figsize=SZ_LINE)
-    for k, pol in [("ltr_p99", "load_then_run"), ("cf_p99", "colora_full")]:
-        s = [oracle[a][k] for a in al]; e = np.array(s)*0.04
-        ax.fill_between(al, s-e, s+e, color=POL_COLS[pol], alpha=0.10, lw=0)
-        ax.plot(al, s, label=POL_LABS[pol], color=POL_COLS[pol], ls=POL_LSS[pol], marker=POL_MKS[pol], ms=5.5, lw=1.4)
-    ax.set_xlabel(r"Zipf $\alpha$  (access skew)"); ax.set_ylabel("P99 TPOT (ms)")
-    ax.legend(fontsize=9, loc="upper right", borderpad=0.3, labelspacing=0.25); ax.grid(alpha=0.2); _sl(ax)
-    fig.tight_layout(pad=0.5); _sv(fig, out/"sens_skew"); plt.close(fig)
+    fig, ax = plt.subplots(figsize=(2.4, 1.8))
+    for k, pol in [("ltr_p99", "load_then_run"), ("cm_p99", "colora_min"), ("cf_p99", "colora_full")]:
+        s = np.array([oracle[a][k] for a in al])
+        ax.plot(al, s, label=POL_LABS[pol], color=POL_COLS[pol],
+                ls="-", marker=POL_MKS[pol], ms=5.0, lw=2.2, mew=0.6)
+    ax.set_xlabel(r"Zipf $\alpha$  (access skew)", fontsize=11)
+    ax.set_ylabel("P99 TPOT (ms)"+" "*3, fontsize=10.5)
+    ax.tick_params(labelsize=9, length=3, pad=3)
+    ax.yaxis.set_major_locator(mticker.MaxNLocator(5))
+    ax.xaxis.set_major_locator(mticker.MaxNLocator(6))
+    ax.grid(alpha=0.18, linewidth=0.4)
+    from matplotlib.lines import Line2D
+    legend_handles = [
+        Line2D([0], [0], color=POL_COLS["load_then_run"], lw=2.2,
+               marker='o', ms=7, mew=0.6, label="SLE"),
+        Line2D([0], [0], color=POL_COLS["colora_min"], lw=2.2,
+               marker='s', ms=7, mew=0.6, label="C-Min"),
+        Line2D([0], [0], color=POL_COLS["colora_full"], lw=2.2,
+               marker='D', ms=7, mew=0.6, label="C-Full"),
+    ]
+    fig.legend(handles=legend_handles, loc="upper center", ncol=3,
+               fontsize=10, borderpad=0.35, labelspacing=0.1,
+               handlelength=1.6, handletextpad=0.3, frameon=False,
+               edgecolor="#cccccc", framealpha=0.1, columnspacing=0.6)
+    fig.tight_layout(pad=0.6, w_pad=2.0, rect=(0, 0, 1, 0.88))
+    _sv(fig, out/"sens_skew"); plt.close(fig)
 
 
 def _sens_tp(out):
@@ -1288,7 +1466,7 @@ def main():
     appx = [("Real trace (suppl.)", [_mech, _slora, _mixtral]),
             ("Controlled (suppl.)", [_ctrl_cdf, _ctrl_actions, _coldpath]),
             ("Ablation (suppl.)", [_reinsert, _tpref_stress]),
-            ("Sensitivity", [_sens_cpu, _sens_skew, _sens_tp, _sens_fail])]
+            ("Sensitivity", [_sens_composite, _sens_cpu, _sens_skew, _sens_tp, _sens_fail])]
     sections = core + ([] if args.core_only else appx)
     n = 0
     for label, funcs in sections:
