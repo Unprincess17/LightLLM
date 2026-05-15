@@ -533,8 +533,8 @@ POL_LABS  = {"s_lora_expert": "S-LoRA-Expert", "load_then_run": "Load-then-run",
              "async_promotion": "Async-Promo",
              "colora_min": "CoLoRA-Min", "colora_full": "CoLoRA-Full"}
 POL_COLS  = {"s_lora_expert": "#2d4059", "load_then_run": "#2d4059",
-             "async_promotion": "#9dbdff",
-             "colora_min": "#E69F00", "colora_full": "#ea5455"}
+             "async_promotion": "#E69F00",
+             "colora_min": "#6fa3ff", "colora_full": "#ea5455"}
 POL_LSS   = {"s_lora_expert": "-", "load_then_run": "-",
              "async_promotion": (0, (3, 2)),
              "colora_min": (0, (4.5, 1.8)), "colora_full": (0, (2.8, 1.4))}
@@ -562,7 +562,7 @@ def _eb(arr): return _err(arr)
 # ===================================================================
 
 SHARED_LS   = {"load_then_run": "-",   "colora_min": "-",   "colora_full": "-"}
-SHARED_COLS = {"load_then_run": "#2d4059", "colora_min": "#E69F00", "colora_full": "#ea5455"}
+SHARED_COLS = {"load_then_run": "#2d4059", "colora_min": "#6fa3ff", "colora_full": "#ea5455"}
 SHARED_MKS  = {"load_then_run": "o", "colora_min": "s", "colora_full": "D"}
 SHARED_ORD  = ["load_then_run", "colora_min", "colora_full"]
 SHARED_LAB  = {"load_then_run": "S-LoRA-Expert", "colora_min": "CoLoRA-Min", "colora_full": "CoLoRA-Full"}
@@ -954,8 +954,8 @@ def _decomp(out):
 def _ab_promo(out):
     oracle = ORACLE_ABLATION_PROMOTION
     vars_ = ["s_lora_expert", "async_promotion", "colora_min", "colora_full"]
-    vl = ["SLE", "Async", "C-Min", "C-Full"]
-    vc = ["#2d4059", "#9dbdff", "#E69F00", "#ea5455"]
+    vl = ["SLE", "Async ", "C-Min", "C-Full"]
+    vc = ["#2d4059", "#E69F00", "#6fa3ff", "#ea5455"]
     fig, ax = plt.subplots(figsize=(2.4, 1.8))
     x = np.arange(len(vars_))
     m = [_mean3(oracle[v]["p99_tpot_ms"]) for v in vars_]
@@ -1157,7 +1157,7 @@ _SENS_LAB = {
 }
 _SENS_COL = {
     "load_then_run": "#2d4059",
-    "colora_min": "#E69F00",
+    "colora_min": "#6fa3ff",
     "colora_full": "#ea5455",
 }
 _SENS_LS = {
