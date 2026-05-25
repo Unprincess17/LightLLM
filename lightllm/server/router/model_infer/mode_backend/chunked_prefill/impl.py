@@ -171,6 +171,8 @@ class ChunkedPrefillBackend(ModeBackend):
                     time.sleep(0.02)
                     continue
 
+        except SystemExit:
+            self.logger.info("infer_loop exiting due to shutdown request")
         except BaseException as e:
             self.logger.exception(str(e))
             raise e

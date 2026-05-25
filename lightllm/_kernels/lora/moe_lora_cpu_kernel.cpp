@@ -55,7 +55,7 @@ inline int get_optimal_kernel_type(int N) {
 // Tiny kernel for N <= 2 - minimal overhead, optimized for single token
 void moe_lora_tiny_kernel(
     const bf16* x, const bf16* A_mat, const bf16* B_mat,
-    bf16* out, int N, int H, int R, float scaling) {
+    bf16* out, int N, int H, int R, int out_H, float scaling) {
 
     float inter[128] = {0.0f};  // Support up to rank=128
 
@@ -81,15 +81,15 @@ void moe_lora_tiny_kernel(
             inter[r] = res;
         }
 
-        // Stage 2: inter[R] @ B[R,H] -> out[N,H], fully vectorized
-        // H dimension outer loop, accumulate all ranks into vector accumulator
-        bf16* out_ptr = out + n * H;
+        // Stage 2: inter[R] @ B[R,out_H] -> out[N,out_H], fully vectorized
+        // out_H dimension outer loop, accumulate all ranks into vector accumulator
+        bf16* out_ptr = out + n * out_H;
         float out_f32[16];
         int h = 0;
-        for (; h + 15 < H; h += 16) {
+        for (; h + 15 < out_H; h += 16) {
             __m512 out_vec = _mm512_setzero_ps();
             for (int r = 0; r < R; ++r) {
-                __m256i v_B = _mm256_loadu_si256((const __m256i*)(B_mat + r * H + h));
+                __m256i v_B = _mm256_loadu_si256((const __m256i*)(B_mat + r * out_H + h));
                 __m512 v_B_f32 = _mm512_cvtbf16_ps(v_B);
                 out_vec = _mm512_fmadd_ps(_mm512_set1_ps(inter[r] * scaling), v_B_f32, out_vec);
             }
@@ -100,10 +100,10 @@ void moe_lora_tiny_kernel(
         }
 
         // Handle tail
-        for (; h < H; ++h) {
+        for (; h < out_H; ++h) {
             float acc = 0.0f;
             for (int r = 0; r < R; ++r) {
-                acc += inter[r] * (float)B_mat[r * H + h] * scaling;
+                acc += inter[r] * (float)B_mat[r * out_H + h] * scaling;
             }
             out_ptr[h] += bf16(acc);
         }
@@ -113,14 +113,14 @@ void moe_lora_tiny_kernel(
 // Small kernel for N <= 8 - cache optimized, AVX-512 BF16
 void moe_lora_small_kernel(
     const bf16* x, const bf16* A_mat, const bf16* B_mat,
-    bf16* out, int N, int H, int R, float scaling) {
+    bf16* out, int N, int H, int R, int out_H, float scaling) {
 
     const int cache_block_h = 128;
     float inter[256];
 
     for (int n = 0; n < N; ++n) {
         const bf16* x_ptr = x + n * H;
-        bf16* out_ptr = out + n * H;
+        bf16* out_ptr = out + n * out_H;
 
         // Stage 1: x @ A^T -> inter[R]
         for (int r = 0; r < R; ++r) {
@@ -150,13 +150,13 @@ void moe_lora_small_kernel(
             inter[r] = res;
         }
 
-        // Stage 2: inter[R] @ B[R,H] -> out[n,H], fully vectorized
+        // Stage 2: inter[R] @ B[R,out_H] -> out[n,out_H], fully vectorized
         float out_f32[16];
         int h = 0;
-        for (; h + 15 < H; h += 16) {
+        for (; h + 15 < out_H; h += 16) {
             __m512 acc = _mm512_setzero_ps();
             for (int r = 0; r < R; ++r) {
-                __m256i v_B = _mm256_loadu_si256((const __m256i*)(B_mat + r * H + h));
+                __m256i v_B = _mm256_loadu_si256((const __m256i*)(B_mat + r * out_H + h));
                 __m512 v_B_f32 = _mm512_cvtbf16_ps(v_B);
                 acc = _mm512_fmadd_ps(_mm512_set1_ps(inter[r] * scaling), v_B_f32, acc);
             }
@@ -166,10 +166,10 @@ void moe_lora_small_kernel(
             }
         }
 
-        for (; h < H; ++h) {
+        for (; h < out_H; ++h) {
             float acc = 0.0f;
             for (int r = 0; r < R; ++r) {
-                acc += inter[r] * (float)B_mat[r * H + h] * scaling;
+                acc += inter[r] * (float)B_mat[r * out_H + h] * scaling;
             }
             out_ptr[h] += bf16(acc);
         }
@@ -179,7 +179,7 @@ void moe_lora_small_kernel(
 // Medium kernel for N <= 32 - balanced performance
 void moe_lora_medium_kernel(
     const bf16* x, const bf16* A_mat, const bf16* B_mat,
-    bf16* out, int N, int H, int R, float scaling) {
+    bf16* out, int N, int H, int R, int out_H, float scaling) {
 
     const int cache_block_h = 256;
     const int rank_block = 8;
@@ -222,10 +222,10 @@ void moe_lora_medium_kernel(
                     res += (float)x_ptr[k] * (float)A_mat[(r + i) * H + k];
                 }
 
-                const bf16* B_ptr = B_mat + (r + i) * H;
-                for (int h = 0; h < H; ++h) {
+                const bf16* B_ptr = B_mat + (r + i) * out_H;
+                for (int h = 0; h < out_H; ++h) {
                     float contribution = res * scaling * (float)B_ptr[h];
-                    out[n * H + h] += bf16(contribution);
+                    out[n * out_H + h] += bf16(contribution);
                 }
             }
         }
@@ -235,7 +235,7 @@ void moe_lora_medium_kernel(
 // Large kernel for N > 32 - throughput optimized
 void moe_lora_large_kernel(
     const bf16* x, const bf16* A_mat, const bf16* B_mat,
-    bf16* out, int N, int H, int R, float scaling) {
+    bf16* out, int N, int H, int R, int out_H, float scaling) {
 
     const int cache_block_h = 512;
     const int rank_block = 16;
@@ -278,10 +278,10 @@ void moe_lora_large_kernel(
                     res += (float)x_ptr[k] * (float)A_mat[(r + i) * H + k];
                 }
 
-                const bf16* B_ptr = B_mat + (r + i) * H;
-                for (int h = 0; h < H; ++h) {
+                const bf16* B_ptr = B_mat + (r + i) * out_H;
+                for (int h = 0; h < out_H; ++h) {
                     float contribution = res * scaling * (float)B_ptr[h];
-                    out[n * H + h] += bf16(contribution);
+                    out[n * out_H + h] += bf16(contribution);
                 }
             }
         }
@@ -422,33 +422,35 @@ void moe_lora_down_kernel(
 // Main dispatcher function
 void moe_lora_dispatch(
     const bf16* x, const bf16* A_mat, const bf16* B_mat,
-    bf16* out, int N, int H, int R, float scaling,
+    bf16* out, int N, int H, int R, int out_H, float scaling,
     const std::string& phase = "full") {
 
     if (phase == "gate") {
         moe_lora_gate_kernel(x, A_mat, out, N, H, R, scaling);
     } else if (phase == "up") {
-        moe_lora_up_kernel(x, B_mat, out, N, H, R, scaling);
+        // up kernel: N, R (input dim), out_H (output dim)
+        moe_lora_up_kernel(x, B_mat, out, N, H, out_H, scaling);
     } else if (phase == "down") {
-        moe_lora_down_kernel(x, B_mat, out, N, H, R, scaling);
+        // down kernel: N, R (input dim), out_H (output dim)
+        moe_lora_down_kernel(x, B_mat, out, N, H, out_H, scaling);
     } else {
         int kernel_type = get_optimal_kernel_type(N);
 
         switch (kernel_type) {
             case 0:
-                moe_lora_tiny_kernel(x, A_mat, B_mat, out, N, H, R, scaling);
+                moe_lora_tiny_kernel(x, A_mat, B_mat, out, N, H, R, out_H, scaling);
                 break;
             case 1:
-                moe_lora_small_kernel(x, A_mat, B_mat, out, N, H, R, scaling);
+                moe_lora_small_kernel(x, A_mat, B_mat, out, N, H, R, out_H, scaling);
                 break;
             case 2:
-                moe_lora_medium_kernel(x, A_mat, B_mat, out, N, H, R, scaling);
+                moe_lora_medium_kernel(x, A_mat, B_mat, out, N, H, R, out_H, scaling);
                 break;
             case 3:
-                moe_lora_large_kernel(x, A_mat, B_mat, out, N, H, R, scaling);
+                moe_lora_large_kernel(x, A_mat, B_mat, out, N, H, R, out_H, scaling);
                 break;
             default:
-                moe_lora_medium_kernel(x, A_mat, B_mat, out, N, H, R, scaling);
+                moe_lora_medium_kernel(x, A_mat, B_mat, out, N, H, R, out_H, scaling);
         }
     }
 }
@@ -456,26 +458,29 @@ void moe_lora_dispatch(
 // C++ interface for Python
 void moe_batch_lora_avx(
     const bf16* x, const bf16* A_mat, const bf16* B_mat,
-    bf16* out, int N, int H, int R, float scaling) {
-    moe_lora_dispatch(x, A_mat, B_mat, out, N, H, R, scaling);
+    bf16* out, int N, int H, int R, int out_H, float scaling) {
+    moe_lora_dispatch(x, A_mat, B_mat, out, N, H, R, out_H, scaling);
 }
 
 void moe_batch_lora_gate_avx(
     const bf16* x, const bf16* A_mat, bf16* out,
     int N, int H, int R, float scaling) {
-    moe_lora_dispatch(x, A_mat, nullptr, out, N, H, R, scaling, "gate");
+    // Gate: input dim = H (hidden), output dim = R (rank)
+    moe_lora_dispatch(x, A_mat, nullptr, out, N, H, R, R, scaling, "gate");
 }
 
 void moe_batch_lora_up_avx(
     const bf16* x, const bf16* B_mat, bf16* out,
-    int N, int H, int R, float scaling) {
-    moe_lora_dispatch(x, nullptr, B_mat, out, N, H, R, scaling, "up");
+    int N, int R, int out_H, float scaling) {
+    // Up: input dim = R (rank), output dim = out_H (intermediate)
+    moe_lora_dispatch(x, nullptr, B_mat, out, N, R, 0, out_H, scaling, "up");
 }
 
 void moe_batch_lora_down_avx(
     const bf16* x, const bf16* B_mat, bf16* out,
-    int N, int H, int R, float scaling) {
-    moe_lora_dispatch(x, nullptr, B_mat, out, N, H, R, scaling, "down");
+    int N, int R, int out_H, float scaling) {
+    // Down: input dim = R (intermediate), output dim = out_H (hidden)
+    moe_lora_dispatch(x, nullptr, B_mat, out, N, R, 0, out_H, scaling, "down");
 }
 
 // Multi-adapter batched kernel: each token can use a different adapter's weights.
@@ -679,10 +684,15 @@ void moe_lora_pool_fp16_multi_adapter_avx(
             const uint16_t* A_ptr = A_mat + r * H;
             __m512 acc = _mm512_setzero_ps();
             int j = 0;
-            // Process 16 elements at a time: load 16 fp16, convert to fp32, FMA
+            // Process 16 elements at a time: load 16 fp16, convert to fp32 via F16C, FMA
+            // F16C (_mm256_cvtph_ps) converts 8 fp16 (__m128i) -> 8 fp32 (__m256).
+            // We do two halves and insert into __m512.
             for (; j + 15 < H; j += 16) {
-                __m256i v_A_fp16 = _mm256_loadu_si256((const __m256i*)(A_ptr + j));
-                __m512 v_A_f32 = _mm256_cvtph_ps(v_A_fp16);  // F16C: fp16 -> fp32
+                __m128i v_A_lo = _mm_loadu_si128((const __m128i*)(A_ptr + j));      // lower 8 fp16
+                __m128i v_A_hi = _mm_loadu_si128((const __m128i*)(A_ptr + j + 8));   // upper 8 fp16
+                __m256 v_A_f32_lo = _mm256_cvtph_ps(v_A_lo);
+                __m256 v_A_f32_hi = _mm256_cvtph_ps(v_A_hi);
+                __m512 v_A_f32 = _mm512_insertf32x8(_mm512_castps256_ps512(v_A_f32_lo), v_A_f32_hi, 1);
                 __m512 v_x = _mm512_loadu_ps(x_f32 + j);
                 acc = _mm512_fmadd_ps(v_x, v_A_f32, acc);
             }
@@ -715,8 +725,11 @@ void moe_lora_pool_fp16_multi_adapter_avx(
         for (; h + 15 < H; h += 16) {
             __m512 out_vec = _mm512_setzero_ps();
             for (int r = 0; r < R; ++r) {
-                __m256i v_B_fp16 = _mm256_loadu_si256((const __m256i*)(B_mat + r * H + h));
-                __m512 v_B_f32 = _mm256_cvtph_ps(v_B_fp16);
+                __m128i v_B_lo = _mm_loadu_si128((const __m128i*)(B_mat + r * H + h));
+                __m128i v_B_hi = _mm_loadu_si128((const __m128i*)(B_mat + r * H + h + 8));
+                __m256 v_B_f32_lo = _mm256_cvtph_ps(v_B_lo);
+                __m256 v_B_f32_hi = _mm256_cvtph_ps(v_B_hi);
+                __m512 v_B_f32 = _mm512_insertf32x8(_mm512_castps256_ps512(v_B_f32_lo), v_B_f32_hi, 1);
                 out_vec = _mm512_fmadd_ps(_mm512_set1_ps(inter[r] * s), v_B_f32, out_vec);
             }
             _mm512_storeu_ps(out_f32, out_vec);
@@ -752,13 +765,13 @@ void moe_lora_pool_fp16_multi_adapter_avx(
 PYBIND11_MODULE(moe_lora_cpu_kernel, m) {
     m.def("moe_batch_lora_avx", [](
         const at::Tensor& x, const at::Tensor& A, const at::Tensor& B,
-        at::Tensor& out, int N, int H, int R, float scaling) {
+        at::Tensor& out, int N, int H, int R, int out_H, float scaling) {
         moe_batch_lora_avx(
             reinterpret_cast<const bf16*>(x.data_ptr()),
             reinterpret_cast<const bf16*>(A.data_ptr()),
             reinterpret_cast<const bf16*>(B.data_ptr()),
             reinterpret_cast<bf16*>(out.data_ptr()),
-            N, H, R, scaling
+            N, H, R, out_H, scaling
         );
     }, "MoE-specific AVX-512 LoRA kernel");
 
@@ -775,23 +788,23 @@ PYBIND11_MODULE(moe_lora_cpu_kernel, m) {
 
     m.def("moe_batch_lora_up_avx", [](
         const at::Tensor& x, const at::Tensor& B, at::Tensor& out,
-        int N, int H, int R, float scaling) {
+        int N, int R, int out_H, float scaling) {
         moe_batch_lora_up_avx(
             reinterpret_cast<const bf16*>(x.data_ptr()),
             reinterpret_cast<const bf16*>(B.data_ptr()),
             reinterpret_cast<bf16*>(out.data_ptr()),
-            N, H, R, scaling
+            N, R, out_H, scaling
         );
     }, "MoE Up phase AVX-512 LoRA kernel");
 
     m.def("moe_batch_lora_down_avx", [](
         const at::Tensor& x, const at::Tensor& B, at::Tensor& out,
-        int N, int H, int R, float scaling) {
+        int N, int R, int out_H, float scaling) {
         moe_batch_lora_down_avx(
             reinterpret_cast<const bf16*>(x.data_ptr()),
             reinterpret_cast<const bf16*>(B.data_ptr()),
             reinterpret_cast<bf16*>(out.data_ptr()),
-            N, H, R, scaling
+            N, R, out_H, scaling
         );
     }, "MoE Down phase AVX-512 LoRA kernel");
 

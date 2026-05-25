@@ -65,14 +65,13 @@ def test_moe_adapter_loader_preserves_experts_and_pool_slots(tmp_path):
         (torch.arange(16, dtype=torch.float32).reshape(8, 2) + 10).transpose(0, 1).to(torch.float16),
     )
     assert torch.equal(
-        layer_weights[0][LoRATargetType.ATTN_Q_PROJ]["q_proj"]["A"],
+        layer_weights[0][LoRATargetType.ATTN_Q_PROJ]["A"],
         torch.arange(16, dtype=torch.float32).reshape(8, 2).transpose(0, 1).to(torch.float16),
     )
 
     pool = create_lora_mem_pool(
         num_layers=1,
-        pool_size=2,
-        adapter_capacity=2,
+        pool_size=4,
         max_rank=2,
         num_heads=2,
         head_dim=4,
@@ -142,6 +141,7 @@ def test_init_batched_lora_adapters_uses_direct_loader_and_sizes_pool(monkeypatc
         colora_temporal_hot_cache_slots=8,
         colora_max_continuations=8,
         metric_port=None,
+        node_rank=0,
     )
     backend.logger = SimpleNamespace(
         info=lambda *a, **k: None,
@@ -152,7 +152,17 @@ def test_init_batched_lora_adapters_uses_direct_loader_and_sizes_pool(monkeypatc
     DummyModel = type("DummyModel", (), {})
     DummyModel.__module__ = "lightllm.models.qwen3_vl_moe.model"
     backend.model = DummyModel()
-    backend.model.config = {
+    class _HybridConfig:
+        def __init__(self, d):
+            self.__dict__.update(d)
+        def __getitem__(self, key):
+            return getattr(self, key)
+        def get(self, key, default=None):
+            return getattr(self, key, default)
+        def __contains__(self, key):
+            return hasattr(self, key)
+
+    backend.model.config = _HybridConfig({
         "num_hidden_layers": 1,
         "num_attention_heads": 2,
         "num_key_value_heads": 2,
@@ -161,12 +171,14 @@ def test_init_batched_lora_adapters_uses_direct_loader_and_sizes_pool(monkeypatc
         "moe_intermediate_size": 6,
         "hidden_size": 8,
         "vocab_size": 32,
-        "num_experts": 2,
-    }
+        "num_local_experts": 2,
+    })
     backend.model.data_type = torch.float16
     backend.model.layers_num = 1
     backend.model.layers_infer = []
     backend.rank_in_node = 0
+    backend.node_world_size = 1
+    backend.global_rank = 0
     backend._lora_compute_config = _CPU_LORA_CONFIG
     backend.colora_metric_client = None
     backend._load_lora_adapter_fn = lambda **kwargs: (_ for _ in ()).throw(
@@ -183,6 +195,7 @@ def test_init_batched_lora_adapters_uses_direct_loader_and_sizes_pool(monkeypatc
 
     monkeypatch.setattr(lora_pkg, "create_lora_mem_pool", _fake_create_pool)
     monkeypatch.setattr(base_backend_mod, "get_global_world_size", lambda: 1)
+    monkeypatch.setattr(base_backend_mod, "get_global_rank", lambda: 0)
 
     backend.init_batched_lora_adapters(
         {
@@ -191,7 +204,6 @@ def test_init_batched_lora_adapters_uses_direct_loader_and_sizes_pool(monkeypatc
         }
     )
 
-    assert captured_pool_kwargs["adapter_capacity"] == 2
     assert captured_pool_kwargs["num_experts"] == 2
     assert len(captured_loads) == 2
     assert captured_loads[0][1:3] == (2, 2.0)

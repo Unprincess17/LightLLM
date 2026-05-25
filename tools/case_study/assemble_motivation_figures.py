@@ -40,9 +40,9 @@ CONDITION_LABELS = {
     "joint_corr": "C2 (Corr)",
 }
 CONDITION_COLORS = {
-    "expert_only": "#355070",
-    "joint_indep": "#C8553D",
-    "joint_corr": "#2A9D8F",
+    "expert_only": "#2d4059",
+    "joint_indep": "#ea5455",
+    "joint_corr": "#6fa3ff",
 }
 CONDITION_LINEWIDTHS = {
     "expert_only": 1.5,
@@ -513,9 +513,14 @@ def plot_tail_blowout(
     tail_band_left = headline_x - 0.05
     tail_band_right = curve_x[-1] + 0.04
 
-    ax.axhline(METAL_FLOOR_MS, color="#7A7F85", linewidth=1.0, linestyle="--", alpha=0.9)
-    ax.axvline(headline_x, color="#B08F7A", linewidth=0.95, linestyle=":", alpha=0.85, zorder=1)
-    ax.axvspan(tail_band_left, tail_band_right, color="#F4E6D8", alpha=0.36, zorder=0)
+    # ax.axhline(METAL_FLOOR_MS, color="#7A7F85", linewidth=1.0, linestyle="--", alpha=0.9)
+    ax.axvline(headline_x,         color="#7A7F85",
+        linewidth=1.5,
+        linestyle="--",
+        alpha=0.9,
+        zorder=1,
+    )
+    # ax.axvspan(tail_band_left, tail_band_right, color="#F4E6D8", alpha=0.36, zorder=0)
     ax.set_xlim(curve_x[0] - 0.06, curve_x[-1] + 0.18)
     ax.set_ylim(1.0, max_latency + 0.35)
     ax.set_xticks(tick_x)

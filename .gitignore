@@ -8,7 +8,6 @@ dist
 tmp/
 S-LoRA
 
-figures
 
 test/lora/awkprof.out
 test/lora/avx/benchmark_roundtrip.py
@@ -36,8 +35,13 @@ benchmark_lora.log
 .specstory/
 .cursor/
 tools/common/nsys/run_layer_moe_from_timings.sh
-configs/live_e2e/*.yaml
-.codex
+.moved_to_evaluation_repo/
 
 results/
 autoresearch-results.tsv
+.claude/plans
+
+figures/evaluation
+.mcp.json
+CoLoRA.log
+.trae

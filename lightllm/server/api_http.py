@@ -500,3 +500,77 @@ async def unload_lora_adapter(adapter_id: str):
     except Exception as e:
         logger.error(f"Failed to unload LoRA adapter: {e}")
         return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e))
+
+
+@app.get("/colora_stats", summary="Get COLoRA cumulative stats")
+async def get_colora_stats():
+    """Return aggregated COLoRA cumulative stats from all transformer layers."""
+    import zmq
+    try:
+        lora_req_socket = g_objs.httpserver_manager.lora_req_socket
+        await lora_req_socket.send_pyobj({"action": "colora_stats"})
+        response = await lora_req_socket.recv_pyobj()
+
+        if "error" in response:
+            return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, response["error"])
+
+        return JSONResponse(response, status_code=200)
+    except zmq.ZMQError as e:
+        logger.error(f"ZMQ error communicating with router: {e}")
+        return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e))
+    except Exception as e:
+        logger.error(f"Failed to get colora stats: {e}")
+        return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e))
+
+
+@app.post("/colora_config", summary="Set COLoRA runtime config")
+async def set_colora_config(request: Request):
+    """Dynamically update COLoRA runtime configuration (e.g. disable promotion)."""
+    import zmq
+    try:
+        body = await request.json()
+        lora_req_socket = g_objs.httpserver_manager.lora_req_socket
+        await lora_req_socket.send_pyobj({"action": "colora_config", "config": body})
+        response = await lora_req_socket.recv_pyobj()
+
+        if "error" in response:
+            return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, response["error"])
+
+        return JSONResponse(response, status_code=200)
+    except zmq.ZMQError as e:
+        logger.error(f"ZMQ error communicating with router: {e}")
+        return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e))
+    except Exception as e:
+        logger.error(f"Failed to set colora config: {e}")
+        return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e))
+
+
+@app.post("/colora_promote_adapters", summary="Block-promote all expert projections for adapters")
+async def colora_promote_adapters(request: Request):
+    """Blocking promotion of all gate/up/down expert projections for specified adapter IDs.
+
+    Request body: {"adapter_ids": ["adapter1", "adapter2", ...]}
+    """
+    import zmq
+    try:
+        body = await request.json()
+        adapter_ids = body.get("adapter_ids", [])
+        if not adapter_ids:
+            return create_error_response(HTTPStatus.BAD_REQUEST, "adapter_ids is required")
+
+        lora_req_socket = g_objs.httpserver_manager.lora_req_socket
+        await lora_req_socket.send_pyobj({
+            "action": "colora_promote_adapters",
+            "adapter_ids": adapter_ids
+        })
+        response = await lora_req_socket.recv_pyobj()
+
+        if "error" in response:
+            return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, response["error"])
+        return JSONResponse(response, status_code=200)
+    except zmq.ZMQError as e:
+        logger.error(f"ZMQ error communicating with router: {e}")
+        return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e))
+    except Exception as e:
+        logger.error(f"Failed to promote adapters: {e}")
+        return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e))

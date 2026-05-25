@@ -114,6 +114,14 @@ def make_argument_parser() -> argparse.ArgumentParser:
         help="Default adapter ID to use when server starts with LoRA (default: 'default')",
     )
     parser.add_argument(
+        "--lora_clone_count",
+        type=int,
+        default=1,
+        help="Number of in-memory clones to create from the first --lora_dir template. "
+             "Each clone gets a unique adapter index but identical weights, avoiding repeated disk I/O. "
+             "When set, only the first directory in --lora_dir is used as the template. (default: 1)",
+    )
+    parser.add_argument(
         "--lora_rank",
         type=int,
         default=16,
@@ -277,6 +285,14 @@ def make_argument_parser() -> argparse.ArgumentParser:
         help="""Force use of slow path for LoRA (per-expert computation).
         This enables per-expert LoRA but significantly reduces throughput.
         Used for baseline performance testing.""",
+    )
+    parser.add_argument(
+        "--router_trace_path",
+        type=str,
+        default=None,
+        help="Path to router trace for expert injection (.jsonl). "
+        "When set, TraceExpertInjection will load the trace and force "
+        "expert selection per (req_idx, layer_id, token_pos).",
     )
 
     parser.add_argument(

@@ -124,6 +124,7 @@ else
     done
 fi
 LORA_DIR=$(IFS=,; echo "${DEFAULT_LORA_DIRS[*]}")
+LORA_CLONE_COUNT="1"
 USE_LORA=true
 PORT=8040
 TP=2
@@ -183,7 +184,7 @@ COLORA_OVERLAP_MODE="full"
 
 # Environment variables
 LOADWORKER=8
-LIGHTLLM_LOGGING="${LIGHTLLM_LOGGING:-DEBUG}"
+LIGHTLLM_LOGGING="${LIGHTLLM_LOGGING:-INFO}"
 MOE_MODE="TP"
 MOCK_PREFILL_LOGITS="TRUE"
 MOE_ADAPTER_EXPERT_PROFILING=0
@@ -207,6 +208,10 @@ while [[ $# -gt 0 ]]; do
         --lora_dirs)
             LORA_DIR="$2"
             USE_LORA=true
+            shift 2
+            ;;
+        --lora_clone_count)
+            LORA_CLONE_COUNT="$2"
             shift 2
             ;;
         --no_lora)
@@ -448,6 +453,9 @@ if [[ "$USE_LORA" == "true" && -n "$LORA_DIR" ]]; then
 else
     echo "LoRA Adapter(s): disabled"
 fi
+if [[ "$LORA_CLONE_COUNT" -gt 1 ]]; then
+    echo "LoRA Clone Count: $LORA_CLONE_COUNT"
+fi
 echo "Host: $HOST"
 echo "Port: $PORT"
 echo "TP: $TP"
@@ -480,6 +488,9 @@ fi
 
 if [[ "$USE_LORA" == "true" && -n "$LORA_DIR" ]]; then
     CMD="$CMD --lora_dir $LORA_DIR --lora_max_size $LORA_MAX_SIZE"
+fi
+if [[ "$LORA_CLONE_COUNT" -gt 1 ]]; then
+    CMD="$CMD --lora_clone_count $LORA_CLONE_COUNT"
 fi
 
 if [[ "$ENABLE_MULTIMODAL" == "true" ]]; then
@@ -536,6 +547,9 @@ if [[ -n "$COLORA_REQUEST_SKIP" ]]; then
 fi
 if [[ -n "$COLORA_MAX_CONTINUATIONS" ]]; then
     CMD="$CMD --colora_max_continuations $COLORA_MAX_CONTINUATIONS"
+fi
+if [[ -n "$MOE_ROUTER_TRACE_PATH" && -f "$MOE_ROUTER_TRACE_PATH" ]]; then
+    CMD="$CMD --router_trace_path $MOE_ROUTER_TRACE_PATH"
 fi
 
 # Export environment variables

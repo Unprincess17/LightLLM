@@ -349,6 +349,9 @@ class _MoEHybridPhaseState:
     blocking_promotion_time: float = 0.0
     blocking_promotion_bytes: float = 0.0
     blocking_promotion_count: int = 0
+    # Pre-promotion key-level demand counters (before any schedule/blocking promotion)
+    demand_key_access_count: int = 0
+    demand_key_miss_count: int = 0
     # P2 microbench component timings (seconds)
     pack_time: float = 0.0
     d2h_activation_time: float = 0.0
@@ -1175,6 +1178,65 @@ class Qwen3VLMoELoRADispatcher:
             queued = manager.schedule_promotion(promotion_keys)
             if queued > 0:
                 self._record_background_stat("promotion_admitted", 1)
+
+    def set_colora_config(self, config: Dict[str, Any]) -> None:
+        """Dynamically update COLoRA runtime configuration.
+
+        Supported keys:
+          - deferred_promotion_delta_steps (int): 0 disables promotion, >0 enables.
+          - temporal_prefetch (bool): enable/disable temporal prefetch.
+        """
+        steps = config.get("deferred_promotion_delta_steps")
+        if steps is not None:
+            self._deferred_promotion_delta_steps = max(int(steps), 0)
+            logger.info(
+                "[COLoRA] deferred_promotion_delta_steps set to %d",
+                self._deferred_promotion_delta_steps,
+            )
+        prefetch = config.get("temporal_prefetch")
+        if prefetch is not None:
+            self._temporal_prefetch_enabled = bool(prefetch)
+            logger.info(
+                "[COLoRA] temporal_prefetch set to %s",
+                self._temporal_prefetch_enabled,
+            )
+        return
+
+    def promote_adapters_blocking(self, adapter_bins: List[int]) -> Dict[str, Any]:
+        """Blocking promotion of all expert projections for given adapter bins.
+
+        Returns stats about how many keys were promoted.
+        """
+        manager = self.expert_cache_manager
+        if manager is None:
+            return {"promoted_count": 0, "transferred_bytes": 0, "status": "no_manager"}
+
+        from lightllm.server.lora.expert_cache import ExpertCacheKey
+
+        keys: List[ExpertCacheKey] = []
+        # Qwen3-VL-30B-A3B has 24 transformer layers and 128 routed experts
+        n_layers = self.num_layers
+        n_experts = 128
+
+        for adapter_bin in adapter_bins:
+            if int(adapter_bin) < 0:
+                continue
+            for layer_id in range(n_layers):
+                for expert_id in range(n_experts):
+                    keys.append(ExpertCacheKey("gate", adapter_bin, layer_id, expert_id))
+                    keys.append(ExpertCacheKey("up", adapter_bin, layer_id, expert_id))
+                    keys.append(ExpertCacheKey("down", adapter_bin, layer_id, expert_id))
+
+        if not keys:
+            return {"promoted_count": 0, "transferred_bytes": 0, "status": "no_keys"}
+
+        result = manager.promote_blocking(keys)
+        return {
+            "promoted_count": int(result.promoted_count),
+            "transferred_bytes": int(result.transferred_bytes),
+            "status": "ok",
+            "requested_keys": len(keys),
+        }
 
     def begin_temporal_prefetch_step(self, decode_step_id: int) -> Dict[str, int]:
         step_id = int(decode_step_id)
@@ -2383,6 +2445,9 @@ class Qwen3VLMoELoRADispatcher:
             state.miss_policy = str(getattr(getattr(manager, "config", None), "miss_policy", MISS_POLICY_CPU_FIRST))
             state.ready_slots = manager.lookup_many(state.keys)
             state.miss_keys = [key for key in state.keys if key not in state.ready_slots]
+            # Record pre-promotion demand counters before any schedule/blocking promotion
+            state.demand_key_access_count = len(state.keys)
+            state.demand_key_miss_count = len(state.miss_keys)
             allow_inline_promotion_schedule = decode_context is None
             if allow_inline_promotion_schedule and state.miss_policy in (MISS_POLICY_CPU_FIRST, MISS_POLICY_LOAD_THEN_RUN):
                 manager.schedule_promotion(state.miss_keys)
@@ -2825,6 +2890,8 @@ class Qwen3VLMoELoRADispatcher:
             "cpu_async_submitted": int(state.cpu_async_submitted),
             "cpu_inline_executed": int(state.cpu_inline_executed),
             "blocking_promotion_count": int(state.blocking_promotion_count),
+            "demand_key_access_count": int(state.demand_key_access_count),
+            "demand_key_miss_count": int(state.demand_key_miss_count),
             "miss_policy": state.miss_policy,
             "overlap_mode": self.colora_overlap_mode,
             "cpu_queue_depth": self._get_cpu_queue_depth(),

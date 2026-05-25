@@ -275,6 +275,51 @@ class InferenceContext:
             g_infer_state_lock.release()
         return
 
+    def recover_colora_paused_reqs(self, colora_paused_reqs: List["InferReq"]):
+        """Recover COLoRA-paused requests that may be stuck.
+
+        This handles requests that are in colora_paused state (waiting for
+        CPU completion) but have timed out or had their completion fail.
+        Unlike recover_paused_reqs which handles 'paused' flag, this handles
+        the 'colora_paused' flag which uses a different state machine.
+
+        Args:
+            colora_paused_reqs: List of requests currently in colora_paused state
+        """
+        if not colora_paused_reqs:
+            return
+
+        g_infer_state_lock.acquire()
+        try:
+            for req_obj in colora_paused_reqs:
+                # Check if request is actually done (all tokens processed)
+                if req_obj.shm_req.can_released_mark or req_obj.shm_req.is_aborted:
+                    logger.warning(
+                        f"[COLoRA] Recovering stuck paused request {req_obj.req_id}: "
+                        f"can_released={req_obj.shm_req.can_released_mark}, "
+                        f"is_aborted={req_obj.shm_req.is_aborted}"
+                    )
+                    # CRITICAL FIX: Always release ref_count for both finished and aborted requests
+                    # Aborted requests (e.g., from client disconnect) might not have can_released_mark set
+                    # We need to ensure the ref_count is decremented to prevent reference leaks
+                    if not req_obj.shm_req.can_released_mark:
+                        # Aborted request - set can_released_mark to ensure proper cleanup
+                        req_obj.shm_req.can_released_mark = True
+                    # Release the ref_count that was incremented in _init_all_state()
+                    # but never decremented for paused requests
+                    g_infer_context.shm_req_manager.put_back_req_obj(req_obj.shm_req)
+                    # Add idempotency check to prevent double-free
+                    if not req_obj.colora_paused:
+                        # Only release if still paused (to prevent double-free if timeout handler
+                        # already released it)
+                        g_infer_context.shm_req_manager.put_back_req_obj(req_obj.shm_req)
+                    # Clear pause state and continuation to unblock the request Clear pause state and continuation to unblock the request
+                    req_obj.colora_paused = False
+                    req_obj.colora_pause_time = 0.0
+                    req_obj.colora_continuation = None
+        finally:
+            g_infer_state_lock.release()
+
     def get_can_alloc_token_num(self):
         radix_cache_unref_token_num = 0
         if self.radix_cache is not None:
@@ -415,6 +460,7 @@ class InferReq:
         # the continuation information for resumption after CPU completion
         self.colora_continuation: Optional[ColoraContinuation] = None
         self.colora_paused: bool = False  # Mark request as paused waiting for CPU completion
+        self.colora_pause_time: float = 0.0  # Track when request was paused for timeout detection
 
         self._init_all_state()
         if init_prefix_cache:

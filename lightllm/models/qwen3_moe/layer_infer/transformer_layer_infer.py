@@ -96,6 +96,10 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
         self.lora_dispatcher_: Optional[Any] = None
         self.use_detached_lora_: bool = False
         self.req_bins_: Optional[torch.Tensor] = None  # Per-request adapter indices for batched LoRA
+        self.trace_expert_injection_: Optional[Any] = None  # TraceExpertInjection for forcing expert selection
+
+        # Persistent cumulative colora stats for /colora_stats endpoint
+        self._cumulative_colora_stats: Dict[str, float] = {}
 
         return
 
@@ -106,6 +110,14 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
             req_bins: Tensor of shape [batch_size] containing per-request adapter indices
         """
         self.req_bins_ = req_bins
+
+    def set_trace_expert_injection(self, injection):
+        """Set the TraceExpertInjection object for forcing expert selection from trace.
+
+        Args:
+            injection: TraceExpertInjection instance or None to disable
+        """
+        self.trace_expert_injection_ = injection
 
     def _validate_decode_colora_metadata(self, infer_state: LlamaInferStateInfo, num_tokens: int) -> None:
         if not _colora_phase1_metadata_validation_enabled():
@@ -350,6 +362,11 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
             "stale": 0,
             "not_ready": 0,
             "fallback": 0,
+            # Lock contention metrics (nanoseconds)
+            "infer_state_lock_count": 0,
+            "infer_state_lock_wait_ns": 0,
+            "infer_state_lock_hold_ns": 0,
+            "infer_state_lock_max_wait_ns": 0,
         }
 
     def _merge_colora_stats(self, agg_stats: Dict[str, float]) -> None:
@@ -401,6 +418,39 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
             agg_stats["overlap_ratio_count"] += 1
         agg_stats["promotion_queue_depth"] = int(stats.get("promotion_queue_depth", agg_stats["promotion_queue_depth"]))
         agg_stats["cache_hit_rate"] = float(stats.get("cache_hit_rate", agg_stats["cache_hit_rate"]))
+
+        # Also accumulate into persistent stats for /colora_stats endpoint.
+        # Gauge keys (current state) use last-value semantics;
+        # counter keys use cumulative sum.
+        gauge_keys = {
+            "promotion_queue_depth",
+            "promotion_drop_queue_high_watermark",
+            "cache_capacity_slots", "cache_resident_slots", "cache_free_slots",
+            "gate_capacity_slots", "gate_resident_slots", "gate_free_slots",
+            "up_capacity_slots", "up_resident_slots", "up_free_slots",
+            "down_capacity_slots", "down_resident_slots", "down_free_slots",
+            "overlap_ratio",
+            "cache_hit_rate", "cache_miss_rate",
+            "cpu_queue_depth",
+        }
+        for key, value in stats.items():
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                continue
+            if key in gauge_keys:
+                self._cumulative_colora_stats[key] = float(value)
+            else:
+                if key in self._cumulative_colora_stats:
+                    self._cumulative_colora_stats[key] += float(value)
+                else:
+                    self._cumulative_colora_stats[key] = float(value)
+
+    def get_cumulative_colora_stats(self) -> Dict[str, float]:
+        """Return a copy of the persistent cumulative colora stats."""
+        return dict(self._cumulative_colora_stats)
+
+    def reset_cumulative_colora_stats(self) -> None:
+        """Reset the persistent cumulative colora stats."""
+        self._cumulative_colora_stats.clear()
 
     def _get_study2_profile_prefix(self, expert_id: int, step_idx: int, token_count: int) -> Optional[str]:
         """Build Study2 NVTX prefix for real-model profiling when enabled via env."""
@@ -872,6 +922,20 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
         # ----------------------------------------------------------------
         if not use_per_expert_lora:
             router_logits = layer_weight.moe_gate.mm(hidden_states)
+
+            # Trace Expert Injection: bias router_logits to force trace-specified experts
+            trace_injection = getattr(self, 'trace_expert_injection_', None)
+            if trace_injection is not None:
+                req_indices = self._expand_req_indices_for_trace(infer_state, num_tokens)
+                token_positions = self._extract_token_positions_for_trace(infer_state, num_tokens)
+                router_logits = trace_injection.bias_router_logits(
+                    router_logits=router_logits,
+                    layer_id=self.layer_num_,
+                    req_indices=req_indices,
+                    token_positions=token_positions,
+                    top_k=self.num_experts_per_tok,
+                )
+
             adapter_profile_enabled = (
                 os.environ.get("MOE_ADAPTER_EXPERT_PROFILING", "0") == "1"
                 and self.req_bins_ is not None
@@ -924,6 +988,19 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
         # 1. Router computation
         with NvtxAnnotate("MoE_SlowPath_RouterComputation"):
             router_logits = layer_weight.moe_gate.mm(hidden_states)
+
+        # Trace Expert Injection: bias router_logits to force trace-specified experts
+        trace_injection = getattr(self, 'trace_expert_injection_', None)
+        if trace_injection is not None:
+            req_indices = self._expand_req_indices_for_trace(infer_state, num_tokens)
+            token_positions = self._extract_token_positions_for_trace(infer_state, num_tokens)
+            router_logits = trace_injection.bias_router_logits(
+                router_logits=router_logits,
+                layer_id=self.layer_num_,
+                req_indices=req_indices,
+                token_positions=token_positions,
+                top_k=self.num_experts_per_tok,
+            )
 
         # 2. Explicit routing
         with NvtxAnnotate("MoE_SlowPath_TopKRouting"):
@@ -1483,7 +1560,7 @@ class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
             overlap_ratio_avg = 0.0
             if colora_stats["overlap_ratio_count"] > 0:
                 overlap_ratio_avg = colora_stats["overlap_ratio_sum"] / float(colora_stats["overlap_ratio_count"])
-            logger.debug(
+            logger.info(
                 "[COLoRA] layer=%s hit_tokens=%s miss_tokens=%s queue_depth=%s hit_rate=%.4f "
                 "cpu_compute_time=%.6f gpu_compute_time=%.6f cpu_queue_wait=%.6f "
                 "d2h_bytes=%.0f h2d_bytes=%.0f overlap_ratio=%.4f fallback_degrade_count=%s cpu_queue_depth=%s "

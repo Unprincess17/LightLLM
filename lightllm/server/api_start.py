@@ -29,6 +29,11 @@ def setup_signal_handlers(http_server_process, process_manager):
                 kill_recursive(http_server_process)
 
             process_manager.terminate_all_processes()
+            try:
+                from lightllm.utils.auto_shm_cleanup import get_auto_cleanup
+                get_auto_cleanup()._cleanup()
+            except Exception:
+                pass
             logger.info("All processes have been forcefully terminated.")
             sys.exit(0)
         elif sig == signal.SIGTERM:
@@ -50,6 +55,11 @@ def setup_signal_handlers(http_server_process, process_manager):
                     kill_recursive(http_server_process)
 
             process_manager.terminate_all_processes()
+            try:
+                from lightllm.utils.auto_shm_cleanup import get_auto_cleanup
+                get_auto_cleanup()._cleanup()
+            except Exception:
+                pass
             logger.info("All processes have been terminated gracefully.")
             sys.exit(0)
 

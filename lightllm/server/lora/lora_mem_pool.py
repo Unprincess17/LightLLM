@@ -285,10 +285,15 @@ class LoRAModulePool:
 
         if a_weight is not None:
             # A weight matrix: [rank, hidden]
-            # Case 1: Perfect match (TP=1 or pre-sharded weights)
+            # Case 1: Perfect match (TP=1 or pre-sharded weights exactly match buffer size)
             if self.a_buffer.shape[-1] == a_weight.shape[-1]:
                 self.a_buffer[loc, :rank] = a_weight.to(self.a_buffer.dtype)
-            # Case 2: TP sharding needed - validate math is consistent
+            # Case 2: Weight is pre-sharded (exactly buffer_size // tp_world_size)
+            # Accept pre-sharded weights directly without slicing
+            elif (tp_world_size > 1 and
+                  a_weight.shape[-1] == self.a_buffer.shape[-1] // tp_world_size):
+                self.a_buffer[loc, :rank, :a_weight.shape[-1]] = a_weight.to(self.a_buffer.dtype)
+            # Case 3: Full unsharded weight - slice it for this rank
             elif (self.a_buffer.shape[-1] < a_weight.shape[-1] and
                   a_weight.shape[-1] == self.a_buffer.shape[-1] * tp_world_size):
                 split_size = self.a_buffer.shape[-1]
@@ -301,7 +306,7 @@ class LoRAModulePool:
                 else:
                     logger.error(f"TP slicing out of bounds! rank={tp_rank}, size={split_size}, w_shape={a_weight.shape}")
                     return False
-            # Case 3: Invalid mismatch
+            # Case 4: Invalid mismatch
             else:
                 logger.error(
                     f"Shape Mismatch Error: Buffer {self.a_buffer.shape[-1]} vs Weight {a_weight.shape[-1]}. "
@@ -310,11 +315,17 @@ class LoRAModulePool:
                 return False
 
         if b_weight is not None:
-            # B weight matrix: [rank, hidden]
-            # Case 1: Perfect match (TP=1 or pre-sharded weights)
+            # B weight matrix: [rank, hidden] (same orientation as A after loader processing)
+            # The LoRAAdapterLoader keeps B as [rank, out_features] from safetensors.
+            # Case 1: Perfect match (TP=1 or pre-sharded weights exactly match buffer size)
             if self.b_buffer.shape[-1] == b_weight.shape[-1]:
                 self.b_buffer[loc, :rank] = b_weight.to(self.b_buffer.dtype)
-            # Case 2: TP sharding needed - validate math is consistent
+            # Case 2: Weight is pre-sharded (exactly buffer_size // tp_world_size)
+            # Accept pre-sharded weights directly without slicing
+            elif (tp_world_size > 1 and
+                  b_weight.shape[-1] == self.b_buffer.shape[-1] // tp_world_size):
+                self.b_buffer[loc, :rank, :b_weight.shape[-1]] = b_weight.to(self.b_buffer.dtype)
+            # Case 3: Full unsharded weight - slice it for this rank along hidden dimension
             elif (self.b_buffer.shape[-1] < b_weight.shape[-1] and
                   b_weight.shape[-1] == self.b_buffer.shape[-1] * tp_world_size):
                 split_size = self.b_buffer.shape[-1]
@@ -327,7 +338,7 @@ class LoRAModulePool:
                 else:
                     logger.error(f"TP slicing out of bounds! rank={tp_rank}, size={split_size}, w_shape={b_weight.shape}")
                     return False
-            # Case 3: Invalid mismatch
+            # Case 4: Invalid mismatch
             else:
                 logger.error(
                     f"Shape Mismatch Error: Buffer {self.b_buffer.shape[-1]} vs Weight {b_weight.shape[-1]}. "
@@ -383,8 +394,11 @@ class LoRAModulePool:
             return False
 
         first_layer_content = layer_weights[first_layer_id]
-        first_val = next(iter(first_layer_content.values())) if first_layer_content else None
-        is_moe_structure = isinstance(first_val, dict) and "A" in first_val
+        if not first_layer_content:
+            first_val = None
+        else:
+            first_val = next(iter(first_layer_content.values()))
+        is_moe_structure = isinstance(first_val, dict) and ("A" in first_val)
 
         # Count valid layers for metadata
         valid_layers = 0
@@ -468,7 +482,9 @@ class LoRAModulePool:
 
                         # Calculate flattened index: layer * num_experts + local_expert_id
                         loc = loc_start + buffer_layer_id * self.num_experts + local_expert_id
-                        self._write_weights(loc, rank, scaling, weights, tp_rank, tp_world_size)
+                        if not self._write_weights(loc, rank, scaling, weights, tp_rank, tp_world_size):
+                            logger.error(f"Failed to write weights for layer {layer_id}, expert {expert_id}")
+                            return False
             else:
                 # Flat structure: {layer_id: {"A": ..., "B": ...}}
                 for layer_id, weights in layer_weights.items():
@@ -485,7 +501,9 @@ class LoRAModulePool:
                         continue
 
                     loc = loc_start + buffer_layer_id
-                    self._write_weights(loc, rank, scaling, weights, tp_rank, tp_world_size)
+                    if not self._write_weights(loc, rank, scaling, weights, tp_rank, tp_world_size):
+                        logger.error(f"Failed to write weights for layer {layer_id}")
+                        return False
         except Exception as e:
             logger.error(f"Error loading adapter weights: {e}")
             return False
@@ -857,6 +875,9 @@ class LoRAMemPool:
             # Handle vision layer offset (10000+) - strip offset for buffer indexing
             if layer_id >= 10000:
                 buffer_layer_id = layer_id - 10000
+            elif layer_id == -1:
+                # lm_head uses layer_id = -1, map to buffer index 0 (only has 1 layer)
+                buffer_layer_id = 0
             else:
                 buffer_layer_id = layer_id
 
@@ -872,9 +893,7 @@ class LoRAMemPool:
                 if target_type not in pool_weights:
                     pool_weights[target_type] = {}
 
-                # Strip module_name level - pool expects {layer_id: {"A": tensor, "B": tensor}}
-                # module_weights is {module_name: {"A": tensor, "B": tensor}}, take first value
-                weight_dict = next(iter(module_weights.values())) if module_weights else {}
+                weight_dict = module_weights
 
                 # Add to pool's weight collection
                 pool_weights[target_type][buffer_layer_id] = weight_dict
@@ -882,19 +901,26 @@ class LoRAMemPool:
         # Now load all weights for each pool in a single call
         for target_type, weights_by_layer in pool_weights.items():
             pool = self.get_pool(target_type)
-            if pool is not None:
-                pool.load_adapter(
-                    adapter_idx=adapter_idx,
-                    rank=rank,
-                    scaling=scaling,
-                    layer_weights=weights_by_layer,
-                    tp_rank=self.tp_rank_,
-                    tp_world_size=self.tp_world_size_,
-                    ep_rank=self.ep_rank_,
-                    ep_world_size=self.ep_world_size_,
-                    total_experts=self.num_experts
-                )
-                logger.debug(f"[LoRA]   Loaded {target_type} with {len(weights_by_layer)} layers")
+            if pool is None:
+                continue
+            # Skip empty weights (adapter may not have this target type, e.g. no lm_head)
+            if not weights_by_layer:
+                continue
+            ok = pool.load_adapter(
+                adapter_idx=adapter_idx,
+                rank=rank,
+                scaling=scaling,
+                layer_weights=weights_by_layer,
+                tp_rank=self.tp_rank_,
+                tp_world_size=self.tp_world_size_,
+                ep_rank=self.ep_rank_,
+                ep_world_size=self.ep_world_size_,
+                total_experts=self.num_experts
+            )
+            if not ok:
+                logger.error(f"[LoRA]   Failed to load {target_type}")
+                return False
+            logger.debug(f"[LoRA]   Loaded {target_type} with {len(weights_by_layer)} layers")
 
         self.adapter_dirs.append(adapter_dir)
         self.idx_map[adapter_dir] = adapter_idx
@@ -989,16 +1015,19 @@ class LoRAAdapterLoader:
         # 1. Language Model Layers (e.g. model.language_model.layers.9...)
         re_llm_layer = re.compile(r"model\.language_model\.layers\.(\d+)\.(.+)")
 
-        # 2. LM Head (e.g. model.language_model.lm_head...)
+        # 2. Mixtral-style Model Layers (e.g. model.layers.9...)
+        re_mixtral_layer = re.compile(r"model\.layers\.(\d+)\.(.+)")
+
+        # 3. LM Head (e.g. model.language_model.lm_head...)
         re_lm_head = re.compile(r"model\.language_model\.lm_head")
 
-        # 3. Vision Blocks (e.g. model.visual.blocks.0...)
+        # 4. Vision Blocks (e.g. model.visual.blocks.0...)
         re_vis_block = re.compile(r"model\.visual\.blocks\.(\d+)\.(.+)")
 
-        # 4. Deepstack Merger (e.g. model.visual.deepstack_merger_list.0...)
+        # 5. Deepstack Merger (e.g. model.visual.deepstack_merger_list.0...)
         re_vis_deepstack = re.compile(r"model\.visual\.deepstack_merger_list\.(\d+)\.(.+)")
 
-        # 5. Simple Merger (e.g. model.visual.merger...)
+        # 6. Simple Merger (e.g. model.visual.merger...)
         re_vis_merger = re.compile(r"model\.visual\.merger\.(.+)")
 
         # Expert ID Pattern (nested inside layer suffix)
@@ -1013,7 +1042,7 @@ class LoRAAdapterLoader:
             target_type = None
             expert_id = None
 
-            # 1. Language Model Layers
+            # 1. Language Model Layers (Qwen-style)
             match = re_llm_layer.search(key)
             if match:
                 layer_id = int(match.group(1))
@@ -1042,53 +1071,100 @@ class LoRAAdapterLoader:
                         elif "down_proj" in suffix:
                             target_type = LoRATargetType.MOE_EXPERT_DOWN
 
-            # 2. LM Head (Special Layer -1)
-            elif re_lm_head.search(key):
+            # 2. Mixtral-style Model Layers (e.g. model.layers.9...)
+            if layer_id is None:
+                match = re_mixtral_layer.search(key)
+                if match:
+                    layer_id = int(match.group(1))
+                    suffix = match.group(2)
+
+                    # Attention
+                    if "self_attn.q_proj" in suffix:
+                        target_type = LoRATargetType.ATTN_Q_PROJ
+                    elif "self_attn.k_proj" in suffix:
+                        target_type = LoRATargetType.ATTN_K_PROJ
+                    elif "self_attn.v_proj" in suffix:
+                        target_type = LoRATargetType.ATTN_V_PROJ
+                    elif "self_attn.o_proj" in suffix:
+                        target_type = LoRATargetType.ATTN_O_PROJ
+
+                    # MoE Experts (e.g. block_sparse_moe.experts.0.w1)
+                    elif "block_sparse_moe.experts" in suffix:
+                        expert_match = re_expert_id.search(suffix)
+                        if expert_match:
+                            expert_id = int(expert_match.group(1))
+
+                            if "w1" in suffix:
+                                target_type = LoRATargetType.MOE_EXPERT_GATE
+                            elif "w3" in suffix:
+                                target_type = LoRATargetType.MOE_EXPERT_UP
+                            elif "w2" in suffix:
+                                target_type = LoRATargetType.MOE_EXPERT_DOWN
+
+                    # MoE Gate (e.g. block_sparse_moe.gate)
+                    elif "block_sparse_moe.gate" in suffix:
+                        target_type = LoRATargetType.MOE_EXPERT_GATE
+
+            # 3. LM Head (Special Layer -1)
+            if layer_id is None and re_lm_head.search(key):
                 layer_id = -1
                 target_type = LoRATargetType.LM_HEAD
 
-            # 3. Vision Blocks (Offset +10000)
-            elif (match := re_vis_block.search(key)):
-                layer_id = 10000 + int(match.group(1))
-                suffix = match.group(2)
+            # 4. Vision Blocks (Offset +10000)
+            if layer_id is None:
+                match = re_vis_block.search(key)
+                if match:
+                    layer_id = 10000 + int(match.group(1))
+                    suffix = match.group(2)
 
-                if "attn.q_proj" in suffix:
-                    target_type = LoRATargetType.VL_Q_PROJ
-                elif "attn.k_proj" in suffix:
-                    target_type = LoRATargetType.VL_K_PROJ
-                elif "attn.v_proj" in suffix:
-                    target_type = LoRATargetType.VL_V_PROJ
-                elif "attn.o_proj" in suffix:
-                    target_type = LoRATargetType.VL_O_PROJ
-                elif "mlp.linear_fc1" in suffix:
-                    target_type = LoRATargetType.VL_FC1
-                elif "mlp.linear_fc2" in suffix:
-                    target_type = LoRATargetType.VL_FC2
+                    if "attn.q_proj" in suffix:
+                        target_type = LoRATargetType.VL_Q_PROJ
+                    elif "attn.k_proj" in suffix:
+                        target_type = LoRATargetType.VL_K_PROJ
+                    elif "attn.v_proj" in suffix:
+                        target_type = LoRATargetType.VL_V_PROJ
+                    elif "attn.o_proj" in suffix:
+                        target_type = LoRATargetType.VL_O_PROJ
+                    elif "mlp.linear_fc1" in suffix:
+                        target_type = LoRATargetType.VL_FC1
+                    elif "mlp.linear_fc2" in suffix:
+                        target_type = LoRATargetType.VL_FC2
 
-            # 4. Deepstack Mergers (Offset +20000)
-            elif (match := re_vis_deepstack.search(key)):
-                layer_id = 20000 + int(match.group(1))
-                suffix = match.group(2)
+            # 5. Deepstack Mergers (Offset +20000)
+            if layer_id is None:
+                match = re_vis_deepstack.search(key)
+                if match:
+                    layer_id = 20000 + int(match.group(1))
+                    suffix = match.group(2)
 
-                if "linear_fc1" in suffix:
-                    target_type = LoRATargetType.VL_FC1
-                elif "linear_fc2" in suffix:
-                    target_type = LoRATargetType.VL_FC2
+                    if "linear_fc1" in suffix:
+                        target_type = LoRATargetType.VL_FC1
+                    elif "linear_fc2" in suffix:
+                        target_type = LoRATargetType.VL_FC2
 
-            # 5. Simple Merger (Offset +29999)
-            elif (match := re_vis_merger.search(key)):
-                layer_id = 29999
-                suffix = match.group(1)
+            # 6. Simple Merger (Offset +29999)
+            if layer_id is None:
+                match = re_vis_merger.search(key)
+                if match:
+                    layer_id = 29999
+                    suffix = match.group(1)
 
-                if "linear_fc1" in suffix:
-                    target_type = LoRATargetType.VL_FC1
-                elif "linear_fc2" in suffix:
-                    target_type = LoRATargetType.VL_FC2
+                    if "linear_fc1" in suffix:
+                        target_type = LoRATargetType.VL_FC1
+                    elif "linear_fc2" in suffix:
+                        target_type = LoRATargetType.VL_FC2
 
             # Storage Logic
             if layer_id is not None and target_type is not None:
                 if layer_id not in result:
                     result[layer_id] = {}
+
+                # Fix: PEFT LoRA weight shapes:
+                #   lora_A.weight: shape [in_features, rank] = [h, r] -> WRONG! Need last dim = h
+                #   lora_B.weight: shape [rank, out_features] = [r, h] -> already correct (last dim = h)
+                # Transpose A matrix so last dim = hidden_dim (not rank)
+                if matrix_type == "A":
+                    tensor = tensor.transpose(0, 1)
 
                 # Handle Experts separately if expert_id exists
                 if expert_id is not None:

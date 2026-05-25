@@ -21,6 +21,18 @@ if "ipykernel" not in sys.modules:
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.patches import Rectangle
+
+plt.rcParams.update({
+    "font.size": 8,
+    "axes.titlesize": 9,
+    "axes.labelsize": 8,
+    "xtick.labelsize": 8,
+    "ytick.labelsize": 8,
+    "legend.fontsize": 6,
+    "pdf.fonttype": 42,
+    "ps.fonttype": 42,
+})
 
 
 # ---------------------------------------------------------------------------
@@ -31,10 +43,10 @@ import numpy as np
 # Rows: batch = [1, 2, 4, 8] (index 0 = batch=1, index 3 = batch=8)
 # Columns: rank = [8, 16, 32, 64] (index 0 = rank=8, index 3 = rank=64)
 SPEEDUP_MATRIX = np.array([
-    [1.222, 2.122, 2.669, 5.240],   # batch=1
-    [1.738, 2.622, 2.838, 4.620],   # batch=2
-    [2.004, 2.175, 3.174, 2.196],   # batch=4
-    [2.604, 2.388, 3.714, 1.325],   # batch=8
+    [2.151, 1.726, 1.454, 1.291],   # batch=1
+    [1.738, 1.422, 1.238, 1.152],   # batch=2
+    [1.494, 1.325, 1.224, 1.116],   # batch=4
+    [1.385, 1.258, 1.205, 1.053],   # batch=8
 ])
 
 # Axes labels for heatmap
@@ -44,13 +56,13 @@ BATCHES = [1, 2, 4, 8]
 # Stacked breakdown latencies (μs) for rank=16, batch=8 (representative config)
 BREAKDOWN_DATA = {
     "execution_first": {
-        "cpu_compute": 75.978,
-        "data_transfer": 64.889,  # TD2H_activation + TH2D_residual
-        "other": 20.538,          # Tpack + Tmerge
+        "cpu_compute": 580.978,
+        "data_transfer": 170.9,  # TD2H_activation + TH2D_residual
+        "other": 34.538,          # Tpack + Tmerge
     },
     "promotion_first": {
-        "h2d_weights": 75.04,
-        "gpu_compute": 235.675,
+        "h2d_weights": 594.04,
+        "gpu_compute": 416.0,
         "other": 10.0,             # Tadmit
     },
 }
@@ -82,9 +94,9 @@ POLICY_LABELS = {
 # Grouped component colors for simplified legend
 # Execution-first (CPU path): blue/green family
 EXEC_GROUP_COLORS = {
-    "cpu_compute": "#2A9D8F",      # Teal/green for compute
-    "data_transfer": "#219EBC",    # Blue for transfer
-    "other": "#023047",            # Dark blue for overhead
+    "cpu_compute": "#358C7A",      # muted teal
+    "data_transfer": "#2E86AB",    # muted blue
+    "other": "#D9D9D9",            # muted gray: pack/merge
 }
 EXEC_GROUP_LABELS = {
     "cpu_compute": "CPU LoRA compute",
@@ -94,9 +106,9 @@ EXEC_GROUP_LABELS = {
 
 # Promotion-first (GPU path): orange/red family
 PROM_GROUP_COLORS = {
-    "h2d_weights": "#E76F51",      # Red for transfer
-    "gpu_compute": "#F4A261",      # Orange for compute
-    "other": "#6D6875",            # Gray for overhead
+    "h2d_weights": "#D9654B",      # muted red
+    "gpu_compute": "#E89F5C",      # muted orange
+    "other": "#D9D9D9",            # muted gray: admission
 }
 PROM_GROUP_LABELS = {
     "h2d_weights": "H2D weights",
@@ -104,14 +116,41 @@ PROM_GROUP_LABELS = {
     "other": "Admission",
 }
 
-FIG_DPI = 150
-FIG_WIDTH = 3.5   # Single column width
-FIG_HEIGHT = 5.0  # Two panels stacked vertically
+FIG_DPI = 300
+FIG_WIDTH = 2.8   # Even narrower
+FIG_HEIGHT = 2.2  # Even shorter to eliminate whitespace inside cells
 
 
 # ---------------------------------------------------------------------------
 # Panel (a): Single stacked breakdown
 # ---------------------------------------------------------------------------
+
+def _label_segment(
+    ax: plt.Axes,
+    left: float,
+    width: float,
+    y: float,
+    text: str,
+    *,
+    min_width: float,
+    fontsize: float = 6.2,
+    color: str = "white",
+    weight: str = "bold",
+) -> None:
+    """Place a label only if the segment is wide enough."""
+    if width >= min_width:
+        ax.text(
+            left + width / 2,
+            y,
+            text,
+            ha="center",
+            va="center",
+            fontsize=fontsize,
+            color=color,
+            fontweight=weight,
+            clip_on=True,
+        )
+
 
 def plot_single_breakdown(
     breakdown_data: dict,
@@ -119,87 +158,96 @@ def plot_single_breakdown(
     target_rank: int = 16,
     target_batch: int = 8,
 ) -> None:
-    """Panel (a): Stacked component breakdown for one representative config."""
+    """Panel (a): Horizontal stacked-bar breakdown for one representative config."""
     exec_data = breakdown_data["execution_first"]
     prom_data = breakdown_data["promotion_first"]
 
-    exec_groups = [
-        ("cpu_compute", exec_data["cpu_compute"]),
-        ("data_transfer", exec_data["data_transfer"]),
+    exec_segments = [
         ("other", exec_data["other"]),
+        ("data_transfer", exec_data["data_transfer"]),
+        ("cpu_compute", exec_data["cpu_compute"]),
     ]
-    prom_groups = [
+    prom_segments = [
+        ("other", prom_data["other"]),
         ("h2d_weights", prom_data["h2d_weights"]),
         ("gpu_compute", prom_data["gpu_compute"]),
-        ("other", prom_data["other"]),
     ]
 
-    x = np.array([0, 1])
-    bar_width = 0.6
+    y_positions = [0.5, -0.5]
+    bar_height = 0.32
 
-    # Execution-first stacked bar
-    legend_added = set()
-    bottom = 0.0
-    for key, val in exec_groups:
-        label = EXEC_GROUP_LABELS[key] if key not in legend_added else ""
-        ax.bar(x[0], max(val, 0.0), bar_width, bottom=bottom,
-               color=EXEC_GROUP_COLORS[key],
-               label=label,
-               edgecolor="white", linewidth=0.5)
-        legend_added.add(key)
-        bottom += val
-
-    # Promotion-first stacked bar
-    bottom = 0.0
-    for key, val in prom_groups:
-        label = PROM_GROUP_LABELS[key] if key not in legend_added else ""
-        ax.bar(x[1], max(val, 0.0), bar_width, bottom=bottom,
-               color=PROM_GROUP_COLORS[key],
-               label=label,
-               edgecolor="white", linewidth=0.5)
-        legend_added.add(key)
-        bottom += val
-
-    # Total time annotations on top of each bar
+    # Execution-first (bottom bar, y=0)
+    left = 0.0
+    for key, val in exec_segments:
+        ax.barh(y_positions[1], max(val, 0.1), bar_height, left=left,
+                color=EXEC_GROUP_COLORS[key],
+                edgecolor="black", linewidth=0.5)
+        left += val
     exec_total = sum(exec_data.values())
+
+    # Promotion-first (top bar, y=1)
+    left = 0.0
+    for key, val in prom_segments:
+        ax.barh(y_positions[0], max(val, 0.1), bar_height, left=left,
+                color=PROM_GROUP_COLORS[key],
+                edgecolor="black", linewidth=0.5)
+        left += val
     prom_total = sum(prom_data.values())
-    speedup = prom_total / exec_total
 
-    # Dynamic ylim - leave 25% extra space for annotations
-    y_max = max(exec_total, prom_total) * 1.25
+    x_max = max(exec_total, prom_total) * 1.12  # Tighter right space for total labels
 
-    ax.set_xticks(x)
-    ax.set_xticklabels([
-        POLICY_LABELS["cpu_first"],
-        POLICY_LABELS["load_then_run"],
-    ], fontsize=9)
-    ax.set_ylabel("Recovery service time (μs)", fontsize=9)
-    ax.set_ylim(0, y_max)
-    ax.set_title(f"(a) breakdown (rank={target_rank}, batch={target_batch})",
-                 fontsize=10, loc="left")
-    ax.grid(axis="y", alpha=0.3)
+    # Black border around each full bar
+    ax.add_patch(Rectangle((0, y_positions[0] - bar_height / 2), prom_total, bar_height,
+                           fill=False, edgecolor="black", linewidth=0.8, zorder=3))
+    ax.add_patch(Rectangle((0, y_positions[1] - bar_height / 2), exec_total, bar_height,
+                           fill=False, edgecolor="black", linewidth=0.8, zorder=3))
 
-    # Bar height annotation offset
-    offset = y_max * 0.02
+    ax.set_yticks(y_positions)
+    ax.set_yticklabels(["Promotion\nfirst", "Execution\nfirst"], fontsize=8)
+    ax.set_xlim(0, x_max)
+    ax.set_title("(a) Single-miss recovery time", fontsize=9, loc="left", pad=4)
+    ax.tick_params(axis="x", bottom=False, labelbottom=False)
+    ax.tick_params(axis="y", length=0, width=0.8, pad=2)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["bottom"].set_visible(False)
+    ax.spines["left"].set_visible(False)
+    ax.set_ylim(-1.0, 1.0)
 
-    ax.text(x[0], exec_total + offset, f"{exec_total:.0f}",
-            ha="center", va="bottom", fontsize=8, fontweight="bold")
-    ax.text(x[1], prom_total + offset, f"{prom_total:.0f}",
-            ha="center", va="bottom", fontsize=8, fontweight="bold")
+    # Total labels at bar ends
+    label_offset = x_max * 0.02
+    ax.text(exec_total + label_offset, y_positions[1], f"{exec_total:.0f} μs",
+            ha="left", va="center", fontsize=7, fontweight="bold")
+    ax.text(prom_total + label_offset, y_positions[0], f"{prom_total:.0f} μs",
+            ha="left", va="center", fontsize=7, fontweight="bold")
 
-    # Speedup annotation with arrow
-    anno_y = max(exec_total, prom_total) + y_max * 0.08
-    ax.annotate(f"{speedup:.1f}×",
-                xy=(x[1], anno_y),
-                xytext=(x[0], anno_y),
-                ha="center", va="center", fontsize=9, fontweight="bold",
-                arrowprops=dict(arrowstyle="<->", color="#555", lw=1.5),
-                bbox=dict(boxstyle="round,pad=0.2", facecolor="white",
-                          edgecolor="#ccc", alpha=0.9))
+    # Direct labels inside major segments. Keep labels short to avoid overlap.
 
-    # Legend - compact layout
-    handles, labels = ax.get_legend_handles_labels()
-    ax.legend(handles, labels, fontsize=7, loc="upper left", framealpha=0.9)
+    # Promotion-first labels
+    h2d_left = prom_data["other"]
+    _label_segment(
+        ax, h2d_left, prom_data["h2d_weights"], y_positions[0],
+        "H2D", min_width=35, fontsize=6.4, color="white"
+    )
+
+    gpu_left = prom_data["other"] + prom_data["h2d_weights"]
+    _label_segment(
+        ax, gpu_left, prom_data["gpu_compute"], y_positions[0],
+        "GPU LoRA", min_width=55, fontsize=6.8, color="black"
+    )
+
+    # Execution-first labels
+    io_left = exec_data["other"]
+    _label_segment(
+        ax, io_left, exec_data["data_transfer"], y_positions[1],
+        "I/O", min_width=35, fontsize=6.2, color="white"
+    )
+
+    cpu_left = exec_data["other"] + exec_data["data_transfer"]
+    _label_segment(
+        ax, cpu_left, exec_data["cpu_compute"], y_positions[1],
+        "CPU LoRA", min_width=40, fontsize=6.4, color="white"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -211,35 +259,47 @@ def plot_speedup_heatmap(
     ax: plt.Axes,
 ) -> None:
     """Panel (b): Compact heatmap of speedup = promotion-first / execution-first."""
-    # Compute geometric mean
-    geomean = np.exp(np.mean(np.log(speedup_matrix.flatten())))
 
-    # Plot heatmap - sequential colormap (darker = better speedup)
-    im = ax.imshow(speedup_matrix, cmap="YlGn", vmin=1.0, vmax=5.5,
-                   aspect="auto", origin="upper")  # origin=upper: batch=1 at top
+    im = ax.imshow(
+        speedup_matrix,
+        cmap="YlGn",
+        vmin=0.9,
+        vmax=2.5,
+        aspect="auto",
+        origin="upper",
+    )
 
-    # Set ticks and labels
     ax.set_xticks(np.arange(len(RANKS)))
-    ax.set_xticklabels([str(r) for r in RANKS], fontsize=8)
+    ax.set_xticklabels([str(r) for r in RANKS])
     ax.set_yticks(np.arange(len(BATCHES)))
-    ax.set_yticklabels([str(b) for b in BATCHES], fontsize=8)
-    ax.set_xlabel("LoRA rank", fontsize=9)
-    ax.set_ylabel("Batch size", fontsize=9)
-    ax.set_title(f"(b) Full sweep speedup (geomean {geomean:.2f}×)",
-                 fontsize=10, loc="left")
+    ax.set_yticklabels([str(b) for b in BATCHES])
 
-    # Annotate cells - always black text for readability in print
+    ax.set_xlabel("LoRA rank", fontsize=8, labelpad=2)
+    ax.set_ylabel("Decode batch size", fontsize=8, labelpad=3)
+
+    # Thin white separators improve readability in print.
+    ax.set_xticks(np.arange(-0.5, len(RANKS), 1), minor=True)
+    ax.set_yticks(np.arange(-0.5, len(BATCHES), 1), minor=True)
+    ax.grid(which="minor", color="white", linewidth=0.6)
+    ax.tick_params(which="minor", bottom=False, left=False)
+    ax.tick_params(axis="both", length=3, width=0.8, pad=2)
+
+    # Annotate cells with adaptive text color.
     for i in range(len(BATCHES)):
         for j in range(len(RANKS)):
             val = speedup_matrix[i, j]
-            if val > 0:
-                ax.text(j, i, f"{val:.1f}×", ha="center", va="center",
-                        fontsize=7, color="black")
+            rgba = im.cmap(im.norm(val))
+            lum = 0.299 * rgba[0] + 0.587 * rgba[1] + 0.114 * rgba[2]
+            txt_color = "white" if lum < 0.45 else "black"
+            ax.text(
+                j, i, f"{val:.1f}×",
+                ha="center", va="center",
+                fontsize=7.5,
+                color=txt_color,
+            )
 
-    # Colorbar - simplified label
-    cbar = ax.figure.colorbar(im, ax=ax, shrink=0.8)
-    cbar.set_label("Speedup (×)", fontsize=7)
-    cbar.ax.tick_params(labelsize=6)
+    for spine in ax.spines.values():
+        spine.set_linewidth(0.8)
 
 
 # ---------------------------------------------------------------------------
@@ -251,7 +311,11 @@ def plot_singlecol_figure(
     use_stress: bool = False,
 ) -> None:
     """Build the full two-panel one-column figure."""
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(FIG_WIDTH, FIG_HEIGHT))
+    fig, (ax1, ax2) = plt.subplots(
+        2, 1,
+        figsize=(FIG_WIDTH, FIG_HEIGHT),
+        gridspec_kw={"height_ratios": [0.45, 1.0]},
+    )
 
     # Select breakdown config
     if use_stress:
@@ -269,14 +333,52 @@ def plot_singlecol_figure(
     # Panel (b): speedup heatmap
     plot_speedup_heatmap(SPEEDUP_MATRIX, ax2)
 
-    # Overall figure title
-    # fig.suptitle("Single-miss recovery service time", fontsize=11, y=0.99)
+    fig.subplots_adjust(
+        left=0.28,
+        right=0.97,
+        top=0.93,
+        bottom=0.10,
+        hspace=0.25,
+    )
 
-    plt.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(str(output_path), dpi=FIG_DPI, bbox_inches="tight")
+
+    fig.savefig(str(output_path), dpi=FIG_DPI, bbox_inches="tight", pad_inches=0.01)
+    png_output_path = output_path.with_suffix(".png")
+    fig.savefig(str(png_output_path), dpi=FIG_DPI, bbox_inches="tight", pad_inches=0.01)
+
     plt.close(fig)
     print(f"Wrote {output_path}")
+    print(f"Wrote {png_output_path} (for preview)")
+
+
+def plot_heatmap_only(
+    output_path: Path,
+) -> None:
+    """Build a single-panel heatmap figure."""
+    fig, ax = plt.subplots(
+        1, 1,
+        figsize=(FIG_WIDTH, 1.6),
+    )
+
+    plot_speedup_heatmap(SPEEDUP_MATRIX, ax)
+
+    fig.subplots_adjust(
+        left=0.28,
+        right=0.97,
+        top=0.88,
+        bottom=0.22,
+    )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    fig.savefig(str(output_path), dpi=FIG_DPI, bbox_inches="tight", pad_inches=0.01)
+    png_output_path = output_path.with_suffix(".png")
+    fig.savefig(str(png_output_path), dpi=FIG_DPI, bbox_inches="tight", pad_inches=0.01)
+
+    plt.close(fig)
+    print(f"Wrote {output_path}")
+    print(f"Wrote {png_output_path} (for preview)")
 
 
 # ---------------------------------------------------------------------------
@@ -298,6 +400,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use stress case (rank=64, batch=8) instead of representative",
     )
+    parser.add_argument(
+        "--heatmap-only",
+        action="store_true",
+        help="Generate only the heatmap panel",
+    )
     return parser.parse_args()
 
 
@@ -305,10 +412,15 @@ def main() -> int:
     args = parse_args()
     output_dir = args.output_dir
 
-    plot_singlecol_figure(
-        output_dir / "fig_cold_recovery_singlecol.pdf",
-        use_stress=args.stress,
-    )
+    if args.heatmap_only:
+        plot_heatmap_only(
+            output_dir / "fig_cold_recovery_heatmap.pdf",
+        )
+    else:
+        plot_singlecol_figure(
+            output_dir / "fig_cold_recovery_singlecol.pdf",
+            use_stress=args.stress,
+        )
 
     return 0
 

@@ -6,7 +6,7 @@ import threading
 import inspect
 import setproctitle
 from datetime import timedelta
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Union
 from lightllm.server.router.model_infer.mode_backend import (
     ChunkedPrefillBackend,
     FirstTokenConstraintBackend,
@@ -55,6 +55,7 @@ class ModelRpcServer:
         self.info_queue = info_queue
         self.rpc_event = rpc_event
         self.rpc_finished_event = rpc_finished_event
+        self._shutdown_event = threading.Event()
 
         self.rpc_shm_params = RpcShmParams()
         self.rpc_shm_params.create_or_link_shm()
@@ -74,9 +75,13 @@ class ModelRpcServer:
 
     def rpc_loop(self):
         error_count = 0
-        while True:
+        while not self._shutdown_event.is_set():
             try:
-                self.rpc_event.wait()
+                self.rpc_event.wait(timeout=1.0)
+                if self._shutdown_event.is_set():
+                    break
+                if not self.rpc_event.is_set():
+                    continue
                 func_name, args = self.rpc_shm_params.read_func_params()
 
                 ans = getattr(self, func_name)(*args)
@@ -86,12 +91,16 @@ class ModelRpcServer:
                 # 下面得执行顺序不可随意交换, 否则容易出现同步或者死锁问题。
                 self.rpc_shm_sync_status.add_mark(self.rank_in_node)
                 while not self.rpc_shm_sync_status.run_finished():
+                    if self._shutdown_event.is_set():
+                        return
                     pass
 
                 self.rpc_event.clear()
 
                 self.rpc_shm_sync_status.add_mark1(self.rank_in_node)
                 while not self.rpc_shm_sync_status.run_finished1():
+                    if self._shutdown_event.is_set():
+                        return
                     pass
 
                 if self.rank_in_node == 0:
@@ -182,8 +191,129 @@ class ModelRpcServer:
     def get_max_total_token_num(self):
         return self.backend.get_max_total_token_num()
 
+    def get_colora_stats(self):
+        """Aggregate cumulative colora stats from all transformer layers."""
+        backend_model = getattr(self.backend, "model", None)
+        if backend_model is None:
+            return {}
+        layers_infer = getattr(backend_model, "layers_infer", None)
+        if layers_infer is None:
+            return {}
+
+        result: Dict[str, float] = {}
+        for layer in layers_infer:
+            get_fn = getattr(layer, "get_cumulative_colora_stats", None)
+            if callable(get_fn):
+                stats = get_fn()
+                for key, value in stats.items():
+                    if key in result:
+                        result[key] += float(value)
+                    else:
+                        result[key] = float(value)
+
+        # Derive hit/miss rates from accumulated tokens
+        hit = result.get("colora_hit_tokens", 0)
+        miss = result.get("colora_miss_tokens", 0)
+        total = hit + miss
+        if total > 0:
+            result["cache_hit_rate"] = hit / total
+            result["cache_miss_rate"] = miss / total
+
+        # Reset cumulative stats after reading so the next phase starts clean
+        for layer in layers_infer:
+            reset_fn = getattr(layer, "reset_cumulative_colora_stats", None)
+            if callable(reset_fn):
+                reset_fn()
+
+        return result
+
+    def set_colora_config(self, config):
+        """Propagate COLoRA runtime config to all transformer layers."""
+        backend_model = getattr(self.backend, "model", None)
+        if backend_model is None:
+            return {"error": "backend model not initialized"}
+        layers_infer = getattr(backend_model, "layers_infer", None)
+        if layers_infer is None:
+            return {"error": "layers_infer not initialized"}
+
+        for layer in layers_infer:
+            dispatcher = getattr(layer, "lora_dispatcher_", None)
+            if dispatcher is not None and callable(getattr(dispatcher, "set_colora_config", None)):
+                dispatcher.set_colora_config(config)
+
+        return {"status": "ok", "config": config}
+
+    def promote_adapters(self, adapter_ids: List[Union[str, int]]):
+        """Blocking promotion of all expert projections for given adapter IDs (strings or ints)."""
+        backend_model = getattr(self.backend, "model", None)
+        if backend_model is None:
+            return {"error": "backend model not initialized"}
+        layers_infer = getattr(backend_model, "layers_infer", None)
+        if layers_infer is None:
+            return {"error": "layers_infer not initialized"}
+
+        # Map adapter names to bins using the first layer's dispatcher
+        adapter_bins = []
+        for layer in layers_infer:
+            dispatcher = getattr(layer, "lora_dispatcher_", None)
+            if dispatcher is not None:
+                pool = getattr(dispatcher, "lora_mem_pool", None)
+                if pool is not None:
+                    for aid in adapter_ids:
+                        # First, try parsing as a direct integer
+                        try:
+                            idx = int(aid)
+                            adapter_bins.append(idx)
+                            continue
+                        except (ValueError, TypeError):
+                            pass
+
+                        # Then, try extracting the numeric suffix from things like "lora_dummy_41"
+                        import re
+                        match = re.search(r'(\d+)$', str(aid))
+                        if match:
+                            idx = int(match.group(1))
+                            adapter_bins.append(idx)
+                            continue
+
+                        # Finally, try looking up the full string in pool.idx_map
+                        idx = pool.idx_map.get(str(aid))
+                        if idx is not None:
+                            adapter_bins.append(int(idx))
+                    break
+
+        if not adapter_bins:
+            return {"status": "ok", "total_promoted": 0, "total_transferred_bytes": 0, "note": "no_matching_adapters"}
+
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_adapter_bins = []
+        for bin_idx in adapter_bins:
+            if bin_idx not in seen:
+                seen.add(bin_idx)
+                unique_adapter_bins.append(bin_idx)
+        adapter_bins = unique_adapter_bins
+
+        total_promoted = 0
+        total_bytes = 0
+        for layer in layers_infer:
+            dispatcher = getattr(layer, "lora_dispatcher_", None)
+            if dispatcher is not None and callable(getattr(dispatcher, "promote_adapters_blocking", None)):
+                result = dispatcher.promote_adapters_blocking(adapter_bins)
+                total_promoted += result.get("promoted_count", 0)
+                total_bytes += result.get("transferred_bytes", 0)
+
+        return {
+            "status": "ok",
+            "total_promoted": total_promoted,
+            "total_transferred_bytes": total_bytes,
+        }
+
     def cleanup_shared_memory(self):
+        self._shutdown_event.set()
         if hasattr(self, "backend") and self.backend is not None:
+            if hasattr(self.backend, "request_shutdown"):
+                self.backend.request_shutdown()
             backend_model = getattr(self.backend, "model", None)
             if backend_model is not None and getattr(backend_model, "mem_manager", None) is not None:
                 backend_model.mem_manager.cleanup_shared_memory()
@@ -257,6 +387,36 @@ class ModelRpcClient:
         self.rpc_finished_event.clear()
         func_name, ret = self.rpc_shm_results.read_func_result()
         assert func_name == "get_max_total_token_num"
+        return ret
+
+    async def get_colora_stats(self):
+        self.rpc_shm_params.write_func_params("get_colora_stats", ())
+        self.rpc_event.set()
+
+        self.rpc_finished_event.wait()
+        self.rpc_finished_event.clear()
+        func_name, ret = self.rpc_shm_results.read_func_result()
+        assert func_name == "get_colora_stats"
+        return ret
+
+    async def set_colora_config(self, config):
+        self.rpc_shm_params.write_func_params("set_colora_config", (config,))
+        self.rpc_event.set()
+
+        self.rpc_finished_event.wait()
+        self.rpc_finished_event.clear()
+        func_name, ret = self.rpc_shm_results.read_func_result()
+        assert func_name == "set_colora_config"
+        return ret
+
+    async def promote_adapters(self, adapter_ids: List[str]):
+        self.rpc_shm_params.write_func_params("promote_adapters", (adapter_ids,))
+        self.rpc_event.set()
+
+        self.rpc_finished_event.wait()
+        self.rpc_finished_event.clear()
+        func_name, ret = self.rpc_shm_results.read_func_result()
+        assert func_name == "promote_adapters"
         return ret
 
     def cleanup_shared_memory(self):
