@@ -44,6 +44,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cpu-threads", type=int, default=0)
     p.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16"])
     p.add_argument("--avx-mode", type=str, default="auto", choices=["auto", "on", "off"])
+    p.add_argument("--sweep-threads", action="store_true",
+                   help="Sweep CPU thread counts (1,2,4,8,16,all) to find optimal")
     p.add_argument("--no-plot", action="store_true")
     return p.parse_args()
 
@@ -78,6 +80,121 @@ def resolve_avx(avx_mode: str) -> Tuple[bool, bool, Optional[Callable]]:
         raise RuntimeError("AVX mode forced on, but kernel is unavailable.")
     use_avx = avx_ready and avx_mode != "off"
     return avx_ready, use_avx, (moe_batch_lora_avx if use_avx else None)
+
+
+# ---------------------------------------------------------------------------
+# System metadata
+# ---------------------------------------------------------------------------
+
+def get_system_metadata() -> dict:
+    """Collect CPU model, core count, memory, PCIe info."""
+    import os
+    import subprocess
+
+    meta = {}
+    # CPU model
+    try:
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if "model name" in line:
+                    meta["cpu_model"] = line.split(":", 1)[1].strip()
+                    break
+    except Exception:
+        meta["cpu_model"] = "unknown"
+
+    meta["cpu_cores_physical"] = os.cpu_count() or 0
+    meta["cpu_threads_logical"] = os.cpu_count() or 0  # approximation
+
+    # Memory
+    try:
+        result = subprocess.run(["free", "-b"], capture_output=True, text=True)
+        for line in result.stdout.split("\n"):
+            if "Mem:" in line:
+                parts = line.split()
+                meta["memory_total_bytes"] = int(parts[1])
+                break
+    except Exception:
+        meta["memory_total_bytes"] = 0
+
+    meta["pytorch_version"] = torch.__version__
+    meta["cuda_version"] = torch.version.cuda or "unknown"
+
+    return meta
+
+
+def sweep_threads(
+    hidden_dim: int,
+    intermediate_dim: int,
+    ranks: List[int],
+    num_miss_list: List[int],
+    warmup: int,
+    iters: int,
+    dtype: torch.dtype,
+    device: str,
+    use_avx: bool,
+    avx_fn,
+) -> dict:
+    """Sweep torch.set_num_threads() to find optimal CPU thread count for Path B."""
+    thread_counts = [1, 2, 4, 8, 16]
+    all_cores = torch.get_num_threads()
+    if all_cores not in thread_counts:
+        thread_counts.append(all_cores)
+
+    print("\n" + "=" * 80)
+    print("CPU Thread Sweep (Path B only, r=64, miss=4)")
+    print("=" * 80)
+
+    # Pick a representative config
+    test_rank = 64
+    test_miss = 4
+    max_miss = max(num_miss_list)
+
+    all_weights = pregenerate_weights(ranks, max_miss, hidden_dim, intermediate_dim, dtype)
+    w = all_weights[test_rank]
+    a_cpu = w["a"][:test_miss]
+    b_cpu = w["b"][:test_miss]
+
+    activation_gpu = torch.randn(1, hidden_dim, device=device, dtype=dtype)
+    cpu_act = torch.empty(1, hidden_dim, device="cpu", dtype=dtype).pin_memory()
+    cpu_out = torch.empty(test_miss, 1, intermediate_dim, device="cpu", dtype=dtype).pin_memory()
+    gpu_out = torch.empty(test_miss, 1, intermediate_dim, device=device, dtype=dtype)
+
+    best_time = float("inf")
+    best_threads = all_cores
+
+    for n_threads in thread_counts:
+        torch.set_num_threads(n_threads)
+
+        # Warmup
+        for _ in range(warmup):
+            if use_avx:
+                _run_path_b_avx(activation_gpu, a_cpu, b_cpu, cpu_act, cpu_out, gpu_out, 1.0, avx_fn)
+            else:
+                _run_path_b_torch(activation_gpu, a_cpu, b_cpu, cpu_act, cpu_out, gpu_out, 1.0)
+            torch.cuda.synchronize()
+
+        samples = []
+        for _ in range(iters):
+            if use_avx:
+                _, cpu_c, _, total = _run_path_b_avx(
+                    activation_gpu, a_cpu, b_cpu, cpu_act, cpu_out, gpu_out, 1.0, avx_fn)
+            else:
+                _, cpu_c, _, total = _run_path_b_torch(
+                    activation_gpu, a_cpu, b_cpu, cpu_act, cpu_out, gpu_out, 1.0)
+            samples.append(total)
+            torch.cuda.synchronize()
+
+        median_us = _median_us(samples)
+        marker = ""
+        if median_us < best_time:
+            best_time = median_us
+            best_threads = n_threads
+            marker = " <-- BEST"
+        print(f"  threads={n_threads:>3}: total={median_us:>8.1f}us{marker}")
+
+    print(f"\nOptimal: threads={best_threads} ({best_time:.1f}us)")
+    print("=" * 80)
+    return {"best_threads": best_threads, "best_time_us": best_time, "all_cores": all_cores}
 
 
 # ---------------------------------------------------------------------------
@@ -551,17 +668,39 @@ def main() -> None:
 
     avx_ready, use_avx, avx_fn = resolve_avx(args.avx_mode)
     device_name = torch.cuda.get_device_name(torch.cuda.current_device())
+    sys_meta = get_system_metadata()
 
     print("=" * 80)
     print("CoLoRA Motivation Study: Single MoE Layer Microbenchmark")
     print("=" * 80)
     print(f"GPU: {device_name}")
+    print(f"CPU: {sys_meta['cpu_model']} ({sys_meta['cpu_cores_physical']} cores)")
+    print(f"Memory: {sys_meta['memory_total_bytes'] / (1024**3):.1f} GB")
+    print(f"PyTorch: {sys_meta['pytorch_version']}, CUDA: {sys_meta['cuda_version']}")
     print(f"AVX kernel: available={avx_ready}, use={use_avx}")
     print(f"Model: hidden_dim={args.hidden_dim}, intermediate_dim={args.intermediate_dim}")
     print(f"Sweep: ranks={ranks}, num_miss={num_miss_list}")
     print(f"dtype={args.dtype}, warmup={args.warmup}, iters={args.iters}")
     print(f"CPU threads: {torch.get_num_threads()}")
     print("=" * 80)
+
+    # Thread sweep if requested
+    sweep_result = None
+    if args.sweep_threads:
+        sweep_result = sweep_threads(
+            hidden_dim=args.hidden_dim,
+            intermediate_dim=args.intermediate_dim,
+            ranks=ranks,
+            num_miss_list=num_miss_list,
+            warmup=args.warmup,
+            iters=min(args.iters, 30),
+            dtype=dtype,
+            device=args.device,
+            use_avx=use_avx,
+            avx_fn=avx_fn,
+        )
+        torch.set_num_threads(sweep_result["best_threads"])
+        print(f"\nUsing optimal CPU threads: {sweep_result['best_threads']}")
 
     results = run_benchmark(
         hidden_dim=args.hidden_dim,
@@ -581,6 +720,27 @@ def main() -> None:
 
     if not args.no_plot:
         plot_results(results, str(Path(args.output).parent))
+
+    # Write metadata JSON
+    import json
+    meta_path = Path(args.output).parent / "motivation_metadata.json"
+    metadata = {
+        **sys_meta,
+        "hidden_dim": args.hidden_dim,
+        "intermediate_dim": args.intermediate_dim,
+        "ranks": ranks,
+        "num_miss_list": num_miss_list,
+        "dtype": args.dtype,
+        "warmup": args.warmup,
+        "iters": args.iters,
+        "gpu_name": device_name,
+        "avx_enabled": use_avx,
+        "cpu_threads_used": torch.get_num_threads(),
+    }
+    if sweep_result:
+        metadata["thread_sweep"] = sweep_result
+    meta_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    print(f"Metadata written to: {meta_path}")
 
     n_expected = len(ranks) * len(num_miss_list) * 2
     print(f"\nTotal rows: {len(results)} (expected: {n_expected})")
