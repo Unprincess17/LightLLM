@@ -315,7 +315,8 @@ def print_summary(results: List[dict]) -> None:
     print("CROSSOVER TABLE (Path B CPU vs Path A GPU)")
     print("  Cell: speedup of winner. B = CPU wins, A = GPU wins.")
     print("=" * 90)
-    header = f"{'Rank\\Miss':>10}"
+    rank_label = "Rank\\Miss"
+    header = f"{rank_label:>10}"
     for m in misses:
         header += f"{m:>12}"
     print(header)
