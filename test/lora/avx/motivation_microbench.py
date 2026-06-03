@@ -479,10 +479,9 @@ def plot_results(results: List[dict], output_dir: str) -> None:
             bottom += comp
 
         bottom = 0
-        labels_b = ["D2H (act)", "CPU compute", "H2D (result)"]
-        for comp, color, label in [(path_b["d2h_ms"], "#9999ff"),
-                                    (path_b["cpu_compute_ms"], "#4444ff"),
-                                    (path_b["h2d_ms"], "#6666cc")]:
+        for comp, color, label in [(path_b["d2h_ms"], "#9999ff", "D2H (act)"),
+                                    (path_b["cpu_compute_ms"], "#4444ff", "CPU compute"),
+                                    (path_b["h2d_ms"], "#6666cc", "H2D (result)")]:
             ax.bar(x[1], comp, width, bottom=bottom, color=color, alpha=0.85, label=label)
             bottom += comp
 
