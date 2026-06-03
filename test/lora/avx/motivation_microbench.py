@@ -21,7 +21,7 @@ import csv
 import statistics
 import time
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -43,6 +43,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", type=str, default="cuda:0")
     p.add_argument("--cpu-threads", type=int, default=0)
     p.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16"])
+    p.add_argument("--avx-mode", type=str, default="auto", choices=["auto", "on", "off"])
     p.add_argument("--no-plot", action="store_true")
     return p.parse_args()
 
@@ -55,20 +56,41 @@ def _dtype(name: str) -> torch.dtype:
     return torch.bfloat16 if name == "bfloat16" else torch.float16
 
 
+# ---------------------------------------------------------------------------
+# AVX kernel resolution
+# ---------------------------------------------------------------------------
+
+def resolve_avx(avx_mode: str) -> Tuple[bool, bool, Optional[Callable]]:
+    """Returns (avx_available, use_avx, avx_fn)."""
+    if avx_mode == "off":
+        return False, False, None
+    try:
+        from lightllm._kernels.lora.moe_lora_cpu_kernel import (
+            moe_batch_lora_avx,
+            is_available as avx_is_available,
+        )
+    except Exception:
+        if avx_mode == "on":
+            raise RuntimeError("AVX mode forced on, but kernel import failed.")
+        return False, False, None
+    avx_ready = bool(avx_is_available())
+    if avx_mode == "on" and not avx_ready:
+        raise RuntimeError("AVX mode forced on, but kernel is unavailable.")
+    use_avx = avx_ready and avx_mode != "off"
+    return avx_ready, use_avx, (moe_batch_lora_avx if use_avx else None)
+
+
+# ---------------------------------------------------------------------------
+# Pre-generate weights
+# ---------------------------------------------------------------------------
+
 def pregenerate_weights(
     ranks: List[int],
-    num_miss_list: List[int],
+    max_miss: int,
     hidden_dim: int,
     intermediate_dim: int,
     dtype: torch.dtype,
 ) -> dict:
-    """Pre-generate all LoRA weights in CPU pinned memory.
-
-    Returns dict keyed by rank, each containing:
-      - a_cpu: [max_miss, rank, hidden_dim] pinned bf16
-      - b_cpu: [max_miss, rank, intermediate_dim] pinned bf16
-    """
-    max_miss = max(num_miss_list)
     weights = {}
     for rank in ranks:
         a = torch.randn(max_miss, rank, hidden_dim, device="cpu", dtype=dtype).pin_memory()
@@ -77,114 +99,125 @@ def pregenerate_weights(
     return weights
 
 
-def measure_path_a(
-    hidden_states: torch.Tensor,
-    weights_a: torch.Tensor,
-    weights_b: torch.Tensor,
-    gpu_out: torch.Tensor,
+# ---------------------------------------------------------------------------
+# Path A: GPU-transfer (H2D weights → GPU compute)
+# ---------------------------------------------------------------------------
+
+def _run_path_a(
+    activation: torch.Tensor,
+    a_cpu: torch.Tensor,
+    b_cpu: torch.Tensor,
+    a_gpu: torch.Tensor,
+    b_gpu: torch.Tensor,
+    temp_buf: torch.Tensor,
+    result_buf: torch.Tensor,
     scaling: float,
 ) -> Tuple[float, float, float]:
-    """Path A: GPU-transfer.
-
-    Steps:
-      1. H2D: transfer all LoRA weights CPU→GPU (batched, one transfer)
-      2. GPU compute: for each adapter, compute activation @ A^T @ B^T
-
-    Returns (h2d_us, gpu_compute_us, total_us).
-    """
-    num_miss = weights_a.shape[0]
-    rank = weights_a.shape[1]
-    hidden_dim = weights_a.shape[2]
-    intermediate_dim = weights_b.shape[2]
-
-    a_gpu = torch.empty_like(weights_a, device="cuda")
-    b_gpu = torch.empty_like(weights_b, device="cuda")
-    temp = torch.empty(num_miss, 1, rank, device="cuda", dtype=weights_a.dtype)
+    """Path A: H2D weight transfer + GPU batched matmul. No allocations inside."""
+    num_miss = a_cpu.shape[0]
 
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
-    # Step 1: H2D transfer (all weights batched)
-    a_gpu.copy_(weights_a, non_blocking=True)
-    b_gpu.copy_(weights_b, non_blocking=True)
+    # H2D: transfer weights (batched)
+    a_gpu.copy_(a_cpu, non_blocking=True)
+    b_gpu.copy_(b_cpu, non_blocking=True)
     torch.cuda.synchronize()
     t1 = time.perf_counter()
 
-    # Step 2: GPU compute — for each miss adapter: act @ A^T @ B^T
-    # activation: [1, H], A: [R, H] → inter: [1, R], B: [R, I] → out: [1, I]
-    # Batched: act [1, H] @ A^T [num_miss, H, R] → [num_miss, 1, R]
-    # Then: [num_miss, 1, R] @ B [num_miss, R, I] → [num_miss, 1, I]
-    a_t = weights_a.transpose(1, 2).to(device="cuda")  # [num_miss, H, R]
-    temp = torch.bmm(hidden_states.unsqueeze(0).expand(num_miss, -1, -1), a_t)
-    result = torch.bmm(temp, b_gpu) * scaling  # [num_miss, 1, I]
+    # GPU compute: act [1,H] @ A^T [num_miss,H,R] → [num_miss,1,R] @ B [num_miss,R,I]
+    act_exp = activation.unsqueeze(0).expand(num_miss, -1, -1)  # view, no alloc
+    torch.bmm(act_exp, a_gpu.transpose(1, 2), out=temp_buf)
+    torch.bmm(temp_buf, b_gpu, out=result_buf)
+    result_buf.mul_(scaling)
     torch.cuda.synchronize()
     t2 = time.perf_counter()
 
-    h2d_us = (t1 - t0) * 1e6
-    gpu_compute_us = (t2 - t1) * 1e6
-    total_us = (t2 - t0) * 1e6
-
-    del a_gpu, b_gpu, a_t, temp, result
-    return h2d_us, gpu_compute_us, total_us
+    return (t1 - t0) * 1e6, (t2 - t1) * 1e6, (t2 - t0) * 1e6
 
 
-def measure_path_b(
-    hidden_states: torch.Tensor,
-    weights_a: torch.Tensor,
-    weights_b: torch.Tensor,
+# ---------------------------------------------------------------------------
+# Path B: CPU-compute (D2H activation → CPU compute → H2D result)
+# ---------------------------------------------------------------------------
+
+def _run_path_b_torch(
+    activation: torch.Tensor,
+    a_cpu: torch.Tensor,
+    b_cpu: torch.Tensor,
     cpu_act: torch.Tensor,
+    cpu_out: torch.Tensor,
     gpu_out: torch.Tensor,
     scaling: float,
 ) -> Tuple[float, float, float, float]:
-    """Path B: CPU-compute.
-
-    Steps:
-      1. D2H: transfer activation GPU→CPU (just hidden_dim floats)
-      2. CPU compute: for each adapter, act @ A^T @ B^T
-      3. H2D: transfer results CPU→GPU
-
-    Returns (d2h_us, cpu_compute_us, h2d_us, total_us).
-    """
-    num_miss = weights_a.shape[0]
-    rank = weights_a.shape[1]
-    intermediate_dim = weights_b.shape[2]
-
-    # Pre-allocate CPU output buffer
-    cpu_out = torch.empty(num_miss, 1, intermediate_dim, device="cpu", dtype=weights_a.dtype).pin_memory()
+    """Path B using PyTorch BLAS on CPU (float32 bmm). No allocations inside."""
+    num_miss = a_cpu.shape[0]
 
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
-    # Step 1: D2H transfer (activation only)
-    cpu_act.copy_(hidden_states, non_blocking=True)
+    # D2H: transfer activation
+    cpu_act.copy_(activation, non_blocking=True)
     torch.cuda.synchronize()
     t1 = time.perf_counter()
 
-    # Step 2: CPU compute
-    # activation: [1, H], A: [num_miss, R, H] → inter: [num_miss, 1, R]
-    # B: [num_miss, R, I] → out: [num_miss, 1, I]
+    # CPU compute: float32 bmm
     act_f32 = cpu_act.float()  # [1, H]
-    a_f32 = weights_a.float()  # [num_miss, R, H]
-    b_f32 = weights_b.float()  # [num_miss, R, I]
+    a_f32 = a_cpu.float()  # [num_miss, R, H]
+    b_f32 = b_cpu.float()  # [num_miss, R, I]
     inter = torch.bmm(act_f32.unsqueeze(0).expand(num_miss, -1, -1),
                       a_f32.transpose(1, 2))  # [num_miss, 1, R]
-    result = torch.bmm(inter, b_f32) * scaling  # [num_miss, 1, I]
-    cpu_out.copy_(result.to(dtype=weights_a.dtype))
+    result = torch.bmm(inter, b_f32).mul_(scaling)  # [num_miss, 1, I]
+    cpu_out.copy_(result.to(dtype=cpu_act.dtype))
     t2 = time.perf_counter()
 
-    # Step 3: H2D transfer (results)
+    # H2D: transfer results back
     torch.cuda.synchronize()
     gpu_out.copy_(cpu_out, non_blocking=True)
     torch.cuda.synchronize()
     t3 = time.perf_counter()
 
-    d2h_us = (t1 - t0) * 1e6
-    cpu_compute_us = (t2 - t1) * 1e6
-    h2d_us = (t3 - t2) * 1e6
-    total_us = (t3 - t0) * 1e6
+    return (t1 - t0) * 1e6, (t2 - t1) * 1e6, (t3 - t2) * 1e6, (t3 - t0) * 1e6
 
-    return d2h_us, cpu_compute_us, h2d_us, total_us
 
+def _run_path_b_avx(
+    activation: torch.Tensor,
+    a_cpu: torch.Tensor,
+    b_cpu: torch.Tensor,
+    cpu_act: torch.Tensor,
+    cpu_out: torch.Tensor,
+    gpu_out: torch.Tensor,
+    scaling: float,
+    avx_fn: Callable,
+) -> Tuple[float, float, float, float]:
+    """Path B using AVX-512 kernel. One AVX call per adapter."""
+    num_miss = a_cpu.shape[0]
+
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+
+    # D2H: transfer activation
+    cpu_act.copy_(activation, non_blocking=True)
+    torch.cuda.synchronize()
+    t1 = time.perf_counter()
+
+    # CPU compute: AVX-512, one call per miss adapter
+    for i in range(num_miss):
+        out_i = avx_fn(cpu_act, a_cpu[i], b_cpu[i], scaling)
+        cpu_out[i].copy_(out_i)
+    t2 = time.perf_counter()
+
+    # H2D: transfer results back
+    torch.cuda.synchronize()
+    gpu_out.copy_(cpu_out, non_blocking=True)
+    torch.cuda.synchronize()
+    t3 = time.perf_counter()
+
+    return (t1 - t0) * 1e6, (t2 - t1) * 1e6, (t3 - t2) * 1e6, (t3 - t0) * 1e6
+
+
+# ---------------------------------------------------------------------------
+# Benchmark driver
+# ---------------------------------------------------------------------------
 
 def run_benchmark(
     hidden_dim: int,
@@ -195,19 +228,27 @@ def run_benchmark(
     iters: int,
     dtype: torch.dtype,
     device: str,
+    use_avx: bool,
+    avx_fn: Optional[Callable],
 ) -> List[dict]:
-    """Run all benchmark configurations."""
     max_miss = max(num_miss_list)
     scaling = 1.0
 
-    # Pre-generate weights
-    all_weights = pregenerate_weights(ranks, num_miss_list, hidden_dim, intermediate_dim, dtype)
+    all_weights = pregenerate_weights(ranks, max_miss, hidden_dim, intermediate_dim, dtype)
 
-    # Pre-allocate buffers
+    # Fixed activation on GPU
     activation_gpu = torch.randn(1, hidden_dim, device=device, dtype=dtype)
-    gpu_out_a = torch.empty(max_miss, 1, intermediate_dim, device=device, dtype=dtype)
-    gpu_out_b = torch.empty(max_miss, 1, intermediate_dim, device=device, dtype=dtype)
+
+    # Pre-allocate GPU buffers for Path A (max config)
+    a_gpu = torch.empty(max_miss, max(ranks), hidden_dim, device=device, dtype=dtype)
+    b_gpu = torch.empty(max_miss, max(ranks), intermediate_dim, device=device, dtype=dtype)
+    temp_buf = torch.empty(max_miss, 1, max(ranks), device=device, dtype=dtype)
+    result_buf_a = torch.empty(max_miss, 1, intermediate_dim, device=device, dtype=dtype)
+
+    # Pre-allocate buffers for Path B
     cpu_act_pinned = torch.empty(1, hidden_dim, device="cpu", dtype=dtype).pin_memory()
+    cpu_out_pinned = torch.empty(max_miss, 1, intermediate_dim, device="cpu", dtype=dtype).pin_memory()
+    gpu_out_b = torch.empty(max_miss, 1, intermediate_dim, device=device, dtype=dtype)
 
     results: List[dict] = []
 
@@ -217,18 +258,25 @@ def run_benchmark(
             a_cpu = w["a"][:num_miss]  # [num_miss, R, H]
             b_cpu = w["b"][:num_miss]  # [num_miss, R, I]
 
-            # --- Path A warmup ---
+            # Slice pre-allocated GPU buffers to current config
+            a_gpu_cfg = a_gpu[:num_miss, :rank, :]
+            b_gpu_cfg = b_gpu[:num_miss, :rank, :]
+            temp_cfg = temp_buf[:num_miss, :, :rank]
+            result_a_cfg = result_buf_a[:num_miss]
+            result_b_cfg = gpu_out_b[:num_miss]
+            cpu_out_cfg = cpu_out_pinned[:num_miss]
+
+            # --- Path A warmup + measurement ---
             for _ in range(warmup):
-                measure_path_a(activation_gpu, a_cpu, b_cpu,
-                               gpu_out_a[:num_miss], scaling)
+                _run_path_a(activation_gpu, a_cpu, b_cpu,
+                            a_gpu_cfg, b_gpu_cfg, temp_cfg, result_a_cfg, scaling)
                 torch.cuda.synchronize()
 
-            # --- Path A measurement ---
             a_samples = []
             for _ in range(iters):
-                h2d, gpu_c, total = measure_path_a(
+                h2d, gpu_c, total = _run_path_a(
                     activation_gpu, a_cpu, b_cpu,
-                    gpu_out_a[:num_miss], scaling)
+                    a_gpu_cfg, b_gpu_cfg, temp_cfg, result_a_cfg, scaling)
                 a_samples.append((h2d, gpu_c, total))
                 torch.cuda.synchronize()
 
@@ -236,18 +284,28 @@ def run_benchmark(
             gpu_c_a = _median_us([s[1] for s in a_samples])
             total_a = _median_us([s[2] for s in a_samples])
 
-            # --- Path B warmup ---
+            # --- Path B warmup + measurement ---
+            path_b_fn = _run_path_b_avx if use_avx else _run_path_b_torch
+
             for _ in range(warmup):
-                measure_path_b(activation_gpu, a_cpu, b_cpu,
-                               cpu_act_pinned, gpu_out_b[:num_miss], scaling)
+                if use_avx:
+                    _run_path_b_avx(activation_gpu, a_cpu, b_cpu,
+                                    cpu_act_pinned, cpu_out_cfg, result_b_cfg, scaling, avx_fn)
+                else:
+                    _run_path_b_torch(activation_gpu, a_cpu, b_cpu,
+                                      cpu_act_pinned, cpu_out_cfg, result_b_cfg, scaling)
                 torch.cuda.synchronize()
 
-            # --- Path B measurement ---
             b_samples = []
             for _ in range(iters):
-                d2h, cpu_c, h2d, total = measure_path_b(
-                    activation_gpu, a_cpu, b_cpu,
-                    cpu_act_pinned, gpu_out_b[:num_miss], scaling)
+                if use_avx:
+                    d2h, cpu_c, h2d, total = _run_path_b_avx(
+                        activation_gpu, a_cpu, b_cpu,
+                        cpu_act_pinned, cpu_out_cfg, result_b_cfg, scaling, avx_fn)
+                else:
+                    d2h, cpu_c, h2d, total = _run_path_b_torch(
+                        activation_gpu, a_cpu, b_cpu,
+                        cpu_act_pinned, cpu_out_cfg, result_b_cfg, scaling)
                 b_samples.append((d2h, cpu_c, h2d, total))
                 torch.cuda.synchronize()
 
@@ -258,24 +316,16 @@ def run_benchmark(
 
             # Path A row
             results.append({
-                "rank": rank,
-                "num_miss": num_miss,
-                "path": "A",
-                "h2d_ms": f"{h2d_a / 1000:.6f}",
-                "d2h_ms": "",
-                "gpu_compute_ms": f"{gpu_c_a / 1000:.6f}",
-                "cpu_compute_ms": "",
+                "rank": rank, "num_miss": num_miss, "path": "A",
+                "h2d_ms": f"{h2d_a / 1000:.6f}", "d2h_ms": "",
+                "gpu_compute_ms": f"{gpu_c_a / 1000:.6f}", "cpu_compute_ms": "",
                 "total_ms": f"{total_a / 1000:.6f}",
             })
             # Path B row
             results.append({
-                "rank": rank,
-                "num_miss": num_miss,
-                "path": "B",
-                "h2d_ms": f"{h2d_b / 1000:.6f}",
-                "d2h_ms": f"{d2h_b / 1000:.6f}",
-                "gpu_compute_ms": "",
-                "cpu_compute_ms": f"{cpu_c_b / 1000:.6f}",
+                "rank": rank, "num_miss": num_miss, "path": "B",
+                "h2d_ms": f"{h2d_b / 1000:.6f}", "d2h_ms": f"{d2h_b / 1000:.6f}",
+                "gpu_compute_ms": "", "cpu_compute_ms": f"{cpu_c_b / 1000:.6f}",
                 "total_ms": f"{total_b / 1000:.6f}",
             })
 
@@ -288,6 +338,10 @@ def run_benchmark(
 
     return results
 
+
+# ---------------------------------------------------------------------------
+# Output: CSV, summary, plots
+# ---------------------------------------------------------------------------
 
 def write_csv(results: List[dict], output_path: str) -> None:
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
@@ -302,7 +356,6 @@ def write_csv(results: List[dict], output_path: str) -> None:
 
 
 def print_summary(results: List[dict]) -> None:
-    """Print crossover table."""
     from collections import defaultdict
     by_config: dict = defaultdict(dict)
     for r in results:
@@ -321,7 +374,6 @@ def print_summary(results: List[dict]) -> None:
         header += f"{m:>12}"
     print(header)
     print("-" * 90)
-
     for rank in ranks:
         line = f"{rank:>10}"
         for num_miss in misses:
@@ -340,7 +392,6 @@ def print_summary(results: List[dict]) -> None:
 
 
 def plot_results(results: List[dict], output_dir: str) -> None:
-    """Generate crossover heatmap and latency breakdown plots."""
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -369,7 +420,7 @@ def plot_results(results: List[dict], output_dir: str) -> None:
 
     # Figure 2a: Crossover Heatmap
     matrix_speedup = np.zeros((len(ranks), len(misses)))
-    matrix_winner = np.zeros((len(ranks), len(misses)))  # 1 = CPU wins, -1 = GPU wins
+    matrix_winner = np.zeros((len(ranks), len(misses)))
 
     for i, rank in enumerate(ranks):
         for j, num_miss in enumerate(misses):
@@ -382,7 +433,6 @@ def plot_results(results: List[dict], output_dir: str) -> None:
                 matrix_winner[i, j] = 1 if b_time < a_time else -1
 
     fig, ax = plt.subplots(figsize=(9, 5.5))
-    # Use RdBu_r: red = GPU wins, blue = CPU wins
     masked = np.ma.masked_where(matrix_winner == 0, matrix_winner)
     im = ax.imshow(masked, aspect="auto", cmap="RdBu_r", vmin=-1, vmax=1)
 
@@ -408,7 +458,7 @@ def plot_results(results: List[dict], output_dir: str) -> None:
         plt.savefig(out / f"fig2a_crossover_heatmap.{fmt}", dpi=300)
     plt.close()
 
-    # Figure 2b: Latency Breakdown (selected configs)
+    # Figure 2b: Latency Breakdown
     selected = [(32, 1), (32, 4), (32, 16)]
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
 
@@ -417,28 +467,22 @@ def plot_results(results: List[dict], output_dir: str) -> None:
         key = (sel_rank, sel_miss)
         if key not in by_config:
             continue
-
         path_a = by_config[key]["A"]
         path_b = by_config[key]["B"]
-
-        # Path A: H2D + GPU compute
-        a_components = [path_a["h2d_ms"], path_a["gpu_compute_ms"]]
-        # Path B: D2H + CPU compute + H2D
-        b_components = [path_b["d2h_ms"], path_b["cpu_compute_ms"], path_b["h2d_ms"]]
 
         x = [0, 1]
         width = 0.35
 
         bottom = 0
-        colors_a = ["#ff9999", "#ff4444"]
-        for comp, color in zip(a_components, colors_a):
+        for comp, color in [(path_a["h2d_ms"], "#ff9999"), (path_a["gpu_compute_ms"], "#ff4444")]:
             ax.bar(x[0], comp, width, bottom=bottom, color=color, alpha=0.85)
             bottom += comp
 
         bottom = 0
-        colors_b = ["#9999ff", "#4444ff", "#6666cc"]
         labels_b = ["D2H (act)", "CPU compute", "H2D (result)"]
-        for comp, color, label in zip(b_components, colors_b, labels_b):
+        for comp, color, label in [(path_b["d2h_ms"], "#9999ff"),
+                                    (path_b["cpu_compute_ms"], "#4444ff"),
+                                    (path_b["h2d_ms"], "#6666cc")]:
             ax.bar(x[1], comp, width, bottom=bottom, color=color, alpha=0.85, label=label)
             bottom += comp
 
@@ -457,12 +501,9 @@ def plot_results(results: List[dict], output_dir: str) -> None:
     # Figure 2c: Per-LoRA Scaling
     fig, ax = plt.subplots(figsize=(9, 5.5))
     colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"]
-    line_styles = {"A": "--", "B": "-"}
 
     for i, rank in enumerate(ranks):
-        a_times = []
-        b_times = []
-        miss_vals = []
+        a_times, b_times, miss_vals = [], [], []
         for num_miss in misses:
             key = (rank, num_miss)
             if key in by_config:
@@ -489,6 +530,10 @@ def plot_results(results: List[dict], output_dir: str) -> None:
     print(f"Plots saved to: {out}")
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main() -> None:
     args = parse_args()
 
@@ -505,12 +550,14 @@ def main() -> None:
     torch.manual_seed(42)
     torch.cuda.manual_seed_all(42)
 
+    avx_ready, use_avx, avx_fn = resolve_avx(args.avx_mode)
     device_name = torch.cuda.get_device_name(torch.cuda.current_device())
 
     print("=" * 80)
     print("CoLoRA Motivation Study: Single MoE Layer Microbenchmark")
     print("=" * 80)
     print(f"GPU: {device_name}")
+    print(f"AVX kernel: available={avx_ready}, use={use_avx}")
     print(f"Model: hidden_dim={args.hidden_dim}, intermediate_dim={args.intermediate_dim}")
     print(f"Sweep: ranks={ranks}, num_miss={num_miss_list}")
     print(f"dtype={args.dtype}, warmup={args.warmup}, iters={args.iters}")
@@ -526,6 +573,8 @@ def main() -> None:
         iters=args.iters,
         dtype=dtype,
         device=args.device,
+        use_avx=use_avx,
+        avx_fn=avx_fn,
     )
 
     write_csv(results, args.output)
@@ -534,7 +583,8 @@ def main() -> None:
     if not args.no_plot:
         plot_results(results, str(Path(args.output).parent))
 
-    print(f"\nTotal rows: {len(results)} (expected: {len(ranks) * len(num_miss_list) * 2})")
+    n_expected = len(ranks) * len(num_miss_list) * 2
+    print(f"\nTotal rows: {len(results)} (expected: {n_expected})")
 
 
 if __name__ == "__main__":
