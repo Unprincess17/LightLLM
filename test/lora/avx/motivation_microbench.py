@@ -223,9 +223,10 @@ def run_path_b_avx(
     t1 = time.perf_counter()
     d2h_us = (t1 - t0) * 1e6
 
-    # CPU compute: wall-clock (sync before/after isolates CPU-only time)
+    # CPU compute: pass pre-allocated output buffer directly to AVX kernel
+    # Avoids: 1) torch.zeros allocation per call, 2) intermediate .copy_()
     t2 = time.perf_counter()
-    cpu_out[:].copy_(avx_fn(cpu_act, a_cpu, b_cpu, scaling))
+    avx_fn(cpu_act, a_cpu, b_cpu, scaling, out=cpu_out)
     torch.cuda.synchronize()
     t3 = time.perf_counter()
     cpu_c_us = (t3 - t2) * 1e6
