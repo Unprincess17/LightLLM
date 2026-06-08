@@ -47,19 +47,14 @@ import argparse
 import csv as csv_lib
 import json
 import os
-import pickle
-import re
-import signal
 import socket
 import statistics
 import struct
 import subprocess
 import sys
-import threading
 import time
-from concurrent import futures
 from pathlib import Path
-from typing import Any, BinaryIO, Dict, List, Optional, Sequence, TextIO, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -75,15 +70,7 @@ BYTES_PER_PARAM = 2  # bf16
 # ------------------------------------------------------------------
 # Protocol constants
 # ------------------------------------------------------------------
-SOCKET_VERSION = 1
-# Message types sent as single-byte tag over the wire
-MSG_CONFIG = 0x01   # Server: receive benchmark config
-MSG_RESULT = 0x02   # Server: send timing result back
-MSG_DONE   = 0x03   # Client: close connection
-MSG_PING   = 0x04   # Health-check round-trip
 
-
-# ------------------------------------------------------------------
 # Argument parsing
 # ------------------------------------------------------------------
 
@@ -96,14 +83,19 @@ def parse_args() -> argparse.Namespace:
     g = parser.add_argument_group("Network")
     g.add_argument(
         "--master-addr",
+        default="10.10.1.1",
+        help="IP address of rank 0 for torch.distributed rendezvous (UM253 IB IP)",
+    )
+    g.add_argument(
+        "--server-addr",
         default="10.10.1.3",
-        help="IP address of UM251 (torch.distributed master)",
+        help="IP address of UM251 cross_node_server.py (TCP control)",
     )
     g.add_argument(
         "--master-port",
         type=int,
         default=29500,
-        help="Port for torch.distributed rendezvous on UM251",
+        help="Port for torch.distributed rendezvous on UM253",
     )
     g.add_argument(
         "--server-port",
@@ -111,13 +103,6 @@ def parse_args() -> argparse.Namespace:
         default=29501,
         help="TCP port where UM251 cross_node_server.py is listening",
     )
-    g.add_argument(
-        "--listen-port",
-        type=int,
-        default=29502,
-        help="TCP port on which this script (UM253) listens for result bundles",
-    )
-
     g = parser.add_argument_group("Benchmark")
     g.add_argument(
         "--ranks",
@@ -205,6 +190,24 @@ def setup_distributed(args: argparse.Namespace) -> int:
     os.environ["MASTER_ADDR"] = args.master_addr
     os.environ["MASTER_PORT"] = str(args.master_port)
 
+    # Ensure GLOO uses the IB interface, not loopback
+    if "GLOO_SOCKET_IFNAME" not in os.environ:
+        # Auto-detect IB interface
+        import subprocess as _sp
+        try:
+            result = _sp.run(
+                ["ip", "-o", "link", "show"],
+                capture_output=True, text=True, timeout=5,
+            )
+            for line in result.stdout.splitlines():
+                if "ibs" in line or "ibp" in line:
+                    iface = line.split(": ")[1]
+                    os.environ["GLOO_SOCKET_IFNAME"] = iface
+                    print(f"[dist] Auto-detected GLOO_SOCKET_IFNAME={iface}", flush=True)
+                    break
+        except Exception:
+            pass
+
     dist.init_process_group(
         backend="gloo",
         rank=0,          # always 0 on UM253
@@ -216,7 +219,6 @@ def setup_distributed(args: argparse.Namespace) -> int:
 
 def cleanup_distributed() -> None:
     if dist.is_initialized():
-        dist.barrier()
         dist.destroy_process_group()
 
 
@@ -235,23 +237,21 @@ def generate_weights(
     Generate LoRA A and B weight tensors.
 
     Returns:
-        a_tensors: list of num_miss tensors of shape (rank, intermediate_dim)
-        b_tensors: list of num_miss tensors of shape (hidden_dim, rank)
+        a_tensors: list of num_miss tensors of shape (rank, hidden_dim)
+        b_tensors: list of num_miss tensors of shape (rank, intermediate_dim)
 
-    Tensors are bf16 on CPU with pinned memory for fast GLOO transfer.
+    So that: activation @ A^T @ B^T = [1, H] @ [H, R] @ [R, I] = [1, I]
     """
     a_tensors: List[torch.Tensor] = []
     b_tensors: List[torch.Tensor] = []
 
     for _ in range(num_miss):
-        # A: (rank, intermediate_dim) — rows are independent LoRA projections
-        a = torch.empty((rank, intermediate_dim), dtype=dtype)
+        a = torch.empty((rank, hidden_dim), dtype=dtype)
         torch.nn.init.xavier_uniform_(a)
         a = a.pin_memory()
         a_tensors.append(a)
 
-        # B: (hidden_dim, rank)
-        b = torch.empty((hidden_dim, rank), dtype=dtype)
+        b = torch.empty((rank, intermediate_dim), dtype=dtype)
         torch.nn.init.xavier_uniform_(b)
         b = b.pin_memory()
         b_tensors.append(b)
@@ -279,130 +279,29 @@ def generate_activation(
 # Socket protocol helpers
 # ------------------------------------------------------------------
 
-def _write_msg(sock: socket.socket, tag: int, payload: bytes) -> None:
-    """Send a length-prefixed message: [version:u8][tag:u8][len:u32][payload]."""
-    version = SOCKET_VERSION.to_bytes(1, "little")
-    tbyte = tag.to_bytes(1, "little")
-    length = len(payload).to_bytes(4, "little")
-    sock.sendall(version + tbyte + length + payload)
+def send_json(sock: socket.socket, obj: Dict[str, Any]) -> None:
+    """Send a JSON-serialisable object with 4-byte big-endian length prefix."""
+    payload = json.dumps(obj).encode("utf-8")
+    header = struct.pack("!I", len(payload))
+    sock.sendall(header + payload)
 
 
-def _read_msg(sock: socket.socket) -> Tuple[int, bytes]:
-    """Block until a full message is received. Returns (tag, payload)."""
-    header = _recv_exact(sock, 6)
-    version, tag = struct.unpack("<BB", header[:2])
-    length = struct.unpack("<I", header[2:6])[0]
-    payload = _recv_exact(sock, length)
-    if version != SOCKET_VERSION:
-        raise RuntimeError(
-            f"Protocol version mismatch: expected {SOCKET_VERSION}, got {version}"
-        )
-    return tag, payload
-
-
-def _recv_exact(sock: socket.socket, n: int) -> bytes:
-    """Receive exactly n bytes from a socket."""
-    data = b""
-    while len(data) < n:
-        chunk = sock.recv(n - len(data))
+def recv_json(sock: socket.socket) -> Dict[str, Any]:
+    """Receive a JSON object with 4-byte big-endian length prefix."""
+    header = b""
+    while len(header) < 4:
+        chunk = sock.recv(4 - len(header))
         if not chunk:
-            raise EOFError("Socket closed before receiving expected bytes")
-        data += chunk
-    return data
-
-
-def send_json(sock: socket.socket, tag: int, obj: Dict[str, Any]) -> None:
-    """Pickle and send a JSON-serialisable object as a protocol message."""
-    payload = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
-    _write_msg(sock, tag, payload)
-
-
-def recv_json(sock: socket.socket, expected_tag: int) -> Dict[str, Any]:
-    """Receive and unpickle a protocol message."""
-    tag, payload = _read_msg(sock)
-    if tag != expected_tag:
-        raise RuntimeError(f"Unexpected message tag: expected {expected_tag}, got {tag}")
-    return pickle.loads(payload)
-
-
-# ------------------------------------------------------------------
-# Socket server (accepts result bundles from UM251 after each run)
-# ------------------------------------------------------------------
-
-class ResultListener:
-    """
-    TCP server on UM253 that accepts timing result bundles pushed by UM251.
-
-    UM251 pushes results to UM253 after each benchmark iteration group,
-    allowing UM253 to independently verify / supplement timings.
-    """
-
-    def __init__(self, port: int) -> None:
-        self.port = port
-        self._sock: Optional[socket.socket] = None
-        self._thread: Optional[threading.Thread] = None
-        self._results: List[Dict[str, Any]] = []
-        self._results_lock = threading.Lock()
-        self._stop_event = threading.Event()
-
-    def start(self) -> None:
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._sock.bind(("0.0.0.0", self.port))
-        self._sock.listen(4)
-        self._sock.settimeout(1.0)  # allow periodic stop-check
-
-        self._stop_event.clear()
-        self._thread = threading.Thread(target=self._serve, daemon=True)
-        self._thread.start()
-
-    def stop(self) -> None:
-        self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=3.0)
-            self._thread = None
-        if self._sock is not None:
-            self._sock.close()
-            self._sock = None
-
-    def get_results(self) -> List[Dict[str, Any]]:
-        with self._results_lock:
-            return list(self._results)
-
-    def clear_results(self) -> None:
-        with self._results_lock:
-            self._results.clear()
-
-    def _serve(self) -> None:
-        while not self._stop_event.is_set():
-            try:
-                conn, _ = self._sock.accept()
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-            try:
-                self._handle_conn(conn)
-            except Exception as exc:
-                print(f"[ResultListener] error handling connection: {exc}", flush=True)
-            finally:
-                conn.close()
-
-    def _handle_conn(self, conn: socket.socket) -> None:
-        conn.settimeout(10.0)
-        try:
-            tag, payload = _read_msg(conn)
-            if tag == MSG_RESULT:
-                result = pickle.loads(payload)
-                with self._results_lock:
-                    self._results.append(result)
-                # Send ack
-                _write_msg(conn, MSG_DONE, b"")
-            else:
-                # Unknown message — ignore
-                pass
-        except Exception as exc:
-            print(f"[ResultListener] error reading result: {exc}", flush=True)
+            raise EOFError("Socket closed before receiving header")
+        header += chunk
+    msg_len = struct.unpack("!I", header)[0]
+    payload = b""
+    while len(payload) < msg_len:
+        chunk = sock.recv(msg_len - len(payload))
+        if not chunk:
+            raise EOFError("Socket closed during payload")
+        payload += chunk
+    return json.loads(payload.decode("utf-8"))
 
 
 # ------------------------------------------------------------------
@@ -413,7 +312,7 @@ def connect_to_server(args: argparse.Namespace) -> socket.socket:
     """Connect TCP socket to UM251's cross_node_server.py."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(120.0)
-    sock.connect((args.master_addr, args.server_port))
+    sock.connect((args.server_addr, args.server_port))
     return sock
 
 
@@ -435,37 +334,31 @@ def run_strategy1_timing(
     warmup: int,
     iters: int,
     args: argparse.Namespace,
-    result_listener: Optional[ResultListener],
 ) -> Dict[str, Any]:
     """
-    Execute Strategy 1 (weight-transfer) timing loop.
-
-    Returns a dict of per-stage median timings in milliseconds.
+    S1 (weight-transfer): UM251 generates LoRA weights, sends via GLOO.
+    UM253 receives weights, uploads to GPU, computes LoRA merge.
     """
     device_gpu = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-    # --- Pre-generate data once per config (reused across iterations) ---
-    a_tensors, b_tensors = generate_weights(
-        rank=rank, num_miss=num_miss,
-        intermediate_dim=args.intermediate_dim, hidden_dim=args.hidden_dim,
-    )
-    activation = generate_activation(args.hidden_dim)
+    # Pre-allocate receive buffers on pinned CPU
+    a_bufs = [torch.empty(rank, args.hidden_dim, dtype=torch.bfloat16, pin_memory=True)
+              for _ in range(num_miss)]
+    b_bufs = [torch.empty(rank, args.intermediate_dim, dtype=torch.bfloat16, pin_memory=True)
+              for _ in range(num_miss)]
 
-    # GPU-side copies for local compute
-    activation_gpu = activation.to(device_gpu)
-    a_gpu_list = [a.to(device_gpu) for a in a_tensors]
-    b_gpu_list = [b.to(device_gpu) for b in b_tensors]
+    # GPU activation (reused across iterations)
+    activation_gpu = generate_activation(args.hidden_dim).to(device_gpu)
 
     rdma_weight_times: List[float] = []
     gpu_compute_times: List[float] = []
 
     sock = connect_to_server(args)
     try:
-        # Send benchmark config to server
-        send_json(sock, MSG_CONFIG, {
+        send_json(sock, {
+            "type": "strategy1_transfer",
             "rank": rank,
             "num_miss": num_miss,
-            "strategy": 1,
             "warmup": warmup,
             "iters": iters,
             "hidden_dim": args.hidden_dim,
@@ -474,25 +367,29 @@ def run_strategy1_timing(
 
         for phase_name, n_iters in [("warmup", warmup), ("measure", iters)]:
             for _ in range(n_iters):
-                # --- RDMA weight transfer (UM253 pinned-CPU → GLOO → UM251) ---
+                # Receive weights from UM251 via GLOO
                 t0 = time.perf_counter()
-                for a, b in zip(a_tensors, b_tensors):
-                    dist.send(tensor=a, dst=1)
-                    dist.send(tensor=b, dst=1)
+                for a_buf, b_buf in zip(a_bufs, b_bufs):
+                    dist.recv(tensor=a_buf, src=1)
+                    dist.recv(tensor=b_buf, src=1)
                 t1 = time.perf_counter()
                 rdma_weight_ms = (t1 - t0) * 1000.0
 
-                # --- GPU compute (UM253 local) ---
+                # Upload to GPU and compute
                 gpu_t0 = time.perf_counter()
+                a_gpu = [a.to(device_gpu, non_blocking=True) for a in a_bufs]
+                b_gpu = [b.to(device_gpu, non_blocking=True) for b in b_bufs]
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+
                 with torch.no_grad():
-                    result_gpu = activation_gpu.clone()
-                    for a_g, b_g in zip(a_gpu_list, b_gpu_list):
-                        # LoRA delta: activation @ A^T @ B^T
-                        # a_g: (rank, inter), b_g: (hidden, rank)
-                        # activation: (1, hidden)
-                        tmp = activation_gpu @ a_g.T    # (1, rank)
-                        delta = tmp @ b_g.T             # (1, hidden)
-                        result_gpu = result_gpu + delta
+                    for a_g, b_g in zip(a_gpu, b_gpu):
+                        # a_g: [R, H], b_g: [R, I]
+                        # act [1, H] @ A^T [H, R] @ B [R, I] = [1, I] (LoRA delta)
+                        tmp = activation_gpu @ a_g.t()        # [1, H] @ [H, R] = [1, R]
+                        delta = tmp @ b_g                     # [1, R] @ [R, I] = [1, I]
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
                 gpu_t1 = time.perf_counter()
                 gpu_compute_ms = (gpu_t1 - gpu_t0) * 1000.0
 
@@ -500,23 +397,22 @@ def run_strategy1_timing(
                     rdma_weight_times.append(rdma_weight_ms)
                     gpu_compute_times.append(gpu_compute_ms)
 
-        # Signal server we are done; receive its timing bundle
-        send_json(sock, MSG_DONE, {})
-        try:
-            result_bundle: Dict[str, Any] = recv_json(sock, MSG_RESULT)
-        except Exception as exc:
-            print(f"[S1] No/bad result bundle from server: {exc}", flush=True)
-            result_bundle = {}
+        # Send timing summary to server
+        timing = torch.tensor(
+            [statistics.median(rdma_weight_times) if rdma_weight_times else 0.0,
+             statistics.median(gpu_compute_times) if gpu_compute_times else 0.0],
+            dtype=torch.float32,
+        )
+        dist.send(tensor=timing, dst=1)
+
+        # Receive server's result bundle
+        result_bundle = recv_json(sock)
 
     finally:
         sock.close()
 
     median_rdma = statistics.median(rdma_weight_times) if rdma_weight_times else 0.0
     median_gpu = statistics.median(gpu_compute_times) if gpu_compute_times else 0.0
-    total_times = [
-        a + b for a, b in zip(rdma_weight_times, gpu_compute_times)
-    ]
-    median_total = statistics.median(total_times) if total_times else 0.0
 
     return {
         "rank": rank,
@@ -524,8 +420,7 @@ def run_strategy1_timing(
         "strategy": 1,
         "rdma_weight_ms": round(median_rdma, 4),
         "gpu_compute_ms": round(median_gpu, 4),
-        "total_ms": round(median_total, 4),
-        "server_bundle": result_bundle,
+        "total_ms": round(median_rdma + median_gpu, 4),
     }
 
 
@@ -551,17 +446,17 @@ def run_strategy2_timing(
     warmup: int,
     iters: int,
     args: argparse.Namespace,
-    result_listener: Optional[ResultListener],
 ) -> Dict[str, Any]:
     """
-    Execute Strategy 2 (activation-transfer) timing loop.
-
-    Returns a dict of per-stage median timings in milliseconds.
+    S2 (activation-transfer + CPU compute):
+    UM253 sends activation [1, H] to UM251 via GLOO.
+    UM251 computes act @ A^T @ B^T on CPU, sends result [num_miss, I] back.
     """
     device_gpu = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-    # Activation tensor on GPU (what we start with on UM253)
     activation_gpu = generate_activation(args.hidden_dim).to(device_gpu)
+    act_pinned = torch.empty(1, args.hidden_dim, dtype=torch.bfloat16, pin_memory=True)
+    result_pinned = torch.empty(num_miss, args.intermediate_dim, dtype=torch.bfloat16, pin_memory=True)
 
     d2h_times: List[float] = []
     rdma_act_times: List[float] = []
@@ -570,11 +465,10 @@ def run_strategy2_timing(
 
     sock = connect_to_server(args)
     try:
-        # Send benchmark config to server
-        send_json(sock, MSG_CONFIG, {
+        send_json(sock, {
+            "type": "strategy2_compute",
             "rank": rank,
             "num_miss": num_miss,
-            "strategy": 2,
             "warmup": warmup,
             "iters": iters,
             "hidden_dim": args.hidden_dim,
@@ -583,49 +477,39 @@ def run_strategy2_timing(
 
         for phase_name, n_iters in [("warmup", warmup), ("measure", iters)]:
             for _ in range(n_iters):
-                # --- D2H copy (GPU → pinned CPU) ---
+                # D2H: GPU → pinned CPU
                 d2h_t0 = time.perf_counter()
                 act_cpu = activation_gpu.to("cpu", non_blocking=True)
+                act_pinned.copy_(act_cpu, non_blocking=True)
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
-                act_pinned = act_cpu.pin_memory()
                 d2h_t1 = time.perf_counter()
-                d2h_ms = (d2h_t1 - d2h_t0) * 1000.0
 
-                # --- RDMA activation send (UM253 → UM251) ---
+                # Send activation to UM251
                 act_t0 = time.perf_counter()
                 dist.send(tensor=act_pinned, dst=1)
                 act_t1 = time.perf_counter()
-                rdma_act_ms = (act_t1 - act_t0) * 1000.0
 
-                # --- RDMA result recv (UM251 → UM253) ---
-                result_pinned = torch.empty_like(act_pinned)
+                # Receive result from UM251: [num_miss, I]
                 res_t0 = time.perf_counter()
                 dist.recv(tensor=result_pinned, src=1)
                 res_t1 = time.perf_counter()
-                rdma_res_ms = (res_t1 - res_t0) * 1000.0
 
-                # --- H2D copy (pinned CPU → GPU) ---
+                # H2D: pinned CPU → GPU
                 h2d_t0 = time.perf_counter()
                 result_gpu = result_pinned.to(device_gpu, non_blocking=True)
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 h2d_t1 = time.perf_counter()
-                h2d_ms = (h2d_t1 - h2d_t0) * 1000.0
 
                 if phase_name == "measure":
-                    d2h_times.append(d2h_ms)
-                    rdma_act_times.append(rdma_act_ms)
-                    rdma_res_times.append(rdma_res_ms)
-                    h2d_times.append(h2d_ms)
+                    d2h_times.append((d2h_t1 - d2h_t0) * 1000.0)
+                    rdma_act_times.append((act_t1 - act_t0) * 1000.0)
+                    rdma_res_times.append((res_t1 - res_t0) * 1000.0)
+                    h2d_times.append((h2d_t1 - h2d_t0) * 1000.0)
 
-        # Signal done and receive server timing bundle
-        send_json(sock, MSG_DONE, {})
-        try:
-            result_bundle: Dict[str, Any] = recv_json(sock, MSG_RESULT)
-        except Exception as exc:
-            print(f"[S2] No/bad result bundle from server: {exc}", flush=True)
-            result_bundle = {}
+        # Receive server's result bundle
+        result_bundle = recv_json(sock)
 
     finally:
         sock.close()
@@ -646,8 +530,8 @@ def run_strategy2_timing(
         "rdma_activation_ms": _med(rdma_act_times),
         "rdma_result_ms": _med(rdma_res_times),
         "h2d_ms": _med(h2d_times),
+        "cpu_compute_ms": result_bundle.get("cpu_compute_ms", 0.0),
         "total_ms": round(statistics.median(total_times), 4) if total_times else 0.0,
-        "server_bundle": result_bundle,
     }
 
 
@@ -678,42 +562,34 @@ def run_strategy3_timing(
     warmup: int,
     iters: int,
     args: argparse.Namespace,
-    result_listener: Optional[ResultListener],
 ) -> Dict[str, Any]:
     """
-    Execute Strategy 3 (activation relay → GPU compute) timing loop.
+    S3 (activation relay → GPU compute, pre-cached weights):
+    Weights are PRE-CACHED on UM253 GPU. No weight transfer.
 
-    Weights are pre-cached on UM253 GPU. This step only transfers
-    activation and result — no weight movement.
-
-    Returns a dict of per-stage median timings in milliseconds.
+    Flow:
+      1. UM253 GPU → D2H → pinned CPU: activation [1, H]
+      2. Pinned CPU → GLOO → UM251: activation
+      3. UM251 relays activation back to UM253 via GLOO
+      4. UM253 GPU: LoRA compute with pre-cached weights
+      5. UM253 → GLOO → UM251: result [num_miss, I]
     """
     device_gpu = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     activation_gpu = generate_activation(args.hidden_dim).to(device_gpu)
 
-    # GPU-side weights: pre-cached on UM253 GPU (assumed loaded from prior S1).
-    # For the microbenchmark, we generate and load them here to simulate
-    # the "already cached" state.
+    # Pre-cached weights on GPU
     a_gpu_list: List[torch.Tensor] = []
     b_gpu_list: List[torch.Tensor] = []
     for _ in range(num_miss):
-        a_g = torch.randn(
-            rank, args.hidden_dim, device=device_gpu, dtype=torch.bfloat16
-        ) / (rank ** 0.5)
-        b_g = torch.randn(
-            rank, args.intermediate_dim, device=device_gpu, dtype=torch.bfloat16
-        ) / (rank ** 0.5)
+        a_g = torch.randn(rank, args.hidden_dim, device=device_gpu, dtype=torch.bfloat16) / (rank ** 0.5)
+        b_g = torch.randn(rank, args.intermediate_dim, device=device_gpu, dtype=torch.bfloat16) / (rank ** 0.5)
         a_gpu_list.append(a_g)
         b_gpu_list.append(b_g)
 
-    # Pinned CPU buffer reused for send/recv (activation relay)
-    act_pinned = torch.empty(
-        args.hidden_dim, dtype=torch.bfloat16, pin_memory=True
-    )
-    result_pinned = torch.empty(
-        num_miss * args.intermediate_dim, dtype=torch.bfloat16, pin_memory=True
-    )
+    # Pinned CPU buffers
+    act_pinned = torch.empty(args.hidden_dim, dtype=torch.bfloat16, pin_memory=True)
+    result_pinned = torch.empty(num_miss * args.intermediate_dim, dtype=torch.bfloat16, pin_memory=True)
 
     d2h_times: List[float] = []
     rdma_act_times: List[float] = []
@@ -722,10 +598,10 @@ def run_strategy3_timing(
 
     sock = connect_to_server(args)
     try:
-        send_json(sock, MSG_CONFIG, {
+        send_json(sock, {
+            "type": "strategy3_bundled",
             "rank": rank,
             "num_miss": num_miss,
-            "strategy": 3,
             "warmup": warmup,
             "iters": iters,
             "hidden_dim": args.hidden_dim,
@@ -734,64 +610,44 @@ def run_strategy3_timing(
 
         for phase_name, n_iters in [("warmup", warmup), ("measure", iters)]:
             for _ in range(n_iters):
-                # --- Step 1: D2H (GPU → pinned CPU) ---
+                # D2H: GPU → pinned CPU
                 d2h_t0 = time.perf_counter()
-                act_cpu = activation_gpu.to("cpu", non_blocking=True)
+                act_cpu = activation_gpu.view(-1).to("cpu", non_blocking=True)
                 act_pinned.copy_(act_cpu, non_blocking=True)
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 d2h_t1 = time.perf_counter()
-                d2h_ms = (d2h_t1 - d2h_t0) * 1000.0
 
-                # --- Step 2: RDMA activation relay (UM253 → UM251 → UM253) ---
-                #    We measure the round-trip: send to UM251, then receive back.
+                # RDMA activation relay: send to UM251, recv back
                 rdma_act_t0 = time.perf_counter()
-                # Send activation to UM251
                 dist.send(tensor=act_pinned, dst=1)
-                # UM251 relays it back to us — recv overwrites the same buffer
                 dist.recv(tensor=act_pinned, src=1)
                 rdma_act_t1 = time.perf_counter()
-                rdma_act_ms = (rdma_act_t1 - rdma_act_t0) * 1000.0
 
-                # --- Step 3: GPU compute with pre-cached weights ---
-                act_for_gpu = act_pinned.view(1, args.hidden_dim).to(device_gpu)
+                # GPU compute with pre-cached weights
+                act_gpu = act_pinned.view(1, args.hidden_dim).to(device_gpu)
                 gpu_t0 = time.perf_counter()
                 with torch.no_grad():
-                    result_gpu = torch.zeros(
-                        num_miss, args.intermediate_dim,
-                        device=device_gpu, dtype=torch.bfloat16
-                    )
-                    for act_row, a_g, b_g in zip(
-                        act_for_gpu, a_gpu_list, b_gpu_list
-                    ):
-                        # act_row: [1, H], a_g: [R, H], b_g: [R, I]
-                        tmp = act_row @ a_g.t()           # [1, R]
-                        delta = tmp @ b_g.t()               # [1, I]
-                        result_gpu += delta
+                    for a_g, b_g in zip(a_gpu_list, b_gpu_list):
+                        # a_g: [R, H], b_g: [R, I]
+                        tmp = act_gpu @ a_g.t()     # [1, H] @ [H, R] = [1, R]
+                        delta = tmp @ b_g            # [1, R] @ [R, I] = [1, I]
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 gpu_t1 = time.perf_counter()
-                gpu_compute_ms = (gpu_t1 - gpu_t0) * 1000.0
 
-                # --- Step 4: RDMA send result to UM251 (for bookkeeping) ---
-                result_pinned.copy_(result_gpu.to("cpu"), non_blocking=True)
+                # Send result to UM251
                 rdma_res_t0 = time.perf_counter()
                 dist.send(tensor=result_pinned, dst=1)
                 rdma_res_t1 = time.perf_counter()
-                rdma_result_ms = (rdma_res_t1 - rdma_res_t0) * 1000.0
 
                 if phase_name == "measure":
-                    d2h_times.append(d2h_ms)
-                    rdma_act_times.append(rdma_act_ms)
-                    gpu_compute_times.append(gpu_compute_ms)
-                    rdma_result_times.append(rdma_result_ms)
+                    d2h_times.append((d2h_t1 - d2h_t0) * 1000.0)
+                    rdma_act_times.append((rdma_act_t1 - rdma_act_t0) * 1000.0)
+                    gpu_compute_times.append((gpu_t1 - gpu_t0) * 1000.0)
+                    rdma_result_times.append((rdma_res_t1 - rdma_res_t0) * 1000.0)
 
-        send_json(sock, MSG_DONE, {})
-        try:
-            result_bundle: Dict[str, Any] = recv_json(sock, MSG_RESULT)
-        except Exception as exc:
-            print(f"[S3] No/bad result bundle from server: {exc}", flush=True)
-            result_bundle = {}
+        result_bundle = recv_json(sock)
 
     finally:
         sock.close()
@@ -801,8 +657,7 @@ def run_strategy3_timing(
 
     total_times = [
         a + b + c + d
-        for a, b, c, d in zip(d2h_times, rdma_act_times,
-                                gpu_compute_times, rdma_result_times)
+        for a, b, c, d in zip(d2h_times, rdma_act_times, gpu_compute_times, rdma_result_times)
     ]
 
     return {
@@ -810,13 +665,12 @@ def run_strategy3_timing(
         "num_miss": num_miss,
         "strategy": 3,
         "d2h_ms": _med(d2h_times),
-        "rdma_activation_ms": _med(rdma_act_times),   # round-trip: send+recv activation
+        "rdma_activation_ms": _med(rdma_act_times),
         "gpu_compute_ms": _med(gpu_compute_times),
         "rdma_result_ms": _med(rdma_result_times),
         "bundle_ms": 0.0,
         "bundle_bytes": 0,
         "total_ms": round(statistics.median(total_times), 4) if total_times else 0.0,
-        "server_bundle": result_bundle,
     }
 
 
@@ -830,7 +684,6 @@ def run_benchmark_for_config(
     warmup: int,
     iters: int,
     args: argparse.Namespace,
-    result_listener: ResultListener,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     """
     Run all three strategies for a single (rank, num_miss) config.
@@ -846,17 +699,17 @@ def run_benchmark_for_config(
     t1 = run_strategy1_timing(
         rank=rank, num_miss=num_miss,
         warmup=warmup, iters=iters,
-        args=args, result_listener=result_listener,
+        args=args,
     )
     t2 = run_strategy2_timing(
         rank=rank, num_miss=num_miss,
         warmup=warmup, iters=iters,
-        args=args, result_listener=result_listener,
+        args=args,
     )
     t3 = run_strategy3_timing(
         rank=rank, num_miss=num_miss,
         warmup=warmup, iters=iters,
-        args=args, result_listener=result_listener,
+        args=args,
     )
 
     print(
@@ -871,7 +724,7 @@ def run_benchmark_for_config(
         f"h2d={t2['h2d_ms']:.3f}ms) | "
         f"S3_total={t3['total_ms']:.3f}ms "
         f"(d2h={t3['d2h_ms']:.3f}ms, "
-        f"bundle={t3['bundle_ms']:.3f}ms, "
+        f"rdma_act={t3['rdma_activation_ms']:.3f}ms, "
         f"gpu={t3['gpu_compute_ms']:.3f}ms)",
         flush=True,
     )
@@ -1313,7 +1166,6 @@ def main() -> None:
     print("=" * 60, flush=True)
     print(f"  Master addr    : {args.master_addr}:{args.master_port}", flush=True)
     print(f"  Server port    : {args.server_port}", flush=True)
-    print(f"  Listen port    : {args.listen_port}", flush=True)
     print(f"  Ranks          : {ranks}", flush=True)
     print(f"  NumMiss list   : {num_miss_list}", flush=True)
     print(f"  EP BW pct list : {ep_bw_pct_list}", flush=True)
@@ -1341,12 +1193,6 @@ def main() -> None:
     # ----------------------------------------------------------------
     setup_distributed(args)
 
-    # ----------------------------------------------------------------
-    # Start async result listener (UM253 listens for pushed bundles from UM251)
-    # ----------------------------------------------------------------
-    result_listener = ResultListener(args.listen_port)
-    result_listener.start()
-
     all_results: List[Dict[str, Any]] = []
     errors: List[Dict[str, Any]] = []
 
@@ -1369,9 +1215,6 @@ def main() -> None:
                 print(f"[warning] EP traffic start failed: {exc}", flush=True)
                 ep_gen = None
 
-            # Global barrier across both nodes before starting benchmark
-            dist.barrier()
-
             for rank in ranks:
                 for num_miss in num_miss_list:
                     try:
@@ -1381,7 +1224,6 @@ def main() -> None:
                             warmup=args.warmup,
                             iters=args.iters,
                             args=args,
-                            result_listener=result_listener,
                         )
                         t1["ep_bw_pct"] = ep_pct
                         t2["ep_bw_pct"] = ep_pct
@@ -1404,8 +1246,7 @@ def main() -> None:
                 ep_gen.stop()
                 ep_gen = None
 
-            # Barrier before next EP group
-            dist.barrier()
+            # EP group complete
 
     except KeyboardInterrupt:
         print("\n[interrupt] Received Ctrl+C — saving partial results", flush=True)
@@ -1413,7 +1254,6 @@ def main() -> None:
     finally:
         if ep_gen is not None:
             ep_gen.stop()
-        result_listener.stop()
         cleanup_distributed()
 
     # ----------------------------------------------------------------

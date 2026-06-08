@@ -14,6 +14,7 @@ TCP socket used for JSON control messages between the two nodes.
 
 import argparse
 import json
+import os
 import socket
 import struct
 import threading
@@ -78,12 +79,10 @@ def generate_lora_weights(
         a = torch.empty(
             rank, hidden_dim,
             dtype=torch.bfloat16,
-            pin_memory=True,
         ).normal_(mean=0.0, std=0.02)
         b = torch.empty(
             rank, intermediate_dim,
             dtype=torch.bfloat16,
-            pin_memory=True,
         ).normal_(mean=0.0, std=0.02)
         a_tensors.append(a)
         b_tensors.append(b)
@@ -104,13 +103,11 @@ def run_strategy1(
     iters: int,
 ) -> dict[str, Any]:
     """
-    Generate LoRA A and B weights for num_miss adapters on UM251,
-    then send them to UM253 (rank 0) via torch.distributed GLOO send.
+    S1 (weight-transfer): UM251 generates LoRA weights and sends them to
+    UM253 (rank 0) via GLOO. UM253 times the transfer + GPU upload + compute.
 
-    The client side times the full transfer + GPU upload pipeline.
-    UM251 just sends; timing is reported back by the client.
+    UM251 generates and sends weights; no timing done here.
     """
-    # Generate weights for all miss adapters
     a_tensors, b_tensors = generate_lora_weights(
         rank=rank,
         hidden_dim=hidden_dim,
@@ -118,39 +115,32 @@ def run_strategy1(
         num_adapters=num_miss,
     )
 
-    # Send A tensors one by one (rank 0 is the destination)
-    for a in a_tensors:
-        dist.send(tensor=a, dst=0)
+    # Warmup: send weights (interleaved A,B per adapter)
+    for _ in range(warmup):
+        for a, b in zip(a_tensors, b_tensors):
+            dist.send(tensor=a, dst=0)
+            dist.send(tensor=b, dst=0)
 
-    # Send B tensors one by one
-    for b in b_tensors:
-        dist.send(tensor=b, dst=0)
+    # Timed iterations: send weights (interleaved A,B per adapter)
+    for _ in range(iters):
+        for a, b in zip(a_tensors, b_tensors):
+            dist.send(tensor=a, dst=0)
+            dist.send(tensor=b, dst=0)
 
-    # The client sends back timing data after its benchmark loop.
-    # We receive a small dict tensor (float32) with the timing fields.
-    timing_tensor = torch.empty(6, dtype=torch.float32)
+    # Receive timing summary from UM253
+    timing_tensor = torch.empty(2, dtype=torch.float32)
     dist.recv(timing_tensor, src=0)
-
-    (
-        rdma_weight_ms,
-        total_ms,
-        ep_bw_pct,
-        gpu_compute_ms,
-        gpu_upstream_ms,
-        gpu_stream_ms,
-    ) = timing_tensor.tolist()
+    rdma_weight_ms, gpu_compute_ms = timing_tensor.tolist()
 
     return {
         "type": "timing_result",
         "rank": rank,
         "num_miss": num_miss,
         "strategy": 1,
-        "ep_bw_pct": int(ep_bw_pct),
+        "ep_bw_pct": 0,
         "rdma_weight_ms": rdma_weight_ms,
-        "total_ms": total_ms,
+        "total_ms": rdma_weight_ms + gpu_compute_ms,
         "gpu_compute_ms": gpu_compute_ms,
-        "gpu_upstream_ms": gpu_upstream_ms,
-        "gpu_stream_ms": gpu_stream_ms,
     }
 
 
@@ -167,103 +157,63 @@ def run_strategy2(
     iters: int,
 ) -> dict[str, Any]:
     """
-    Receive activation tensor from UM253, compute the LoRA merge
-    result = act @ A^T @ B^T on CPU (float32 BLAS), send result back.
+    S2 (activation-transfer + CPU compute):
+    UM251 pre-generates weights, receives activation [1, H] from UM253,
+    computes act @ A^T @ B^T on CPU (float32), sends result [num_miss, I] back.
 
-    Timing breakdown is measured on UM251 (this server).
+    Timing breakdown measured on UM251.
     """
-    total_weights_bytes = 0
-    for r in [16, 32, 64, 128]:
-        total_weights_bytes += r * hidden_dim * 2  # A
-        total_weights_bytes += r * intermediate_dim * 2  # B
+    # Pre-generate weights (reused across all iterations)
+    a_tensors, b_tensors = generate_lora_weights(
+        rank=rank,
+        hidden_dim=hidden_dim,
+        intermediate_dim=intermediate_dim,
+        num_adapters=num_miss,
+    )
+    a_f32 = [a.to(torch.float32) for a in a_tensors]
+    b_f32 = [b.to(torch.float32) for b in b_tensors]
 
-    # ---- Warmup: receive + compute + send (warm the caches / interconnects) ----
+    act = torch.empty(1, hidden_dim, dtype=torch.bfloat16)
+
+    # Warmup
     for _ in range(warmup):
-        # Receive activation [seq_len, intermediate_dim] as bf16
-        act = torch.empty(num_miss, intermediate_dim, dtype=torch.bfloat16)
         dist.recv(tensor=act, src=0)
-
-        # Receive A and B for each miss adapter
-        a_list: list[torch.Tensor] = []
-        b_list: list[torch.Tensor] = []
-        for _ in range(num_miss):
-            a = torch.empty(rank, hidden_dim, dtype=torch.bfloat16)
-            b = torch.empty(rank, intermediate_dim, dtype=torch.bfloat16)
-            dist.recv(tensor=a, src=0)
-            dist.recv(tensor=b, src=0)
-            a_list.append(a)
-            b_list.append(b)
-
-        # CPU merge: result = act @ A^T @ B^T
-        # act:      [num_miss, intermediate_dim]
-        # A^T:      [hidden_dim, rank]
-        # inter:    [num_miss, rank]
-        # B^T:      [intermediate_dim, rank]
-        # result:   [num_miss, rank]
         act_f32 = act.to(torch.float32)
-        results: list[torch.Tensor] = []
-        for a, b in zip(a_list, b_list):
-            inter = act_f32 @ a.to(torch.float32).t()      # [num_miss, rank]
-            result = inter @ b.to(torch.float32).t()         # [num_miss, rank]
-            results.append(result)
+        results = []
+        for a, b in zip(a_f32, b_f32):
+            inter = act_f32 @ a.t()   # [1, H] @ [H, R] = [1, R]
+            delta = inter @ b        # [1, R] @ [R, I] = [1, I]
+            results.append(delta.to(torch.bfloat16))
+        result_packed = torch.cat(results, dim=0)  # [num_miss, I]
+        dist.send(tensor=result_packed, dst=0)
 
-        # Send result back to UM253
-        for result in results:
-            dist.send(tensor=result, dst=0)
-
-    # ---- Timed iterations ----
-    d2h_times: list[float] = []
+    # Timed iterations
     cpu_compute_times: list[float] = []
-    rdma_result_times: list[float] = []
     total_times: list[float] = []
 
     for _ in range(iters):
         iter_start = time.perf_counter()
 
-        # Step 1: receive activation from UM253
-        act = torch.empty(num_miss, intermediate_dim, dtype=torch.bfloat16)
         dist.recv(tensor=act, src=0)
         recv_end = time.perf_counter()
 
-        # Step 2: receive LoRA weights from UM253 (A and B per adapter)
-        a_list: list[torch.Tensor] = []
-        b_list: list[torch.Tensor] = []
-        for _ in range(num_miss):
-            a = torch.empty(rank, hidden_dim, dtype=torch.bfloat16)
-            b = torch.empty(rank, intermediate_dim, dtype=torch.bfloat16)
-            dist.recv(tensor=a, src=0)
-            dist.recv(tensor=b, src=0)
-            a_list.append(a)
-            b_list.append(b)
-        weights_recv_end = time.perf_counter()
-
-        # Step 3: CPU merge compute (float32 BLAS)
         act_f32 = act.to(torch.float32)
         results: list[torch.Tensor] = []
-        for a, b in zip(a_list, b_list):
-            inter = act_f32 @ a.to(torch.float32).t()
-            result = inter @ b.to(torch.float32).t()
-            results.append(result)
+        for a, b in zip(a_f32, b_f32):
+            inter = act_f32 @ a.t()         # [1, H] @ [H, R] = [1, R]
+            delta = inter @ b              # [1, R] @ [R, I] = [1, I]
+            results.append(delta.to(torch.bfloat16))
         compute_end = time.perf_counter()
 
-        # Step 4: send result back to UM253
-        for result in results:
-            dist.send(tensor=result, dst=0)
+        # Stack results: [num_miss, I]
+        result_packed = torch.cat(results, dim=0)  # [num_miss, I]
+        dist.send(tensor=result_packed, dst=0)
         send_end = time.perf_counter()
 
-        d2h_ms = (weights_recv_end - recv_end) * 1000.0
-        cpu_compute_ms = (compute_end - weights_recv_end) * 1000.0
-        rdma_result_ms = (send_end - compute_end) * 1000.0
-        iter_ms = (send_end - iter_start) * 1000.0
+        cpu_compute_times.append((compute_end - recv_end) * 1000.0)
+        total_times.append((send_end - iter_start) * 1000.0)
 
-        d2h_times.append(d2h_ms)
-        cpu_compute_times.append(cpu_compute_ms)
-        rdma_result_times.append(rdma_result_ms)
-        total_times.append(iter_ms)
-
-    d2h_avg = sum(d2h_times) / len(d2h_times)
     cpu_compute_avg = sum(cpu_compute_times) / len(cpu_compute_times)
-    rdma_result_avg = sum(rdma_result_times) / len(rdma_result_times)
     total_avg = sum(total_times) / len(total_times)
 
     return {
@@ -272,10 +222,10 @@ def run_strategy2(
         "num_miss": num_miss,
         "strategy": 2,
         "ep_bw_pct": 0,
-        "d2h_ms": d2h_avg,
+        "d2h_ms": 0.0,
         "rdma_activation_ms": 0.0,
         "cpu_compute_ms": cpu_compute_avg,
-        "rdma_result_ms": rdma_result_avg,
+        "rdma_result_ms": 0.0,
         "h2d_ms": 0.0,
         "total_ms": total_avg,
     }
@@ -307,11 +257,11 @@ def run_strategy3(
     GPU compute time is measured by UM253 client.
     """
     act_elem = hidden_dim  # [1, hidden_dim] flattened
-    act_tensor = torch.empty(act_elem, dtype=torch.bfloat16, pin_memory=True)
+    act_tensor = torch.empty(act_elem, dtype=torch.bfloat16, pin_memory=False)
 
     # Result size: [num_miss, 1, intermediate_dim] — one delta per adapter
     result_elem = num_miss * intermediate_dim
-    result_tensor = torch.empty(result_elem, dtype=torch.bfloat16, pin_memory=True)
+    result_tensor = torch.empty(result_elem, dtype=torch.bfloat16, pin_memory=False)
 
     # ---- Warmup ----
     for _ in range(warmup):
@@ -465,6 +415,24 @@ def main() -> None:
 
     # ---- Initialise PyTorch Distributed (GLOO backend) ----
     # world_size=2: rank 0 = UM253 (GPU), rank 1 = UM251 (CPU)
+
+    # Ensure GLOO uses the IB interface, not loopback
+    if "GLOO_SOCKET_IFNAME" not in os.environ:
+        import subprocess as _sp
+        try:
+            result = _sp.run(
+                ["ip", "-o", "link", "show"],
+                capture_output=True, text=True, timeout=5,
+            )
+            for line in result.stdout.splitlines():
+                if "ibs" in line or "ibp" in line:
+                    iface = line.split(": ")[1]
+                    os.environ["GLOO_SOCKET_IFNAME"] = iface
+                    print(f"[UM251] Auto-detected GLOO_SOCKET_IFNAME={iface}")
+                    break
+        except Exception:
+            pass
+
     dist.init_process_group(
         backend="gloo",
         init_method=f"tcp://{args.master_addr}:{args.master_port}",
