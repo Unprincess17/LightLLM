@@ -116,9 +116,10 @@ void moe_lora_small_kernel(
     bf16* out, int N, int H, int R, int out_H, float scaling) {
 
     const int cache_block_h = 128;
-    float inter[256];
 
+    #pragma omp parallel for schedule(static) if(N > 1)
     for (int n = 0; n < N; ++n) {
+        float inter[256];
         const bf16* x_ptr = x + n * H;
         bf16* out_ptr = out + n * out_H;
 
