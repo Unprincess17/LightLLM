@@ -7,7 +7,7 @@ Compares two LoRA miss-recovery paths for decode phase (one token per sequence, 
   Path A (GPU-transfer): Transfer LoRA weights CPU→GPU, compute merge on GPU
   Path B (CPU-compute):   Transfer activation GPU→CPU, compute merge on CPU, result→GPU
 
-Sweeps LoRA rank and n_tokens (N, batch size) to find the crossover point.
+Sweeps LoRA rank and batch_size (N, batch size) to find the crossover point.
 This is the "no-expand" CPU path: batch all N tokens in one AVX call (O(1) in N).
 
 Key fix: Both GPU and CPU paths process N tokens with ONE adapter in ONE call.
@@ -41,8 +41,8 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="CoLoRA Motivation Study Microbenchmark")
     p.add_argument("--hidden-dim", type=int, default=HIDDEN_DIM)
     p.add_argument("--intermediate-dim", type=int, default=INTERMEDIATE_DIM)
-    p.add_argument("--ranks", type=str, default="16,32,64,128")
-    p.add_argument("--n-tokens", type=str, default="1,2,4,8,16")
+    p.add_argument("--ranks", type=str, default="8,16,32,64,128")
+    p.add_argument("--batch-size", type=str, default="1,2,4,8,16")
     p.add_argument("--warmup", type=int, default=20)
     p.add_argument("--iters", type=int, default=100)
     p.add_argument("--output", type=str, default="results/motivation_study.csv")
@@ -365,7 +365,7 @@ def run_benchmark(
     hidden_dim: int,
     intermediate_dim: int,
     ranks: List[int],
-    n_tokens_list: List[int],
+    batch_sizes: List[int],
     warmup: int,
     iters: int,
     dtype: torch.dtype,
@@ -375,7 +375,7 @@ def run_benchmark(
 ) -> List[dict]:
     """Run the motivation study benchmark.
 
-    For each (rank, n_tokens) config, measure:
+    For each (rank, batch_size) config, measure:
       Path A: GPU H2D transfer + GPU matmul
       Path B: CPU D2H + AVX compute + H2D result
 
@@ -384,7 +384,7 @@ def run_benchmark(
     associated transfer costs (H2D for GPU path, D2H+H2D for CPU path).
     """
     max_rank = max(ranks)
-    max_n = max(n_tokens_list)
+    max_n = max(batch_sizes)
     scaling = 1.0
 
     all_weights = pregenerate_weights(ranks, hidden_dim, intermediate_dim, dtype)
@@ -426,7 +426,7 @@ def run_benchmark(
         b_gpu[:rank].copy_(b_cpu)
         torch.cuda.synchronize()
 
-        for n in n_tokens_list:
+        for n in batch_sizes:
             act_n = act_gpu[:n]
             inter_n = inter_gpu_per_rank[rank][:n]
             result_n = gpu_out[:n]
@@ -484,13 +484,13 @@ def run_benchmark(
             total_a = min(s[2] for s in a_samples)
 
             results.append({
-                "rank": rank, "n_tokens": n, "path": "A",
+                "rank": rank, "batch_size": n, "path": "A",
                 "h2d_ms": f"{h2d_a / 1000:.6f}", "d2h_ms": "",
                 "gpu_compute_ms": f"{gpu_c_a / 1000:.6f}", "cpu_compute_ms": "",
                 "total_ms": f"{total_a / 1000:.6f}",
             })
             results.append({
-                "rank": rank, "n_tokens": n, "path": "B",
+                "rank": rank, "batch_size": n, "path": "B",
                 "h2d_ms": f"{h2d_b / 1000:.6f}", "d2h_ms": f"{d2h_b / 1000:.6f}",
                 "gpu_compute_ms": "", "cpu_compute_ms": f"{cpu_c_b / 1000:.6f}",
                 "total_ms": f"{total_b / 1000:.6f}",
@@ -513,7 +513,7 @@ def run_benchmark(
 
 def write_csv(results: List[dict], output_path: str) -> None:
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = ["rank", "n_tokens", "path", "h2d_ms", "d2h_ms",
+    fieldnames = ["rank", "batch_size", "path", "h2d_ms", "d2h_ms",
                   "gpu_compute_ms", "cpu_compute_ms", "total_ms"]
     with open(output_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -527,10 +527,10 @@ def print_summary(results: List[dict]) -> None:
     from collections import defaultdict
     by_config: dict = defaultdict(dict)
     for r in results:
-        by_config[(r["rank"], r["n_tokens"])][r["path"]] = float(r["total_ms"])
+        by_config[(r["rank"], r["batch_size"])][r["path"]] = float(r["total_ms"])
 
     ranks = sorted(set(r["rank"] for r in results))
-    n_tokens = sorted(set(r["n_tokens"] for r in results))
+    batch_size = sorted(set(r["batch_size"] for r in results))
 
     print("\n" + "=" * 90)
     print("CROSSOVER TABLE (Path B CPU vs Path A GPU)")
@@ -538,13 +538,13 @@ def print_summary(results: List[dict]) -> None:
     print("=" * 90)
     rank_label = "Rank\\N"
     header = f"{rank_label:>10}"
-    for n in n_tokens:
+    for n in batch_size:
         header += f"{n:>12}"
     print(header)
     print("-" * 90)
     for rank in ranks:
         line = f"{rank:>10}"
-        for n in n_tokens:
+        for n in batch_size:
             key = (rank, n)
             if key in by_config and "A" in by_config[key] and "B" in by_config[key]:
                 a_time = by_config[key]["A"]
@@ -575,7 +575,7 @@ def plot_results(results: List[dict], output_dir: str) -> None:
     from collections import defaultdict
     by_config: dict = defaultdict(dict)
     for r in results:
-        by_config[(r["rank"], r["n_tokens"])][r["path"]] = {
+        by_config[(r["rank"], r["batch_size"])][r["path"]] = {
             "total_ms": float(r["total_ms"]),
             "h2d_ms": float(r["h2d_ms"]) if r["h2d_ms"] else 0,
             "d2h_ms": float(r["d2h_ms"]) if r["d2h_ms"] else 0,
@@ -584,14 +584,14 @@ def plot_results(results: List[dict], output_dir: str) -> None:
         }
 
     ranks = sorted(set(r["rank"] for r in results))
-    n_tokens_list = sorted(set(r["n_tokens"] for r in results))
+    batch_sizes = sorted(set(r["batch_size"] for r in results))
 
     # --- Figure 2a: Crossover Heatmap ---
-    matrix_speedup = np.zeros((len(ranks), len(n_tokens_list)))
-    matrix_winner = np.zeros((len(ranks), len(n_tokens_list)))
+    matrix_speedup = np.zeros((len(ranks), len(batch_sizes)))
+    matrix_winner = np.zeros((len(ranks), len(batch_sizes)))
 
     for i, rank in enumerate(ranks):
-        for j, n in enumerate(n_tokens_list):
+        for j, n in enumerate(batch_sizes):
             key = (rank, n)
             if key in by_config and "A" in by_config[key] and "B" in by_config[key]:
                 a_time = by_config[key]["A"]["total_ms"]
@@ -605,18 +605,18 @@ def plot_results(results: List[dict], output_dir: str) -> None:
     im = ax.imshow(masked, aspect="auto", cmap="RdBu_r", vmin=-1, vmax=1)
 
     for i in range(len(ranks)):
-        for j in range(len(n_tokens_list)):
+        for j in range(len(batch_sizes)):
             if matrix_winner[i, j] != 0:
                 text = f"{matrix_speedup[i, j]:.1f}x"
                 ax.text(j, i, text, ha="center", va="center",
                         fontsize=10, fontweight="bold",
                         color="white" if abs(matrix_winner[i, j]) > 0 else "black")
 
-    ax.set_xticks(range(len(n_tokens_list)))
-    ax.set_xticklabels([str(n) for n in n_tokens_list])
+    ax.set_xticks(range(len(batch_sizes)))
+    ax.set_xticklabels([str(n) for n in batch_sizes])
     ax.set_yticks(range(len(ranks)))
     ax.set_yticklabels([f"r={r}" for r in ranks])
-    ax.set_xlabel("N_dec (decode batch size)")
+    ax.set_xlabel("Batch size")
     ax.set_ylabel("LoRA Rank")
     ax.set_title("Figure 2a: Crossover Heatmap\n(Blue = CPU wins, Red = GPU wins)")
     cbar = plt.colorbar(im, ax=ax, ticks=[-1, 1])
@@ -670,13 +670,13 @@ def plot_results(results: List[dict], output_dir: str) -> None:
         plt.savefig(out / f"fig2b_latency_breakdown.{fmt}", dpi=300)
     plt.close()
 
-    # --- Figure 2c: Per-N Scaling ---
+    # --- Figure 2c: Batch-size Scaling ---
     fig, ax = plt.subplots(figsize=(9, 5.5))
     colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"]
 
     for i, rank in enumerate(ranks):
         a_times, b_times, n_vals = [], [], []
-        for n in n_tokens_list:
+        for n in batch_sizes:
             key = (rank, n)
             if key in by_config:
                 a_times.append(by_config[key]["A"]["total_ms"])
@@ -689,9 +689,9 @@ def plot_results(results: List[dict], output_dir: str) -> None:
         ax.plot(n_vals, b_times, marker="o", ls="-", color=color,
                 label=f"Path B (CPU), r={rank}", ms=5, lw=1.5)
 
-    ax.set_xlabel("N_dec (decode batch size)")
+    ax.set_xlabel("Batch size")
     ax.set_ylabel("Total Latency (ms)")
-    ax.set_title("Figure 2c: Per-Token Scaling (decode batch)")
+    ax.set_title("Figure 2c: Batch-size Scaling")
     ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=7)
     ax.grid(True, alpha=0.25)
     plt.tight_layout()
@@ -710,7 +710,7 @@ def main() -> None:
     args = parse_args()
 
     ranks = [int(x.strip()) for x in args.ranks.split(",") if x.strip()]
-    n_tokens_list = [int(x.strip()) for x in args.n_tokens.split(",") if x.strip()]
+    batch_sizes = [int(x.strip()) for x in args.batch_size.split(",") if x.strip()]
     dtype = _dtype(args.dtype)
 
     if not torch.cuda.is_available():
@@ -736,7 +736,7 @@ def main() -> None:
     print(f"PyTorch: {sys_meta['pytorch_version']}, CUDA: {sys_meta['cuda_version']}")
     print(f"AVX kernel: available={avx_ready}, use={use_avx}")
     print(f"Model: hidden_dim={args.hidden_dim}, intermediate_dim={args.intermediate_dim}")
-    print(f"Sweep: ranks={ranks}, n_tokens={n_tokens_list}")
+    print(f"Sweep: ranks={ranks}, batch_size={batch_sizes}")
     print(f"dtype={args.dtype}, warmup={args.warmup}, iters={args.iters}")
     print(f"CPU threads: {torch.get_num_threads()}")
     print("=" * 80)
@@ -761,7 +761,7 @@ def main() -> None:
         hidden_dim=args.hidden_dim,
         intermediate_dim=args.intermediate_dim,
         ranks=ranks,
-        n_tokens_list=n_tokens_list,
+        batch_sizes=batch_sizes,
         warmup=args.warmup,
         iters=args.iters,
         dtype=dtype,
@@ -783,7 +783,7 @@ def main() -> None:
         "hidden_dim": args.hidden_dim,
         "intermediate_dim": args.intermediate_dim,
         "ranks": ranks,
-        "n_tokens_list": n_tokens_list,
+        "batch_sizes": batch_sizes,
         "dtype": args.dtype,
         "warmup": args.warmup,
         "iters": args.iters,
@@ -797,7 +797,7 @@ def main() -> None:
     meta_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     print(f"Metadata written to: {meta_path}")
 
-    n_expected = len(ranks) * len(n_tokens_list) * 2
+    n_expected = len(ranks) * len(batch_sizes) * 2
     print(f"\nTotal rows: {len(results)} (expected: {n_expected})")
 
 
