@@ -224,10 +224,9 @@ def run_path_b_avx(
     d2h_us = (t1 - t0) * 1e6
 
     # CPU compute: pass pre-allocated output buffer directly to AVX kernel
-    # Avoids: 1) torch.zeros allocation per call, 2) intermediate .copy_()
+    # No CUDA sync needed — CPU compute is purely a CPU operation
     t2 = time.perf_counter()
     avx_fn(cpu_act, a_cpu, b_cpu, scaling, out=cpu_out)
-    torch.cuda.synchronize()
     t3 = time.perf_counter()
     cpu_c_us = (t3 - t2) * 1e6
 
@@ -262,14 +261,13 @@ def run_path_b_torch(
     torch.cuda.synchronize()
     t1 = time.perf_counter()
 
-    # CPU: float32 matmul
+    # CPU: float32 matmul (no CUDA sync needed — purely CPU operation)
     act_f32 = cpu_act.float()        # [N, H]
     a_f32 = a_cpu.float()            # [R, H]
     b_f32 = b_cpu.float()            # [R, I]
     inter = torch.mm(act_f32, a_f32.t())   # [N, R]
     result = torch.mm(inter, b_f32) * scaling  # [N, I]
     cpu_out[:].copy_(result.to(dtype=cpu_act.dtype))
-    torch.cuda.synchronize()
     t2 = time.perf_counter()
 
     # H2D
