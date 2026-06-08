@@ -110,13 +110,12 @@ void moe_lora_tiny_kernel(
     }
 }
 
-// Small kernel for N <= 8 - cache optimized, AVX-512 BF16 with rank-blocking
+// Small kernel for N <= 8 - cache optimized, AVX-512 BF16
 void moe_lora_small_kernel(
     const bf16* x, const bf16* A_mat, const bf16* B_mat,
     bf16* out, int N, int H, int R, int out_H, float scaling) {
 
-    const int cache_block_h = 512;
-    const int rank_block = 4;
+    const int cache_block_h = 128;
 
     #pragma omp parallel for schedule(static) if(N > 1)
     for (int n = 0; n < N; ++n) {
@@ -124,41 +123,32 @@ void moe_lora_small_kernel(
         const bf16* x_ptr = x + n * H;
         bf16* out_ptr = out + n * out_H;
 
-        // Stage 1: x @ A^T -> inter[R], rank-blocked for cache reuse of x
-        // Process rank_block ranks per H-block so x stays in L1 cache
-        for (int r = 0; r < R; r += rank_block) {
-            const int r_end = (r + rank_block < R) ? r + rank_block : R;
-            const int r_count = r_end - r;
-
-            // Initialize accumulators for all ranks in this block
-            __m512 rank_acc[4];
-            for (int i = 0; i < r_count; ++i) rank_acc[i] = _mm512_setzero_ps();
+        // Stage 1: x @ A^T -> inter[R]
+        for (int r = 0; r < R; ++r) {
+            const bf16* A_ptr = A_mat + r * H;
+            __m512 acc = _mm512_setzero_ps();
 
             int k = 0;
             for (; k + cache_block_h <= H; k += cache_block_h) {
                 const bf16* x_block = x_ptr + k;
+                const bf16* A_block = A_ptr + k;
 
-                // Process x_block in 32-element chunks, reuse across all ranks
                 int j = 0;
                 for (; j + 31 < cache_block_h; j += 32) {
                     __m512i v_x = _mm512_loadu_si512((const __m512i*)(x_block + j));
-                    for (int i = 0; i < r_count; ++i) {
-                        const bf16* A_block = A_mat + (r + i) * H + k + j;
-                        __m512i v_A = _mm512_loadu_si512((const __m512i*)(A_block));
-                        rank_acc[i] = _mm512_dpbf16_ps(rank_acc[i], (__m512bh)v_x, (__m512bh)v_A);
-                    }
+                    __m512i v_A = _mm512_loadu_si512((const __m512i*)(A_block + j));
+                    acc = _mm512_dpbf16_ps(acc, (__m512bh)v_x, (__m512bh)v_A);
                 }
+
+                // Small cache block tail inside - handled by main loop
             }
 
-            // Tail: process remaining H elements for each rank independently
-            const int tail_start = k;
-            for (int i = 0; i < r_count; ++i) {
-                float res = _mm512_reduce_add_ps(rank_acc[i]);
-                for (int kk = tail_start; kk < H; ++kk) {
-                    res += (float)x_ptr[kk] * (float)A_mat[(r + i) * H + kk];
-                }
-                inter[r + i] = res;
+            float res = _mm512_reduce_add_ps(acc);
+            // Main H tail
+            for (; k < H; ++k) {
+                res += (float)x_ptr[k] * (float)A_mat[r * H + k];
             }
+            inter[r] = res;
         }
 
         // Stage 2: inter[R] @ B[R,out_H] -> out[n,out_H], fully vectorized
