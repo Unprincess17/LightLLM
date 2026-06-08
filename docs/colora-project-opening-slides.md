@@ -156,24 +156,55 @@ CPU path (D2H activation + AVX-512 + H2D result):
 
 ## Slide 7 — EP Contention: Network Awareness Matters
 
-**EP all-to-all traffic competes with miss-recovery traffic on shared IB link.**
+**EP all-to-all traffic competes with miss-recovery traffic on the shared IB fabric, but the measured signal is not strictly monotonic yet.**
 
-Latency under EP contention (R=64, N=2):
+Focused counter-validated run with Python IPoIB all-to-all traffic (R=64, N_miss=2, warmup=10, iters=50):
 
 | EP load | S1 total (ms) | S2 total (ms) | S3 total (ms) |
 |---------|---------------|---------------|---------------|
-| 0% | 3.50 | 3.09 | **0.84** |
-| 25% | 2.86 | 3.39 | **1.13** |
-| 50% | 3.86 | 3.38 | **1.12** |
-| 75% | 2.07 | 2.85 | **0.81** |
-| 90% | 1.89 | 2.83 | **0.98** |
+| 0% | 3.44 | 3.33 | 1.59 |
+| 25% | 3.92 | 3.68 | **0.81** |
+| 50% | 3.85 | 6.84 | 1.64 |
+| 75% | 4.57 | 5.68 | 1.55 |
+| 90% | 3.20 | 4.94 | 1.22 |
 
-**Observations:**
-- S3 degrades gracefully — small activation payload is less sensitive to contention
-- S1 shows non-monotonic behavior (possible EP generator issues — needs verification)
-- S2 degrades most — multiple round-trips amplify contention
+**What this shows:**
+- Counter validation confirms the background generator is actually injecting traffic on the IB port
+- S2 is sensitive to contention because it performs activation transfer, remote CPU compute, and result transfer; in this focused run it degrades from **3.33ms → 6.84ms** at 50% EP load
+- S1 and S3 are less stable across load levels because the benchmark still has order/noise effects and the Python IPoIB generator is not a faithful RDMA all-to-all workload
+- The old `ib_write_bw` table should not be used as evidence: it had invalid rate flags, `-z` misuse, one-shot server lifecycle bugs, and missing liveness checks
 
-**Implication:** CoLoRA needs **EP-aware scheduling** — schedule miss-recovery traffic during EP quiet gaps.
+**Implication:** The safe claim is that EP contention can materially affect miss-recovery latency, especially S2, so CoLoRA should be network-aware. Do **not** claim a monotonic measured EP-degradation curve yet; the next experiment should use a lower-level RDMA/QP all-to-all generator or real MoE all-to-all traces with per-level IB counter summaries.
+
+---
+
+## Slide 7b — Insight: EP Load ≠ Effective Contention
+
+**Observation (from Slide 7's focused run):** counter-validated traffic is present at every EP level, yet S2 latency jumps **3.33ms → 6.84ms** at 50% requested load and then *improves* at 75% and 90%.
+
+**Hypothesis:** nominal EP load is a **poor predictor of effective contention** seen by LoRA miss recovery. What actually hurts the recovery path depends on:
+
+- **Direction:** IB is full-duplex; interfering traffic may not share the queue/direction used by S1/S2/S3.
+- **Burstiness & pacing:** higher requested rate can reorganize bursts and gaps rather than uniformly raising pressure.
+- **Bottleneck identity:** at some load levels the bottleneck is IB bandwidth; at others it shifts to CPU scheduling, DMA descriptors, or remote compute.
+- **Sustained vs. instantaneous rate:** the generator's "90%" is a target, not a guaranteed effective rate during a given benchmark window.
+
+**Why this is interesting, not just noise:**
+- The S2 jump at 50% is too large to be measurement noise alone — contention is real.
+- Real MoE all-to-all is also bursty and irregular, so non-uniform contention is the **expected regime**, not an artifact.
+
+**Unifying insight — EP workload and LoRA weight transfer are one scheduling problem:**
+- Both consume the same fabric (IB QPs, CPU DMA path, GPU PCIe lanes).
+- A static "EP load %" threshold cannot decide whether to use S1, S2, or S3.
+- CoLoRA should react to **measured fabric pressure**, not requested load.
+
+> *Fabric pressure* = a short-window estimate of how busy the shared communication path is **right now**, on the same resources LoRA recovery would use. Concrete signals:
+> - **IB port counter deltas** over the last few ms (`port_xmit_data`, `port_rcv_data` from `/sys/class/infiniband/.../counters`) → effective bytes/s in each direction.
+> - **RDMA CQ depth / posted-but-uncompleted WRs** → queue contention on the QP we would use.
+> - **Recent activation RTT** (small probe over the same QP) → end-to-end stack pressure including CPU and DMA, not just link bandwidth.
+> - Optionally **PCIe H2D/D2H busy fraction** → contention on the GPU's bus, relevant for S1.
+>
+> The point: pressure is **path-specific** and **time-local**, while EP load % is global and aggregate. The first is actionable for per-miss strategy selection; the second is not.
 
 ---
 
@@ -217,9 +248,11 @@ Latency under EP contention (R=64, N=2):
 
 ## Slide 9 — CoLoRA Design: Network-Aware Scheduling
 
-**Problem:** EP all-to-all and LoRA recovery share the same IB link.
+**Problem:** EP all-to-all and LoRA recovery share the same IB link, CPU DMA path, and GPU PCIe bus.
 
-**Solution: Opportunistic scheduling in EP gaps**
+**Key design principle (from Slide 7b):** schedule on **measured fabric pressure**, not on nominal EP load.
+
+**Solution: Pressure-aware opportunistic scheduling**
 
 ```
 EP traffic pattern (MoE all-to-all):
@@ -235,10 +268,29 @@ At miss time: activation relay only (no weight transfer needed)
 ```
 
 **Mechanism:**
-- Monitor EP traffic phases via RDMA CQ polling
-- Pre-fetch LoRA weights during EP gaps (background, non-blocking)
-- At miss time: only small activation transfer needed → S3 path
-- Fallback to S2 if weights not yet cached (first-time miss)
+
+1. **Sense fabric pressure (per-path, time-local):**
+   - IB port counter deltas over the last few ms (`port_xmit_data`, `port_rcv_data`)
+   - RDMA CQ depth / outstanding WRs on the QP that S1/S2/S3 would use
+   - Recent activation-RTT probe over the same QP
+   - PCIe H2D/D2H busy fraction (for S1 weight-transfer cost)
+
+2. **Pre-cache in low-pressure windows:**
+   - When the sensed pressure on the recovery path is low, push popular cold LoRA weights to the local GPU in the background.
+
+3. **At miss time, pick the cheapest path under current pressure:**
+   - Weights already on GPU → warm GPU compute
+   - Local miss, low pressure on PCIe/GPU → CPU AVX (small N_dec) or GPU H2D (large N_dec)
+   - Cross-machine miss, weights pre-cached → **S3** (activation relay)
+   - Cross-machine miss, weights not cached, IB QP under pressure → **S2** (remote compute, smaller payload exposure)
+   - Cross-machine miss, IB QP idle and weights reusable → **S1** (one-time weight transfer + future warm hits)
+
+**Why this unifies EP analysis and LoRA weight transfer:**
+
+- They are not two problems; they are one **shared-fabric scheduling problem**.
+- EP-workload analysis tells us *when* the fabric is busy and *how* (which direction, which queue, which bottleneck).
+- LoRA recovery turns that signal into a per-miss choice between S1/S2/S3 and CPU/GPU paths.
+- Static EP-load thresholds cannot do this; per-path pressure sensing can.
 
 ---
 
@@ -247,7 +299,7 @@ At miss time: activation relay only (no weight transfer needed)
 | Study | Status | What it proves |
 |-------|--------|----------------|
 | **1. Single-layer crossover** | ✅ Data collected (optimized) | CPU wins at N_dec ≤ 8 for all ranks (1.01–1.75×). GPU wins at N_dec ≥ 16. Crossover shifted from N=1 to N=8 after eliminating benchmark overheads (allocation, unnecessary CUDA sync) and optimizing AVX kernel (OpenMP, 32-wide vectorization). |
-| **2. Cross-node benchmark** | ✅ Data collected (60/60 configs) | S3 (pre-cached relay) is 1.5-7× faster. EP contention affects S1/S2 more than S3. |
+| **2. Cross-node benchmark** | ✅ Data collected (60/60 configs + focused EP run) | S3 (pre-cached relay) is 1.5-7× faster. Focused EP run shows counter-validated contention can degrade S2, but not yet a monotonic curve. |
 | **3. Analytical case studies** | 📝 Code complete, needs anchor file | Payload asymmetry (Case A), reuse-aware crossover (Case B), EP contention model (Case D) |
 | **4. E2E serving** | 🔲 Planned | TPOT impact under real workload; CoLoRA vs S-LoRA baseline |
 
@@ -266,7 +318,7 @@ At miss time: activation relay only (no weight transfer needed)
 
 3. **Cross-machine recovery requires pre-caching** — Strategy 3 (relay + pre-cached weights) is 1.5-7× faster than naive weight transfer
 
-4. **EP contention motivates gap-aware scheduling** — recovery traffic must exploit EP quiet periods
+4. **EP load is a poor proxy for contention** — CoLoRA schedules on **measured fabric pressure** (IB counter deltas, CQ depth, recent RTT, PCIe busy fraction) on the *same path* the recovery would use, not on nominal EP load %.
 
 5. **CoLoRA's hybrid policy adapts to the regime** — local CPU-first for cold misses (N_dec ≤ 8), local GPU for large batches (N_dec ≥ 16), cross-machine pre-cache + relay, schedule around EP traffic
 
@@ -274,7 +326,7 @@ At miss time: activation relay only (no weight transfer needed)
 
 ## Slide 12 — Next Steps
 
-1. **Verify EP traffic generator** — current cross-node results show non-monotonic degradation; need to confirm `ib_write_bw` is actually generating contention
+1. **Replace EP traffic generator** — Python IPoIB all-to-all confirms traffic and S2 degradation, but still lacks a monotonic curve; next use RDMA/QP-level all-to-all or real MoE traces with per-level IB counter summaries
 
 2. **Run analytical case studies (A/B/D)** — code is ready, needs calibration anchor file from measured data
 

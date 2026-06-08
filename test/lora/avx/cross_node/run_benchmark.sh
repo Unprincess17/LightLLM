@@ -22,6 +22,10 @@ python -c "import torch; import torch.distributed" || {
     echo "ERROR: torch.distributed not available"
     exit 1
 }
+command -v ib_write_bw >/dev/null || {
+    echo "ERROR: ib_write_bw not found; install perftest"
+    exit 1
+}
 
 # CUDA check
 python -c "import torch; assert torch.cuda.is_available()" || {
@@ -51,14 +55,16 @@ echo "Master (rendezvous): ${MASTER_ADDR}:${MASTER_PORT}"
 echo "Server (UM251): ${SERVER_ADDR}:${SERVER_PORT}"
 echo "Output: ${OUTPUT_DIR}"
 echo "Warmup: ${WARMUP}, Iters: ${ITERS}"
+echo "EP traffic requires a remote ib_write_bw server on ${SERVER_ADDR}:18515:"
+echo "  ib_write_bw -d mlx5_0 -p 18515 --duration=999999 -b"
 echo "============================================================"
 
 python "${BENCHMARK_SCRIPT}" \
-    --rank "${RANK}" \
     --master-addr "${MASTER_ADDR}" \
     --master-port "${MASTER_PORT}" \
     --server-addr "${SERVER_ADDR}" \
     --server-port "${SERVER_PORT}" \
+    --ep-ssh-host "${EP_SSH_HOST:-}" \
     --output-dir "${OUTPUT_DIR}" \
     --warmup "${WARMUP}" \
     --iters "${ITERS}" \

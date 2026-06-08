@@ -167,6 +167,29 @@ def parse_args() -> argparse.Namespace:
         default="10.10.1.3",
         help="Remote IP of UM251 for EP traffic",
     )
+    g.add_argument(
+        "--ep-port",
+        type=int,
+        default=18515,
+        help="TCP control port for ib_write_bw EP traffic",
+    )
+    g.add_argument(
+        "--ep-ssh-host",
+        default=None,
+        help="Optional SSH host for starting a fresh remote ib_write_bw server per EP level",
+    )
+    g.add_argument(
+        "--ep-direction",
+        choices=("unidirectional", "bidirectional"),
+        default="bidirectional",
+        help="Direction of ib_write_bw background traffic; bidirectional better models EP all-to-all",
+    )
+    g.add_argument(
+        "--ep-generator",
+        choices=("ib_write_bw", "alltoall"),
+        default="ib_write_bw",
+        help="Background EP traffic generator implementation",
+    )
 
     return parser.parse_args()
 
@@ -1201,22 +1224,28 @@ def main() -> None:
         local_ip=args.local_ip,
         remote_ip=args.remote_ip,
         mlx_device=args.mlx_device,
+        base_port=args.ep_port,
+        remote_ssh_host=args.ep_ssh_host,
+        direction=args.ep_direction,
+        mode=args.ep_generator,
     )
 
     try:
         for ep_pct in ep_bw_pct_list:
             print(f"\n>>> EP background traffic: {ep_pct}%", flush=True)
 
-            # Start EP traffic for this group
+            # Start EP traffic for this group. For ep_pct > 0 this requires an
+            # ib_write_bw server already running on args.remote_ip:base_port.
             ep_gen = EPTrafficGenerator(ep_config, mode="continuous")
-            try:
-                ep_gen.start(bw_pct=ep_pct)
-            except Exception as exc:
-                print(f"[warning] EP traffic start failed: {exc}", flush=True)
-                ep_gen = None
+            ep_gen.start(bw_pct=ep_pct)
 
             for rank in ranks:
                 for num_miss in num_miss_list:
+                    if ep_gen is not None and not ep_gen.is_running():
+                        raise RuntimeError(
+                            f"EP traffic generator stopped during ep_bw_pct={ep_pct}; "
+                            "aborting to avoid recording un-contended results as contended."
+                        )
                     try:
                         t1, t2, t3 = run_benchmark_for_config(
                             rank=rank,
