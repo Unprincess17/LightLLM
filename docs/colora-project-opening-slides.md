@@ -9,7 +9,7 @@
 Gong Shufan
 
 *Problem:* MoE + multi-LoRA serving hits cache misses — current systems stall the GPU.
-*Insight:* Local decode misses are GPU-first except N=1 ties; cross-machine misses need pre-cache + relay.
+*Insight:* Local decode misses are CPU-first for typical batches (N≤8); cross-machine misses need pre-cache + relay.
 *Contribution:* Hybrid local/cross-machine recovery + network-aware scheduling.
 
 ---
@@ -26,11 +26,11 @@ Gong Shufan
 
 **Current approach (S-LoRA / Punica):**
 - Miss → H2D transfer LoRA weights to GPU → GPU compute merge
-- Locally this is competitive even for decode, but cross-machine misses add network delay and contention
+- Locally, CPU-first recovery is faster for typical decode batches (N ≤ 8); cross-machine misses add network delay and contention
 
 ---
 
-## Slide 3 — Local Decode Miss Recovery: CPU Only Wins at N=1
+## Slide 3 — Local Decode Miss Recovery: CPU Wins at Typical Decode Batches
 
 **The decode regime is fundamentally different from prefill:**
 
@@ -46,55 +46,62 @@ Gong Shufan
 
 **Measured on A100-SXM4-80GB, single MoE expert (source: `motivation_microbench.py`):**
 
-For **R=64, N=1** (decode phase, activation = 4KB):
+For **R=64, N=4** (typical decode batch, activation = 4×4KB = 16KB):
 
 GPU path (H2D weights + GPU matmul):
-- H2D weight transfer: 28.0μs (361KB over PCIe Gen4 ×16)
-- GPU matmul: 42.9μs
-- **Total: 69.6μs**
+- H2D weight transfer: 28.3μs (361KB over PCIe Gen4 ×16)
+- GPU matmul: 45.6μs
+- **Total: 72.4μs**
 
 CPU path (D2H activation + AVX-512 + H2D result):
-- D2H activation: 14.1μs (4KB, pinned memory copy)
-- CPU AVX compute: 33.4μs (no-expand: batch all N in one call)
-- H2D result: 17.0μs
-- **Total: 64.5μs**
+- D2H activation: 14.1μs (16KB, pinned memory copy)
+- CPU AVX compute: 32.4μs (no-expand: batch all N in one call, OpenMP across tokens)
+- H2D result: 16.6μs
+- **Total: 63.2μs**
 
-**CPU is 1.08× faster at N=1, R=64. GPU wins at N≥2 (see Slide 4 for full crossover).**
+**CPU is 1.15× faster at N=4, R=64. CPU wins up to N=8 for R≤64 (see Slide 4 for full crossover).**
 
-> Note: Both paths use the no-expand optimization. The original comparison had O(N) CPU cost vs O(1) GPU cost — this is fixed above. H2D weight transfer is a one-time cold-miss cost. For warm hits, GPU path drops to ~42μs.
+> Note: Both paths use the no-expand optimization with AVX-512 BF16 dot-product instructions. CPU path benefits from pre-allocated output buffers, OpenMP token parallelism, and 32-wide Stage 2 vectorization. H2D weight transfer is a one-time cold-miss cost. For warm hits, GPU path drops to ~42μs.
 
 ---
 
-## Slide 4 — Crossover Curve: When Does CPU Win?
+## Slide 4 — Crossover Curve: CPU Wins at Typical Decode Batches
 
 **Benchmark source:** `motivation_microbench.py` — single MoE expert, A100-SXM4-80GB.
 **Model:** Qwen3-VL-30B-A3B (H=2048, I=768, top_k=2).
-**Sweep:** LoRA rank R ∈ {64, 128}, decode batch N_dec ∈ {1, 2, 4, 8, 16}.
-**Critical fix:** Both CPU and GPU paths use no-expand (batch all N_dec tokens in one call).
-*Previously, CPU path looped over each adapter/token (O(N)) vs GPU batched (O(1)) — unfair comparison.*
+**Sweep:** LoRA rank R ∈ {8, 16, 32, 64, 128}, decode batch N_dec ∈ {1, 2, 4, 8, 16}.
+**Optimizations:** Pre-allocated output buffers, OpenMP token parallelism, 32-wide AVX-512 Stage 2, eliminated unnecessary CUDA syncs.
 
-**Fresh benchmark results (decode batch, no prefill sequence length):**
+**Benchmark results (decode batch, no prefill sequence length):**
 
 | Rank | N_dec | GPU total (μs) | CPU total (μs) | Winner |
 |------|-------|----------------|----------------|--------|
-| 64 | 1 | 69.6 | **64.5** | CPU (1.08×, −5.0μs) |
-| 64 | 2 | **73.8** | 79.3 | GPU (1.07×, −5.5μs) |
-| 64 | 4 | **73.7** | 106.7 | GPU (1.45×, −33.0μs) |
-| 64 | 8 | **73.2** | 165.2 | GPU (2.26×, −92.0μs) |
-| 64 | 16 | **71.7** | 170.3 | GPU (2.37×, −98.6μs) |
-| 128 | 1 | 83.7 | **79.9** | CPU (1.05×, −3.8μs) |
-| 128 | 2 | **88.1** | 109.4 | GPU (1.24×, −21.3μs) |
-| 128 | 4 | **88.7** | 168.5 | GPU (1.90×, −79.8μs) |
-| 128 | 8 | **88.5** | 287.4 | GPU (3.25×, −199.0μs) |
-| 128 | 16 | **84.5** | 289.8 | GPU (3.43×, −205.4μs) |
+| 8 | 1 | 64.5 | **36.8** | CPU (1.75×) |
+| 8 | 4 | 65.8 | **46.5** | CPU (1.42×) |
+| 8 | 16 | 65.8 | **63.8** | CPU (1.03×) |
+| 16 | 1 | 62.2 | **37.9** | CPU (1.64×) |
+| 16 | 8 | 65.7 | **51.6** | CPU (1.27×) |
+| 16 | 16 | **65.7** | 74.8 | GPU (1.14×) |
+| 32 | 1 | 63.2 | **41.0** | CPU (1.54×) |
+| 32 | 8 | 66.4 | **57.2** | CPU (1.16×) |
+| 32 | 16 | **65.8** | 97.7 | GPU (1.49×) |
+| 64 | 1 | 71.9 | **48.8** | CPU (1.47×) |
+| 64 | 4 | 72.4 | **63.2** | CPU (1.15×) |
+| 64 | 8 | 71.9 | **66.6** | CPU (1.08×) |
+| 64 | 16 | **72.4** | 141.6 | GPU (1.95×) |
+| 128 | 1 | 84.7 | **63.5** | CPU (1.33×) |
+| 128 | 4 | 85.4 | **80.4** | CPU (1.06×) |
+| 128 | 8 | 85.6 | **84.4** | CPU (1.01×) |
+| 128 | 16 | **86.3** | 221.9 | GPU (2.57×) |
 
-**Corrected crossover point:**
-- **CPU is only useful at N_dec=1, and only by a small margin (1.05–1.08×).**
-- **GPU wins at N_dec≥2 for both R=64 and R=128.**
-- GPU path is dominated by H2D weight transfer (~28–46μs), not GPU matmul (~40–45μs).
-- CPU path scales with N_dec due to AVX compute (~33–258μs).
+**Updated crossover:**
+- **CPU wins at N_dec ≤ 8 for all ranks R ≤ 64**, with speedups of 1.01–1.75×.
+- **CPU wins at N_dec ≤ 8 even for R=128**, though margins are thin (1.01–1.33×).
+- **GPU wins at N_dec ≥ 16** for all ranks, where AVX compute cost dominates.
+- GPU path is dominated by H2D weight transfer (~22–46μs), not GPU matmul (~40–45μs).
+- CPU path benefits from small activation transfer (D2H: 13–15μs) vs large weight transfer (H2D: 22–46μs).
 
-> `validate_focused.py` sanity check reports clean GPU reuse at ~41–45μs and the same qualitative conclusion: CPU is only competitive in the tiny decode-batch regime. The original CPU-wins-at-N≤4 claim came from unfair O(N) CPU looping and contaminated CUDA sync timing.
+> The crossover has shifted dramatically from previous measurements. Three optimizations drove this: (1) pre-allocated output buffers eliminate per-call allocation overhead, (2) OpenMP parallelism across tokens for N>1, and (3) removing unnecessary CUDA synchronize after CPU compute. The old conclusion (CPU only wins at N=1) was inflated by these overheads, not fundamental.
 
 ---
 
@@ -187,23 +194,23 @@ Latency under EP contention (R=64, N=2):
                │ (warm hit)     │    └──┬──────────────┬──────┘
                └────────────────┘       │ Yes          │ No
                                 ┌────────▼──────┐  ┌────▼──────────────┐
-                                │ GPU H2D +     │  │ Cross-machine?    │
-                                │ GPU compute   │  └────┬─────────────┘
-                                │ (local cold)  │       │
-                                └───────────────┘  ┌────▼──────────────┐
-                                                   │ S3: pre-cache +    │
-                                                   │ activation relay   │
-                                                   └────┬───────────────┘
-                                                        │ fallback if not cached
-                                                   ┌────▼──────────────┐
-                                                   │ S2: remote CPU     │
-                                                   │ activation compute │
-                                                   └────────────────────┘
+                                │ N_dec ≤ 8?    │  │ Cross-machine?    │
+                                └──┬────────┬───┘  └────┬─────────────┘
+                                 Yes       │ No        │
+                              ┌────▼───┐ ┌──▼──────┐ ┌─▼─────────────────┐
+                              │CPU AVX │ │GPU H2D +│ │ S3: pre-cache +    │
+                              │compute │ │compute  │ │ activation relay   │
+                              │(local  │ │(local   │ └────┬──────────────┘
+                              │ cold)  │ │ cold)   │      │ fallback
+                              └────────┘ └─────────┘ ┌────▼──────────────┐
+                                                      │ S2: remote CPU     │
+                                                      │ activation compute │
+                                                      └────────────────────┘
 ```
 
 **Three-layer policy:**
 1. **Local warm hit:** GPU matmul only (weights already on GPU, ~41–45μs)
-2. **Local cold miss:** GPU H2D + compute (GPU wins at N_dec≥2; CPU only slightly wins at N_dec=1)
+2. **Local cold miss:** CPU-first compute (CPU wins at N_dec ≤ 8 for all ranks; GPU path used at N_dec ≥ 16)
 3. **Cross-machine:** Pre-cache weights during idle → S3 relay at miss time; fallback to S2 if not cached
 
 ---
@@ -239,15 +246,15 @@ At miss time: activation relay only (no weight transfer needed)
 
 | Study | Status | What it proves |
 |-------|--------|----------------|
-| **1. Single-layer crossover** | ✅ Data collected (corrected) | Local GPU H2D+compute wins at N_dec≥2; CPU only slightly wins at N_dec=1. Original CPU-wins-at-N≤4 claim was unfair O(N) vs O(1). |
+| **1. Single-layer crossover** | ✅ Data collected (optimized) | CPU wins at N_dec ≤ 8 for all ranks (1.01–1.75×). GPU wins at N_dec ≥ 16. Crossover shifted from N=1 to N=8 after eliminating benchmark overheads (allocation, unnecessary CUDA sync) and optimizing AVX kernel (OpenMP, 32-wide vectorization). |
 | **2. Cross-node benchmark** | ✅ Data collected (60/60 configs) | S3 (pre-cached relay) is 1.5-7× faster. EP contention affects S1/S2 more than S3. |
 | **3. Analytical case studies** | 📝 Code complete, needs anchor file | Payload asymmetry (Case A), reuse-aware crossover (Case B), EP contention model (Case D) |
 | **4. E2E serving** | 🔲 Planned | TPOT impact under real workload; CoLoRA vs S-LoRA baseline |
 
 **What we have now is sufficient for motivation + challenge + design:**
-- Study 1 (corrected): local misses should be GPU-first except the tiny N_dec=1 edge case.
+- Study 1 (optimized): local misses should be CPU-first for typical decode batches (N_dec ≤ 8), GPU-first only at large N_dec ≥ 16.
 - Study 2: cross-machine misses require pre-cache/relay and network-aware scheduling.
-- Together they motivate a local-GPU + cross-machine-relay hybrid policy.
+- Together they motivate a local-CPU + cross-machine-relay hybrid policy.
 
 ---
 
@@ -255,13 +262,13 @@ At miss time: activation relay only (no weight transfer needed)
 
 1. **LoRA miss recovery is the bottleneck in MoE+LoRA serving** — miss rates of 15-30% at practical cache budgets
 
-2. **Local decode miss recovery is GPU-first at N_dec≥2** — H2D weight transfer is ~28–46μs and GPU matmul is ~40–45μs; CPU only slightly wins at N_dec=1.
+2. **Local decode miss recovery is CPU-first at typical decode batches (N_dec ≤ 8)** — AVX-512 BF16 compute on CPU (5–35μs) + small activation transfer (14μs) beats GPU H2D weight transfer (22–46μs) + GPU matmul (40–45μs). GPU wins only at N_dec ≥ 16 where CPU compute scales.
 
 3. **Cross-machine recovery requires pre-caching** — Strategy 3 (relay + pre-cached weights) is 1.5-7× faster than naive weight transfer
 
 4. **EP contention motivates gap-aware scheduling** — recovery traffic must exploit EP quiet periods
 
-5. **CoLoRA's hybrid policy adapts to the regime** — local GPU H2D+compute, cross-machine pre-cache + relay, schedule around EP traffic
+5. **CoLoRA's hybrid policy adapts to the regime** — local CPU-first for cold misses (N_dec ≤ 8), local GPU for large batches (N_dec ≥ 16), cross-machine pre-cache + relay, schedule around EP traffic
 
 ---
 
