@@ -326,7 +326,7 @@ At miss time: activation relay only (no weight transfer needed)
 
 ## Slide 12 — Next Steps
 
-1. **Replace EP traffic generator** — Python IPoIB all-to-all confirms traffic and S2 degradation, but still lacks a monotonic curve; next use RDMA/QP-level all-to-all or real MoE traces with per-level IB counter summaries
+1. **Replace EP traffic generator** — Python IPoIB all-to-all confirms traffic and S2 degradation, but still lacks a monotonic curve; next use RDMA/QP-level (queue pair) all-to-all or real MoE traces with per-level IB counter summaries
 
 2. **Run analytical case studies (A/B/D)** — code is ready, needs calibration anchor file from measured data
 
