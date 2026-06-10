@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CoLoRA Opening Deck TODOs</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --panel: #111827;
+      --panel-2: #1f2937;
+      --text: #e5e7eb;
+      --muted: #9ca3af;
+      --line: #334155;
+      --accent: #38bdf8;
+      --ok: #22c55e;
+      --warn: #f59e0b;
+      --bad: #ef4444;
+      --win: #a78bfa;
+      --shadow: 0 24px 70px rgba(0, 0, 0, 0.34);
+      --radius: 18px;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: radial-gradient(circle at top left, rgba(56, 189, 248, 0.22), transparent 34%), var(--bg);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.55;
+    }
+
+    .deck {
+      width: min(1180px, calc(100vw - 48px));
+      margin: 0 auto;
+      padding: 42px 0;
+    }
+
+    .dashboard {
+      background: linear-gradient(145deg, rgba(17, 24, 39, 0.96), rgba(15, 23, 42, 0.98));
+      border: 1px solid rgba(148, 163, 184, 0.24);
+      border-radius: calc(var(--radius) + 8px);
+      box-shadow: var(--shadow);
+      padding: 34px;
+    }
+
+    .slide {
+      min-height: 720px;
+      padding: 42px;
+      border-radius: var(--radius);
+      background: var(--panel);
+    }
+
+    h1,
+    h2,
+    h3 {
+      margin: 0 0 0.55em;
+      line-height: 1.12;
+      letter-spacing: -0.035em;
+    }
+
+    h1 {
+      font-size: clamp(2.4rem, 5vw, 4.6rem);
+    }
+
+    h2 {
+      font-size: clamp(1.7rem, 3vw, 2.6rem);
+    }
+
+    h3 {
+      font-size: 1.1rem;
+      color: var(--accent);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 1rem 0;
+      overflow: hidden;
+      border-radius: 12px;
+    }
+
+    th,
+    td {
+      padding: 0.8rem 1rem;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      color: #f8fafc;
+      background: rgba(56, 189, 248, 0.1);
+    }
+
+    pre {
+      margin: 1rem 0;
+      padding: 1rem;
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: #020617;
+      color: #d1fae5;
+    }
+
+    blockquote {
+      margin: 1rem 0;
+      padding: 1rem 1.2rem;
+      border-left: 4px solid var(--accent);
+      border-radius: 0 12px 12px 0;
+      background: rgba(56, 189, 248, 0.08);
+      color: #dbeafe;
+    }
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      padding: 0.2rem 0.58rem;
+      border: 1px solid rgba(148, 163, 184, 0.35);
+      border-radius: 999px;
+      color: #e0f2fe;
+      background: rgba(14, 165, 233, 0.12);
+      font-size: 0.82rem;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+    }
+
+    .muted {
+      color: var(--muted);
+    }
+
+    .lead {
+      max-width: 780px;
+      margin: 0;
+      color: #cbd5e1;
+      font-size: clamp(1.05rem, 1.7vw, 1.35rem);
+    }
+
+    .ok {
+      color: var(--ok);
+    }
+
+    .warn {
+      color: var(--warn);
+    }
+
+    .bad {
+      color: var(--bad);
+    }
+
+    .win {
+      color: var(--win);
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 18px;
+    }
+
+    .grid3 {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 18px;
+    }
+
+    .card {
+      border: 1px solid rgba(148, 163, 184, 0.2);
+      border-radius: var(--radius);
+      background: rgba(31, 41, 55, 0.68);
+      padding: 20px;
+    }
+
+    .dashboard-header {
+      display: flex;
+      justify-content: space-between;
+      gap: 24px;
+      align-items: flex-start;
+      margin-bottom: 26px;
+    }
+
+    .dashboard-title {
+      display: grid;
+      gap: 10px;
+    }
+
+    .dashboard-title h1 {
+      margin-bottom: 0;
+    }
+
+    .summary-counts {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 14px;
+      margin: 28px 0;
+    }
+
+    .count-card {
+      display: grid;
+      gap: 4px;
+      min-height: 112px;
+      align-content: center;
+      padding: 18px;
+      border: 1px solid rgba(148, 163, 184, 0.24);
+      border-radius: var(--radius);
+      background: rgba(15, 23, 42, 0.72);
+    }
+
+    .count-card strong {
+      display: block;
+      font-size: 2.5rem;
+      line-height: 1;
+    }
+
+    .count-card span {
+      color: var(--muted);
+      font-weight: 700;
+    }
+
+    details {
+      margin-top: 16px;
+      border: 1px solid rgba(148, 163, 184, 0.22);
+      border-radius: var(--radius);
+      background: rgba(15, 23, 42, 0.66);
+      overflow: hidden;
+    }
+
+    summary {
+      cursor: pointer;
+      padding: 18px 20px;
+      color: #f8fafc;
+      font-size: 1.05rem;
+      font-weight: 800;
+      list-style-position: inside;
+      background: rgba(31, 41, 55, 0.7);
+    }
+
+    .checklist-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      padding: 18px;
+    }
+
+    .checklist-grid .card {
+      min-height: 96px;
+    }
+
+    footer {
+      margin-top: 28px;
+      padding-top: 18px;
+      border-top: 1px solid rgba(148, 163, 184, 0.18);
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+
+    @media (max-width: 850px) {
+      .deck {
+        width: min(100% - 28px, 1180px);
+        padding: 18px 0;
+      }
+
+      .dashboard {
+        padding: 22px;
+      }
+
+      .dashboard-header,
+      .summary-counts,
+      .grid,
+      .grid3,
+      .checklist-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .dashboard-header {
+        display: grid;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="deck">
+    <section class="dashboard" aria-labelledby="dashboard-title">
+      <header class="dashboard-header">
+        <div class="dashboard-title">
+          <span class="tag">Canonical checklist</span>
+          <h1 id="dashboard-title">CoLoRA Opening Deck TODOs</h1>
+          <p class="lead">This dashboard is Claude-readable and human-readable. Treat it as the canonical checklist for the CoLoRA opening deck conversion.</p>
+        </div>
+      </header>
+
+      <div class="summary-counts" aria-label="Dashboard summary counts">
+        <div class="count-card"><strong class="ok">6</strong><span>Done / Keep</span></div>
+        <div class="count-card"><strong class="warn">3</strong><span>Stale / Retire</span></div>
+        <div class="count-card"><strong class="win">3</strong><span>Active Next</span></div>
+        <div class="count-card"><strong class="bad">2</strong><span>Decisions</span></div>
+      </div>
+
+      <details open>
+        <summary>Done / Keep</summary>
+        <div class="checklist-grid">
+          <div class="card">Local CPU/GPU crossover is measured and optimized; CPU wins for typical decode batches up to N_dec ≤ 8.</div>
+          <div class="card">Cross-node S1/S2/S3 benchmark is collected, including the 60/60 configurations and focused EP run.</div>
+          <div class="card">Calibration anchor file exists.</div>
+          <div class="card">System TPOT simulation and synthetic sweeps exist.</div>
+          <div class="card">Small live validation pipeline exists.</div>
+          <div class="card">Figure assembly pipeline exists.</div>
+        </div>
+      </details>
+
+      <details open>
+        <summary>Stale / Retire</summary>
+        <div class="checklist-grid">
+          <div class="card">“Case studies need anchor file” is stale because the calibration anchor exists.</div>
+          <div class="card">“Minimal E2E validation is only planned” is stale because the B11 live-validation pipeline exists.</div>
+          <div class="card">Any monotonic EP-degradation claim should be retired unless supported by a stronger generator or trace-backed study.</div>
+        </div>
+      </details>
+
+      <details open>
+        <summary>Active Next</summary>
+        <div class="checklist-grid">
+          <div class="card">Run an RDMA/QP-level all-to-all or real MoE trace pressure study.</div>
+          <div class="card">Produce per-load IB counter summaries.</div>
+          <div class="card">Run a paper claim-to-artifact audit before final writing.</div>
+        </div>
+      </details>
+
+      <details open>
+        <summary>Decisions Needed</summary>
+        <div class="checklist-grid">
+          <div class="card">Decide whether to invest in a lower-level RDMA generator or frame the current EP result as qualitative contention evidence.</div>
+          <div class="card">Decide which claims belong in the main paper versus appendix.</div>
+        </div>
+      </details>
+
+      <footer>
+        Static self-contained HTML shell for the CoLoRA opening deck dashboard.
+      </footer>
+    </section>
+  </main>
+</body>
+</html>
