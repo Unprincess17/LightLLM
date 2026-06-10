@@ -345,6 +345,253 @@
         Static self-contained HTML shell for the CoLoRA opening deck dashboard.
       </footer>
     </section>
+
+    <section class="slide" aria-labelledby="slide-1-title">
+      <span class="tag">Slide 1</span>
+      <h1 id="slide-1-title">CoLoRA: Network-Aware LoRA Miss Recovery for Distributed MoE Serving</h1>
+      <p class="lead">Gong Shufan</p>
+      <div class="grid3" style="margin-top: 2rem;">
+        <div class="card">
+          <h3>Problem</h3>
+          <p>MoE serving already spends network budget on expert-parallel traffic. LoRA cache misses add recovery work exactly when decode latency is most visible.</p>
+        </div>
+        <div class="card">
+          <h3>Insight</h3>
+          <p>Miss recovery is not a fixed CPU-vs-GPU choice. The best path depends on decode batch size, adapter rank, cache reuse, and live fabric pressure.</p>
+        </div>
+        <div class="card">
+          <h3>Contribution</h3>
+          <p>CoLoRA combines local CPU/GPU crossover evidence, cross-machine recovery strategies, and network-aware scheduling for miss recovery in distributed MoE + LoRA serving.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="slide" aria-labelledby="slide-2-title">
+      <span class="tag">Slide 2</span>
+      <h2 id="slide-2-title">The Miss Problem in MoE + LoRA Serving</h2>
+      <p class="lead">Serving many LoRA adapters over MoE creates a second locality problem beyond expert placement.</p>
+      <div class="grid" style="margin-top: 1.5rem;">
+        <div class="card">
+          <h3>Setup</h3>
+          <ul>
+            <li>Requests carry adapter IDs; hot adapters may be cached locally.</li>
+            <li>Decode executes repeatedly at small batch sizes, where every miss can affect TPOT.</li>
+            <li>MoE routing simultaneously consumes cross-GPU or cross-node bandwidth.</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3>Why misses are common</h3>
+          <ul>
+            <li>Long-tail adapters exceed per-GPU cache capacity.</li>
+            <li>Load balancing and expert placement move requests away from cached adapters.</li>
+            <li>Multi-tenant arrivals change the hot set over time.</li>
+          </ul>
+        </div>
+      </div>
+      <blockquote>Current approach: fetch or recompute the missing LoRA weights on the critical path, usually without asking whether the network is already under EP pressure.</blockquote>
+    </section>
+
+    <section class="slide" aria-labelledby="slide-3-title">
+      <span class="tag">Slide 3</span>
+      <h2 id="slide-3-title">Local Decode Miss Recovery: CPU Wins at Typical Decode Batches</h2>
+      <p class="lead">For small decode batches, CPU-side recovery can beat the GPU path even before considering network contention.</p>
+      <table>
+        <thead>
+          <tr><th>Phase</th><th>Prefill</th><th>Decode</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Work shape</td><td>Large token block; high arithmetic intensity</td><td>Small N_dec; latency-sensitive repeated steps</td></tr>
+          <tr><td>LoRA miss impact</td><td>Amortized over many tokens</td><td>Exposed directly in per-token latency</td></tr>
+          <tr><td>Likely recovery path</td><td>GPU-friendly</td><td>CPU path can win for typical N_dec</td></tr>
+        </tbody>
+      </table>
+      <div class="grid">
+        <div class="card">
+          <h3>GPU path, R=64 N=4</h3>
+          <p>Launch and GPU-side scheduling overheads are paid for a small decode batch.</p>
+        </div>
+        <div class="card">
+          <h3>CPU path, R=64 N=4</h3>
+          <p>CPU computes the small LoRA delta while avoiding the GPU launch bottleneck.</p>
+        </div>
+      </div>
+      <blockquote><strong>CPU is 1.15× faster at N=4, R=64</strong> in the local decode miss microbenchmark.</blockquote>
+      <!-- Hidden from rendered deck: Detailed implementation note preserved from the markdown narrative. The local decode recovery benchmark was corrected to avoid timing bugs from D2H and GPU stream synchronization; the CPU path measures host-side LoRA delta computation for small N_dec, while the GPU path includes the launch/scheduling cost that matters on the critical decode path. -->
+    </section>
+
+    <section class="slide" aria-labelledby="slide-4-title">
+      <span class="tag">Slide 4</span>
+      <h2 id="slide-4-title">Crossover Curve: CPU Wins at Typical Decode Batches</h2>
+      <p class="lead">Benchmark source: <code>tools/crossover_curve_microbench.py</code>, using corrected D2H and GPU-stream measurement.</p>
+      <table>
+        <thead>
+          <tr><th>Rank</th><th>N_dec</th><th>Representative result</th><th>Interpretation</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>R=8</td><td>1-8</td><td>CPU faster</td><td>Launch overhead dominates tiny decode work.</td></tr>
+          <tr><td>R=16</td><td>1-8</td><td>CPU faster</td><td>CPU remains preferable for typical decode batches.</td></tr>
+          <tr><td>R=64</td><td>4</td><td>CPU 1.15× faster</td><td>Concrete local miss-recovery anchor.</td></tr>
+          <tr><td>R=64</td><td>all swept S</td><td>CPU-first wins, roughly 2-50× in the corrected sweep</td><td>Small decode batches strongly favor CPU-first recovery.</td></tr>
+        </tbody>
+      </table>
+      <div class="grid">
+        <div class="card">
+          <h3>Updated crossover bullets</h3>
+          <ul>
+            <li>CPU wins for typical decode batches up to N_dec ≤ 8.</li>
+            <li>The old intuition “GPU is always faster” is false for miss recovery.</li>
+            <li>Use GPU only after the batch/rank crossover justifies launch and contention costs.</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3>Design implication</h3>
+          <p>The local policy should be CPU-first for small decode misses, then promote or reuse recovered adapters when future accesses make the transfer worthwhile.</p>
+        </div>
+      </div>
+      <!-- Hidden from rendered deck: Optimization-note rationale. The crossover slide should cite corrected benchmark evidence, not the earlier unoptimized kernel narrative. The key story is the stable CPU-first region after fixing synchronization and widening the small-kernel vectorization; implementation details belong in backup notes, not on the main slide. -->
+    </section>
+
+    <section class="slide" aria-labelledby="slide-5-title">
+      <span class="tag">Slide 5</span>
+      <h2 id="slide-5-title">The Cross-Machine Challenge</h2>
+      <p class="lead">A miss on UM253 may be recoverable from UM251, but the same fabric is also carrying expert-parallel traffic.</p>
+      <pre aria-label="UM253 and UM251 cross-machine miss-recovery diagram">UM253 request stream
+  ├─ local adapter cache: miss
+  ├─ local CPU recovery: possible
+  └─ remote path to UM251: adapter / delta / promotion
+
+UM251 adapter state
+  ├─ cached LoRA weights
+  ├─ candidate for reuse-aware promotion
+  └─ shares network with MoE EP all-to-all</pre>
+      <table>
+        <thead>
+          <tr><th>Strategy</th><th>Action</th><th>When it helps</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>S1</td><td>Remote fetch / direct transfer</td><td>When fabric is idle and remote cache has the adapter.</td></tr>
+          <tr><td>S2</td><td>Local CPU recovery</td><td>When decode batch is small or network is pressured.</td></tr>
+          <tr><td>S3</td><td>Hybrid recovery + promotion</td><td>When immediate CPU recovery can unblock decode and later reuse can justify promotion.</td></tr>
+        </tbody>
+      </table>
+      <blockquote>Key question: should a miss consume scarce cross-node bandwidth now, or recover locally and promote only when reuse makes the network cost worthwhile?</blockquote>
+    </section>
+
+    <section class="slide" aria-labelledby="slide-6-title">
+      <span class="tag">Slide 6</span>
+      <h2 id="slide-6-title">Cross-Node Results: Strategy Comparison</h2>
+      <p class="lead">Measured setup: UM253/UM251 cross-machine recovery benchmark with 60/60 configurations and a focused EP run.</p>
+      <table>
+        <thead>
+          <tr><th>Strategy</th><th>Observed behavior</th><th>Takeaway</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>S1: network-first</td><td>Fast when the network is free; exposed to EP traffic when the fabric is busy.</td><td>Good best case, fragile under contention.</td></tr>
+          <tr><td>S2: CPU-first</td><td>Stable for small decode batches; avoids immediate cross-node transfer.</td><td>Best latency hedge when EP pressure is unknown.</td></tr>
+          <tr><td>S3: hybrid</td><td>Unblocks decode locally, then promotes based on expected reuse and pressure.</td><td>Matches CoLoRA’s foreground + reuse-aware design.</td></tr>
+        </tbody>
+      </table>
+      <div class="grid">
+        <div class="card">
+          <h3>Key findings</h3>
+          <ul>
+            <li>Cross-node recovery is not only a bandwidth problem; timing relative to EP matters.</li>
+            <li>CPU-first is competitive for immediate decode latency at small N_dec.</li>
+            <li>Hybrid promotion preserves future reuse without forcing every miss onto the network.</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3>Claim boundary</h3>
+          <p>Use these measurements as strategy-comparison evidence; reserve stronger fabric-degradation claims for counter-validated pressure studies.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="slide" aria-labelledby="slide-7-title">
+      <span class="tag">Slide 7</span>
+      <h2 id="slide-7-title">EP Contention: Network Awareness Matters</h2>
+      <p class="lead">Counter-validated Python IPoIB run: the focused EP experiment shows path-specific contention, but not a final monotonic degradation curve.</p>
+      <table>
+        <thead>
+          <tr><th>EP load condition</th><th>Counter / timing signal</th><th>How to use it</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>No background EP</td><td>Baseline path latency and counters</td><td>Calibrate remote recovery when the fabric is quiet.</td></tr>
+          <tr><td>Focused Python IPoIB EP load</td><td>Counter-validated traffic on the target path</td><td>Qualitative evidence that recovery must be network-aware.</td></tr>
+          <tr><td>Higher nominal load</td><td>Not yet a validated monotonic curve</td><td>Do not overclaim until RDMA/QP-level or trace-backed evidence exists.</td></tr>
+        </tbody>
+      </table>
+      <ul>
+        <li>EP traffic and miss recovery can collide on the same fabric window.</li>
+        <li>Network-aware scheduling should react to measured pressure, not just configured load.</li>
+        <li><strong class="warn">Do not claim a monotonic measured EP-degradation curve yet.</strong></li>
+      </ul>
+      <!-- Hidden from rendered deck: The old ib_write_bw evidence is invalid for this main claim because it did not create the intended all-to-all EP-like contention on the measured path. Keep it out of rendered slides; mention only the counter-validated Python IPoIB run unless a stronger RDMA/QP-level generator or real MoE trace study is added. -->
+    </section>
+
+    <section class="slide" aria-labelledby="slide-7b-title">
+      <span class="tag">Slide 7b</span>
+      <h2 id="slide-7b-title">Insight: EP Load ≠ Effective Contention</h2>
+      <p class="lead">Nominal load settings are not enough; CoLoRA needs path-specific fabric pressure signals.</p>
+      <div class="grid">
+        <div class="card">
+          <h3>Why nominal load can fail</h3>
+          <ul>
+            <li>Traffic may use a different path or queue pair than miss recovery.</li>
+            <li>Timing may not overlap the recovery transfer window.</li>
+            <li>Host, socket, and IPoIB effects can hide or reshape fabric contention.</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3>Pressure signals to prefer</h3>
+          <ul>
+            <li>Per-path latency of recent recovery operations.</li>
+            <li>IB counters aligned with the target link and time window.</li>
+            <li>Queueing delay or retry signals from the actual communication path.</li>
+          </ul>
+        </div>
+      </div>
+      <blockquote>Schedule against measured, path-specific, time-local fabric pressure—not against nominal EP load labels.</blockquote>
+    </section>
+
+    <section class="slide" aria-labelledby="slide-8-title">
+      <span class="tag">Slide 8</span>
+      <h2 id="slide-8-title">CoLoRA Design: Hybrid Recovery Policy</h2>
+      <p class="lead">Recover the current token quickly, then decide whether promotion is worth the network cost.</p>
+      <pre aria-label="Hybrid recovery policy diagram">On LoRA cache miss during decode
+  ├─ estimate local crossover: rank, N_dec, CPU/GPU cost
+  ├─ estimate reuse: adapter popularity, active sequences, remaining tokens
+  ├─ sense fabric pressure: recent path latency + counters
+  └─ choose
+      ├─ CPU foreground recovery
+      ├─ GPU recovery when batch/rank crosses over
+      └─ deferred remote promotion when reuse is high and pressure is low</pre>
+      <ul>
+        <li>Foreground path optimizes the current decode step.</li>
+        <li>Promotion path optimizes future reuse, not immediate correctness.</li>
+        <li>The policy can be conservative: CPU-first for small N_dec, promote only when predicted reuse pays back.</li>
+      </ul>
+    </section>
+
+    <section class="slide" aria-labelledby="slide-9-title">
+      <span class="tag">Slide 9</span>
+      <h2 id="slide-9-title">CoLoRA Design: Network-Aware Scheduling</h2>
+      <p class="lead">Scheduling integrates EP pressure and adapter pre-cache opportunities before choosing a recovery path.</p>
+      <pre aria-label="EP and pre-cache scheduling diagram">Request arrives with adapter A
+  ├─ EP scheduler predicts expert traffic window
+  ├─ adapter cache manager checks local and remote A
+  ├─ pressure monitor reports path-specific fabric state
+  └─ CoLoRA scheduler
+      ├─ sense pressure
+      ├─ pre-cache or defer promotion when safe
+      └─ pick CPU / GPU / remote path for this miss</pre>
+      <ol>
+        <li><strong>Sense:</strong> use recent recovery latency and IB counters for the target path.</li>
+        <li><strong>Pre-cache:</strong> move adapters ahead of demand only when reuse is likely and EP pressure is low.</li>
+        <li><strong>Pick path:</strong> choose CPU, GPU, or remote recovery based on crossover and live pressure.</li>
+      </ol>
+      <blockquote>CoLoRA turns LoRA miss recovery from a fixed transfer decision into a network-aware scheduling decision.</blockquote>
+    </section>
   </main>
 </body>
 </html>
