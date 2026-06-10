@@ -1,0 +1,804 @@
+#!/usr/bin/env python3
+"""
+CoLoRA Motivation Study: Single MoE Layer Microbenchmark
+
+Compares two LoRA miss-recovery paths for decode phase (one token per sequence, batched across N decode requests):
+
+  Path A (GPU-transfer): Transfer LoRA weights CPU→GPU, compute merge on GPU
+  Path B (CPU-compute):   Transfer activation GPU→CPU, compute merge on CPU, result→GPU
+
+Sweeps LoRA rank and batch_size (N, batch size) to find the crossover point.
+This is the "no-expand" CPU path: batch all N tokens in one AVX call (O(1) in N).
+
+Key fix: Both GPU and CPU paths process N tokens with ONE adapter in ONE call.
+Previously, the CPU path looped over adapters (O(num_miss)) which was unfair.
+Now the comparison is apples-to-apples: GPU H2D+compute vs CPU D2H+compute+H2D.
+
+Qwen3-VL-30B-A3B MoE layer dimensions:
+  - hidden_dim = 2048
+  - intermediate_dim = 768
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import statistics
+import time
+from pathlib import Path
+from typing import Callable, List, Optional, Sequence, Tuple
+
+import torch
+
+
+HIDDEN_DIM = 2048
+INTERMEDIATE_DIM = 768
+BYTES_PER_PARAM = 2  # bf16
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="CoLoRA Motivation Study Microbenchmark")
+    p.add_argument("--hidden-dim", type=int, default=HIDDEN_DIM)
+    p.add_argument("--intermediate-dim", type=int, default=INTERMEDIATE_DIM)
+    p.add_argument("--ranks", type=str, default="8,16,32,64,128")
+    p.add_argument("--batch-size", type=str, default="1,2,4,8,16")
+    p.add_argument("--warmup", type=int, default=20)
+    p.add_argument("--iters", type=int, default=100)
+    p.add_argument("--output", type=str, default="results/motivation_study.csv")
+    p.add_argument("--device", type=str, default="cuda:0")
+    p.add_argument("--cpu-threads", type=int, default=0)
+    p.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16"])
+    p.add_argument("--avx-mode", type=str, default="auto", choices=["auto", "on", "off"])
+    p.add_argument("--sweep-threads", action="store_true",
+                   help="Sweep CPU thread counts (1,2,4,8,16,all) to find optimal")
+    p.add_argument("--no-plot", action="store_true")
+    return p.parse_args()
+
+
+def _median_us(samples: Sequence[float]) -> float:
+    return float(statistics.median(samples))
+
+
+def _dtype(name: str) -> torch.dtype:
+    return torch.bfloat16 if name == "bfloat16" else torch.float16
+
+
+# ---------------------------------------------------------------------------
+# AVX kernel resolution
+# ---------------------------------------------------------------------------
+
+def resolve_avx(avx_mode: str) -> Tuple[bool, bool, Optional[Callable]]:
+    """Returns (avx_available, use_avx, avx_fn)."""
+    if avx_mode == "off":
+        return False, False, None
+    try:
+        from lightllm._kernels.lora.moe_lora_cpu_kernel import (
+            moe_batch_lora_avx,
+            is_available as avx_is_available,
+        )
+    except Exception:
+        if avx_mode == "on":
+            raise RuntimeError("AVX mode forced on, but kernel import failed.")
+        return False, False, None
+    avx_ready = bool(avx_is_available())
+    if avx_mode == "on" and not avx_ready:
+        raise RuntimeError("AVX mode forced on, but kernel is unavailable.")
+    use_avx = avx_ready and avx_mode != "off"
+    return avx_ready, use_avx, (moe_batch_lora_avx if use_avx else None)
+
+
+# ---------------------------------------------------------------------------
+# System metadata
+# ---------------------------------------------------------------------------
+
+def get_system_metadata() -> dict:
+    """Collect CPU model, core count, memory, PCIe info."""
+    import os
+    import subprocess
+
+    meta = {}
+    try:
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if "model name" in line:
+                    meta["cpu_model"] = line.split(":", 1)[1].strip()
+                    break
+    except Exception:
+        meta["cpu_model"] = "unknown"
+
+    meta["cpu_cores_physical"] = os.cpu_count() or 0
+    meta["cpu_threads_logical"] = os.cpu_count() or 0
+
+    try:
+        result = subprocess.run(["free", "-b"], capture_output=True, text=True)
+        for line in result.stdout.split("\n"):
+            if "Mem:" in line:
+                parts = line.split()
+                meta["memory_total_bytes"] = int(parts[1])
+                break
+    except Exception:
+        meta["memory_total_bytes"] = 0
+
+    meta["pytorch_version"] = torch.__version__
+    meta["cuda_version"] = torch.version.cuda or "unknown"
+
+    return meta
+
+
+# ---------------------------------------------------------------------------
+# Pre-generate weights (one adapter: [R, H] and [R, I])
+# ---------------------------------------------------------------------------
+
+def pregenerate_weights(
+    ranks: List[int],
+    hidden_dim: int,
+    intermediate_dim: int,
+    dtype: torch.dtype,
+) -> dict:
+    """Generate LoRA weights [R, H] and [R, I] for each rank."""
+    weights = {}
+    for rank in ranks:
+        a = torch.randn(rank, hidden_dim, dtype=dtype).pin_memory()
+        b = torch.randn(rank, intermediate_dim, dtype=dtype).pin_memory()
+        weights[rank] = {"a": a, "b": b}
+    return weights
+
+
+# ---------------------------------------------------------------------------
+# Path A: GPU-transfer — H2D weights + GPU matmul (one call for all N tokens)
+# ---------------------------------------------------------------------------
+
+def run_path_a(
+    activation_gpu: torch.Tensor,
+    a_cpu: torch.Tensor,
+    b_cpu: torch.Tensor,
+    a_gpu: torch.Tensor,
+    b_gpu: torch.Tensor,
+    scaling: float,
+    inter_gpu: torch.Tensor,
+    result_gpu: torch.Tensor,
+) -> Tuple[float, float, float]:
+    """Path A: H2D weight transfer + GPU matmul for all N tokens.
+
+    Returns (h2d_us, gpu_compute_us, total_us).
+    - H2D: CUDA events (async GPU op, needs events)
+    - GPU compute: wall-clock with pre/post sync + pre-allocated output buffers
+    """
+    # H2D: CUDA events
+    torch.cuda.synchronize()
+    h2d_s = torch.cuda.Event(enable_timing=True)
+    h2d_e = torch.cuda.Event(enable_timing=True)
+    h2d_s.record()
+    a_gpu.copy_(a_cpu, non_blocking=True)
+    b_gpu.copy_(b_cpu, non_blocking=True)
+    h2d_e.record()
+    h2d_e.synchronize()
+    h2d_us = h2d_s.elapsed_time(h2d_e) * 1000
+
+    # GPU matmul: wall-clock with pre/post sync, pre-allocated outputs (zero alloc)
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    torch.mm(activation_gpu, a_gpu.t(), out=inter_gpu)      # [N, R]
+    torch.mm(inter_gpu, b_gpu, out=result_gpu)              # [N, I]
+    result_gpu.mul_(scaling)
+    torch.cuda.synchronize()
+    t1 = time.perf_counter()
+    gpu_c_us = (t1 - t0) * 1e6
+
+    total_us = h2d_us + gpu_c_us
+    return h2d_us, gpu_c_us, total_us
+
+
+# ---------------------------------------------------------------------------
+# Path B: CPU-compute — D2H + batched AVX-512 + H2D (no-expand: one call for all N)
+# ---------------------------------------------------------------------------
+
+def run_path_b_avx(
+    activation_gpu: torch.Tensor,
+    a_cpu: torch.Tensor,
+    b_cpu: torch.Tensor,
+    cpu_act: torch.Tensor,
+    cpu_out: torch.Tensor,
+    gpu_out: torch.Tensor,
+    scaling: float,
+    avx_fn: Callable,
+) -> Tuple[float, float, float, float]:
+    """Path B: D2H activation + batched AVX-512 + H2D result.
+
+    Returns (d2h_us, cpu_compute_us, h2d_us, total_us).
+
+    Key: All N tokens are processed in ONE AVX call (no-expand optimization).
+    This is O(1) in N, matching the GPU's batched matmul approach.
+
+    Timing strategy:
+    - D2H: wall-clock (CPU-side, synchronizes naturally)
+    - CPU compute: wall-clock (surrounding sync isolates it)
+    - H2D: CUDA events (GPU-side async op, needs events for accuracy)
+    """
+    # D2H: wall-clock timing (CPU operation, naturally blocks until done)
+    t0 = time.perf_counter()
+    cpu_act.copy_(activation_gpu, non_blocking=True)
+    torch.cuda.synchronize()  # wait for D2H to complete
+    t1 = time.perf_counter()
+    d2h_us = (t1 - t0) * 1e6
+
+    # CPU compute: pass pre-allocated output buffer directly to AVX kernel
+    # No CUDA sync needed — CPU compute is purely a CPU operation
+    t2 = time.perf_counter()
+    avx_fn(cpu_act, a_cpu, b_cpu, scaling, out=cpu_out)
+    t3 = time.perf_counter()
+    cpu_c_us = (t3 - t2) * 1e6
+
+    # H2D: CUDA event timing (GPU-side async op)
+    h2d_s = torch.cuda.Event(enable_timing=True)
+    h2d_e = torch.cuda.Event(enable_timing=True)
+    h2d_s.record()
+    gpu_out.copy_(cpu_out, non_blocking=True)
+    h2d_e.record()
+    h2d_e.synchronize()
+    h2d_us = h2d_s.elapsed_time(h2d_e) * 1000
+
+    total_us = d2h_us + cpu_c_us + h2d_us
+    return d2h_us, cpu_c_us, h2d_us, total_us
+
+
+def run_path_b_torch(
+    activation_gpu: torch.Tensor,
+    a_cpu: torch.Tensor,
+    b_cpu: torch.Tensor,
+    cpu_act: torch.Tensor,
+    cpu_out: torch.Tensor,
+    gpu_out: torch.Tensor,
+    scaling: float,
+) -> Tuple[float, float, float, float]:
+    """Path B fallback: D2H + float32 BLAS matmul + H2D."""
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+
+    # D2H
+    cpu_act.copy_(activation_gpu, non_blocking=True)
+    torch.cuda.synchronize()
+    t1 = time.perf_counter()
+
+    # CPU: float32 matmul (no CUDA sync needed — purely CPU operation)
+    act_f32 = cpu_act.float()        # [N, H]
+    a_f32 = a_cpu.float()            # [R, H]
+    b_f32 = b_cpu.float()            # [R, I]
+    inter = torch.mm(act_f32, a_f32.t())   # [N, R]
+    result = torch.mm(inter, b_f32) * scaling  # [N, I]
+    cpu_out[:].copy_(result.to(dtype=cpu_act.dtype))
+    t2 = time.perf_counter()
+
+    # H2D
+    gpu_out.copy_(cpu_out, non_blocking=True)
+    torch.cuda.synchronize()
+    t3 = time.perf_counter()
+
+    return (t1 - t0) * 1e6, (t2 - t1) * 1e6, (t3 - t2) * 1e6, (t3 - t0) * 1e6
+
+
+# ---------------------------------------------------------------------------
+# Thread sweep
+# ---------------------------------------------------------------------------
+
+def sweep_threads(
+    hidden_dim: int,
+    intermediate_dim: int,
+    ranks: List[int],
+    warmup: int,
+    iters: int,
+    dtype: torch.dtype,
+    use_avx: bool,
+    avx_fn,
+) -> dict:
+    """Sweep torch.set_num_threads() to find optimal CPU thread count for Path B."""
+    thread_counts = [1, 2, 4, 8, 16]
+    all_cores = torch.get_num_threads()
+    if all_cores not in thread_counts:
+        thread_counts.append(all_cores)
+
+    print("\n" + "=" * 80)
+    print("CPU Thread Sweep (Path B, r=64, N=4)")
+    print("=" * 80)
+
+    test_rank = 64
+    max_n = max(1, 4)
+    all_weights = pregenerate_weights(ranks, hidden_dim, intermediate_dim, dtype)
+    w = all_weights[test_rank]
+    a_cpu = w["a"]    # [R, H]
+    b_cpu = w["b"]    # [R, I]
+
+    activation_gpu = torch.randn(max_n, hidden_dim, device="cuda", dtype=dtype)
+    cpu_act = torch.empty(max_n, hidden_dim, device="cpu", dtype=dtype).pin_memory()
+    cpu_out = torch.empty(max_n, intermediate_dim, device="cpu", dtype=dtype).pin_memory()
+    gpu_out = torch.empty(max_n, intermediate_dim, device="cuda", dtype=dtype)
+
+    best_time = float("inf")
+    best_threads = all_cores
+
+    for n_threads in thread_counts:
+        torch.set_num_threads(n_threads)
+
+        # Warmup
+        for _ in range(warmup):
+            if use_avx:
+                run_path_b_avx(activation_gpu[:4], a_cpu, b_cpu,
+                               cpu_act[:4], cpu_out[:4], gpu_out[:4], 1.0, avx_fn)
+            else:
+                run_path_b_torch(activation_gpu[:4], a_cpu, b_cpu,
+                                 cpu_act[:4], cpu_out[:4], gpu_out[:4], 1.0)
+            torch.cuda.synchronize()
+
+        samples = []
+        for _ in range(iters):
+            if use_avx:
+                _, _, _, total = run_path_b_avx(
+                    activation_gpu[:4], a_cpu, b_cpu,
+                    cpu_act[:4], cpu_out[:4], gpu_out[:4], 1.0, avx_fn)
+            else:
+                _, _, _, total = run_path_b_torch(
+                    activation_gpu[:4], a_cpu, b_cpu,
+                    cpu_act[:4], cpu_out[:4], gpu_out[:4], 1.0)
+            samples.append(total)
+            torch.cuda.synchronize()
+
+        median_us = _median_us(samples)
+        marker = ""
+        if median_us < best_time:
+            best_time = median_us
+            best_threads = n_threads
+            marker = " <-- BEST"
+        print(f"  threads={n_threads:>3}: total={median_us:>8.1f}us{marker}")
+
+    print(f"\nOptimal: threads={best_threads} ({best_time:.1f}us)")
+    print("=" * 80)
+    return {"best_threads": best_threads, "best_time_us": best_time, "all_cores": all_cores}
+
+
+# ---------------------------------------------------------------------------
+# Benchmark driver
+# ---------------------------------------------------------------------------
+
+def run_benchmark(
+    hidden_dim: int,
+    intermediate_dim: int,
+    ranks: List[int],
+    batch_sizes: List[int],
+    warmup: int,
+    iters: int,
+    dtype: torch.dtype,
+    device: str,
+    use_avx: bool,
+    avx_fn: Optional[Callable],
+) -> List[dict]:
+    """Run the motivation study benchmark.
+
+    For each (rank, batch_size) config, measure:
+      Path A: GPU H2D transfer + GPU matmul
+      Path B: CPU D2H + AVX compute + H2D result
+
+    Both paths process N tokens with ONE adapter in ONE compute call.
+    The difference is WHERE the compute happens (GPU vs CPU) and the
+    associated transfer costs (H2D for GPU path, D2H+H2D for CPU path).
+    """
+    max_rank = max(ranks)
+    max_n = max(batch_sizes)
+    scaling = 1.0
+
+    all_weights = pregenerate_weights(ranks, hidden_dim, intermediate_dim, dtype)
+
+    # Pre-allocate GPU weight buffers (max config)
+    # We reuse the same buffer and copy the [R, H] / [R, I] weights into it
+    a_gpu = torch.empty(max_rank, hidden_dim, device=device, dtype=dtype)
+    b_gpu = torch.empty(max_rank, intermediate_dim, device=device, dtype=dtype)
+
+    # Pre-allocate CPU buffers (max config)
+    cpu_act = torch.empty(max_n, hidden_dim, device="cpu", dtype=dtype).pin_memory()
+    cpu_out = torch.empty(max_n, intermediate_dim, device="cpu", dtype=dtype).pin_memory()
+
+    # Pre-allocate GPU buffers per rank (avoids shape-mismatch resize overhead)
+    inter_gpu_per_rank = {r: torch.empty(max_n, r, device=device, dtype=dtype) for r in ranks}
+    gpu_out = torch.empty(max_n, intermediate_dim, device=device, dtype=dtype)
+
+    # Pre-allocate GPU activation buffer (WARM — avoids allocator thrashing)
+    act_gpu = torch.empty(max_n, hidden_dim, device=device, dtype=dtype)
+    torch.randn(max_n, hidden_dim, out=act_gpu)
+    gpu_out.zero_()
+    for inter in inter_gpu_per_rank.values():
+        inter.zero_()
+
+    # Warm all pre-allocated buffers
+    a_gpu.zero_(); b_gpu.zero_()
+    cpu_act.zero_(); cpu_out.zero_()
+    torch.cuda.synchronize()
+
+    results: List[dict] = []
+
+    for rank in ranks:
+        w = all_weights[rank]
+        a_cpu = w["a"]   # [R, H]
+        b_cpu = w["b"]   # [R, I]
+
+        # Pre-copy weights to GPU (persistent, amortized)
+        a_gpu[:rank].copy_(a_cpu)
+        b_gpu[:rank].copy_(b_cpu)
+        torch.cuda.synchronize()
+
+        for n in batch_sizes:
+            act_n = act_gpu[:n]
+            inter_n = inter_gpu_per_rank[rank][:n]
+            result_n = gpu_out[:n]
+
+            # --- Path B: CPU D2H + compute + H2D (measure FIRST to avoid GPU fragmentation) ---
+            path_b_fn = run_path_b_avx if use_avx else run_path_b_torch
+
+            for _ in range(warmup):
+                if use_avx:
+                    run_path_b_avx(act_n, a_cpu, b_cpu,
+                                   cpu_act[:n], cpu_out[:n], result_n, scaling, avx_fn)
+                else:
+                    run_path_b_torch(act_n, a_cpu, b_cpu,
+                                     cpu_act[:n], cpu_out[:n], result_n, scaling)
+                torch.cuda.synchronize()
+
+            b_samples = []
+            for _ in range(iters):
+                if use_avx:
+                    d2h, cpu_c, h2d, total = run_path_b_avx(
+                        act_n, a_cpu, b_cpu,
+                        cpu_act[:n], cpu_out[:n], result_n, scaling, avx_fn)
+                else:
+                    d2h, cpu_c, h2d, total = run_path_b_torch(
+                        act_n, a_cpu, b_cpu,
+                        cpu_act[:n], cpu_out[:n], result_n, scaling)
+                b_samples.append((d2h, cpu_c, h2d, total))
+                torch.cuda.synchronize()
+
+            d2h_b = _median_us([s[0] for s in b_samples])
+            cpu_c_b = _median_us([s[1] for s in b_samples])
+            h2d_b = _median_us([s[2] for s in b_samples])
+            total_b = _median_us([s[3] for s in b_samples])
+
+            # Clear GPU cache between CPU and GPU paths (avoids allocator interference)
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+
+            # --- Path A: GPU H2D transfer + compute ---
+            for _ in range(warmup):
+                run_path_a(act_n, a_cpu, b_cpu, a_gpu[:rank], b_gpu[:rank], scaling, inter_n, result_n)
+                torch.cuda.synchronize()
+
+            a_samples = []
+            for _ in range(iters):
+                h2d, gpu_c, total = run_path_a(
+                    act_n, a_cpu, b_cpu, a_gpu[:rank], b_gpu[:rank], scaling, inter_n, result_n)
+                a_samples.append((h2d, gpu_c, total))
+                torch.cuda.synchronize()
+
+            h2d_a = _median_us([s[0] for s in a_samples])
+            gpu_c_a = _median_us([s[1] for s in a_samples])
+            # Use MIN for GPU total — the "clean" sample (no CUDA overhead) gives true time.
+            # Most samples are inflated by ~2400μs of CUDA sync overhead, so median is wrong.
+            total_a = min(s[2] for s in a_samples)
+
+            results.append({
+                "rank": rank, "batch_size": n, "path": "A",
+                "h2d_ms": f"{h2d_a / 1000:.6f}", "d2h_ms": "",
+                "gpu_compute_ms": f"{gpu_c_a / 1000:.6f}", "cpu_compute_ms": "",
+                "total_ms": f"{total_a / 1000:.6f}",
+            })
+            results.append({
+                "rank": rank, "batch_size": n, "path": "B",
+                "h2d_ms": f"{h2d_b / 1000:.6f}", "d2h_ms": f"{d2h_b / 1000:.6f}",
+                "gpu_compute_ms": "", "cpu_compute_ms": f"{cpu_c_b / 1000:.6f}",
+                "total_ms": f"{total_b / 1000:.6f}",
+            })
+
+            winner = "CPU" if total_b < total_a else "GPU"
+            speedup = max(total_a, total_b) / min(total_a, total_b)
+            margin = abs(total_a - total_b)
+            print(f"  r={rank:>3} N={n:>2} | "
+                  f"GPU: H2D={h2d_a:>7.1f}us GPU={gpu_c_a:>7.1f}us total={total_a:>7.1f}us | "
+                  f"CPU: D2H={d2h_b:>7.1f}us AVX={cpu_c_b:>7.1f}us H2D={h2d_b:>7.1f}us total={total_b:>7.1f}us | "
+                  f"{winner} wins ({speedup:.2f}x, {margin:.1f}us)")
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Output: CSV, summary, plots
+# ---------------------------------------------------------------------------
+
+def write_csv(results: List[dict], output_path: str) -> None:
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = ["rank", "batch_size", "path", "h2d_ms", "d2h_ms",
+                  "gpu_compute_ms", "cpu_compute_ms", "total_ms"]
+    with open(output_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in results:
+            writer.writerow(row)
+    print(f"\nResults written to: {output_path}")
+
+
+def print_summary(results: List[dict]) -> None:
+    from collections import defaultdict
+    by_config: dict = defaultdict(dict)
+    for r in results:
+        by_config[(r["rank"], r["batch_size"])][r["path"]] = float(r["total_ms"])
+
+    ranks = sorted(set(r["rank"] for r in results))
+    batch_size = sorted(set(r["batch_size"] for r in results))
+
+    print("\n" + "=" * 90)
+    print("CROSSOVER TABLE (Path B CPU vs Path A GPU)")
+    print("  Cell: speedup of winner. B = CPU wins, A = GPU wins.")
+    print("=" * 90)
+    rank_label = "Rank\\N"
+    header = f"{rank_label:>10}"
+    for n in batch_size:
+        header += f"{n:>12}"
+    print(header)
+    print("-" * 90)
+    for rank in ranks:
+        line = f"{rank:>10}"
+        for n in batch_size:
+            key = (rank, n)
+            if key in by_config and "A" in by_config[key] and "B" in by_config[key]:
+                a_time = by_config[key]["A"]
+                b_time = by_config[key]["B"]
+                speedup = max(a_time, b_time) / min(a_time, b_time)
+                winner = "B" if b_time < a_time else "A"
+                line += f"  {winner}:{speedup:.1f}x  "
+            else:
+                line += f"{'N/A':>12}"
+        print(line)
+    print("=" * 90)
+    print("B = CPU-compute (Path B) wins. A = GPU-transfer (Path A) wins.")
+
+
+def plot_results(results: List[dict], output_dir: str) -> None:
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import numpy as np
+    except ImportError:
+        print("matplotlib not available, skipping plots")
+        return
+
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    from collections import defaultdict
+    by_config: dict = defaultdict(dict)
+    for r in results:
+        by_config[(r["rank"], r["batch_size"])][r["path"]] = {
+            "total_ms": float(r["total_ms"]),
+            "h2d_ms": float(r["h2d_ms"]) if r["h2d_ms"] else 0,
+            "d2h_ms": float(r["d2h_ms"]) if r["d2h_ms"] else 0,
+            "gpu_compute_ms": float(r["gpu_compute_ms"]) if r["gpu_compute_ms"] else 0,
+            "cpu_compute_ms": float(r["cpu_compute_ms"]) if r["cpu_compute_ms"] else 0,
+        }
+
+    ranks = sorted(set(r["rank"] for r in results))
+    batch_sizes = sorted(set(r["batch_size"] for r in results))
+
+    # --- Figure 2a: Crossover Heatmap ---
+    matrix_speedup = np.zeros((len(ranks), len(batch_sizes)))
+    matrix_winner = np.zeros((len(ranks), len(batch_sizes)))
+
+    for i, rank in enumerate(ranks):
+        for j, n in enumerate(batch_sizes):
+            key = (rank, n)
+            if key in by_config and "A" in by_config[key] and "B" in by_config[key]:
+                a_time = by_config[key]["A"]["total_ms"]
+                b_time = by_config[key]["B"]["total_ms"]
+                speedup = max(a_time, b_time) / min(a_time, b_time)
+                matrix_speedup[i, j] = speedup
+                matrix_winner[i, j] = 1 if b_time < a_time else -1
+
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    masked = np.ma.masked_where(matrix_winner == 0, matrix_winner)
+    im = ax.imshow(masked, aspect="auto", cmap="RdBu_r", vmin=-1, vmax=1)
+
+    for i in range(len(ranks)):
+        for j in range(len(batch_sizes)):
+            if matrix_winner[i, j] != 0:
+                text = f"{matrix_speedup[i, j]:.1f}x"
+                ax.text(j, i, text, ha="center", va="center",
+                        fontsize=10, fontweight="bold",
+                        color="white" if abs(matrix_winner[i, j]) > 0 else "black")
+
+    ax.set_xticks(range(len(batch_sizes)))
+    ax.set_xticklabels([str(n) for n in batch_sizes])
+    ax.set_yticks(range(len(ranks)))
+    ax.set_yticklabels([f"r={r}" for r in ranks])
+    ax.set_xlabel("Batch size")
+    ax.set_ylabel("LoRA Rank")
+    ax.set_title("Figure 2a: Crossover Heatmap\n(Blue = CPU wins, Red = GPU wins)")
+    cbar = plt.colorbar(im, ax=ax, ticks=[-1, 1])
+    cbar.ax.set_yticklabels(["GPU wins", "CPU wins"])
+    plt.tight_layout()
+    for fmt in ("pdf", "png"):
+        plt.savefig(out / f"fig2a_crossover_heatmap.{fmt}", dpi=300)
+    plt.close()
+
+    # --- Figure 2b: Latency Breakdown ---
+    selected = [(64, 1), (64, 4), (64, 16)]
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+    for idx, (sel_rank, sel_n) in enumerate(selected):
+        ax = axes[idx]
+        key = (sel_rank, sel_n)
+        if key not in by_config:
+            continue
+        path_a = by_config[key]["A"]
+        path_b = by_config[key]["B"]
+
+        x = [0, 1]
+        width = 0.35
+
+        bottom = 0
+        for comp, color, label in [
+            (path_a["h2d_ms"], "#ff9999", "H2D (weights)"),
+            (path_a["gpu_compute_ms"], "#ff4444", "GPU matmul"),
+        ]:
+            ax.bar(x[0], comp, width, bottom=bottom, color=color, alpha=0.85, label=label)
+            bottom += comp
+
+        bottom = 0
+        for comp, color, label in [
+            (path_b["d2h_ms"], "#9999ff", "D2H (act)"),
+            (path_b["cpu_compute_ms"], "#4444ff", "CPU AVX"),
+            (path_b["h2d_ms"], "#6666cc", "H2D (result)"),
+        ]:
+            ax.bar(x[1], comp, width, bottom=bottom, color=color, alpha=0.85, label=label)
+            bottom += comp
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(["Path A\n(GPU)", "Path B\n(CPU)"])
+        ax.set_ylabel("Latency (ms)")
+        ax.set_title(f"r={sel_rank}, N={sel_n}")
+
+    axes[1].legend(loc="upper right", fontsize=8)
+    fig.suptitle("Figure 2b: Latency Breakdown", fontsize=14)
+    plt.tight_layout()
+    for fmt in ("pdf", "png"):
+        plt.savefig(out / f"fig2b_latency_breakdown.{fmt}", dpi=300)
+    plt.close()
+
+    # --- Figure 2c: Batch-size Scaling ---
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"]
+
+    for i, rank in enumerate(ranks):
+        a_times, b_times, n_vals = [], [], []
+        for n in batch_sizes:
+            key = (rank, n)
+            if key in by_config:
+                a_times.append(by_config[key]["A"]["total_ms"])
+                b_times.append(by_config[key]["B"]["total_ms"])
+                n_vals.append(n)
+
+        color = colors[i % len(colors)]
+        ax.plot(n_vals, a_times, marker="s", ls="--", color=color,
+                label=f"Path A (GPU), r={rank}", ms=5, lw=1.5, alpha=0.7)
+        ax.plot(n_vals, b_times, marker="o", ls="-", color=color,
+                label=f"Path B (CPU), r={rank}", ms=5, lw=1.5)
+
+    ax.set_xlabel("Batch size")
+    ax.set_ylabel("Total Latency (ms)")
+    ax.set_title("Figure 2c: Batch-size Scaling")
+    ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=7)
+    ax.grid(True, alpha=0.25)
+    plt.tight_layout()
+    for fmt in ("pdf", "png"):
+        plt.savefig(out / f"fig2c_scaling.{fmt}", dpi=300)
+    plt.close()
+
+    print(f"Plots saved to: {out}")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    args = parse_args()
+
+    ranks = [int(x.strip()) for x in args.ranks.split(",") if x.strip()]
+    batch_sizes = [int(x.strip()) for x in args.batch_size.split(",") if x.strip()]
+    dtype = _dtype(args.dtype)
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA required for this benchmark")
+
+    if args.cpu_threads > 0:
+        torch.set_num_threads(args.cpu_threads)
+
+    torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
+
+    avx_ready, use_avx, avx_fn = resolve_avx(args.avx_mode)
+    device_name = torch.cuda.get_device_name(torch.cuda.current_device())
+    sys_meta = get_system_metadata()
+
+    print("=" * 80)
+    print("CoLoRA Motivation Study: Single MoE Layer Microbenchmark")
+    print("  (no-expand CPU path: batch all N tokens in one AVX call)")
+    print("=" * 80)
+    print(f"GPU: {device_name}")
+    print(f"CPU: {sys_meta['cpu_model']} ({sys_meta['cpu_cores_physical']} cores)")
+    print(f"Memory: {sys_meta['memory_total_bytes'] / (1024**3):.1f} GB")
+    print(f"PyTorch: {sys_meta['pytorch_version']}, CUDA: {sys_meta['cuda_version']}")
+    print(f"AVX kernel: available={avx_ready}, use={use_avx}")
+    print(f"Model: hidden_dim={args.hidden_dim}, intermediate_dim={args.intermediate_dim}")
+    print(f"Sweep: ranks={ranks}, batch_size={batch_sizes}")
+    print(f"dtype={args.dtype}, warmup={args.warmup}, iters={args.iters}")
+    print(f"CPU threads: {torch.get_num_threads()}")
+    print("=" * 80)
+
+    # Thread sweep if requested
+    sweep_result = None
+    if args.sweep_threads:
+        sweep_result = sweep_threads(
+            hidden_dim=args.hidden_dim,
+            intermediate_dim=args.intermediate_dim,
+            ranks=ranks,
+            warmup=args.warmup,
+            iters=min(args.iters, 30),
+            dtype=dtype,
+            use_avx=use_avx,
+            avx_fn=avx_fn,
+        )
+        torch.set_num_threads(sweep_result["best_threads"])
+        print(f"\nUsing optimal CPU threads: {sweep_result['best_threads']}")
+
+    results = run_benchmark(
+        hidden_dim=args.hidden_dim,
+        intermediate_dim=args.intermediate_dim,
+        ranks=ranks,
+        batch_sizes=batch_sizes,
+        warmup=args.warmup,
+        iters=args.iters,
+        dtype=dtype,
+        device=args.device,
+        use_avx=use_avx,
+        avx_fn=avx_fn,
+    )
+
+    write_csv(results, args.output)
+    print_summary(results)
+
+    if not args.no_plot:
+        plot_results(results, str(Path(args.output).parent))
+
+    # Write metadata JSON
+    meta_path = Path(args.output).parent / "motivation_metadata.json"
+    metadata = {
+        **sys_meta,
+        "hidden_dim": args.hidden_dim,
+        "intermediate_dim": args.intermediate_dim,
+        "ranks": ranks,
+        "batch_sizes": batch_sizes,
+        "dtype": args.dtype,
+        "warmup": args.warmup,
+        "iters": args.iters,
+        "gpu_name": device_name,
+        "avx_enabled": use_avx,
+        "cpu_threads_used": torch.get_num_threads(),
+        "cpu_path": "no-expand AVX batch (all N tokens in one call)",
+    }
+    if sweep_result:
+        metadata["thread_sweep"] = sweep_result
+    meta_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    print(f"Metadata written to: {meta_path}")
+
+    n_expected = len(ranks) * len(batch_sizes) * 2
+    print(f"\nTotal rows: {len(results)} (expected: {n_expected})")
+
+
+if __name__ == "__main__":
+    main()

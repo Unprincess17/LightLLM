@@ -73,7 +73,8 @@ def moe_batch_lora_avx(
     x: torch.Tensor,
     A: torch.Tensor,
     B: torch.Tensor,
-    scaling: float
+    scaling: float,
+    out: torch.Tensor = None,
 ) -> torch.Tensor:
     """
     Apply MoE-specific LoRA using AVX-512 BF16 instructions.
@@ -86,6 +87,7 @@ def moe_batch_lora_avx(
         A: LoRA projection matrix A [R, H]
         B: LoRA projection matrix B [R, out_dim]
         scaling: Scaling factor for the LoRA output
+        out: Optional pre-allocated output tensor [N, out_dim]. If None, allocates internally.
 
     Returns:
         LoRA output [N, out_dim]
@@ -94,12 +96,15 @@ def moe_batch_lora_avx(
     if _moe_lora_cpu_kernel is None:
         raise RuntimeError("moe_lora_cpu_kernel extension failed to load")
     out_H = B.shape[1]  # Output dimension (intermediate_dim for gate/up, hidden_size for down)
-    output = torch.zeros(x.shape[0], out_H, dtype=x.dtype, device=x.device)
+    if out is None:
+        out = torch.zeros(x.shape[0], out_H, dtype=x.dtype, device=x.device)
+    else:
+        out.zero_()
     _moe_lora_cpu_kernel.moe_batch_lora_avx(
-        x, A, B, output,
+        x, A, B, out,
         x.shape[0], x.shape[1], A.shape[0], out_H, scaling
     )
-    return output
+    return out
 
 def moe_batch_lora_gate_avx(
     x: torch.Tensor,

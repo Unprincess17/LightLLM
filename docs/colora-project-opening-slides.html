@@ -1,0 +1,689 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CoLoRA Opening Deck TODOs</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --panel: #111827;
+      --panel-2: #1f2937;
+      --text: #e5e7eb;
+      --muted: #9ca3af;
+      --line: #334155;
+      --accent: #38bdf8;
+      --ok: #22c55e;
+      --warn: #f59e0b;
+      --bad: #ef4444;
+      --win: #a78bfa;
+      --shadow: 0 24px 70px rgba(0, 0, 0, 0.34);
+      --radius: 18px;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: radial-gradient(circle at top left, rgba(56, 189, 248, 0.22), transparent 34%), var(--bg);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.55;
+    }
+
+    .deck {
+      width: min(1180px, calc(100vw - 48px));
+      margin: 0 auto;
+      padding: 42px 0;
+    }
+
+    .dashboard {
+      background: linear-gradient(145deg, rgba(17, 24, 39, 0.96), rgba(15, 23, 42, 0.98));
+      border: 1px solid rgba(148, 163, 184, 0.24);
+      border-radius: calc(var(--radius) + 8px);
+      box-shadow: var(--shadow);
+      padding: 34px;
+    }
+
+    .slide {
+      min-height: 720px;
+      padding: 42px;
+      border-radius: var(--radius);
+      background: var(--panel);
+    }
+
+    h1,
+    h2,
+    h3 {
+      margin: 0 0 0.55em;
+      line-height: 1.12;
+      letter-spacing: -0.035em;
+    }
+
+    h1 {
+      font-size: clamp(2.4rem, 5vw, 4.6rem);
+    }
+
+    h2 {
+      font-size: clamp(1.7rem, 3vw, 2.6rem);
+    }
+
+    h3 {
+      font-size: 1.1rem;
+      color: var(--accent);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 1rem 0;
+      overflow: hidden;
+      border-radius: 12px;
+    }
+
+    th,
+    td {
+      padding: 0.8rem 1rem;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      color: #f8fafc;
+      background: rgba(56, 189, 248, 0.1);
+    }
+
+    pre {
+      margin: 1rem 0;
+      padding: 1rem;
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: #020617;
+      color: #d1fae5;
+    }
+
+    blockquote {
+      margin: 1rem 0;
+      padding: 1rem 1.2rem;
+      border-left: 4px solid var(--accent);
+      border-radius: 0 12px 12px 0;
+      background: rgba(56, 189, 248, 0.08);
+      color: #dbeafe;
+    }
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      padding: 0.2rem 0.58rem;
+      border: 1px solid rgba(148, 163, 184, 0.35);
+      border-radius: 999px;
+      color: #e0f2fe;
+      background: rgba(14, 165, 233, 0.12);
+      font-size: 0.82rem;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+    }
+
+    .muted {
+      color: var(--muted);
+    }
+
+    .lead {
+      max-width: 780px;
+      margin: 0;
+      color: #cbd5e1;
+      font-size: clamp(1.05rem, 1.7vw, 1.35rem);
+    }
+
+    .ok {
+      color: var(--ok);
+    }
+
+    .warn {
+      color: var(--warn);
+    }
+
+    .bad {
+      color: var(--bad);
+    }
+
+    .win {
+      color: var(--win);
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 18px;
+    }
+
+    .grid3 {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 18px;
+    }
+
+    .card {
+      border: 1px solid rgba(148, 163, 184, 0.2);
+      border-radius: var(--radius);
+      background: rgba(31, 41, 55, 0.68);
+      padding: 20px;
+    }
+
+    .dashboard-header {
+      display: flex;
+      justify-content: space-between;
+      gap: 24px;
+      align-items: flex-start;
+      margin-bottom: 26px;
+    }
+
+    .dashboard-title {
+      display: grid;
+      gap: 10px;
+    }
+
+    .dashboard-title h1 {
+      margin-bottom: 0;
+    }
+
+    .summary-counts {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 14px;
+      margin: 28px 0;
+    }
+
+    .count-card {
+      display: grid;
+      gap: 4px;
+      min-height: 112px;
+      align-content: center;
+      padding: 18px;
+      border: 1px solid rgba(148, 163, 184, 0.24);
+      border-radius: var(--radius);
+      background: rgba(15, 23, 42, 0.72);
+    }
+
+    .count-card strong {
+      display: block;
+      font-size: 2.5rem;
+      line-height: 1;
+    }
+
+    .count-card span {
+      color: var(--muted);
+      font-weight: 700;
+    }
+
+    details {
+      margin-top: 16px;
+      border: 1px solid rgba(148, 163, 184, 0.22);
+      border-radius: var(--radius);
+      background: rgba(15, 23, 42, 0.66);
+      overflow: hidden;
+    }
+
+    summary {
+      cursor: pointer;
+      padding: 18px 20px;
+      color: #f8fafc;
+      font-size: 1.05rem;
+      font-weight: 800;
+      list-style-position: inside;
+      background: rgba(31, 41, 55, 0.7);
+    }
+
+    .checklist-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      padding: 18px;
+    }
+
+    .checklist-grid .card {
+      min-height: 96px;
+    }
+
+    footer {
+      margin-top: 28px;
+      padding-top: 18px;
+      border-top: 1px solid rgba(148, 163, 184, 0.18);
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+
+    @media (max-width: 850px) {
+      .deck {
+        width: min(100% - 28px, 1180px);
+        padding: 18px 0;
+      }
+
+      .dashboard {
+        padding: 22px;
+      }
+
+      .dashboard-header,
+      .summary-counts,
+      .grid,
+      .grid3,
+      .checklist-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .dashboard-header {
+        display: grid;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="deck">
+    <section class="dashboard" aria-labelledby="dashboard-title">
+      <header class="dashboard-header">
+        <div class="dashboard-title">
+          <span class="tag">Canonical checklist</span>
+          <h1 id="dashboard-title">CoLoRA Opening Deck TODOs</h1>
+          <p class="lead">This dashboard is Claude-readable and human-readable. Treat it as the canonical checklist for the CoLoRA opening deck conversion.</p>
+        </div>
+      </header>
+
+      <div class="summary-counts" aria-label="Dashboard summary counts">
+        <div class="count-card"><strong class="ok">6</strong><span>Done / Keep</span></div>
+        <div class="count-card"><strong class="warn">3</strong><span>Stale / Retire</span></div>
+        <div class="count-card"><strong class="win">3</strong><span>Active Next</span></div>
+        <div class="count-card"><strong class="bad">2</strong><span>Decisions</span></div>
+      </div>
+
+      <details open>
+        <summary>Done / Keep</summary>
+        <div class="checklist-grid">
+          <div class="card">Local CPU/GPU crossover is measured and optimized; CPU wins for typical decode batches up to N_dec ≤ 8.</div>
+          <div class="card">Cross-node S1/S2/S3 benchmark is collected, including the 60/60 configurations and focused EP run.</div>
+          <div class="card">Calibration anchor file exists.</div>
+          <div class="card">System TPOT simulation and synthetic sweeps exist.</div>
+          <div class="card">Small live validation pipeline exists.</div>
+          <div class="card">Figure assembly pipeline exists.</div>
+        </div>
+      </details>
+
+      <details open>
+        <summary>Stale / Retire</summary>
+        <div class="checklist-grid">
+          <div class="card">“Case studies need anchor file” is stale because the calibration anchor exists.</div>
+          <div class="card">“Minimal E2E validation is only planned” is stale because the B11 live-validation pipeline exists.</div>
+          <div class="card">Any monotonic EP-degradation claim should be retired unless supported by a stronger generator or trace-backed study.</div>
+        </div>
+      </details>
+
+      <details open>
+        <summary>Active Next</summary>
+        <div class="checklist-grid">
+          <div class="card">Run an RDMA/QP-level all-to-all or real MoE trace pressure study.</div>
+          <div class="card">Produce per-load IB counter summaries.</div>
+          <div class="card">Run a paper claim-to-artifact audit before final writing.</div>
+        </div>
+      </details>
+
+      <details open>
+        <summary>Decisions Needed</summary>
+        <div class="checklist-grid">
+          <div class="card">Decide whether to invest in a lower-level RDMA generator or frame the current EP result as qualitative contention evidence.</div>
+          <div class="card">Decide which claims belong in the main paper versus appendix.</div>
+        </div>
+      </details>
+
+      <footer>
+        Static self-contained HTML shell for the CoLoRA opening deck dashboard.
+      </footer>
+    </section>
+
+    <section class="slide" aria-labelledby="slide-1-title">
+      <span class="tag">Slide 1</span>
+      <h1 id="slide-1-title">CoLoRA: Network-Aware LoRA Miss Recovery for Distributed MoE Serving</h1>
+      <p class="lead">Gong Shufan</p>
+      <div class="grid3" style="margin-top: 2rem;">
+        <div class="card">
+          <h3>Problem</h3>
+          <p>MoE serving already spends network budget on expert-parallel traffic. LoRA cache misses add recovery work exactly when decode latency is most visible.</p>
+        </div>
+        <div class="card">
+          <h3>Insight</h3>
+          <p>Miss recovery is not a fixed CPU-vs-GPU choice. The best path depends on decode batch size, adapter rank, cache reuse, and live fabric pressure.</p>
+        </div>
+        <div class="card">
+          <h3>Contribution</h3>
+          <p>CoLoRA combines local CPU/GPU crossover evidence, cross-machine recovery strategies, and network-aware scheduling for miss recovery in distributed MoE + LoRA serving.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="slide" aria-labelledby="slide-2-title">
+      <span class="tag">Slide 2</span>
+      <h2 id="slide-2-title">The Miss Problem in MoE + LoRA Serving</h2>
+      <p class="lead">Serving many LoRA adapters over MoE creates a second locality problem beyond expert placement.</p>
+      <div class="grid" style="margin-top: 1.5rem;">
+        <div class="card">
+          <h3>Setup</h3>
+          <ul>
+            <li>Requests carry adapter IDs; hot adapters may be cached locally.</li>
+            <li>Decode executes repeatedly at small batch sizes, where every miss can affect TPOT.</li>
+            <li>MoE routing simultaneously consumes cross-GPU or cross-node bandwidth.</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3>Why misses are common</h3>
+          <ul>
+            <li>Long-tail adapters exceed per-GPU cache capacity.</li>
+            <li>Load balancing and expert placement move requests away from cached adapters.</li>
+            <li>Multi-tenant arrivals change the hot set over time.</li>
+          </ul>
+        </div>
+      </div>
+      <blockquote>Current approach: fetch or recompute the missing LoRA weights on the critical path, usually without asking whether the network is already under EP pressure.</blockquote>
+    </section>
+
+    <section class="slide" aria-labelledby="slide-3-title">
+      <span class="tag">Slide 3</span>
+      <h2 id="slide-3-title">Local Decode Miss Recovery: CPU Wins at Typical Decode Batches</h2>
+      <p class="lead">For small decode batches, CPU-side recovery can beat the GPU path even before considering network contention.</p>
+      <table>
+        <thead>
+          <tr><th>Phase</th><th>Prefill</th><th>Decode</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Work shape</td><td>Large token block; high arithmetic intensity</td><td>Small N_dec; latency-sensitive repeated steps</td></tr>
+          <tr><td>LoRA miss impact</td><td>Amortized over many tokens</td><td>Exposed directly in per-token latency</td></tr>
+          <tr><td>Likely recovery path</td><td>GPU-friendly</td><td>CPU path can win for typical N_dec</td></tr>
+        </tbody>
+      </table>
+      <div class="grid">
+        <div class="card">
+          <h3>GPU path, R=64 N=4</h3>
+          <ul>
+            <li>H2D weight transfer: 28.3μs</li>
+            <li>GPU matmul: 45.6μs</li>
+            <li>Total: 72.4μs</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3>CPU path, R=64 N=4</h3>
+          <ul>
+            <li>D2H activation: 14.1μs</li>
+            <li>CPU AVX compute: 32.4μs</li>
+            <li>H2D result: 16.6μs</li>
+            <li>Total: 63.2μs</li>
+          </ul>
+        </div>
+      </div>
+      <blockquote><strong>CPU is 1.15× faster at N=4, R=64</strong> in the local decode miss microbenchmark.</blockquote>
+      <!-- Hidden from rendered deck: Detailed implementation note preserved from the markdown narrative. The local decode recovery benchmark was corrected to avoid timing bugs from D2H and GPU stream synchronization; the CPU path measures host-side LoRA delta computation for small N_dec, while the GPU path includes the launch/scheduling cost that matters on the critical decode path. -->
+    </section>
+
+    <section class="slide" aria-labelledby="slide-4-title">
+      <span class="tag">Slide 4</span>
+      <h2 id="slide-4-title">Crossover Curve: CPU Wins at Typical Decode Batches</h2>
+      <p class="lead">Benchmark source: <code>tools/crossover_curve_microbench.py</code>, using corrected D2H and GPU-stream measurement.</p>
+      <table>
+        <thead>
+          <tr><th>Rank</th><th>N_dec</th><th>GPU μs</th><th>CPU μs</th><th>Winner</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>8</td><td>1</td><td>64.5</td><td class="win">36.8</td><td>CPU (1.75×)</td></tr>
+          <tr><td>8</td><td>4</td><td>65.8</td><td class="win">46.5</td><td>CPU (1.42×)</td></tr>
+          <tr><td>8</td><td>16</td><td>65.8</td><td class="win">63.8</td><td>CPU (1.03×)</td></tr>
+          <tr><td>16</td><td>8</td><td>65.7</td><td class="win">51.6</td><td>CPU (1.27×)</td></tr>
+          <tr><td>32</td><td>8</td><td>66.4</td><td class="win">57.2</td><td>CPU (1.16×)</td></tr>
+          <tr><td>64</td><td>4</td><td>72.4</td><td class="win">63.2</td><td>CPU (1.15×)</td></tr>
+          <tr><td>64</td><td>16</td><td class="win">72.4</td><td>141.6</td><td>GPU (1.95×)</td></tr>
+          <tr><td>128</td><td>8</td><td>85.6</td><td class="win">84.4</td><td>CPU (1.01×)</td></tr>
+          <tr><td>128</td><td>16</td><td class="win">86.3</td><td>221.9</td><td>GPU (2.57×)</td></tr>
+        </tbody>
+      </table>
+      <div class="grid">
+        <div class="card">
+          <h3>Updated crossover bullets</h3>
+          <ul>
+            <li>CPU wins for typical decode batches up to N_dec ≤ 8.</li>
+            <li>The old intuition “GPU is always faster” is false for miss recovery.</li>
+            <li>Use GPU only after the batch/rank crossover justifies launch and contention costs.</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3>Design implication</h3>
+          <p>The local policy should be CPU-first for small decode misses, then promote or reuse recovered adapters when future accesses make the transfer worthwhile.</p>
+        </div>
+      </div>
+      <!-- Hidden from rendered deck: Optimization-note rationale. The crossover slide should cite corrected benchmark evidence, not the earlier unoptimized kernel narrative. The key story is the stable CPU-first region after fixing synchronization and widening the small-kernel vectorization; implementation details belong in backup notes, not on the main slide. -->
+    </section>
+
+    <section class="slide" aria-labelledby="slide-5-title">
+      <span class="tag">Slide 5</span>
+      <h2 id="slide-5-title">The Cross-Machine Challenge</h2>
+      <p class="lead">A miss on UM253 may be recoverable from UM251, but the same fabric is also carrying expert-parallel traffic.</p>
+      <pre aria-label="UM253 and UM251 cross-machine miss-recovery diagram">UM253 request stream
+  ├─ local adapter cache: miss
+  ├─ local CPU recovery: possible
+  └─ remote path to UM251: adapter / delta / promotion
+
+UM251 adapter state
+  ├─ cached LoRA weights
+  ├─ candidate for reuse-aware promotion
+  └─ shares network with MoE EP all-to-all</pre>
+      <table>
+        <thead>
+          <tr><th>Strategy</th><th>Payload definition</th><th>When it helps</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>S1 Weight transfer</td><td>R × (H+I) × 2B (large)</td><td>Remote fetch works when fabric is idle and remote cache has the adapter.</td></tr>
+          <tr><td>S2 Activation transfer</td><td>(H + I) × 2B (small, but 2 RDMA round-trips)</td><td>CPU-side remote/local recovery avoids moving full weights for small decode batches.</td></tr>
+          <tr><td>S3 Pre-cached + relay</td><td>H × 2B (smallest, but needs prior weight transfer)</td><td>Hybrid recovery unblocks decode and uses reuse-aware promotion only when it pays back.</td></tr>
+        </tbody>
+      </table>
+      <blockquote>Key question: should a miss consume scarce cross-node bandwidth now, or recover locally and promote only when reuse makes the network cost worthwhile?</blockquote>
+    </section>
+
+    <section class="slide" aria-labelledby="slide-6-title">
+      <span class="tag">Slide 6</span>
+      <h2 id="slide-6-title">Cross-Node Results: Strategy Comparison</h2>
+      <p class="lead">Measured setup: UM253/UM251 cross-machine recovery benchmark with 60/60 configurations and a focused EP run.</p>
+      <table>
+        <thead>
+          <tr><th>Rank</th><th>N_dec</th><th>S1</th><th>S2</th><th>S3</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>16</td><td>1</td><td>1.37</td><td>0.89</td><td class="win">0.58</td></tr>
+          <tr><td>16</td><td>4</td><td>1.82</td><td class="win">0.69</td><td>0.86</td></tr>
+          <tr><td>64</td><td>1</td><td>1.81</td><td>1.81</td><td class="win">0.75</td></tr>
+          <tr><td>64</td><td>2</td><td>3.50</td><td>3.09</td><td class="win">0.84</td></tr>
+          <tr><td>64</td><td>4</td><td>6.81</td><td>4.68</td><td class="win">0.94</td></tr>
+          <tr><td>128</td><td>4</td><td>6.65</td><td>1.58</td><td class="win">1.02</td></tr>
+        </tbody>
+      </table>
+      <div class="grid">
+        <div class="card">
+          <h3>Key findings</h3>
+          <ul>
+            <li>S3 is consistently low because the foreground payload is the smallest after prior promotion.</li>
+            <li>S2 can beat S1 by avoiding full weight transfer, but it still pays round-trip costs.</li>
+            <li>Hybrid promotion preserves future reuse without forcing every miss onto the network.</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3>Claim boundary</h3>
+          <p>Use these measurements as strategy-comparison evidence; reserve stronger fabric-degradation claims for counter-validated pressure studies.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="slide" aria-labelledby="slide-7-title">
+      <span class="tag">Slide 7</span>
+      <h2 id="slide-7-title">EP Contention: Network Awareness Matters</h2>
+      <p class="lead">Counter-validated Python IPoIB run: the focused EP experiment shows path-specific contention, but not a final monotonic degradation curve.</p>
+      <table>
+        <thead>
+          <tr><th>EP load</th><th>S1</th><th>S2</th><th>S3</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>0%</td><td>3.44</td><td>3.33</td><td class="win">1.59</td></tr>
+          <tr><td>25%</td><td>3.92</td><td>3.68</td><td class="win">0.81</td></tr>
+          <tr><td>50%</td><td>3.85</td><td class="bad">6.84</td><td>1.64</td></tr>
+          <tr><td>75%</td><td>4.57</td><td class="bad">5.68</td><td>1.55</td></tr>
+          <tr><td>90%</td><td>3.20</td><td class="bad">4.94</td><td>1.22</td></tr>
+        </tbody>
+      </table>
+      <ul>
+        <li>EP traffic and miss recovery can collide on the same fabric window.</li>
+        <li>Network-aware scheduling should react to measured pressure, not just configured load.</li>
+        <li><strong class="warn">Do not claim a monotonic measured EP-degradation curve yet.</strong></li>
+      </ul>
+      <!-- Hidden from rendered deck: The old ib_write_bw evidence is invalid for this main claim because it did not create the intended all-to-all EP-like contention on the measured path. Keep it out of rendered slides; mention only the counter-validated Python IPoIB run unless a stronger RDMA/QP-level generator or real MoE trace study is added. -->
+    </section>
+
+    <section class="slide" aria-labelledby="slide-7b-title">
+      <span class="tag">Slide 7b</span>
+      <h2 id="slide-7b-title">Insight: EP Load ≠ Effective Contention</h2>
+      <p class="lead">Nominal load settings are not enough; CoLoRA needs path-specific fabric pressure signals.</p>
+      <div class="grid">
+        <div class="card">
+          <h3>Why nominal load can fail</h3>
+          <ul>
+            <li>Traffic may use a different path or queue pair than miss recovery.</li>
+            <li>Timing may not overlap the recovery transfer window.</li>
+            <li>Host, socket, and IPoIB effects can hide or reshape fabric contention.</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3>Pressure signals to prefer</h3>
+          <ul>
+            <li>Per-path latency of recent recovery operations.</li>
+            <li>IB counters aligned with the target link and time window.</li>
+            <li>Queueing delay or retry signals from the actual communication path.</li>
+          </ul>
+        </div>
+      </div>
+      <blockquote>Schedule against measured, path-specific, time-local fabric pressure—not against nominal EP load labels.</blockquote>
+    </section>
+
+    <section class="slide" aria-labelledby="slide-8-title">
+      <span class="tag">Slide 8</span>
+      <h2 id="slide-8-title">CoLoRA Design: Hybrid Recovery Policy</h2>
+      <p class="lead">Recover the current token quickly, then decide whether promotion is worth the network cost.</p>
+      <pre aria-label="Hybrid recovery policy diagram">On LoRA cache miss during decode
+  ├─ estimate local crossover: rank, N_dec, CPU/GPU cost
+  ├─ estimate reuse: adapter popularity, active sequences, remaining tokens
+  ├─ sense fabric pressure: recent path latency + counters
+  └─ choose
+      ├─ CPU foreground recovery
+      ├─ GPU recovery when batch/rank crosses over
+      └─ deferred remote promotion when reuse is high and pressure is low</pre>
+      <ul>
+        <li>Foreground path optimizes the current decode step.</li>
+        <li>Promotion path optimizes future reuse, not immediate correctness.</li>
+        <li>The policy can be conservative: CPU-first for small N_dec, promote only when predicted reuse pays back.</li>
+      </ul>
+    </section>
+
+    <section class="slide" aria-labelledby="slide-9-title">
+      <span class="tag">Slide 9</span>
+      <h2 id="slide-9-title">CoLoRA Design: Network-Aware Scheduling</h2>
+      <p class="lead">Scheduling integrates EP pressure and adapter pre-cache opportunities before choosing a recovery path.</p>
+      <pre aria-label="EP and pre-cache scheduling diagram">Request arrives with adapter A
+  ├─ EP scheduler predicts expert traffic window
+  ├─ adapter cache manager checks local and remote A
+  ├─ pressure monitor reports path-specific fabric state
+  └─ CoLoRA scheduler
+      ├─ sense pressure
+      ├─ pre-cache or defer promotion when safe
+      └─ pick CPU / GPU / remote path for this miss</pre>
+      <ol>
+        <li><strong>Sense:</strong> use recent recovery latency and IB counters for the target path.</li>
+        <li><strong>Pre-cache:</strong> move adapters ahead of demand only when reuse is likely and EP pressure is low.</li>
+        <li><strong>Pick path:</strong> choose CPU, GPU, or remote recovery based on crossover and live pressure.</li>
+      </ol>
+      <blockquote>CoLoRA turns LoRA miss recovery from a fixed transfer decision into a network-aware scheduling decision.</blockquote>
+    </section>
+
+    <section class="slide" aria-labelledby="slide-10-title">
+      <span class="tag">Slide 10</span>
+      <h2 id="slide-10-title">Updated Experimental Roadmap</h2>
+      <p class="lead">Current evidence supports the opening story while clarifying the remaining validation risk.</p>
+      <table>
+        <thead>
+          <tr><th>Track</th><th>Status</th><th>Current readout</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Single-layer crossover</td><td>Done</td><td>CPU wins at N_dec ≤ 8 for typical decode batches; GPU wins at N_dec ≥ 16.</td></tr>
+          <tr><td>Cross-node benchmark</td><td>Done</td><td>S3 is fastest when weights are pre-cached; S2 is sensitive to contention.</td></tr>
+          <tr><td>Analytical / trace-driven case studies</td><td>Mostly done</td><td>Calibration anchor, system TPOT simulation, synthetic sweeps, small live validation, and figure assembly pipeline exist.</td></tr>
+          <tr><td>EP contention evidence</td><td>Active gap</td><td>Current generator is counter-validated, but not a faithful RDMA/QP or real MoE all-to-all workload.</td></tr>
+          <tr><td>Paper-facing claim audit</td><td>Next</td><td>Align claims, figures, and artifact paths before final writing.</td></tr>
+        </tbody>
+      </table>
+      <blockquote>Current evidence is sufficient for motivation, challenge, and design. The main remaining risk is over-claiming EP contention without a stronger pressure study.</blockquote>
+    </section>
+
+    <section class="slide" aria-labelledby="slide-11-title">
+      <span class="tag">Slide 11</span>
+      <h2 id="slide-11-title">Key Takeaways</h2>
+      <ol>
+        <li>LoRA miss recovery is the bottleneck in MoE + LoRA serving at practical cache budgets.</li>
+        <li>Local decode miss recovery is CPU-first at typical decode batches, especially N_dec ≤ 8.</li>
+        <li>Cross-machine recovery requires pre-caching; S3 is 1.5–7× faster than naive weight transfer.</li>
+        <li>EP load is a poor proxy for contention; CoLoRA should schedule on measured fabric pressure.</li>
+        <li>CoLoRA adapts to the regime: local CPU-first, local GPU for large batches, cross-machine pre-cache plus relay, and pressure-aware scheduling.</li>
+      </ol>
+    </section>
+
+    <section class="slide" aria-labelledby="slide-12-title">
+      <span class="tag">Slide 12</span>
+      <h2 id="slide-12-title">Structured Next-step Checklist</h2>
+      <div class="grid">
+        <div class="card">
+          <h3>Done / Keep</h3>
+          <ul>
+            <li>Local CPU/GPU crossover is measured and optimized; CPU wins for typical decode batches up to N_dec ≤ 8.</li>
+            <li>Cross-node S1/S2/S3 benchmark is collected, including the 60/60 configurations and focused EP run.</li>
+            <li>Calibration anchor file exists.</li>
+            <li>System TPOT simulation and synthetic sweeps exist.</li>
+            <li>Small live validation pipeline exists.</li>
+            <li>Figure assembly pipeline exists.</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3>Stale / Retire</h3>
+          <ul>
+            <li>“Case studies need anchor file” is stale because the calibration anchor exists.</li>
+            <li>“Minimal E2E validation is only planned” is stale because the B11 live-validation pipeline exists.</li>
+            <li>Any monotonic EP-degradation claim should be retired unless supported by a stronger generator or trace-backed study.</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3>Active Next</h3>
+          <ul>
+            <li>Run an RDMA/QP-level all-to-all or real MoE trace pressure study.</li>
+            <li>Produce per-load IB counter summaries.</li>
+            <li>Run a paper claim-to-artifact audit before final writing.</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3>Decisions Needed</h3>
+          <ul>
+            <li>Decide whether to invest in a lower-level RDMA generator or frame the current EP result as qualitative contention evidence.</li>
+            <li>Decide which claims belong in the main paper versus appendix.</li>
+          </ul>
+        </div>
+      </div>
+      <blockquote>Source-of-truth rule: this HTML deck is the maintained opening-slide artifact.</blockquote>
+    </section>
+  </main>
+</body>
+</html>

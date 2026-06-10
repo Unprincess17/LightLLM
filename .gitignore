@@ -39,9 +39,12 @@ tools/common/nsys/run_layer_moe_from_timings.sh
 
 results/
 autoresearch-results.tsv
+.superpowers/
 .claude/plans
 
 figures/evaluation
 .mcp.json
 CoLoRA.log
 .trae
+autoresearch-results.tsv
+autoresearch-results.tsv

@@ -116,9 +116,10 @@ void moe_lora_small_kernel(
     bf16* out, int N, int H, int R, int out_H, float scaling) {
 
     const int cache_block_h = 128;
-    float inter[256];
 
+    #pragma omp parallel for schedule(static) if(N > 1)
     for (int n = 0; n < N; ++n) {
+        float inter[256];
         const bf16* x_ptr = x + n * H;
         bf16* out_ptr = out + n * out_H;
 
@@ -150,9 +151,26 @@ void moe_lora_small_kernel(
             inter[r] = res;
         }
 
-        // Stage 2: inter[R] @ B[R,out_H] -> out[n,out_H], fully vectorized
-        float out_f32[16];
+        // Stage 2: inter[R] @ B[R,out_H] -> out[n,out_H], 32-wide vectorized
+        float out_f32[32];
         int h = 0;
+        for (; h + 31 < out_H; h += 32) {
+            __m512 acc0 = _mm512_setzero_ps();
+            __m512 acc1 = _mm512_setzero_ps();
+            for (int r = 0; r < R; ++r) {
+                __m512 v_scale = _mm512_set1_ps(inter[r] * scaling);
+                __m256i v_B_lo = _mm256_loadu_si256((const __m256i*)(B_mat + r * out_H + h));
+                __m256i v_B_hi = _mm256_loadu_si256((const __m256i*)(B_mat + r * out_H + h + 16));
+                acc0 = _mm512_fmadd_ps(v_scale, _mm512_cvtbf16_ps(v_B_lo), acc0);
+                acc1 = _mm512_fmadd_ps(v_scale, _mm512_cvtbf16_ps(v_B_hi), acc1);
+            }
+            _mm512_storeu_ps(out_f32, acc0);
+            _mm512_storeu_ps(out_f32 + 16, acc1);
+            for (int i = 0; i < 32; ++i) {
+                out_ptr[h + i] += bf16(out_f32[i]);
+            }
+        }
+        // 16-wide tail
         for (; h + 15 < out_H; h += 16) {
             __m512 acc = _mm512_setzero_ps();
             for (int r = 0; r < R; ++r) {
