@@ -408,11 +408,20 @@
       <div class="grid">
         <div class="card">
           <h3>GPU path, R=64 N=4</h3>
-          <p>Launch and GPU-side scheduling overheads are paid for a small decode batch.</p>
+          <ul>
+            <li>H2D weight transfer: 28.3μs</li>
+            <li>GPU matmul: 45.6μs</li>
+            <li>Total: 72.4μs</li>
+          </ul>
         </div>
         <div class="card">
           <h3>CPU path, R=64 N=4</h3>
-          <p>CPU computes the small LoRA delta while avoiding the GPU launch bottleneck.</p>
+          <ul>
+            <li>D2H activation: 14.1μs</li>
+            <li>CPU AVX compute: 32.4μs</li>
+            <li>H2D result: 16.6μs</li>
+            <li>Total: 63.2μs</li>
+          </ul>
         </div>
       </div>
       <blockquote><strong>CPU is 1.15× faster at N=4, R=64</strong> in the local decode miss microbenchmark.</blockquote>
@@ -425,13 +434,18 @@
       <p class="lead">Benchmark source: <code>tools/crossover_curve_microbench.py</code>, using corrected D2H and GPU-stream measurement.</p>
       <table>
         <thead>
-          <tr><th>Rank</th><th>N_dec</th><th>Representative result</th><th>Interpretation</th></tr>
+          <tr><th>Rank</th><th>N_dec</th><th>GPU μs</th><th>CPU μs</th><th>Winner</th></tr>
         </thead>
         <tbody>
-          <tr><td>R=8</td><td>1-8</td><td>CPU faster</td><td>Launch overhead dominates tiny decode work.</td></tr>
-          <tr><td>R=16</td><td>1-8</td><td>CPU faster</td><td>CPU remains preferable for typical decode batches.</td></tr>
-          <tr><td>R=64</td><td>4</td><td>CPU 1.15× faster</td><td>Concrete local miss-recovery anchor.</td></tr>
-          <tr><td>R=64</td><td>all swept S</td><td>CPU-first wins, roughly 2-50× in the corrected sweep</td><td>Small decode batches strongly favor CPU-first recovery.</td></tr>
+          <tr><td>8</td><td>1</td><td>64.5</td><td class="win">36.8</td><td>CPU (1.75×)</td></tr>
+          <tr><td>8</td><td>4</td><td>65.8</td><td class="win">46.5</td><td>CPU (1.42×)</td></tr>
+          <tr><td>8</td><td>16</td><td>65.8</td><td class="win">63.8</td><td>CPU (1.03×)</td></tr>
+          <tr><td>16</td><td>8</td><td>65.7</td><td class="win">51.6</td><td>CPU (1.27×)</td></tr>
+          <tr><td>32</td><td>8</td><td>66.4</td><td class="win">57.2</td><td>CPU (1.16×)</td></tr>
+          <tr><td>64</td><td>4</td><td>72.4</td><td class="win">63.2</td><td>CPU (1.15×)</td></tr>
+          <tr><td>64</td><td>16</td><td class="win">72.4</td><td>141.6</td><td>GPU (1.95×)</td></tr>
+          <tr><td>128</td><td>8</td><td>85.6</td><td class="win">84.4</td><td>CPU (1.01×)</td></tr>
+          <tr><td>128</td><td>16</td><td class="win">86.3</td><td>221.9</td><td>GPU (2.57×)</td></tr>
         </tbody>
       </table>
       <div class="grid">
@@ -466,12 +480,12 @@ UM251 adapter state
   └─ shares network with MoE EP all-to-all</pre>
       <table>
         <thead>
-          <tr><th>Strategy</th><th>Action</th><th>When it helps</th></tr>
+          <tr><th>Strategy</th><th>Payload definition</th><th>When it helps</th></tr>
         </thead>
         <tbody>
-          <tr><td>S1</td><td>Remote fetch / direct transfer</td><td>When fabric is idle and remote cache has the adapter.</td></tr>
-          <tr><td>S2</td><td>Local CPU recovery</td><td>When decode batch is small or network is pressured.</td></tr>
-          <tr><td>S3</td><td>Hybrid recovery + promotion</td><td>When immediate CPU recovery can unblock decode and later reuse can justify promotion.</td></tr>
+          <tr><td>S1 Weight transfer</td><td>R × (H+I) × 2B (large)</td><td>Remote fetch works when fabric is idle and remote cache has the adapter.</td></tr>
+          <tr><td>S2 Activation transfer</td><td>(H + I) × 2B (small, but 2 RDMA round-trips)</td><td>CPU-side remote/local recovery avoids moving full weights for small decode batches.</td></tr>
+          <tr><td>S3 Pre-cached + relay</td><td>H × 2B (smallest, but needs prior weight transfer)</td><td>Hybrid recovery unblocks decode and uses reuse-aware promotion only when it pays back.</td></tr>
         </tbody>
       </table>
       <blockquote>Key question: should a miss consume scarce cross-node bandwidth now, or recover locally and promote only when reuse makes the network cost worthwhile?</blockquote>
@@ -483,20 +497,23 @@ UM251 adapter state
       <p class="lead">Measured setup: UM253/UM251 cross-machine recovery benchmark with 60/60 configurations and a focused EP run.</p>
       <table>
         <thead>
-          <tr><th>Strategy</th><th>Observed behavior</th><th>Takeaway</th></tr>
+          <tr><th>Rank</th><th>N_dec</th><th>S1</th><th>S2</th><th>S3</th></tr>
         </thead>
         <tbody>
-          <tr><td>S1: network-first</td><td>Fast when the network is free; exposed to EP traffic when the fabric is busy.</td><td>Good best case, fragile under contention.</td></tr>
-          <tr><td>S2: CPU-first</td><td>Stable for small decode batches; avoids immediate cross-node transfer.</td><td>Best latency hedge when EP pressure is unknown.</td></tr>
-          <tr><td>S3: hybrid</td><td>Unblocks decode locally, then promotes based on expected reuse and pressure.</td><td>Matches CoLoRA’s foreground + reuse-aware design.</td></tr>
+          <tr><td>16</td><td>1</td><td>1.37</td><td>0.89</td><td class="win">0.58</td></tr>
+          <tr><td>16</td><td>4</td><td>1.82</td><td class="win">0.69</td><td>0.86</td></tr>
+          <tr><td>64</td><td>1</td><td>1.81</td><td>1.81</td><td class="win">0.75</td></tr>
+          <tr><td>64</td><td>2</td><td>3.50</td><td>3.09</td><td class="win">0.84</td></tr>
+          <tr><td>64</td><td>4</td><td>6.81</td><td>4.68</td><td class="win">0.94</td></tr>
+          <tr><td>128</td><td>4</td><td>6.65</td><td>1.58</td><td class="win">1.02</td></tr>
         </tbody>
       </table>
       <div class="grid">
         <div class="card">
           <h3>Key findings</h3>
           <ul>
-            <li>Cross-node recovery is not only a bandwidth problem; timing relative to EP matters.</li>
-            <li>CPU-first is competitive for immediate decode latency at small N_dec.</li>
+            <li>S3 is consistently low because the foreground payload is the smallest after prior promotion.</li>
+            <li>S2 can beat S1 by avoiding full weight transfer, but it still pays round-trip costs.</li>
             <li>Hybrid promotion preserves future reuse without forcing every miss onto the network.</li>
           </ul>
         </div>
@@ -513,12 +530,14 @@ UM251 adapter state
       <p class="lead">Counter-validated Python IPoIB run: the focused EP experiment shows path-specific contention, but not a final monotonic degradation curve.</p>
       <table>
         <thead>
-          <tr><th>EP load condition</th><th>Counter / timing signal</th><th>How to use it</th></tr>
+          <tr><th>EP load</th><th>S1</th><th>S2</th><th>S3</th></tr>
         </thead>
         <tbody>
-          <tr><td>No background EP</td><td>Baseline path latency and counters</td><td>Calibrate remote recovery when the fabric is quiet.</td></tr>
-          <tr><td>Focused Python IPoIB EP load</td><td>Counter-validated traffic on the target path</td><td>Qualitative evidence that recovery must be network-aware.</td></tr>
-          <tr><td>Higher nominal load</td><td>Not yet a validated monotonic curve</td><td>Do not overclaim until RDMA/QP-level or trace-backed evidence exists.</td></tr>
+          <tr><td>0%</td><td>3.44</td><td>3.33</td><td class="win">1.59</td></tr>
+          <tr><td>25%</td><td>3.92</td><td>3.68</td><td class="win">0.81</td></tr>
+          <tr><td>50%</td><td>3.85</td><td class="bad">6.84</td><td>1.64</td></tr>
+          <tr><td>75%</td><td>4.57</td><td class="bad">5.68</td><td>1.55</td></tr>
+          <tr><td>90%</td><td>3.20</td><td class="bad">4.94</td><td>1.22</td></tr>
         </tbody>
       </table>
       <ul>
@@ -631,36 +650,35 @@ UM251 adapter state
         <div class="card">
           <h3>Done / Keep</h3>
           <ul>
-            <li>Local CPU/GPU crossover evidence.</li>
-            <li>Cross-node S1/S2/S3 comparison.</li>
-            <li>Calibration anchor file.</li>
-            <li>System TPOT and synthetic sweeps.</li>
-            <li>Small live validation pipeline.</li>
-            <li>Figure assembly pipeline.</li>
+            <li>Local CPU/GPU crossover is measured and optimized; CPU wins for typical decode batches up to N_dec ≤ 8.</li>
+            <li>Cross-node S1/S2/S3 benchmark is collected, including the 60/60 configurations and focused EP run.</li>
+            <li>Calibration anchor file exists.</li>
+            <li>System TPOT simulation and synthetic sweeps exist.</li>
+            <li>Small live validation pipeline exists.</li>
+            <li>Figure assembly pipeline exists.</li>
           </ul>
         </div>
         <div class="card">
           <h3>Stale / Retire</h3>
           <ul>
-            <li>“Case studies need anchor file.”</li>
-            <li>“Minimal E2E validation is only planned.”</li>
-            <li>Any monotonic EP-degradation claim.</li>
+            <li>“Case studies need anchor file” is stale because the calibration anchor exists.</li>
+            <li>“Minimal E2E validation is only planned” is stale because the B11 live-validation pipeline exists.</li>
+            <li>Any monotonic EP-degradation claim should be retired unless supported by a stronger generator or trace-backed study.</li>
           </ul>
         </div>
         <div class="card">
           <h3>Active Next</h3>
           <ul>
-            <li>RDMA/QP-level all-to-all or real MoE trace pressure study.</li>
-            <li>Per-load IB counter summary.</li>
-            <li>Paper claim-to-artifact audit.</li>
+            <li>Run an RDMA/QP-level all-to-all or real MoE trace pressure study.</li>
+            <li>Produce per-load IB counter summaries.</li>
+            <li>Run a paper claim-to-artifact audit before final writing.</li>
           </ul>
         </div>
         <div class="card">
           <h3>Decisions Needed</h3>
           <ul>
-            <li>Invest in lower-level RDMA generator?</li>
-            <li>Frame current EP result as qualitative contention evidence?</li>
-            <li>Which claims are main-paper versus appendix?</li>
+            <li>Decide whether to invest in a lower-level RDMA generator or frame the current EP result as qualitative contention evidence.</li>
+            <li>Decide which claims belong in the main paper versus appendix.</li>
           </ul>
         </div>
       </div>
