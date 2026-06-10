@@ -86,9 +86,9 @@ Slide 12 should no longer list generic stale next steps. It should become the st
 
 ## Cleanup Rules
 
-Remove unnecessary comments and call-outs from the presentation content. Keep only remarks that affect interpretation of results or prevent an incorrect claim, such as the warning not to claim a monotonic EP-degradation curve.
+Comment out unnecessary words and call-outs from the presentation content using HTML comments (`<!-- -->`) rather than deleting them. This preserves the original reasoning for future reference while keeping the rendered slides clean. Keep visible only remarks that affect interpretation of results or prevent an incorrect claim, such as the warning not to claim a monotonic EP-degradation curve.
 
-The HTML should avoid hidden TODO comments that duplicate the visible dashboard. The visible dashboard is the canonical checklist.
+Do not add hidden TODO comments that duplicate the visible dashboard. The visible dashboard is the canonical checklist.
 
 ## Testing and Review
 
