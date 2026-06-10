@@ -592,6 +592,80 @@ UM251 adapter state
       </ol>
       <blockquote>CoLoRA turns LoRA miss recovery from a fixed transfer decision into a network-aware scheduling decision.</blockquote>
     </section>
+
+    <section class="slide" aria-labelledby="slide-10-title">
+      <span class="tag">Slide 10</span>
+      <h2 id="slide-10-title">Updated Experimental Roadmap</h2>
+      <p class="lead">Current evidence supports the opening story while clarifying the remaining validation risk.</p>
+      <table>
+        <thead>
+          <tr><th>Track</th><th>Status</th><th>Current readout</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Single-layer crossover</td><td>Done</td><td>CPU wins at N_dec ≤ 8 for typical decode batches; GPU wins at N_dec ≥ 16.</td></tr>
+          <tr><td>Cross-node benchmark</td><td>Done</td><td>S3 is fastest when weights are pre-cached; S2 is sensitive to contention.</td></tr>
+          <tr><td>Analytical / trace-driven case studies</td><td>Mostly done</td><td>Calibration anchor, system TPOT simulation, synthetic sweeps, small live validation, and figure assembly pipeline exist.</td></tr>
+          <tr><td>EP contention evidence</td><td>Active gap</td><td>Current generator is counter-validated, but not a faithful RDMA/QP or real MoE all-to-all workload.</td></tr>
+          <tr><td>Paper-facing claim audit</td><td>Next</td><td>Align claims, figures, and artifact paths before final writing.</td></tr>
+        </tbody>
+      </table>
+      <blockquote>Current evidence is sufficient for motivation, challenge, and design. The main remaining risk is over-claiming EP contention without a stronger pressure study.</blockquote>
+    </section>
+
+    <section class="slide" aria-labelledby="slide-11-title">
+      <span class="tag">Slide 11</span>
+      <h2 id="slide-11-title">Key Takeaways</h2>
+      <ol>
+        <li>LoRA miss recovery is the bottleneck in MoE + LoRA serving at practical cache budgets.</li>
+        <li>Local decode miss recovery is CPU-first at typical decode batches, especially N_dec ≤ 8.</li>
+        <li>Cross-machine recovery requires pre-caching; S3 is 1.5–7× faster than naive weight transfer.</li>
+        <li>EP load is a poor proxy for contention; CoLoRA should schedule on measured fabric pressure.</li>
+        <li>CoLoRA adapts to the regime: local CPU-first, local GPU for large batches, cross-machine pre-cache plus relay, and pressure-aware scheduling.</li>
+      </ol>
+    </section>
+
+    <section class="slide" aria-labelledby="slide-12-title">
+      <span class="tag">Slide 12</span>
+      <h2 id="slide-12-title">Structured Next-step Checklist</h2>
+      <div class="grid">
+        <div class="card">
+          <h3>Done / Keep</h3>
+          <ul>
+            <li>Local CPU/GPU crossover evidence.</li>
+            <li>Cross-node S1/S2/S3 comparison.</li>
+            <li>Calibration anchor file.</li>
+            <li>System TPOT and synthetic sweeps.</li>
+            <li>Small live validation pipeline.</li>
+            <li>Figure assembly pipeline.</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3>Stale / Retire</h3>
+          <ul>
+            <li>“Case studies need anchor file.”</li>
+            <li>“Minimal E2E validation is only planned.”</li>
+            <li>Any monotonic EP-degradation claim.</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3>Active Next</h3>
+          <ul>
+            <li>RDMA/QP-level all-to-all or real MoE trace pressure study.</li>
+            <li>Per-load IB counter summary.</li>
+            <li>Paper claim-to-artifact audit.</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3>Decisions Needed</h3>
+          <ul>
+            <li>Invest in lower-level RDMA generator?</li>
+            <li>Frame current EP result as qualitative contention evidence?</li>
+            <li>Which claims are main-paper versus appendix?</li>
+          </ul>
+        </div>
+      </div>
+      <blockquote>Source-of-truth rule: this HTML deck is the maintained opening-slide artifact.</blockquote>
+    </section>
   </main>
 </body>
 </html>
