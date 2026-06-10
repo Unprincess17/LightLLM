@@ -39,6 +39,7 @@ tools/common/nsys/run_layer_moe_from_timings.sh
 
 results/
 autoresearch-results.tsv
+.superpowers/
 .claude/plans
 
 figures/evaluation
