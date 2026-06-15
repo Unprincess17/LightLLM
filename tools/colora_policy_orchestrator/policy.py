@@ -26,4 +26,4 @@ class RecoveryContext:
 
 def choose_path(ctx: RecoveryContext) -> int:
     """Return the chosen recovery strategy id for this miss context."""
-    return S1_REMOTE_WEIGHT
+    return S3_REMOTE_RELAY
