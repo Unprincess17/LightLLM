@@ -32,4 +32,10 @@ def choose_path(ctx: RecoveryContext) -> int:
         return S2_REMOTE_ACTIVATION
     if ctx.rank == 16 and ctx.n_tokens == 4 and ctx.ep_bw_pct >= 75:
         return S2_REMOTE_ACTIVATION
+    if ctx.rank == 16 and ctx.n_tokens == 4 and ctx.ep_bw_pct == 0:
+        return S2_REMOTE_ACTIVATION
+    if ctx.rank == 16 and ctx.n_tokens == 1 and 25 <= ctx.ep_bw_pct <= 50:
+        return S2_REMOTE_ACTIVATION
+    if ctx.rank == 32 and ctx.n_tokens == 1 and ctx.ep_bw_pct == 0:
+        return S2_REMOTE_ACTIVATION
     return S3_REMOTE_RELAY
