@@ -26,9 +26,10 @@ class RecoveryContext:
 
 def choose_path(ctx: RecoveryContext) -> int:
     """Return the chosen recovery strategy id for this miss context."""
-    # S3 (pre-cached relay) is the default winner. Carve out S2 (remote
-    # activation) only at rank=128 n_tokens=1, where the activation payload
-    # stays small while S3's relay has to amortize over only one token.
+    # S3 (pre-cached relay) is the default winner. S2 (remote activation)
+    # carve-outs target high-margin cells from the cross-node sweep.
     if ctx.rank == 128 and ctx.n_tokens == 1:
+        return S2_REMOTE_ACTIVATION
+    if ctx.rank == 16 and ctx.n_tokens == 4 and ctx.ep_bw_pct >= 75:
         return S2_REMOTE_ACTIVATION
     return S3_REMOTE_RELAY
