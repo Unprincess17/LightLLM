@@ -26,9 +26,4 @@ class RecoveryContext:
 
 def choose_path(ctx: RecoveryContext) -> int:
     """Return the chosen recovery strategy id for this miss context."""
-    # Slide 6/7 evidence: S3 (pre-cached relay) is the dominant strategy.
-    # Carve out a narrow S2 (remote activation) regime at small rank where
-    # the activation payload is small enough to beat S3's relay cost.
-    if ctx.rank <= 16:
-        return S2_REMOTE_ACTIVATION
     return S3_REMOTE_RELAY
