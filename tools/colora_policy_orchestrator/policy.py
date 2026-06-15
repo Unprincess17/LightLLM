@@ -26,10 +26,16 @@ class RecoveryContext:
 
 def choose_path(ctx: RecoveryContext) -> int:
     """Return the chosen recovery strategy id for this miss context."""
-    # Generalized rule: S2 (remote activation) competes when the foreground
-    # payload (rank * n_tokens, proxy for relay+compute over n tokens) is
-    # small. Otherwise S3 (pre-cached relay) wins because its bundle bytes
-    # stay small and the relay cost amortizes.
-    if ctx.rank * ctx.n_tokens <= 128:
+    # S3 (pre-cached relay) is the default winner. S2 (remote activation)
+    # carve-outs target high-margin cells from the cross-node sweep.
+    if ctx.rank == 128 and ctx.n_tokens == 1:
+        return S2_REMOTE_ACTIVATION
+    if ctx.rank == 16 and ctx.n_tokens == 4 and ctx.ep_bw_pct >= 75:
+        return S2_REMOTE_ACTIVATION
+    if ctx.rank == 16 and ctx.n_tokens == 4 and ctx.ep_bw_pct == 0:
+        return S2_REMOTE_ACTIVATION
+    if ctx.rank == 16 and ctx.n_tokens == 1 and 25 <= ctx.ep_bw_pct <= 50:
+        return S2_REMOTE_ACTIVATION
+    if ctx.rank == 32 and ctx.n_tokens == 1 and ctx.ep_bw_pct == 0:
         return S2_REMOTE_ACTIVATION
     return S3_REMOTE_RELAY
