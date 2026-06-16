@@ -194,6 +194,9 @@ class RDMATrafficGenerator:
             flush=True,
         )
 
+        # Validate that traffic is actually flowing
+        self._validate_counters()
+
     def stop(self) -> None:
         if self._ctx != ffi.NULL:
             if self._running:
@@ -214,6 +217,36 @@ class RDMATrafficGenerator:
     # ------------------------------------------------------------------
     # Handshake internals
     # ------------------------------------------------------------------
+
+    def _validate_counters(self) -> None:
+        """Read IB port counters before and during burst; assert traffic flows."""
+        counter_paths = {
+            "xmit": Path(f"/sys/class/infiniband/{self._mlx_device}"
+                         f"/ports/{self._ib_port}/counters/port_xmit_data"),
+            "rcv": Path(f"/sys/class/infiniband/{self._mlx_device}"
+                        f"/ports/{self._ib_port}/counters/port_rcv_data"),
+        }
+        scale = 4  # bytes per counter unit
+
+        before = {}
+        for name, path in counter_paths.items():
+            before[name] = int(path.read_text().strip()) * scale
+
+        # Wait for traffic to flow
+        time.sleep(1.0)
+
+        after = {}
+        for name, path in counter_paths.items():
+            after[name] = int(path.read_text().strip()) * scale
+
+        deltas = {name: after[name] - before[name] for name in counter_paths}
+        print(f"[RDMATrafficGenerator] IB counter deltas: {deltas}", flush=True)
+
+        if deltas["xmit"] <= 0 and deltas["rcv"] <= 0:
+            raise RuntimeError(
+                f"IB port counters did not increase after burst start: {deltas}. "
+                f"RDMA traffic may not be flowing."
+            )
 
     def _handshake(self) -> dict:
         """TCP handshake: exchange QP/GID/MR info, return remote info dict."""
