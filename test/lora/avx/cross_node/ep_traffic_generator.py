@@ -57,9 +57,15 @@ class EPTrafficConfig:
     # For bursty mode
     burst_on_ms: float = 10.0
     burst_off_ms: float = 10.0
+    # For verbs_qp mode
+    num_qps: int = 16
+    qp_depth: int = 128
+    msg_bytes: int = 65536
 
     @property
     def server_cmd(self) -> List[str]:
+        if self.mode == "verbs_qp":
+            return ["true"]
         if self.mode == "alltoall":
             script = Path(__file__).with_name("ep_alltoall_traffic.py")
             return [
@@ -86,6 +92,8 @@ class EPTrafficConfig:
 
     @property
     def remote_cleanup_cmd(self) -> str:
+        if self.mode == "verbs_qp":
+            return "pkill -f 'rdma_qp_pressure.*_run_server' 2>/dev/null || true"
         if self.mode == "alltoall":
             return "pkill -f '[e]p_alltoall_traffic.py' || true"
         return "pkill -x ib_write_bw || true"
@@ -160,6 +168,23 @@ class EPTrafficGenerator:
         # Check availability once at construction time
         self._ib_write_bw_available = self._check_ib_write_bw()
 
+        self._verbs_gen = None
+        if self.config.mode == "verbs_qp":
+            from rdma_qp_generator.rdma_qp_pressure import RDMATrafficGenerator
+            self._verbs_gen = RDMATrafficGenerator(
+                local_ip=self.config.local_ip,
+                remote_ip=self.config.remote_ip,
+                mlx_device=self.config.mlx_device,
+                ib_port=self.config.ib_port,
+                num_qps=self.config.num_qps,
+                qp_depth=self.config.qp_depth,
+                msg_bytes=self.config.msg_bytes,
+                control_port=self.config.base_port,
+                remote_ssh_host=self.config.remote_ssh_host,
+                burst_us=int(self.config.burst_on_ms * 1000),
+                gap_us=int(self.config.burst_off_ms * 1000),
+            )
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -178,6 +203,10 @@ class EPTrafficGenerator:
 
             self._bw_pct = bw_pct
             self._running = True
+
+            if self._verbs_gen is not None:
+                self._verbs_gen.start(bw_pct)
+                return
 
             if bw_pct == 0:
                 print(
@@ -212,6 +241,10 @@ class EPTrafficGenerator:
         with self._lock:
             self._running = False
 
+            if self._verbs_gen is not None:
+                self._verbs_gen.stop()
+                return
+
             # Stop burst thread first
             if self._burst_thread is not None:
                 self._burst_stop_event.set()
@@ -234,6 +267,8 @@ class EPTrafficGenerator:
         with self._lock:
             if not self._running:
                 return False
+            if self._verbs_gen is not None:
+                return self._verbs_gen.is_running()
             if self._client_proc is not None and self._client_proc.poll() is not None:
                 print(
                     "[EPTrafficGenerator] client process died unexpectedly — "
