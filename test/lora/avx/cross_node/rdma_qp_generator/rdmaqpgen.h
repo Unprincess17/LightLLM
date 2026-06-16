@@ -14,7 +14,7 @@ typedef struct rdmaqp_ctx rdmaqp_ctx;
 typedef struct {
     int      qpn_base;    /* first local QP number */
     int      lid;         /* local LID from ibv_query_port */
-    char     gid[33];     /* GID string (hex:xxxx:...), nul-terminated */
+    char     gid[40];     /* GID string (hex:xxxx:...), nul-terminated */
     uint64_t mr_addr;     /* virtual address of registered MR */
     uint32_t mr_rkey;     /* rkey of registered MR */
 } rdmaqp_peer_info;

@@ -30,6 +30,8 @@ struct rdmaqp_ctx {
     int    qp_depth;
     int    msg_bytes;
     int    ib_port;
+    int    gid_index;
+    int    active_mtu;
     size_t mr_size;       /* msg_bytes * num_qps * qp_depth */
 
     /* local peer info (filled after create) */
@@ -84,15 +86,30 @@ static int str_to_gid(const char *s, union ibv_gid *gid) {
 /* QP state machine: INIT -> RTR -> RTS                                 */
 /* ------------------------------------------------------------------ */
 
-static int modify_qp_to_rtr(struct ibv_qp *qp, int qp_num,
-                            int ib_port, int remote_qpn, int remote_lid,
+static int modify_qp_to_init(struct ibv_qp *qp, int ib_port) {
+    struct ibv_qp_attr attr;
+    memset(&attr, 0, sizeof(attr));
+
+    attr.qp_state        = IBV_QPS_INIT;
+    attr.pkey_index      = 0;
+    attr.port_num        = ib_port;
+    attr.qp_access_flags = IBV_ACCESS_REMOTE_WRITE;
+
+    int flags = IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT
+              | IBV_QP_ACCESS_FLAGS;
+
+    return ibv_modify_qp(qp, &attr, flags);
+}
+
+static int modify_qp_to_rtr(struct ibv_qp *qp, int ib_port,
+                            int remote_qpn, int remote_lid,
                             const union ibv_gid *remote_gid,
-                            int gid_index) {
+                            int gid_index, int active_mtu) {
     struct ibv_qp_attr attr;
     memset(&attr, 0, sizeof(attr));
 
     attr.qp_state        = IBV_QPS_RTR;
-    attr.path_mtu        = IBV_MTU_4096;
+    attr.path_mtu        = active_mtu;
     attr.dest_qp_num     = remote_qpn;
     attr.rq_psn          = 0;
     attr.max_dest_rd_atomic = 1;
@@ -153,7 +170,7 @@ rdmaqp_ctx* rdmaqp_create(
     c->qp_depth  = qp_depth;
     c->msg_bytes = msg_bytes;
     c->ib_port   = ib_port;
-    c->mr_size   = (size_t)msg_bytes * num_qps * qp_depth;
+    c->mr_size   = (size_t)msg_bytes * (size_t)num_qps * (size_t)qp_depth;
 
     /* --- device discovery --- */
     int ndev;
@@ -182,7 +199,7 @@ rdmaqp_ctx* rdmaqp_create(
         goto fail;
     }
 
-    /* --- port attributes (LID) --- */
+    /* --- port attributes (LID, active MTU) --- */
     struct ibv_port_attr port_attr;
     ret = ibv_query_port(c->ctx, ib_port, &port_attr);
     if (ret) {
@@ -190,15 +207,32 @@ rdmaqp_ctx* rdmaqp_create(
         goto fail;
     }
     c->local_info.lid = port_attr.lid;
+    c->active_mtu = port_attr.active_mtu;
 
-    /* --- GID (index 0) --- */
-    union ibv_gid gid;
-    ret = ibv_query_gid(c->ctx, ib_port, 0, &gid);
-    if (ret) {
-        snprintf_err(errbuf, 256, "ibv_query_gid failed: %s", strerror(errno));
-        goto fail;
+    /* --- GID (auto-detect first valid RoCEv2 or non-zero GID) --- */
+    {
+        union ibv_gid gid;
+        int gid_index = -1;
+        for (int gi = 0; gi < 16; gi++) {
+            ret = ibv_query_gid(c->ctx, ib_port, gi, &gid);
+            if (ret) break;
+            /* Prefer RoCEv2, accept any non-zero GID */
+            int is_nonzero = 0;
+            for (int b = 0; b < 16; b++) { if (gid.raw[b]) { is_nonzero = 1; break; } }
+            if (is_nonzero) { gid_index = gi; break; }
+        }
+        if (gid_index < 0) {
+            snprintf_err(errbuf, 256, "no valid GID found on %s port %d", mlx_device, ib_port);
+            goto fail;
+        }
+        ret = ibv_query_gid(c->ctx, ib_port, gid_index, &gid);
+        if (ret) {
+            snprintf_err(errbuf, 256, "ibv_query_gid failed: %s", strerror(errno));
+            goto fail;
+        }
+        c->gid_index = gid_index;
+        gid_to_str(&gid, c->local_info.gid, sizeof(c->local_info.gid));
     }
-    gid_to_str(&gid, c->local_info.gid, sizeof(c->local_info.gid));
 
     /* --- PD --- */
     c->pd = ibv_alloc_pd(c->ctx);
@@ -288,23 +322,34 @@ int rdmaqp_connect(rdmaqp_ctx *c, const rdmaqp_peer_info *remote,
         return -1;
     }
 
-    /* Transition each QP INIT -> RTR -> RTS */
+    /* Transition each QP RESET -> INIT -> RTR -> RTS */
     for (int i = 0; i < c->num_qps; i++) {
         int remote_qpn = remote->qpn_base + i;
+        int ret;
 
-        if (modify_qp_to_rtr(c->qps[i], c->qps[i]->qp_num,
-                             c->ib_port, remote_qpn, remote->lid,
-                             &rgid, 0) != 0) {
+        ret = modify_qp_to_init(c->qps[i], c->ib_port);
+        if (ret) {
             snprintf_err(errbuf, 256,
-                         "modify_qp_to_rtr[%d] (remote_qpn=%d) failed: %s",
-                         i, remote_qpn, strerror(errno));
+                         "modify_qp_to_init[%d] failed: %s",
+                         i, strerror(-ret));
             return -1;
         }
 
-        if (modify_qp_to_rts(c->qps[i]) != 0) {
+        ret = modify_qp_to_rtr(c->qps[i], c->ib_port, remote_qpn,
+                               remote->lid, &rgid, c->gid_index,
+                               c->active_mtu);
+        if (ret) {
+            snprintf_err(errbuf, 256,
+                         "modify_qp_to_rtr[%d] (remote_qpn=%d) failed: %s",
+                         i, remote_qpn, strerror(-ret));
+            return -1;
+        }
+
+        ret = modify_qp_to_rts(c->qps[i]);
+        if (ret) {
             snprintf_err(errbuf, 256,
                          "modify_qp_to_rts[%d] failed: %s",
-                         i, strerror(errno));
+                         i, strerror(-ret));
             return -1;
         }
     }
