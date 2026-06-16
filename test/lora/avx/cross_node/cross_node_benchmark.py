@@ -186,9 +186,27 @@ def parse_args() -> argparse.Namespace:
     )
     g.add_argument(
         "--ep-generator",
-        choices=("ib_write_bw", "alltoall"),
+        choices=("ib_write_bw", "alltoall", "verbs_qp"),
         default="ib_write_bw",
         help="Background EP traffic generator implementation",
+    )
+    g.add_argument(
+        "--ep-qps",
+        type=int,
+        default=16,
+        help="Number of RC QPs for verbs_qp generator",
+    )
+    g.add_argument(
+        "--ep-qp-depth",
+        type=int,
+        default=128,
+        help="Send-queue WR depth per QP for verbs_qp generator",
+    )
+    g.add_argument(
+        "--ep-msg-bytes",
+        type=int,
+        default=65536,
+        help="RDMA WRITE payload bytes for verbs_qp generator",
     )
 
     return parser.parse_args()
@@ -1228,6 +1246,9 @@ def main() -> None:
         remote_ssh_host=args.ep_ssh_host,
         direction=args.ep_direction,
         mode=args.ep_generator,
+        num_qps=args.ep_qps,
+        qp_depth=args.ep_qp_depth,
+        msg_bytes=args.ep_msg_bytes,
     )
 
     try:
