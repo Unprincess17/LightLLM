@@ -25,6 +25,8 @@ test/lora/*.sqlite
 jupyter.log
 test/lora/benchmark_lora.log
 
+test/lora/avx/cross_node/rdma_qp_generator/*.o
+test/lora/avx/cross_node/rdma_qp_generator/*.so
 .worktrees/
 
 test/lora/avx/*.csv
