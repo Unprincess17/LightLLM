@@ -386,3 +386,209 @@ void rdmaqp_destroy(rdmaqp_ctx *c) {
 
     free(c);
 }
+
+/* ------------------------------------------------------------------ */
+/* Burst loop internals                                                */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    rdmaqp_ctx *ctx;
+    long        burst_us;
+    long        gap_us;
+    int         target_gbps;
+} burst_args;
+
+static void* burst_loop_thread(void *arg) {
+    burst_args *ba = (burst_args*)arg;
+    rdmaqp_ctx *c = ba->ctx;
+
+    const int num_qps   = c->num_qps;
+    const int qp_depth  = c->qp_depth;
+    const int msg_bytes = c->msg_bytes;
+    const uint64_t remote_addr = c->remote_info.mr_addr;
+    const uint32_t remote_rkey = c->remote_info.mr_rkey;
+    const uint32_t local_lkey  = c->mr->lkey;
+
+    /* Pre-compute per-QP local buffer base offsets */
+    uint64_t *local_offsets = calloc(num_qps, sizeof(uint64_t));
+    uint64_t *remote_offsets = calloc(num_qps, sizeof(uint64_t));
+    if (!local_offsets || !remote_offsets) {
+        free(local_offsets);
+        free(remote_offsets);
+        free(ba);
+        c->running = 0;
+        return NULL;
+    }
+    for (int i = 0; i < num_qps; i++) {
+        local_offsets[i]  = (uint64_t)(uintptr_t)c->mr->addr
+                          + (size_t)i * (size_t)qp_depth * (size_t)msg_bytes;
+        remote_offsets[i] = remote_addr
+                          + (size_t)i * (size_t)qp_depth * (size_t)msg_bytes;
+    }
+
+    /* Per-QP ring indices (which WR slot to post next) */
+    int *ring = calloc(num_qps, sizeof(int));
+    if (!ring) {
+        free(local_offsets);
+        free(remote_offsets);
+        free(ba);
+        c->running = 0;
+        return NULL;
+    }
+
+    /* Allocate SGE and WR arrays per QP */
+    struct ibv_sge  *sges = calloc((size_t)num_qps * (size_t)qp_depth,
+                                   sizeof(struct ibv_sge));
+    struct ibv_send_wr *wrs = calloc((size_t)num_qps * (size_t)qp_depth,
+                                     sizeof(struct ibv_send_wr));
+    if (!sges || !wrs) {
+        free(sges);
+        free(wrs);
+        free(ring);
+        free(local_offsets);
+        free(remote_offsets);
+        free(ba);
+        c->running = 0;
+        return NULL;
+    }
+
+    /* Pre-fill SGEs and WRs (addresses are fixed per slot) */
+    for (int q = 0; q < num_qps; q++) {
+        for (int s = 0; s < qp_depth; s++) {
+            int idx = q * qp_depth + s;
+            sges[idx].addr   = local_offsets[q] + (size_t)s * msg_bytes;
+            sges[idx].length = msg_bytes;
+            sges[idx].lkey   = local_lkey;
+
+            wrs[idx].wr_id      = idx;
+            wrs[idx].opcode     = IBV_WR_RDMA_WRITE;
+            wrs[idx].sg_list    = &sges[idx];
+            wrs[idx].num_sge    = 1;
+            wrs[idx].send_flags = IBV_SEND_SIGNALED;
+            wrs[idx].next       = NULL;
+            wrs[idx].wr.rdma.remote_addr = remote_offsets[q]
+                                         + (size_t)s * msg_bytes;
+            wrs[idx].wr.rdma.rkey        = remote_rkey;
+        }
+    }
+
+    /* For rate limiting */
+    uint64_t window_bytes = 0;
+    struct timespec window_start, now;
+
+    clock_gettime(CLOCK_MONOTONIC, &window_start);
+    c->running = 1;
+
+    while (!c->stop_requested) {
+        /* --- Post all WRs to all QPs --- */
+        int total_posted = 0;
+        for (int q = 0; q < num_qps && !c->stop_requested; q++) {
+            for (int s = 0; s < qp_depth; s++) {
+                int idx = q * qp_depth + ring[q];
+                struct ibv_send_wr *bad = NULL;
+                int ret = ibv_post_send(c->qps[q], &wrs[idx], &bad);
+                if (ret != 0) {
+                    fprintf(stderr, "[rdmaqpgen] ibv_post_send QP[%d] failed: %s\n",
+                            q, strerror(ret));
+                    break;
+                }
+                ring[q] = (ring[q] + 1) % qp_depth;
+                total_posted++;
+            }
+        }
+
+        /* --- Poll CQ until all posted WRs complete --- */
+        int completed = 0;
+        int max_polls = total_posted * 10; /* safety valve */
+        while (completed < total_posted && !c->stop_requested && max_polls-- > 0) {
+            struct ibv_wc wc[256];
+            int n = ibv_poll_cq(c->cq, 256, wc);
+            for (int i = 0; i < n; i++) {
+                if (wc[i].status != IBV_WC_SUCCESS) {
+                    fprintf(stderr, "[rdmaqpgen] WC error: status=%d vendor_err=%d\n",
+                            wc[i].status, wc[i].vendor_err);
+                } else {
+                    c->bytes_sent += wc[i].byte_len;
+                    window_bytes  += wc[i].byte_len;
+                }
+                completed++;
+            }
+        }
+
+        /* --- Rate limiting: adjust gap based on achieved rate --- */
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double elapsed_s = (now.tv_sec - window_start.tv_sec)
+                         + (now.tv_nsec - window_start.tv_nsec) / 1e9;
+
+        long effective_gap = ba->gap_us;
+        if (ba->target_gbps > 0 && elapsed_s > 0.1) {
+            double achieved_gbps = (window_bytes * 8.0) / (elapsed_s * 1e9);
+            if (achieved_gbps > ba->target_gbps * 1.05) {
+                double ratio = achieved_gbps / ba->target_gbps;
+                effective_gap = (long)(ba->gap_us * ratio);
+                if (effective_gap > 1000000L) effective_gap = 1000000L;
+            } else if (achieved_gbps < ba->target_gbps * 0.95 && effective_gap > 100) {
+                effective_gap = effective_gap * 9 / 10;
+            }
+            window_bytes = 0;
+            window_start = now;
+        }
+
+        /* --- Gap between bursts --- */
+        if (effective_gap > 0 && !c->stop_requested) {
+            usleep((useconds_t)effective_gap);
+        }
+    }
+
+    c->running = 0;
+    free(local_offsets);
+    free(remote_offsets);
+    free(ring);
+    free(sges);
+    free(wrs);
+    free(ba);
+    return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* Public API: burst loop control                                       */
+/* ------------------------------------------------------------------ */
+
+int rdmaqp_start_burst_loop(rdmaqp_ctx *c, long burst_us, long gap_us,
+                            int target_gbps) {
+    if (!c || c->running) return -1;
+
+    burst_args *ba = malloc(sizeof(burst_args));
+    if (!ba) return -1;
+    ba->ctx         = c;
+    ba->burst_us    = burst_us;
+    ba->gap_us      = gap_us;
+    ba->target_gbps = target_gbps;
+
+    c->stop_requested = 0;
+    int ret = pthread_create(&c->burst_thread, NULL, burst_loop_thread, ba);
+    if (ret != 0) {
+        free(ba);
+        fprintf(stderr, "[rdmaqpgen] pthread_create failed: %s\n", strerror(ret));
+        return -1;
+    }
+
+    printf("[rdmaqpgen] burst loop started (burst=%ldus gap=%ldus target=%dGbps)\n",
+           burst_us, gap_us, target_gbps);
+    return 0;
+}
+
+int rdmaqp_stop(rdmaqp_ctx *c) {
+    if (!c) return -1;
+    c->stop_requested = 1;
+    if (c->running || c->burst_thread) {
+        pthread_join(c->burst_thread, NULL);
+        c->burst_thread = 0;
+    }
+    return 0;
+}
+
+uint64_t rdmaqp_bytes_sent(rdmaqp_ctx *c) {
+    if (!c) return 0;
+    return c->bytes_sent;
+}
