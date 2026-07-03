@@ -1,7 +1,7 @@
 """19-timestamp request timeline, accounting model, and immutable run metadata.
 
 See spec section "Common instrumentation". Timestamps are stored as float
-milliseconds (perf_counter*1e3 or similar). Null means "not applicable for
+seconds (perf_counter or time.time() domain). Null means "not applicable for
 this cell" (e.g., t2/t3 for persistent TCP), NOT zero.
 """
 from dataclasses import dataclass, field, asdict
@@ -36,19 +36,19 @@ class RequestTimeline:
         t0, t18 = self._ts.get("t0"), self._ts.get("t18")
         if t0 is None or t18 is None:
             return float("nan")
-        return (t18 - t0) * 1e3
+        return (t18 - t0) * 1e6
 
     def client_request_span_us(self) -> float:
         t0, t5 = self._ts.get("t0"), self._ts.get("t5")
         if t0 is None or t5 is None:
             return float("nan")
-        return (t5 - t0) * 1e3
+        return (t5 - t0) * 1e6
 
     def server_span_us(self) -> float:
         t6, t17 = self._ts.get("t6"), self._ts.get("t17")
         if t6 is None or t17 is None:
             return float("nan")
-        return (t17 - t6) * 1e3
+        return (t17 - t6) * 1e6
 
 
 @dataclass
