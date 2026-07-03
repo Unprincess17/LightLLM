@@ -1,6 +1,6 @@
 import pytest
 import torch
-from common.instrumentation import RequestTimeline, RunMetadata, account_request
+from common.instrumentation import RequestTimeline, RunMetadata, account_request, should_flag_instrumentation_gap
 
 
 def test_timeline_set_and_get():
@@ -49,3 +49,16 @@ def test_metadata_round_trip():
     d = md.to_dict()
     assert d["schema_version"] == 1
     assert d["cell_id"] == "B3"
+
+
+def test_should_flag_gap_both_conditions():
+    """Flag only when BOTH fraction > 5% AND absolute > 50us."""
+    # Large gap, large fraction -> flag
+    big = {"instrumentation_gap_us": 39000.0, "instrumentation_gap_fraction": 0.95}
+    assert should_flag_instrumentation_gap(big)
+    # Small absolute, large fraction -> no flag (abs < 50us)
+    small_abs = {"instrumentation_gap_us": 30.0, "instrumentation_gap_fraction": 0.95}
+    assert not should_flag_instrumentation_gap(small_abs)
+    # Large absolute, small fraction -> no flag (frac < 5%)
+    small_frac = {"instrumentation_gap_us": 39000.0, "instrumentation_gap_fraction": 0.01}
+    assert not should_flag_instrumentation_gap(small_frac)
