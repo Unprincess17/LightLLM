@@ -306,9 +306,16 @@ treated as instrumentation gap.
 ### What it answers
 
 - Does the tax persist in B2 after fixing the timing method?
-- Does the tax disappear in B6 (C++ matched worker)? If yes -> runtime-stack
-  overhead. If no -> GPU-side (allocation, cuBLAS, cache).
-- Does `same_weights`/`cache_flush` change the tax under correct timing?
+- Does B6 materially reduce the first/rest ratio? If yes -> the Python runtime
+  stack contributed to the tax. If the tax persists, replacing the Python stack
+  was insufficient; the residual remains **unattributed** and is investigated
+  using the allocator, weight-reuse, cache-perturbation, and CUDA-graph
+  diagnostics. Do NOT conclude "GPU-side" from B6 persistence alone — a
+  residual could also come from CUDA-runtime initialization, C++ framework
+  dispatch, allocator behavior, library initialization, graph/capture setup, or
+  another unisolated control-path component.
+- Does `same_weights`/`allocator-reset`/`device-cache-perturbation` change the
+  tax under correct timing?
 - Is the residual first/rest ratio under cuda_graph still 1.45x? If so, **no
   attribution claim** — "residual exists, root cause not isolated."
 
@@ -524,8 +531,9 @@ B2 (persistent TCP, Python executor, active cap=1), B3 (active cap=N=8).
 **Executor pool size fixed across B2/B3; only admission semaphore changes.**
 `B2: workers=N, active cap=1` / `B3: workers=N, active cap=N`.
 
-B2 permits multiple admitted/queued requests but only one active GPU quantum at a
-time. Queued requests visible to scheduler.
+B2 permits multiple admitted/queued requests but only one active logical request
+at a time in the primary atomic study (one active quantum at a time in the
+sliced secondary study). Queued requests visible to scheduler.
 
 **Multiplexed transport inherited from S2.**
 
@@ -575,8 +583,7 @@ Prediction accuracy reported: MAPE, predicted-vs-actual rank correlation.
 
 ### Execution-order instrumentation
 
-Four sequences per request: client submission, server handler-start, GPU-kernel-
-start (CUDA events on common device timeline or CUPTI/Nsight subset), completion.
+Four sequences per request: client submission, server handler-start, GPU-kernel-start (CUDA events on common device timeline or CUPTI/Nsight subset), completion.
 
 **Summary metrics:**
 - **Priority fidelity** = fraction of decisions where light request starts first
@@ -714,9 +721,13 @@ target chosen post-hoc).
 ### Resolving the light-P99 inconsistency (Stage A)
 
 H in {1,8} x B5-original x 1h8l x Poisson at load where heavy cap binds x >=5
-trials x corrected 19-timestamp instrumentation. If light P99 worsens at H=1 ->
-correct, text was error, heavy-lane heavy-favorable. If improves -> table was
-error.
+trials x corrected 19-timestamp instrumentation. Three outcomes:
+- light P99 worsens at H=1 -> old table correct, text was error, heavy-lane
+  heavy-favorable
+- light P99 improves at H=1 -> old table was error
+- neither historical value reproduces within uncertainty -> mark inconsistency
+  unresolved; compare original vs corrected metric code, class filters,
+  timestamp boundaries, and realized load to identify the source
 
 ### B5-original reproduction fidelity
 
@@ -774,11 +785,11 @@ growing queue is not stable capacity.
 | H2: At least one intermediate H lies on Pareto frontier or maximizes constrained SLO/throughput objective | H=2 or H=4 better balance than both extremes for >=1 mixture; need not strictly dominate on every metric. |
 | H3: Pareto-optimal H changes with heavy fraction | Sparse prefers stricter gating; dense may require larger H for throughput; all-heavy exposes pure concurrency-control tradeoff. |
 | H4: In all-heavy, lower H may improve P99 via limiting harmful simultaneous heavy execution | Mechanism not attributed specifically to concurrent-kernel submission until GPU traces isolate it. |
-| H5: No single H minimizes all objectives simultaneously; best H flips by objective. Constrained objective: maximize throughput s.t. light P99 <= L_slo, heavy P99 <= H_slo. |
+| H5: No single H minimizes all objectives simultaneously; best H flips by objective | Different objectives or SLO constraints select different H values; no H significantly dominates every other H across light P99, heavy P99, and throughput. Constrained objective: maximize throughput s.t. light P99 <= L_slo, heavy P99 <= H_slo. |
 
 ### Staged campaign
 
-- **Stage A:** Hin{1,8} x B5-original x 1h8l x 1 Poisson load x 5 trials = 10 runs.
+- **Stage A:** H in {1,8} x B5-original x 1h8l x 1 Poisson load x 5 trials = 10 runs.
 - **Stage B sync:** 4 H x 2 cells (B3, B5-admission) x 3 mixtures x 1 burst x 5
   trials = 120 runs.
 - **Stage B Poisson:** 4 H x 2 cells x 3 mixtures x 4 load conditions x 5 trials
@@ -827,13 +838,14 @@ P=64, E=32, A in {8, 16, 32}
 ```
 Primary contrast: `P=64,A=8` vs `P=64,A=32`.
 
-**Sweep 3 — Executor-width effect (hold active cap non-binding):**
+**Sweep 3 — Executor-width overhead at fixed active concurrency:**
 ```
 P=64, A=8, E in {8, 16, 32}
 ```
-Because every `E >= A`, the active cap remains 8. Any remaining difference is
-attributable to executor-width overhead, queueing implementation, or
-GIL/thread-management effects — not additional active work.
+Here `A=8` is deliberately binding; `E>=A` is non-binding. Because every
+`E >= A`, the active cap remains 8. Any remaining difference is attributable to
+executor-width overhead, queueing implementation, or GIL/thread-management
+effects — not additional active work.
 
 Primary contrast: `E=8` vs `E=32` at fixed (P=64, A=8).
 
@@ -892,11 +904,41 @@ trials = 80 runs.
 **Sweep 3 (executor-width):** P=64 x A=8 x 3 E x S=1 x 2 cells x 2 loads x 5
 trials = 60 runs.
 
-**Stream sensitivity (paired H1 cells):** 2 P-cells x 3 S x B3 x 2 loads x 5
-trials = 60 runs.
+**Stream sensitivity (paired H1 cells):** `(P=8,A=8,E=8)` and `(P=32,A=8,E=8)`
+for every `S in {1, 2, 4}`, on B3. The `S=1` configurations for both P-cells
+already appear in Sweep 1; if those results are reused, stream sensitivity adds
+**40 unique runs** (4 new cells: 2 P-cells x 2 new S values {2,4} x 2 loads x 5
+trials). If S=1 is intentionally rerun as validation, add 20 duplicated
+validation runs (state which).
 
-**S5 total: ~265 runs.** (Reduced from 735 because the invalid full
-cross-product is eliminated.)
+### Historical reproduction subset (B5-original-pool)
+
+The new matched sweeps use combinations such as `P=64, E=32, A=32`. None
+reproduces the historical setup exactly. Add an explicit reproduction subset:
+
+```
+B5-original-pool:
+P in {8, 16, 32}
+E = 256
+A coupled to P through the original pool.borrow() behavior
+original CUDA-stream policy
+original workload and offered-load calibration
+corrected instrumentation alongside original metrics on the same requests
+```
+
+3 pool sizes x 2 loads x 5 trials = **30 runs**.
+
+This distinguishes:
+- **historical reproduction:** P in {8,16,32} under old coupled mechanism
+- **causal active-cap test:** P=64, E=32, A in {8,16,32} (Sweep 2)
+- **physical-pool test:** A=8, E=8, P in {8,16,32,64} (Sweep 1)
+
+Without this subset, the new active-concurrency behavior can be called
+**consistent with** the old result, but not that the old result was reproduced.
+
+**S5 total: ~285 runs.** (Sweep 1: 80 + Sweep 2: 60 + Sweep 3: 60 + stream
+sensitivity: 40 unique + historical reproduction: 30 = 270 matched-sweep +
+historical; +15 buffer for S=1 validation reruns if used.)
 
 ### Preregistered hypotheses
 
@@ -904,7 +946,7 @@ cross-product is eliminated.)
 |-----|-------------------|
 | H1: Physical pool size does not matter once active concurrency controlled | `P=32,A=8` equivalent to `P=8,A=8` (TOST: throughput ratio in [0.95,1.05], P99 ratio in [0.90,1.10]) |
 | H2: At fixed sufficiently large physical pool and executor width, increasing active cap reproduces prior degradation | `P=64,A=32` (E=32, non-binding) degrades like original pool=32; matches B5 reproduction |
-| H3a: At fixed A=8, increasing E beyond A does or does not introduce measurable executor/runtime overhead | `E=8` vs `E=32` at (P=64, A=8) differ on throughput or P99 beyond paired-trial CI |
+| H3a (neutral): At fixed P=64, A=8, determine whether increasing E beyond A causes a material runtime overhead | `E=8` vs `E=32` at (P=64, A=8): equivalence test (throughput ratio in [0.95,1.05], P99 ratio in [0.90,1.10]) — if equivalent, no material overhead; if not, executor-width overhead detected |
 | H3b (secondary): When E<A, executor width acts as additional concurrency limiter | Coupled sensitivity (P=64, A=32, E in {8,16,32}) shows E-dependent degradation correlated with effective-concurrency change |
 | H4: CUDA stream count shifts absolute throughput but not the (P,A) equivalence | Stream count changes throughput uniformly; H1 equivalence holds at each S |
 
@@ -931,44 +973,63 @@ backpressure, original metrics).
 
 Sustained all-heavy reused from S4 when cell/cap/trace/duration/protocol match.
 
-### Three-stage admission
+### Three-stage admission (primary: open queueing, no rejection)
 
 ```
-generated -> client ingress queue -> system admitted -> completed
+t0 = scheduled arrival time
+c0 = actual insertion into client ingress queue
+c1 = selected for network dispatch
+c2 = accepted by the server/control path
+t18 = final response received
+
+application E2E       = t18 - t0      (NOTE: t18 - t0, not t0 - t18)
+generator lateness   = c0 - t0
+client queue wait    = c1 - c0
+dispatch/accept wait = c2 - c1
 ```
 
-**Frozen ingress-queue semantics:**
+**Primary capacity mode (open queueing, no rejection):**
 
 ```
-client_ingress_queue_capacity = large (>= 10x max in-flight), fixed across loads
-admission_timeout             = none (requests wait, not rejected, in primary runs)
-overflow_behavior             = counted and reported; primary runs assume no overflow
-rejection_decision_point      = system admission (c2), not generation
-client-queued time            = c1 - c0; INCLUDED in E2E (t0 - t18)
+client_ingress_queue_capacity = number of scheduled arrivals in the full trace
+admission_timeout             = none
+overload_rejection            = disabled
+overflow                      = invalid-run condition (flag, do not silently drop)
 ```
 
-Distinguish: not-yet-offered (c0 not reached), offered-but-rejected (c2
-reject), admitted-and-queued (c2 admit, s0 not reached), admitted-and-started
-(s5 reached).
+In overload, the system should exhibit: growing client/server queues;
+accepted/completed rate below generated rate; unfinished requests at generation
+end; drain censoring. Do NOT hide overload by rejecting enough arrivals to
+stabilize the queue — that would measure an admission limiter, not raw service
+capacity. The queue is sized from the full pre-generated trace, not merely
+`10x max in-flight` (at 1.05C over a long run, 10x in-flight may be too small
+and create artificial overflow).
 
-Generator places every scheduled arrival into large client ingress queue without
-blocking. Fixed preregistered admission policy admits or rejects. Queue overflow
-counted. Queue bound + rejection policy identical across load levels.
+**Separate admission-policy mode (explicit rejection):** a separate mode may
+explicitly reject requests when the system cannot admit. This mode is used for
+admission-control studies (S4 heavy-lane, S5 active-cap), NOT for S6 raw
+capacity estimation.
+
+Distinguish: not-yet-offered (c0 not reached), offered-but-rejected (c2 reject,
+admission-policy mode only), admitted-and-queued (c2 admit, s0 not reached),
+admitted-and-started (s5 reached).
 
 ### True open-loop generator
 
 Arrivals independent of completion. No `pass` backpressure, no executor blocking.
-If system cannot admit, request explicitly rejected (counted). Generator
-records: generated, admitted, client-queued, server-queued, started, completed,
-rejected, timed-out, unfinished-at-measurement-end, final-queue-length.
+In primary capacity mode, no rejection: every generated arrival enters the
+ingress queue and waits. Generator records: generated, admitted (c2 accept),
+client-queued, server-queued, started, completed, rejected (admission-policy
+mode only), timed-out, unfinished-at-measurement-end, final-queue-length.
 
 ### Capacity definition
 
 `C(cell, mixture)` = highest offered rate where **all of**:
-- generated rate ~= admitted rate (within 1%)
-- admitted rate ~= completion rate during generation (within 1%)
+- scheduled generation rate ~= actual c0 rate (within 1%)
+- c0 arrival rate ~= c2 accepted rate (within 1%)
+- c2 accepted rate ~= completion rate during generation (within 1%)
 - client/server queue-slope CI includes zero
-- rejection + timeout <=1%
+- rejection + timeout <=1% (rejection = 0 in primary open-queueing mode)
 
 Not `admitted~=completed` alone. Measured during steady generation window, not
 after drain.
@@ -1040,7 +1101,7 @@ miscalibration, or real stability.
 | Hyp | Expected evidence |
 |-----|-------------------|
 | H1: Original generator suppresses load variation via backpressure | Nominal rate increases but realized dispatch/admission plateaus; corrected open-loop exposes queue growth/rejection/latency/instability not visible in original |
-| H2: Original capacity estimate omits material control-path/concurrency costs | Predicted capacity exceeds empirical stable capacity by a preregistered materially meaningful margin; anchor decomposition identifies omitted time; nominal rho=0.2 maps to much higher empirical fraction |
+| H2: Original capacity estimate omits material control-path/concurrency costs | Predicted capacity exceeds empirical stable capacity by a preregistered materiality margin: `C_pred / C_empirical >= 1.20` (i.e., predicted is at least 20% above empirical); anchor decomposition identifies omitted time; nominal rho=0.2 maps to much higher empirical fraction |
 | H3: C(NM=1) > C(NM=8); mixture may deviate from linear prediction | Estimate whether mixture capacity differs from linear service-demand prediction; interaction_ratio may be below, near, or above 1 |
 | H4 (neutral): Each workload has measurable latency-load relationship; characterize whether transition sharp or gradual, how differs by workload |
 
@@ -1093,13 +1154,14 @@ not independently determine per-class admission cap.
 | S2 | ~750 |
 | S3 | ~540 |
 | S4 | ~760 |
-| S5 | ~265 |
+| S5 | ~285 |
 | S6 | ~754 |
-| **Total** | **~3,719** |
+| **Total** | **~3,739** |
 
-Approximately 3,700 frozen nominal runs, with a decision-gated upper range
-near 4,000 depending on selected-configuration validation, optional stateful-
-concurrent S2 ablation, and diagnostic follow-ups.
+Approximately 3,735-3,755 frozen nominal runs, with a decision-gated upper
+range near 4,000 depending on selected-configuration validation, optional
+stateful-concurrent S2 ablation, EP-validation subset, and diagnostic
+follow-ups.
 
 ## Frozen workload and environment
 
