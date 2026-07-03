@@ -2,10 +2,10 @@
 
 ## Status
 
-Architecture approved; implementation spec pending final corrections. Supersedes
-the experimental program in `2026-07-01-nm-weight-followup-program-design.md`
-for the six confound families S1-S6. Experiments 2, 7, 8, 10 from that document
-remain separately scoped.
+Implementation specification approved; execution remains decision-gated.
+Supersedes the experimental program in
+`2026-07-01-nm-weight-followup-program-design.md` for the six confound families
+S1-S6. Experiments 2, 7, 8, 10 from that document remain separately scoped.
 
 ## Context
 
@@ -27,8 +27,8 @@ are real:
   variants (1x/miss vs 4x/miss).
 - `concurrent_server.py` opens a new TCP connection per request (`SO_LINGER`
   RST). Cannot distinguish Python from TCP from executor from GIL.
-- The summary's Poisson table reports heavy-lane light P99 going 20,218→39,983 μs
-  (~=2x worse) while the text claims "improves 2x (20ms→16ms)." Unresolved
+- The summary's Poisson table reports heavy-lane light P99 going 20,218->39,983 us
+  (~=2x worse) while the text claims "improves 2x (20ms->16ms)." Unresolved
   inconsistency.
 
 ## Goal
@@ -73,17 +73,17 @@ The RDMA + GPU data plane is identical for every remote cell.
 ### Valid matched contrasts (each changes exactly one axis)
 
 ```
-B2 − B1   executor/queue overhead, Python, conc=1
-B3 − B2   concurrency effect, Python, persistent TCP
-B4 − B2   per-request TCP connection cost, Python, conc=1
-B5 − B3   per-request TCP connection cost, Python, conc=N
-B6 − B2   Python vs C++ runtime stack, persistent TCP, conc=1
-B7 − B3   Python vs C++ runtime stack, persistent TCP, conc=N
-B7 − B6   concurrency effect, C++, persistent TCP
-B8 − B6   connection cost, C++, conc=1
-B9 − B7   connection cost, C++, conc=N
-B8 − B4   Python vs C++, per-request TCP, conc=1
-B9 − B5   Python prototype vs matched C++ counterpart, conc=N
+B2 - B1   executor/queue overhead, Python, conc=1
+B3 - B2   concurrency effect, Python, persistent TCP
+B4 - B2   per-request TCP connection cost, Python, conc=1
+B5 - B3   per-request TCP connection cost, Python, conc=N
+B6 - B2   Python vs C++ runtime stack, persistent TCP, conc=1
+B7 - B3   Python vs C++ runtime stack, persistent TCP, conc=N
+B7 - B6   concurrency effect, C++, persistent TCP
+B8 - B6   connection cost, C++, conc=1
+B9 - B7   connection cost, C++, conc=N
+B8 - B4   Python vs C++, per-request TCP, conc=1
+B9 - B5   Python prototype vs matched C++ counterpart, conc=N
 ```
 
 ### "C++ matched worker" definition
@@ -153,41 +153,65 @@ recorded as null and excluded from interval arithmetic.
 
 ### Accounting model
 
-Separate three quantities:
+Use host-local spans first, so that uninstrumented local intervals do not leak
+into the cross-domain residual.
 
 ```
-cross_domain_residual
-  = client_measured_E2E
-    - sum(client-local measured durations)
-    - sum(server-local measured durations)
+client_request_span = t5 - t0      (one clock domain)
+server_span         = t17 - t6     (one clock domain)
+E2E                 = t18 - t0     (one clock domain)
 
-client_local_gap   = uncovered intervals within client clock domain
-server_local_gap   = uncovered intervals within server clock domain
+client_local_gap    = client_request_span - sum(instrumented client-local subintervals)
+server_local_gap    = server_span         - sum(instrumented server-local subintervals)
 instrumentation_gap = client_local_gap + server_local_gap
+
+cross_domain_residual = E2E - client_request_span - server_span
 ```
 
-The `cross_domain_residual` combines request wire/kernel-buffer time, response
-wire/kernel-buffer time, and any omitted cross-host control activity. It is
-**not** attributed to "TCP wire time." It is **not** the same as
-`unaccounted_us`: by construction, `E2E = sum(client-local) + sum(server-local)
-+ cross_domain_residual` closes exactly, so the residual cannot also serve as
-an independent accounting-quality check.
+This yields the exact decomposition:
 
-The accounting-quality check is `instrumentation_gap` — the uncovered intervals
-*within* a single clock domain (e.g., between handler-start and QP-acquired if
-that sub-interval is not timestamped, or between RDMA-WRITE-completes and
-response-sent). Report `instrumentation_gap_us`, `instrumentation_gap_fraction`.
-Flag if **both** `instrumentation_gap_fraction > 5%` **and**
-`instrumentation_gap_us > 50us`. The 50us absolute threshold is calibrated from
-a no-op control-message experiment.
+```
+E2E = measured_client_subintervals
+    + client_local_gap
+    + measured_server_subintervals
+    + server_local_gap
+    + cross_domain_residual
+```
+
+The `cross_domain_residual` now corresponds to the combined request/response
+cross-host remainder (wire + kernel-buffer + omitted cross-host control), not to
+uninstrumented local queueing. The `instrumentation_gap` is the local
+accounting-quality check.
+
+Report `instrumentation_gap_us`, `instrumentation_gap_fraction`. Flag if **both**
+`instrumentation_gap_fraction > 5%` **and** `instrumentation_gap_us > 50us`.
+The 50us absolute threshold is calibrated from a no-op control-message
+experiment.
 
 Report `cross_domain_residual_us` and `cross_domain_residual_fraction`
 descriptively, but do not use either as a pass/fail accounting check (it is
 unavoidable without PTP and is closed by construction).
 
+### Client-side admission timestamps
+
+Freeze the meaning of client-side stages (do not overload `t1`):
+
+```
+c0 = entered client ingress queue
+c1 = selected for network dispatch
+c2 = system admission decision (if acknowledged)
+t0 = scheduled generation time
+t5 = request sent
+```
+
+`t1` (client admission) is retained for backward compatibility but maps to `c1`
+in the new schema. The four client-side concepts — ingress queue, dispatch
+selection, system admission, server admission — are distinct and must not share
+one timestamp.
+
 ### Dual timing domains for GPU work
 
-CPU submission wall-clock (t12) **and** CUDA-event elapsed (t13→t14). Reported
+CPU submission wall-clock (t12) **and** CUDA-event elapsed (t13->t14). Reported
 separately, never subtracted across domains.
 
 ### Scheduler-specific timestamps (S3, S4)
@@ -238,15 +262,20 @@ B1, B2, B6 (primary); B5 (reproduction).
 1. **baseline** — full per-miss decomposition (alloc, dtype, mm1, mm2), each
    bracketed by CUDA events.
 2. **same_weights** — weight index fixed to 0 for all misses.
-3. **cache_flush** — split into two separate diagnostics:
+3. **cache_flush** — split into two separate diagnostics (separate configs, not
+   one combined variant):
    - **allocator-reset:** `torch.cuda.empty_cache()` before each miss (affects
      the caching allocator, *not* L2). Recorded as a diagnostic, not as a
      "flush."
-   - **device-cache-perturbation:** scratch write sized from the actual device
-     cache capacity (e.g., A100 L2 = 40 MB; RTX 6000 Ada = 48 MB), not a fixed
-     64 MB. Scratch write may globally perturb concurrent work; reported as a
+   - **device-cache-perturbation:** scratch write sized from the **runtime-
+     queried** device L2 cache size (via CUDA device attribute
+     `cudaDevAttrL2CacheSize`, not a hardcoded constant), not a fixed 64 MB.
+     Scratch write may globally perturb concurrent work; reported as a
      separate diagnostic, not bundled into "cache_flush."
-   Neither diagnostic is in the timed per-miss segment.
+   Perturbation cost is reported separately and not hidden:
+   `perturbation_cost_us`, `compute_after_perturbation_us`,
+   `total_E2E_including_perturbation_us`. A variant must not appear faster
+   only because its preparation cost was omitted from the request total.
 4. **cuda_graph** — capture one graph per weight index, replay per miss. **Per-op
    subsegment timing is NOT comparable to eager variants:** a single graph replay
    is one submitted unit, and external CUDA events measure total graph time, not
@@ -269,15 +298,16 @@ sync inside) + GPU execution (CUDA events before/after each op). For the
 cuda_graph variant: CPU submission + total GPU replay time + E2E only (above).
 
 Full accounting per request: `instrumentation_gap` closes near zero (see common
-instrumentation). The cuda_graph variant's `instrumentation_gap` will be larger
-by construction (internal ops not individually timestamped); report it but do
-not flag-fail the graph variant on that basis alone.
+instrumentation). The CUDA-graph path does not expose comparable
+alloc/dtype/mm1/mm2 subsegments, but total graph GPU time remains fully covered
+by the replay interval (t13->t14). Reduced subsegment granularity is **not**
+treated as instrumentation gap.
 
 ### What it answers
 
 - Does the tax persist in B2 after fixing the timing method?
-- Does the tax disappear in B6 (C++ matched worker)? If yes → runtime-stack
-  overhead. If no → GPU-side (allocation, cuBLAS, cache).
+- Does the tax disappear in B6 (C++ matched worker)? If yes -> runtime-stack
+  overhead. If no -> GPU-side (allocation, cuBLAS, cache).
 - Does `same_weights`/`cache_flush` change the tax under correct timing?
 - Is the residual first/rest ratio under cuda_graph still 1.45x? If so, **no
   attribution claim** — "residual exists, root cause not isolated."
@@ -285,11 +315,12 @@ not flag-fail the graph variant on that basis alone.
 ### Explicit non-claims
 
 - No "likely cuBLAS algorithm selection" without a dedicated experiment.
-- No "Python dispatch" claim from B5 alone — only from B6−B2 matched contrast.
+- No "Python dispatch" claim from B5 alone — only from B6-B2 matched contrast.
 
 ### Configs
 
-4 variants x 4 cells x 4 NM (1,2,4,8) x 5 trials = **320 runs**.
+5 variants (baseline, same_weights, allocator-reset, device-cache-perturbation,
+cuda_graph) x 4 cells x 4 NM (1,2,4,8) x 5 trials = **400 runs**.
 
 ## S2 — Splitting re-test (client-side fix + server-side cooperative slicing)
 
@@ -314,7 +345,7 @@ differs only in scheduling location + control count.
 
 ### Cells
 
-- B1 (atomic + stateful client chunking only — no executor → no server scheduler)
+- B1 (atomic + stateful client chunking only — no executor -> no server scheduler)
 - B2 (primary slicing diagnostic; scheduler with one active quantum)
 - B3 (slicing under real concurrent GPU pressure)
 - B5 (atomic reproduction + original fan-out reproduction + server slicing
@@ -351,9 +382,9 @@ order. Hard requirement, not implementation detail.
 ```
 1. Worker submits one quantum to a CUDA stream
 2. Worker records a per-stream CUDA completion event
-3. Worker immediately returns to the worker pool         ← CPU released
+3. Worker immediately returns to the worker pool         <- CPU released
 4. Event poller/callback observes quantum completion
-5. GPU admission token released                          ← GPU token released
+5. GPU admission token released                          <- GPU token released
 6. Continuation marked runnable, appended to scheduler queue
 7. Scheduler later selects the continuation
 8. Next quantum submitted
@@ -412,12 +443,12 @@ If q=8 differs materially, slicing state machine confounds q=1/2/4.
 
 ### Scheduler-only no-op microbenchmark
 
-`enqueue → select → callback → requeue` with no GEMMs. Lower-bound cost of one
+`enqueue -> select -> callback -> requeue` with no GEMMs. Lower-bound cost of one
 yield.
 
 ### Logical latency definition (uniform)
 
-**Primary: logical E2E** = original logical request `t0` → final result available
+**Primary: logical E2E** = original logical request `t0` -> final result available
 at client `t18`. Separately: server service span, GPU compute span, RDMA
 completion span.
 
@@ -451,7 +482,7 @@ CUPTI/Nsight subset — not CPU submission timestamps.
 
 | Hyp | Expected evidence |
 |-----|-------------------|
-| H1: RPC fan-out caused catastrophic split | Stateful sequential chunking reduces heavy P99 by >=2x vs original B5 fan-out at same logical offered load. **Matched persistent fan-out (mechanism d) isolates the fan-out contribution from transport persistence.** If only the bundled-removal comparison is available, weaken to: "bundled removal of fan-out + repeated connect + repeated QP-acquisition eliminates the prior catastrophic result." |
+| H1: RPC fan-out caused catastrophic split | **Primary (matched):** at persistent transport and same active cap, concurrent independent chunk RPCs produce materially worse logical-request latency and/or throughput than sequential stateful chunking. **Caveat:** persistent fan-out still changes concurrent executor tasks, QP acquisitions, RDMA op count, and server state sharing, so the conclusion is "independent RPC fan-out as an implementation bundle is harmful even after connection setup is removed" — a pure "concurrency alone" claim would require a stateful concurrent-chunk ablation (optional). **Reproduction:** original B5 fan-out remains reproduction evidence. |
 | H2: Contiguous chunking cannot reduce HOL | No material light-P99 improvement; worse heavy latency or throughput. Negative control. |
 | H3: Interleaved client chunking reduces light P99 | Lower light P99, bounded heavy slowdown. Caveat: single-client only; not generalized to multi-client. |
 | H4: Server slicing provides cleanest mitigation | Lower light P99 than atomic + client chunking at similar throughput. Strongest comparison: server slicing vs stateful interleaved client chunking. |
@@ -462,8 +493,10 @@ CUPTI/Nsight subset — not CPU submission timestamps.
 ### Staged campaign
 
 **Stage A — diagnostic selection (B2, B3, 1h8l):** 13 variants x 2 cells x 1
-composition x 2 arrival modes x 5 trials = 260 runs. + q=8 equivalence 20 runs.
-+ scheduler no-op 10 runs. **Stage A: ~290 runs.**
+composition x 2 arrival modes x 5 trials = 260 runs. + matched persistent
+fan-out 3 chunk sizes x 1 cell (B3) x 1 composition x 2 modes x 5 trials = 30
+runs. + q=8 equivalence 20 runs. + scheduler no-op 10 runs. **Stage A: ~320
+runs.**
 
 **B5 reference:** 3 fan-out sizes x 1 cell x 2 compositions x 2 modes x 5 trials
 = 60 runs.
@@ -475,14 +508,14 @@ B5-stateful).
 **CUDA-graph sub-study:** 4 policies x 2 (eager/graph) x 2 cells x 1 composition
 x 2 modes x 5 trials = 160 runs.
 
-**S2 total: ~710–730 runs.**
+**S2 total: ~740-760 runs.**
 
 ## S3 — Scheduling study
 
 ### Reviewer concern
 
 Original "SJF" is client-side submission sort only. With
-`ThreadPoolExecutor(max_workers=N)`, submission order ≠ execution order. 3x gain
+`ThreadPoolExecutor(max_workers=N)`, submission order != execution order. 3x gain
 for both classes suspicious. Server-side priority queuing untested.
 
 ### Cells
@@ -512,9 +545,9 @@ Slicing disabled. Priority+slicing is secondary.
 - Client-SJF under Poisson is online: requests enter client-local ready queue in
   arrival order; whenever dispatch slot free, shortest predicted ready job chosen.
   No arbitrary batching window.
-- Server-SJF uses **central dispatcher before executor**: `request received →
-  admitted to central server queue → priority dispatcher selects →
-  active-concurrency token acquired → submitted to executor/GPU path`. Selected
+- Server-SJF uses **central dispatcher before executor**: `request received ->
+  admitted to central server queue -> priority dispatcher selects ->
+  active-concurrency token acquired -> submitted to executor/GPU path`. Selected
   job runs to completion (primary study).
 
 ### Client outstanding-request window
@@ -525,17 +558,17 @@ client_outstanding_cap = W (= N = 8 primary; W=2N sensitivity)
 
 At most W requests sent but unfinished; additional arrivals wait in client ready
 queue. Same W for all policies and both B2/B3. Record
-`client_ready_queue_wait = dispatch_start − client_queue_entry`.
+`client_ready_queue_wait = dispatch_start - client_queue_entry`.
 
 ### Priority key: calibrated predicted service time
 
 ```
 S_hat_cell(NM) = median isolated atomic service time, same cell's runtime/transport
-NM ∈ {1,4,8} calibrated separately
+NM in {1,4,8} calibrated separately
 ```
 
 For sliced execution (secondary): progress-aware remaining time
-`R_hat(total_nm, completed_nm) = Σ predicted costs of unprocessed misses + final
+`R_hat(total_nm, completed_nm) = sum predicted costs of unprocessed misses + final
 copy/RDMA-WRITE`. Model knows whether first-miss/setup cost already paid.
 
 Prediction accuracy reported: MAPE, predicted-vs-actual rank correlation.
@@ -577,7 +610,7 @@ over time. No aging initially (pure SJF characterization).
 |-----|-------------------|
 | H1: Client-side sorting does not reliably control GPU execution order at B3 | Client intended order weaker correlation with GPU-start than server-priority; original both-class improvement does not consistently reproduce; benefit correlates with actual execution order or reduced active concurrency |
 | H2: Server-SJF outperforms Client-SJF | Higher priority fidelity, fewer inversions, lower light P99 at comparable throughput. Caveat: single client may approximate; two-client follow-up strengthens. |
-| H3 (factorial): Decompose scheduling vs concurrency | `Delta_sched(c) = P99(FIFO,c) − P99(Server-SJF,c)` at c∈{1,N}; `Delta_conc(policy) = P99(policy,N) − P99(policy,1)`; `Interaction = Delta_sched(N) − Delta_sched(1)`. Calculated **per class** (light, heavy separately) using ratios + absolute. Interpretation: `Delta_sched(1)>0` = queue-order benefit without GPU concurrency; `Delta_sched(N) > Delta_sched(1)` = scheduling also mitigates concurrent interference; large `Delta_conc` across all policies = active concurrency dominant factor; `FIFO@B2` beats all `@B3` policies = active concurrency dominates scheduling. |
+| H3 (factorial): Decompose scheduling vs concurrency | `Delta_sched(c) = P99(FIFO,c) - P99(Server-SJF,c)` at c in {1,N}; `Delta_conc(policy) = P99(policy,N) - P99(policy,1)`; `Interaction = Delta_sched(N) - Delta_sched(1)`. Calculated **per class** (light, heavy separately) using ratios + absolute. **Primary factorial analysis uses paired common-load traces at the same absolute logical arrival rate.** Matched-utilization runs are used only for normalized operating-point characterization and are NOT used for the causal factorial contrast (different absolute rates confound the effect). Interpretation: `Delta_sched(1)>0` = queue-order benefit without GPU concurrency; `Delta_sched(N) > Delta_sched(1)` = scheduling also mitigates concurrent interference; large `Delta_conc` across all policies = active concurrency dominant factor; `FIFO@B2` beats all `@B3` policies = active concurrency dominates scheduling. |
 | H4 (neutral): Priority and slicing may be complementary when light arrives behind active heavy | Priority alone cannot preempt. Success (multi-objective): light P99 improves >=20% vs standalone priority, heavy worsens <=25%, throughput falls <=10%, no starvation increase. May overlap rather than add. |
 
 ### Staged campaign
@@ -597,7 +630,7 @@ over time. No aging initially (pure SJF characterization).
 
 ### Reviewer concern
 
-(1) Poisson table reports light P99 20,218→39,983 μs but text claims "improves
+(1) Poisson table reports light P99 20,218->39,983 us but text claims "improves
 2x." (2) Original tested only semaphore=1 and one mixture; universality
 unestablished.
 
@@ -624,7 +657,7 @@ When an active slot becomes free:
 ```
 
 At most H active heavy; at most N active total; no dedicated reservation; light
-may occupy >N−H slots if <H heavy active; heavy FIFO within class; light FIFO
+may occupy >N-H slots if <H heavy active; heavy FIFO within class; light FIFO
 within class; bypass only when heavy temporarily ineligible.
 
 ### Heavy threshold
@@ -634,7 +667,7 @@ composition.
 
 ### H sweep
 
-`H ∈ {1, 2, 4, 8}`. H=8 = no heavy sub-cap (bounded by total N=8).
+`H in {1, 2, 4, 8}`. H=8 = no heavy sub-cap (bounded by total N=8).
 
 ### Mixtures
 
@@ -661,19 +694,28 @@ composition.
 2. Matched utilization — each (cell, mixture, H) at rho=0.7, 0.85 of own
    `C(cell, mixture, H)`
 
-### Class-aware vs global-cap control (Stage C)
+### Class-aware vs global-cap control (Stage C, frozen workload)
 
-At one representative mixed workload: heavy-lane (N=8, H∈{1,2,4}) vs global cap
-(K∈{1,2,4}, no heavy sub-cap) vs ungated (N=8, H=8). If heavy-lane preserves
-light latency + throughput better than global K=2, benefit is genuinely
-class-aware. All-heavy cannot demonstrate uniquely heavy-lane benefit (H=global K
-operationally).
+Preregistered workload (not chosen after viewing Stage B):
+- **cell:** B3
+- **mixture:** Poisson 1h3l (25% heavy)
+- **loads:** (1) safe common below min capacity of all 7 policies; (2) common
+  rate near ungated H=8 knee
+
+Compare: heavy-lane (N=8, H in {1,2,4}) vs global cap (K in {1,2,4}, no heavy
+sub-cap) vs ungated (N=8, H=8). If heavy-lane preserves light latency +
+throughput better than global K=2, benefit is genuinely class-aware. All-heavy
+cannot demonstrate uniquely heavy-lane benefit (H=global K operationally).
+
+**Normalized SLO thresholds** use the isolated service time for the same cell,
+class, and runtime path (e.g., `P(latency > 2x isolated)`, not an absolute
+target chosen post-hoc).
 
 ### Resolving the light-P99 inconsistency (Stage A)
 
-H∈{1,8} x B5-original x 1h8l x Poisson at load where heavy cap binds x >=5 trials
-x corrected 19-timestamp instrumentation. If light P99 worsens at H=1 → table
-correct, text was error, heavy-lane heavy-favorable. If improves → table was
+H in {1,8} x B5-original x 1h8l x Poisson at load where heavy cap binds x >=5
+trials x corrected 19-timestamp instrumentation. If light P99 worsens at H=1 ->
+correct, text was error, heavy-lane heavy-favorable. If improves -> table was
 error.
 
 ### B5-original reproduction fidelity
@@ -714,8 +756,8 @@ CIs. Baseline = same cell/mixture/load, H=8.
 ### Open-loop backlog and censoring
 
 Record generated/admitted/started/completed/rejected/timed-out/unfinished/
-final-queue-length. Drain phase: 60–120s generation → bounded drain → include
-full E2E → separately report censored. Queue-length slope near end reported;
+final-queue-length. Drain phase: 60–120s generation -> bounded drain -> include
+full E2E -> separately report censored. Queue-length slope near end reported;
 growing queue = unstable even if completed P99 bounded.
 
 ### Capacity stability
@@ -736,7 +778,7 @@ growing queue is not stable capacity.
 
 ### Staged campaign
 
-- **Stage A:** H∈{1,8} x B5-original x 1h8l x 1 Poisson load x 5 trials = 10 runs.
+- **Stage A:** Hin{1,8} x B5-original x 1h8l x 1 Poisson load x 5 trials = 10 runs.
 - **Stage B sync:** 4 H x 2 cells (B3, B5-admission) x 3 mixtures x 1 burst x 5
   trials = 120 runs.
 - **Stage B Poisson:** 4 H x 2 cells x 3 mixtures x 4 load conditions x 5 trials
@@ -785,14 +827,28 @@ P=64, E=32, A in {8, 16, 32}
 ```
 Primary contrast: `P=64,A=8` vs `P=64,A=32`.
 
-**Sweep 3 — Executor-width effect (hold pool and cap non-binding):**
+**Sweep 3 — Executor-width effect (hold active cap non-binding):**
+```
+P=64, A=8, E in {8, 16, 32}
+```
+Because every `E >= A`, the active cap remains 8. Any remaining difference is
+attributable to executor-width overhead, queueing implementation, or
+GIL/thread-management effects — not additional active work.
+
+Primary contrast: `E=8` vs `E=32` at fixed (P=64, A=8).
+
+**Optional coupled sensitivity (secondary, labeled as such):**
 ```
 P=64, A=32, E in {8, 16, 32}
 ```
-Primary contrast: `E=8` vs `E=32` at fixed (P=64, A=32).
+Labeled "executor bottleneck / effective-concurrency sensitivity," NOT
+"independent executor-width effect," because here E<A makes executor width an
+additional concurrency limiter.
 
-**Stream sensitivity:** run on a small selected subset of feasible
-configurations from each sweep; S in {1, 2, 4}.
+**Stream sensitivity:** paired cells for H1 equivalence at each stream count:
+`(P=8,A=8,E=8)` and `(P=32,A=8,E=8)` for every `S in {1, 2, 4}`, on B3. This
+directly tests H1 at each stream count rather than selecting unrelated
+representative configurations.
 
 ### Cells
 
@@ -833,13 +889,13 @@ trials = 80 runs.
 **Sweep 2 (active-concurrency):** P=64 x 3 A x E=32 x S=1 x 2 cells x 2 loads x
 5 trials = 60 runs.
 
-**Sweep 3 (executor-width):** P=64 x A=32 x 3 E x S=1 x 2 cells x 2 loads x 5
+**Sweep 3 (executor-width):** P=64 x A=8 x 3 E x S=1 x 2 cells x 2 loads x 5
 trials = 60 runs.
 
-**Stream sensitivity:** 3 representative cells x 3 S x B3 x 1 load x 5 trials =
-45 runs.
+**Stream sensitivity (paired H1 cells):** 2 P-cells x 3 S x B3 x 2 loads x 5
+trials = 60 runs.
 
-**S5 total: ~245 runs.** (Reduced from 735 because the invalid full
+**S5 total: ~265 runs.** (Reduced from 735 because the invalid full
 cross-product is eliminated.)
 
 ### Preregistered hypotheses
@@ -848,14 +904,15 @@ cross-product is eliminated.)
 |-----|-------------------|
 | H1: Physical pool size does not matter once active concurrency controlled | `P=32,A=8` equivalent to `P=8,A=8` (TOST: throughput ratio in [0.95,1.05], P99 ratio in [0.90,1.10]) |
 | H2: At fixed sufficiently large physical pool and executor width, increasing active cap reproduces prior degradation | `P=64,A=32` (E=32, non-binding) degrades like original pool=32; matches B5 reproduction |
-| H3: Executor width contributes independently | E=32 differs from E=8 at fixed (P=64, A=32) beyond what active cap alone explains |
+| H3a: At fixed A=8, increasing E beyond A does or does not introduce measurable executor/runtime overhead | `E=8` vs `E=32` at (P=64, A=8) differ on throughput or P99 beyond paired-trial CI |
+| H3b (secondary): When E<A, executor width acts as additional concurrency limiter | Coupled sensitivity (P=64, A=32, E in {8,16,32}) shows E-dependent degradation correlated with effective-concurrency change |
 | H4: CUDA stream count shifts absolute throughput but not the (P,A) equivalence | Stream count changes throughput uniformly; H1 equivalence holds at each S |
 
 ## S6 — Per-class capacity recalibration
 
 ### Reviewer concern
 
-Service time excludes TCP → rho underestimated. Inflight cap 256 + backpressure =
+Service time excludes TCP -> rho underestimated. Inflight cap 256 + backpressure =
 closed-loop. No generated/admitted/rejected split. "Flat P99" is artifact.
 
 ### Cells
@@ -877,8 +934,22 @@ Sustained all-heavy reused from S4 when cell/cap/trace/duration/protocol match.
 ### Three-stage admission
 
 ```
-generated → client ingress queue → system admitted → completed
+generated -> client ingress queue -> system admitted -> completed
 ```
+
+**Frozen ingress-queue semantics:**
+
+```
+client_ingress_queue_capacity = large (>= 10x max in-flight), fixed across loads
+admission_timeout             = none (requests wait, not rejected, in primary runs)
+overflow_behavior             = counted and reported; primary runs assume no overflow
+rejection_decision_point      = system admission (c2), not generation
+client-queued time            = c1 - c0; INCLUDED in E2E (t0 - t18)
+```
+
+Distinguish: not-yet-offered (c0 not reached), offered-but-rejected (c2
+reject), admitted-and-queued (c2 admit, s0 not reached), admitted-and-started
+(s5 reached).
 
 Generator places every scheduled arrival into large client ingress queue without
 blocking. Fixed preregistered admission policy admits or rejects. Queue overflow
@@ -904,8 +975,8 @@ after drain.
 
 ### Bracketed capacity estimate
 
-Low-load validation → geometric increase to instability → bracket boundary →
-binary-search to ±5% → `C_low` (highest stable), `C_high` (lowest unstable),
+Low-load validation -> geometric increase to instability -> bracket boundary ->
+binary-search to +/-5% -> `C_low` (highest stable), `C_high` (lowest unstable),
 estimated C = interpolation. Use C_low for conservative matched-rho.
 
 ### Generator validation (Phase 0)
@@ -926,7 +997,7 @@ lambda = 0.05C, 0.1C, 0.2C, 0.4C, 0.6C, 0.75C, 0.85C, 0.9C, 0.95C, 1.0C, 1.05C
 
 - Exploratory: 20s to estimate C
 - Final: 60–120s generation near knee; longer if P99 unstable
-- Drain: stop generation → bounded drain → include full E2E → separately report
+- Drain: stop generation -> bounded drain -> include full E2E -> separately report
   censored
 - Queue-length slope near end reported
 
@@ -969,8 +1040,8 @@ miscalibration, or real stability.
 | Hyp | Expected evidence |
 |-----|-------------------|
 | H1: Original generator suppresses load variation via backpressure | Nominal rate increases but realized dispatch/admission plateaus; corrected open-loop exposes queue growth/rejection/latency/instability not visible in original |
-| H2: Original estimate omits material control-path/concurrency costs | Anchor decomposition identifies omitted time; predicted C ≫ empirical C; nominal rho=0.2 maps to much higher empirical fraction |
-| H3: C(NM=1) > C(NM=8); mixture may deviate from linear prediction | interaction_ratio ≠ 1 for mixtures |
+| H2: Original capacity estimate omits material control-path/concurrency costs | Predicted capacity exceeds empirical stable capacity by a preregistered materially meaningful margin; anchor decomposition identifies omitted time; nominal rho=0.2 maps to much higher empirical fraction |
+| H3: C(NM=1) > C(NM=8); mixture may deviate from linear prediction | Estimate whether mixture capacity differs from linear service-demand prediction; interaction_ratio may be below, near, or above 1 |
 | H4 (neutral): Each workload has measurable latency-load relationship; characterize whether transition sharp or gradual, how differs by workload |
 
 ### Claim scope
@@ -1005,11 +1076,11 @@ not independently determine per-class admission cap.
 
 ### Decision gates
 
-- Stage A inconclusive → debug/redesign before Stage B
-- Policy clearly dominated → not run through full matrix
-- Two cells statistically equivalent → retain one
-- No slicing benefit at any diagnostic point → reduce CUDA-graph slicing matrix
-- S5 changes preferred active cap → update S6 and policy-validation cells
+- Stage A inconclusive -> debug/redesign before Stage B
+- Policy clearly dominated -> not run through full matrix
+- Two cells statistically equivalent -> retain one
+- No slicing benefit at any diagnostic point -> reduce CUDA-graph slicing matrix
+- S5 changes preferred active cap -> update S6 and policy-validation cells
 
 ~4,000–4,200 runs treated as adaptive campaign, not unconditional batch.
 
@@ -1017,14 +1088,18 @@ not independently determine per-class admission cap.
 
 | Study | Runs |
 |-------|-----:|
-| Anchor (B0–B9 subset) | ~250 |
-| S1 | 320 |
-| S2 | ~730 |
+| Anchor (B0-B9 subset) | ~250 |
+| S1 | 400 |
+| S2 | ~750 |
 | S3 | ~540 |
 | S4 | ~760 |
-| S5 | ~245 |
+| S5 | ~265 |
 | S6 | ~754 |
-| **Total** | **~3,599** |
+| **Total** | **~3,719** |
+
+Approximately 3,700 frozen nominal runs, with a decision-gated upper range
+near 4,000 depending on selected-configuration validation, optional stateful-
+concurrent S2 ablation, and diagnostic follow-ups.
 
 ## Frozen workload and environment
 
@@ -1037,9 +1112,10 @@ hidden dimension H:              2048
 intermediate/output dim I:       2048
 rank:                            64 (current regime; R=256/512 is Exp 2/8, separate)
 dtype: activation f16 -> f32 compute; A, B f32; result f16
-weight layout:                   contiguous, (rank, H) and (rank, I)
+weight layout:                   contiguous, A=[R, H], B=[R, I]
+compute:                         y = x @ A.T @ B      where x=[1, H], y=[1, I]
 CUDA streams:                    1 primary (S=1) unless stream sweep
-server GPU:                      RTX 6000 Ada (UM251), 48 MB L2
+server GPU:                      RTX 6000 Ada (UM251), L2 size runtime-queried
 client GPU:                      A100-80GB (UM253)
 CUDA / driver / PyTorch:         recorded per run (immutable metadata, below)
 rdma-core:                       recorded per run
@@ -1050,6 +1126,12 @@ CPU affinity / NUMA:             pinned and recorded per run
 
 Rank is scoped to R=64 for this program. Claims do not extend to R=256/512
 without the separate Exp 2/8 studies.
+
+**Asymmetric correctness-only test:** because H=I=2048, transposition or
+dimension-order errors can be masked. A separate correctness test uses
+`H != I` (e.g., H=2048, I=1024) to catch incorrect layout assumptions before
+the 3,000-plus-run program begins. Not part of the performance campaign; run
+once per code change.
 
 ## EP regime
 
@@ -1153,9 +1235,9 @@ cell, active cap, heavy cap, trace, timing, and drain protocol match exactly
 | `bench_capacity.py` | Modified — true open-loop, three-stage admission, bracketed C, drain protocol |
 | `concurrent_server.py` | Modified — persistent TCP, central dispatcher, cooperative slicing |
 | `cpp/server_worker.cc` | New — C++ matched worker for B6-B9 |
-| `cpp/protocol.h` | New — shared serialization schema (Python and C++) |
+| `cpp/protocol.h` | New — shared serialization schema: protocol version, byte order, struct packing/alignment, message-length framing, request-ID width — frozen identically for Python and C++ |
 | `cpp/CMakeLists.txt` | New — build path for C++ matched worker |
-| `tests/test_python_cpp_protocol_equivalence.py` | New — verifies serialized bytes, RDMA op sequence, buffer addresses/sizes, CUDA kernel sequence, output numerical equivalence, queue/admission behavior |
+| `tests/test_python_cpp_protocol_equivalence.py` | New — verifies equality of logical GPU operations, shapes, dtypes, stream policy, sync boundaries, allocation policy, RDMA sequence, and numerical output. Records low-level kernel sequences and flags differences, but exact kernel-name identity is NOT a pass condition (cuBLAS/framework dispatch may produce different low-level names for semantically identical ops) unless both paths intentionally call the same low-level CUDA implementation |
 | `qppool.py` | Modified — physical pool / active cap separation |
 | `common/instrumentation.py` | New — 19-timestamp schema, scheduler timestamps, accounting model, paired traces, immutable metadata |
 | `common/load_generator.py` | New — true open-loop generator, no-op validation, drain protocol |
