@@ -6,7 +6,7 @@ bench_first_miss.py, bench_splitting.py, and bench_capacity.py.
 import json
 import struct
 import threading
-from typing import Any, BinaryIO
+from typing import BinaryIO
 
 _id_counter = 0
 _id_lock = threading.Lock()

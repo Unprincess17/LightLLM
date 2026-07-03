@@ -43,3 +43,20 @@ def test_block_bootstrap_ci():
     lo, hi = block_bootstrap_ci(samples, statistic=np.mean, block_size=50,
                                 n_resamples=500, rng=rng)
     assert lo < 100 < hi
+
+
+def test_percentile_ci_covers_true_p99():
+    """Bootstrap CI for P99 should contain the true P99 of a known distribution."""
+    rng = np.random.default_rng(123)
+    # Large sample from a known distribution so the empirical P99 is stable
+    samples = rng.normal(0, 1, size=20000)
+    true_p99 = float(np.percentile(samples, 99))
+    lo, hi = percentile_ci(samples, percentile=99, n_bootstrap=1000, rng=rng)
+    assert lo < true_p99 < hi
+    assert hi - lo > 0
+
+
+def test_percentile_ci_empty():
+    lo, hi = percentile_ci([], percentile=99)
+    assert lo != lo  # NaN
+    assert hi != hi  # NaN

@@ -103,7 +103,8 @@ def account_request(tl: RequestTimeline,
     cross_domain_residual = e2e - client_span - server_span
 
     def frac(part, whole):
-        return (part / whole) if whole and whole == whole and whole > 0 else 0.0  # NaN-safe
+        # NaN-safe: NaN != NaN, so `whole == whole` filters it out; also guards div-by-zero
+        return (part / whole) if whole and whole == whole and whole > 0 else 0.0
 
     return {
         "e2e_us": e2e,

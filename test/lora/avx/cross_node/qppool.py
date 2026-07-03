@@ -16,6 +16,7 @@ import struct
 import json
 import threading
 import time
+from collections import deque
 from typing import Optional, Any
 
 try:
@@ -95,7 +96,7 @@ class QPPoolClient:
         # None means active_cap == size (backward compatible).
         self.active_cap = active_cap if active_cap is not None else size
         self._active_sem = threading.Semaphore(self.active_cap)
-        self._qp_wait_us: list[float] = []
+        self._qp_wait_us: deque = deque(maxlen=100000)
 
     # ------------------------------------------------------------------
     # setup / teardown
@@ -312,7 +313,7 @@ class QPPoolServer:
         # None means active_cap == size (backward compatible, resolved in setup).
         self.active_cap = active_cap
         self._active_sem = threading.Semaphore(1)  # updated in setup
-        self._qp_wait_us: list[float] = []
+        self._qp_wait_us: deque = deque(maxlen=100000)
 
     def setup(self, params: dict[str, Any]) -> None:
         """Create N transports and connect to client.

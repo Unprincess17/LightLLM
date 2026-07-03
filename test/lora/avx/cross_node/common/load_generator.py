@@ -10,7 +10,6 @@ import random
 import threading
 import time
 from dataclasses import dataclass, field, asdict
-from typing import Callable, Optional
 
 
 @dataclass
@@ -99,7 +98,6 @@ class OpenLoopRunner:
         self.drain_timeout_s = drain_timeout_s
         self.counters = AdmissionCounters()
         self._lock = threading.Lock()
-        self._latencies = []
 
     def run(self) -> AdmissionCounters:
         start = time.perf_counter()

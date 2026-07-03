@@ -19,6 +19,7 @@ import struct
 import sys
 import threading
 import time
+from collections import deque
 
 
 def _signal_handler(signum, frame):
@@ -66,7 +67,7 @@ class CentralDispatcher:
         self.active_cap = active_cap
         self._sem = threading.Semaphore(active_cap)
         self._lock = threading.Lock()
-        self.wait_us: list[float] = []  # per-request wait times
+        self.wait_us: deque = deque(maxlen=100000)  # per-request wait times (bounded)
 
     def acquire(self) -> float:
         t0 = time.perf_counter()
