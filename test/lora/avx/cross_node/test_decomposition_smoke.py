@@ -2,7 +2,7 @@
 """Smoke test: B0 (local, no network) runs end-to-end and accounting closes."""
 import pytest
 import torch
-from bench_decomposition import DecompositionConfig, run_cell
+from bench_decomposition import DecompositionConfig, run_cell, INTERMEDIATE_DIM
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
@@ -24,7 +24,7 @@ def test_b0_correct_output_shape():
     config = DecompositionConfig(cell="B0", nm=1, rank=64, n_trials=1, n_iters=1)
     result = run_cell(config)
     assert "outputs" in result
-    assert result["outputs"][0].shape == (1, 2048)
+    assert result["outputs"][0].shape == (1, INTERMEDIATE_DIM)
 
 
 @CUDA

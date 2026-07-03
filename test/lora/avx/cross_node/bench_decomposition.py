@@ -89,7 +89,7 @@ def _run_b0_local(config: DecompositionConfig, cell_spec: dict) -> dict:
     """B0: local buffers, Python direct, conc=1. No network, no RDMA.
     Lower bound for the decomposition matrix."""
     import torch
-    H, I, R, NM = 2048, 2048, config.rank, config.nm
+    H, I, R, NM = HIDDEN_DIM, INTERMEDIATE_DIM, config.rank, config.nm
     device = "cuda"
 
     x = torch.randn(1, H, dtype=torch.float16, device=device)
@@ -244,7 +244,7 @@ def _setup_qp_pool(config: DecompositionConfig, cell_spec: dict,
             "cannot create QP pool for remote cells B1/B2/B5"
         )
 
-    pool_size = 1  # One QP pair; concurrency is managed by the dispatcher
+    pool_size = max(1, cell_spec["conc"])  # QPs must cover the active cap for true parallelism
     qp_pool = QPPoolClient(
         size=pool_size,
         local_ip=local_ip,
