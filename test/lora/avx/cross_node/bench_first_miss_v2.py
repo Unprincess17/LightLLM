@@ -9,7 +9,7 @@ import csv
 import os
 import statistics
 
-from bench_decomposition import DecompositionConfig, run_cell, CELLS
+from bench_decomposition import DecompositionConfig, run_cell, CELLS, RemoteSession
 from common.instrumentation import account_request, RunMetadata
 from common.stats import trial_ci, percentile_ci
 
@@ -24,51 +24,59 @@ def run_s1(output_dir="results/s1_first_miss", server_host=None, ssh_host=None):
     os.makedirs(output_dir, exist_ok=True)
     rows = []
     for cell in CELLS_S1:
+        cell_spec = CELLS[cell]
         for variant in VARIANTS:
-            for nm in NMS:
-                trial_p50s, trial_p99s, first_rest_ratios = [], [], []
-                for trial in range(N_TRIALS):
-                    config = DecompositionConfig(
-                        cell=cell, nm=nm, rank=64,
-                        n_trials=1, n_iters=50,
-                    )
-                    try:
-                        kwargs = {}
-                        if server_host is not None:
-                            kwargs["server_host"] = server_host
-                        if ssh_host is not None:
-                            kwargs["ssh_host"] = ssh_host
-                        result = run_cell(config, variant=variant, **kwargs)
-                    except Exception as e:
-                        print(f"  {cell} {variant} NM={nm} trial {trial}: "
-                              f"skipped ({e})")
-                        continue
-                    lats = result.get("latencies_us", [])
-                    if not lats:
-                        continue
-                    first = lats[0]
-                    rest_mean = statistics.mean(lats[1:]) if len(lats) > 1 else first
-                    ratio = first / rest_mean if rest_mean > 0 else float("nan")
-                    trial_p50s.append(statistics.median(lats))
-                    trial_p99s.append(sorted(lats)[int(0.99 * len(lats)) - 1])
-                    first_rest_ratios.append(ratio)
-                if not trial_p50s:
-                    print(f"{cell} {variant} NM={nm}: no successful trials")
-                    continue
-                p50_lo, p50_hi = trial_ci(trial_p50s)
-                p99_lo, p99_hi = trial_ci(trial_p99s)
-                ratio_lo, ratio_hi = trial_ci(first_rest_ratios)
-                rows.append({
-                    "cell": cell, "variant": variant, "nm": nm,
-                    "p50_median": statistics.median(trial_p50s),
-                    "p50_ci_lo": p50_lo, "p50_ci_hi": p50_hi,
-                    "p99_median": statistics.median(trial_p99s),
-                    "p99_ci_lo": p99_lo, "p99_ci_hi": p99_hi,
-                    "first_rest_ratio_median": statistics.median(first_rest_ratios),
-                    "ratio_ci_lo": ratio_lo, "ratio_ci_hi": ratio_hi,
-                })
-                print(f"{cell} {variant} NM={nm}: "
-                      f"ratio={statistics.median(first_rest_ratios):.2f}x")
+            # Start server + QP pool once per (cell, variant) — 15 cycles
+            # instead of 300 (I3 fix).
+            session_kwargs = {}
+            if server_host is not None:
+                session_kwargs["server_host"] = server_host
+            if ssh_host is not None:
+                session_kwargs["ssh_host"] = ssh_host
+
+            try:
+                with RemoteSession(
+                    cell_spec, cell=cell, variant=variant,
+                    max_nm=max(NMS), **session_kwargs,
+                ) as session:
+                    for nm in NMS:
+                        trial_p50s, trial_p99s, first_rest_ratios = [], [], []
+                        for trial in range(N_TRIALS):
+                            try:
+                                result = session.run(nm, n_iters=50)
+                            except Exception as e:
+                                print(f"  {cell} {variant} NM={nm} trial {trial}: "
+                                      f"skipped ({e})")
+                                continue
+                            lats = result.get("latencies_us", [])
+                            if not lats:
+                                continue
+                            first = lats[0]
+                            rest_mean = statistics.mean(lats[1:]) if len(lats) > 1 else first
+                            ratio = first / rest_mean if rest_mean > 0 else float("nan")
+                            trial_p50s.append(statistics.median(lats))
+                            trial_p99s.append(sorted(lats)[int(0.99 * len(lats)) - 1])
+                            first_rest_ratios.append(ratio)
+                        if not trial_p50s:
+                            print(f"{cell} {variant} NM={nm}: no successful trials")
+                            continue
+                        p50_lo, p50_hi = trial_ci(trial_p50s)
+                        p99_lo, p99_hi = trial_ci(trial_p99s)
+                        ratio_lo, ratio_hi = trial_ci(first_rest_ratios)
+                        rows.append({
+                            "cell": cell, "variant": variant, "nm": nm,
+                            "p50_median": statistics.median(trial_p50s),
+                            "p50_ci_lo": p50_lo, "p50_ci_hi": p50_hi,
+                            "p99_median": statistics.median(trial_p99s),
+                            "p99_ci_lo": p99_lo, "p99_ci_hi": p99_hi,
+                            "first_rest_ratio_median": statistics.median(first_rest_ratios),
+                            "ratio_ci_lo": ratio_lo, "ratio_ci_hi": ratio_hi,
+                        })
+                        print(f"{cell} {variant} NM={nm}: "
+                              f"ratio={statistics.median(first_rest_ratios):.2f}x")
+            except Exception as e:
+                print(f"  {cell} {variant}: session failed ({e})")
+                continue
     if not rows:
         print("No data collected; CSV not written.")
         return

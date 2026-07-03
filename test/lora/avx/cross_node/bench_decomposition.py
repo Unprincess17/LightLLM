@@ -545,6 +545,141 @@ def _run_remote_cell(config: DecompositionConfig, cell_spec: dict,
 
 
 # ---------------------------------------------------------------------------
+# RemoteSession: reusable server + QP pool session (avoids per-trial restart)
+# ---------------------------------------------------------------------------
+
+class RemoteSession:
+    """Manages a live server + QP pool session for a given cell.
+
+    Starts the concurrent_server and QP pool once on __enter__, runs multiple
+    iterations via run(), then tears down on __exit__.  This avoids the
+    per-trial server start/stop overhead (I3 fix).
+
+    Usage::
+
+        with RemoteSession(cell_spec, cell="B1", variant="baseline") as session:
+            for nm in [1, 2, 4, 8]:
+                result = session.run(nm, n_iters=50)
+    """
+
+    def __init__(self, cell_spec: dict, cell: str, variant: str = "baseline",
+                 server_host: str = DEFAULT_SERVER_HOST,
+                 server_port: int = DEFAULT_SERVER_PORT,
+                 ssh_host: str = DEFAULT_SSH_HOST,
+                 local_ip: str = DEFAULT_LOCAL_IP,
+                 base_control_port: int = DEFAULT_BASE_CONTROL_PORT,
+                 max_nm: int = 8, rank: int = 64):
+        self.cell_spec = cell_spec
+        self.cell = cell
+        self.variant = variant
+        self.server_host = server_host
+        self.server_port = server_port
+        self.ssh_host = ssh_host
+        self.local_ip = local_ip
+        self.base_control_port = base_control_port
+        self.max_nm = max_nm
+        self.rank = rank
+        self.qp_pool = None
+        self._started = False
+
+    def __enter__(self):
+        self._start()
+        return self
+
+    def __exit__(self, *args):
+        self._stop()
+
+    def _start(self):
+        """Start server and set up QP pool with buffers sized for max_nm."""
+        _start_concurrent_server(host=self.ssh_host, listen_ip=self.server_host,
+                                  port=self.server_port)
+        try:
+            # Allocate GPU buffers for the largest NM we'll use so the
+            # pool can be reused across different nm values without re-setup.
+            act_bytes = HIDDEN_DIM * BYTES_PER_PARAM
+            result_bytes = self.max_nm * INTERMEDIATE_DIM * BYTES_PER_PARAM
+            gpu_buffer_bytes = act_bytes + result_bytes
+
+            config = DecompositionConfig(
+                cell=self.cell, nm=self.max_nm, rank=self.rank,
+            )
+            self.qp_pool = _setup_qp_pool(
+                config, self.cell_spec, self.server_host, self.server_port,
+                self.local_ip, self.base_control_port, gpu_buffer_bytes,
+            )
+        except Exception:
+            # If QP pool setup fails, stop the server before propagating.
+            _stop_concurrent_server(host=self.ssh_host,
+                                    listen_ip=self.server_host,
+                                    port=self.server_port)
+            raise
+        self._started = True
+
+    def _stop(self):
+        """Teardown QP pool and stop server."""
+        if self.qp_pool is not None:
+            _teardown_qp_pool(self.qp_pool, self.server_host, self.server_port)
+            self.qp_pool = None
+        _stop_concurrent_server(host=self.ssh_host,
+                                listen_ip=self.server_host,
+                                port=self.server_port)
+        self._started = False
+
+    def run(self, nm: int, n_iters: int = 50, n_trials: int = 1,
+            rank: Optional[int] = None) -> dict:
+        """Run *n_trials* x *n_iters* requests with the given *nm*.
+
+        Returns a result dict with the same shape as ``_run_remote_cell``:
+        ``{config, latencies_us, segments_per_request, accounting, cell_spec}``.
+
+        Does NOT start/stop the server — the session must already be active.
+        """
+        if not self._started:
+            raise RuntimeError(
+                "RemoteSession not started; use 'with RemoteSession(...)' "
+                "or call _start() first")
+        if rank is None:
+            rank = self.rank
+
+        config = DecompositionConfig(
+            cell=self.cell, nm=nm, rank=rank,
+            n_trials=n_trials, n_iters=n_iters,
+        )
+        act_bytes = HIDDEN_DIM * BYTES_PER_PARAM
+        result_bytes = nm * INTERMEDIATE_DIM * BYTES_PER_PARAM
+
+        if self.cell_spec["transport"] == "persistent_tcp":
+            latencies, segments, accountings = _run_persistent(
+                config, self.cell_spec, self.variant,
+                self.server_host, self.server_port,
+                self.qp_pool, act_bytes, result_bytes,
+            )
+        else:  # per_request_tcp
+            latencies, segments, accountings = _run_per_request(
+                config, self.cell_spec, self.variant,
+                self.server_host, self.server_port,
+                self.qp_pool, act_bytes, result_bytes,
+            )
+
+        # Aggregate accounting (mean across all requests)
+        if accountings:
+            avg_acc = {
+                k: sum(a[k] for a in accountings) / len(accountings)
+                for k in accountings[0]
+            }
+        else:
+            avg_acc = {}
+
+        return {
+            "config": config.to_dict(),
+            "latencies_us": latencies,
+            "segments_per_request": segments,
+            "accounting": avg_acc,
+            "cell_spec": self.cell_spec,
+        }
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
