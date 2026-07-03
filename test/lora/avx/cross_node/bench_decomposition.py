@@ -61,11 +61,14 @@ class DecompositionConfig:
 
 
 def run_cell(config: DecompositionConfig, pool=None, act_bf16=None,
-             variant: str = "baseline") -> dict:
+             variant: str = "baseline", **kwargs) -> dict:
     """Run one decomposition cell. Returns per-iteration latencies and accounting.
 
     B0 (local) is fully implemented here. B1/B2/B5 connect to the live
     concurrent_server on UM251. B3/B4/B6-B9 are in later plans.
+
+    Extra keyword arguments (e.g. server_host, ssh_host) are forwarded to
+    _run_remote_cell for B1/B2/B5.
     """
     if config.cell not in CELLS:
         raise ValueError(f"unknown cell {config.cell}; valid: {list(CELLS)}")
@@ -74,7 +77,7 @@ def run_cell(config: DecompositionConfig, pool=None, act_bf16=None,
     if config.cell == "B0":
         return _run_b0_local(config, cell_spec)
     if config.cell in ("B1", "B2", "B5"):
-        return _run_remote_cell(config, cell_spec, variant=variant)
+        return _run_remote_cell(config, cell_spec, variant=variant, **kwargs)
     raise NotImplementedError(f"{config.cell} requires C++ worker (Plan 2)")
 
 

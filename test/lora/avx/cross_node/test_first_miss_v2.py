@@ -22,3 +22,12 @@ def test_timing_response_has_cpu_and_gpu_fields():
     assert resp["segments"][0]["name"] == "alloc"
     assert resp["segments"][0]["cpu_us"] == 5.0
     assert resp["segments"][0]["gpu_us"] == 3.0
+
+
+def test_s1_variant_list_complete():
+    from bench_first_miss_v2 import VARIANTS, CELLS_S1, NMS
+    assert len(VARIANTS) == 5
+    assert "cuda_graph" in VARIANTS
+    assert "allocator-reset" in VARIANTS
+    assert CELLS_S1 == ["B1", "B2", "B5"]
+    assert NMS == [1, 2, 4, 8]
