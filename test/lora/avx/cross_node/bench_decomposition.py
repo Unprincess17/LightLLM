@@ -96,6 +96,8 @@ def _run_b0_local(config: DecompositionConfig, cell_spec: dict) -> dict:
 
     latencies_us = []
     outputs = []
+    t0_last = None
+    t18_last = None
     for trial in range(config.n_trials):
         weights_A = [torch.randn(R, H, dtype=torch.float32, device=device) for _ in range(NM)]
         weights_B = [torch.randn(R, I, dtype=torch.float32, device=device) for _ in range(NM)]
@@ -113,12 +115,19 @@ def _run_b0_local(config: DecompositionConfig, cell_spec: dict) -> dict:
             latencies_us.append((t18 - t0) * 1e6)
             if len(outputs) < 1:
                 outputs = miss_outputs
+            t0_last = t0
+            t18_last = t18
 
-    accounting = {
-        "cross_domain_residual_us": 0.0,
-        "instrumentation_gap_us": 0.0,
-        "instrumentation_gap_fraction": 0.0,
-    }
+    # Construct a real RequestTimeline for the last iteration.
+    # B0 is local: no network send (t5=t0), no network receive (t6=t0),
+    # no network response (t17=t18). cross_domain_residual should be ~0.
+    tl = RequestTimeline(req_id=0, cell="B0")
+    tl.set("t0", t0_last)
+    tl.set("t5", t0_last)
+    tl.set("t6", t0_last)
+    tl.set("t17", t18_last)
+    tl.set("t18", t18_last)
+    accounting = account_request(tl)
     return {
         "config": config.to_dict(),
         "latencies_us": latencies_us,

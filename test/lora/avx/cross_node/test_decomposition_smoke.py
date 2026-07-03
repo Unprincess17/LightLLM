@@ -25,3 +25,17 @@ def test_b0_correct_output_shape():
     result = run_cell(config)
     assert "outputs" in result
     assert result["outputs"][0].shape == (1, 2048)
+
+
+@CUDA
+def test_b0_accounting_closes():
+    """B0 has no network: cross_domain_residual should be ~0."""
+    config = DecompositionConfig(cell="B0", nm=1, rank=64, n_trials=1, n_iters=1)
+    result = run_cell(config)
+    acc = result["accounting"]
+    # B0 has no network: cross_domain_residual should be ~0
+    assert abs(acc["cross_domain_residual_us"]) < 100
+    # instrumentation_gap may be large (sub-segments not individually instrumented in B0)
+    # but that's OK -- B0 is a lower bound, not a timing-closure test
+    assert "instrumentation_gap_us" in acc
+    assert "instrumentation_gap_fraction" in acc
