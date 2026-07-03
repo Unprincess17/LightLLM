@@ -86,6 +86,11 @@ class CentralDispatcher:
 _dispatcher: CentralDispatcher | None = None
 
 
+def build_timing_response(nm: int, segments: list, variant: str) -> dict:
+    """Build the timing response with per-segment CPU and GPU timings."""
+    return {"nm": nm, "variant": variant, "segments": segments}
+
+
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
@@ -109,6 +114,17 @@ def _get_scratch_buf():
     if _scratch_buf is None:
         _scratch_buf = torch.empty(64 * 1024 * 1024 // 4, dtype=torch.float32, device="cuda")
     return _scratch_buf
+
+
+_l2_scratch = None
+
+def _get_l2_scratch():
+    """Scratch buffer sized to the device's L2 cache (runtime-queried)."""
+    global _l2_scratch
+    if _l2_scratch is None:
+        l2_size = torch.cuda.get_device_properties(0).l2_cache_size
+        _l2_scratch = torch.empty(l2_size // 4, dtype=torch.float32, device="cuda")
+    return _l2_scratch
 
 
 def handle_setup_pool(conn, params, listen_ip, remote_ip):
@@ -150,9 +166,13 @@ def _gpu_copy_in(transport, hidden_dim, act_bytes):
 def handle_s4a_pooled(conn, params):
     """Execute S4a using a pooled QP.
 
-    If *params* contains ``decompose: true``, each phase is wrapped with
-    ``torch.cuda.synchronize()`` + ``perf_counter`` and per-segment durations
-    (in microseconds) are returned in the response under the ``segments`` key.
+    If *params* contains ``decompose: true``, per-segment timing is returned
+    in the response under the ``segments`` key.  When ``decompose_level`` is
+    ``"fine"``, eager variants use dual-domain timing: CPU via
+    ``time.perf_counter()`` (no sync) and GPU via ``torch.cuda.Event``
+    (read after a single end-of-loop sync).  The ``cuda_graph`` variant
+    reports a single ``graph_replay`` segment with CPU submission time and
+    total GPU replay time.
     """
     global _pool, _dispatcher
     if _pool is None:
@@ -185,17 +205,18 @@ def handle_s4a_pooled(conn, params):
             num_miss, rank, intermediate_dim, dtype=torch.bfloat16, device="cuda"
         )
 
-        segments = []  # list of [name, duration_us] when decompose=True
+        segments = []  # list of {"name", "cpu_us", "gpu_us"} when decompose=True
 
         def _seg(name, fn, *args):
-            """Run *fn*, optionally timing with CUDA sync."""
+            """Run *fn*, optionally timing with CUDA sync (single-domain)."""
             if decompose:
                 torch.cuda.synchronize()
             t0 = time.perf_counter()
             ret = fn(*args)
             if decompose:
                 torch.cuda.synchronize()
-            segments.append([name, (time.perf_counter() - t0) * 1e6])
+            dt = (time.perf_counter() - t0) * 1e6
+            segments.append({"name": name, "cpu_us": dt, "gpu_us": dt})
             return ret
 
         # RDMA READ activation from client's GPU buffer
@@ -203,7 +224,8 @@ def handle_s4a_pooled(conn, params):
             torch.cuda.synchronize()
             t0 = time.perf_counter()
             transport.read_from_remote(0, 0, act_bytes)
-            segments.append(["rdma_read", (time.perf_counter() - t0) * 1e6])
+            dt = (time.perf_counter() - t0) * 1e6
+            segments.append({"name": "rdma_read", "cpu_us": dt, "gpu_us": dt})
         else:
             transport.read_from_remote(0, 0, act_bytes)
 
@@ -257,57 +279,99 @@ def handle_s4a_pooled(conn, params):
 
                 torch.cuda.synchronize()
 
-                # Timed loop: replay graphs
+                # Timed replay: one CUDA event pair around the full batch
+                ev_s = torch.cuda.Event(enable_timing=True)
+                ev_e = torch.cuda.Event(enable_timing=True)
+                ev_s.record()
+                t0 = time.perf_counter()
                 for i in range(num_miss):
-                    torch.cuda.synchronize()
-                    t0 = time.perf_counter()
                     graphs[i].replay()
-                    torch.cuda.synchronize()
-                    segments.append([f"miss_{i}_alloc", (time.perf_counter() - t0) * 1e6])
-                    segments.append([f"miss_{i}_dtype", 0.0])
-                    segments.append([f"miss_{i}_mm1", 0.0])
-                    segments.append([f"miss_{i}_mm2", 0.0])
+                t1 = time.perf_counter()
+                ev_e.record()
+                torch.cuda.synchronize()
+                segments.append({
+                    "name": "graph_replay",
+                    "cpu_us": (t1 - t0) * 1e6,
+                    "gpu_us": ev_s.elapsed_time(ev_e) * 1000,
+                })
 
                 # Copy results from static output buffers to result tensor
                 for i in range(num_miss):
                     result[i] = static_out[i]
 
             else:
-                # Non-cuda_graph variants: alloc, dtype, mm1, mm2 per miss
+                # Eager variants: dual-domain timing per sub-segment
+                # CPU: perf_counter (no sync inside)
+                # GPU: CUDA events (read after a single end-of-loop sync)
+                timing_entries = []  # (name, cpu_us, start_event, end_event)
+
                 for i in range(num_miss):
+                    # Variant-specific perturbation (synced, before timing)
                     if variant == "cache_flush":
                         torch.cuda.empty_cache()
                         _get_scratch_buf().zero_()
                         torch.cuda.synchronize()
+                    elif variant == "allocator-reset":
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+                    elif variant == "device-cache-perturbation":
+                        _get_l2_scratch().zero_()
+                        torch.cuda.synchronize()
 
-                    # --- alloc ---
-                    torch.cuda.synchronize()
+                    # --- alloc --- (no-op placeholder, same as original)
+                    ev_s = torch.cuda.Event(enable_timing=True)
+                    ev_e = torch.cuda.Event(enable_timing=True)
+                    ev_s.record()
                     t0 = time.perf_counter()
-                    torch.cuda.synchronize()
-                    segments.append([f"miss_{i}_alloc", (time.perf_counter() - t0) * 1e6])
+                    # alloc was a no-op in the original code
+                    t1 = time.perf_counter()
+                    ev_e.record()
+                    timing_entries.append(
+                        (f"miss_{i}_alloc", (t1 - t0) * 1e6, ev_s, ev_e))
 
                     # --- dtype ---
-                    torch.cuda.synchronize()
+                    ev_s = torch.cuda.Event(enable_timing=True)
+                    ev_e = torch.cuda.Event(enable_timing=True)
+                    ev_s.record()
                     t0 = time.perf_counter()
                     w_idx = 0 if variant == "same_weights" else i
                     a_f32 = a_gpu[w_idx].to(torch.float32)
                     b_f32 = b_gpu[w_idx].to(torch.float32)
-                    torch.cuda.synchronize()
-                    segments.append([f"miss_{i}_dtype", (time.perf_counter() - t0) * 1e6])
+                    t1 = time.perf_counter()
+                    ev_e.record()
+                    timing_entries.append(
+                        (f"miss_{i}_dtype", (t1 - t0) * 1e6, ev_s, ev_e))
 
                     # --- mm1 ---
-                    torch.cuda.synchronize()
+                    ev_s = torch.cuda.Event(enable_timing=True)
+                    ev_e = torch.cuda.Event(enable_timing=True)
+                    ev_s.record()
                     t0 = time.perf_counter()
                     inter = act_f32 @ a_f32.T
-                    torch.cuda.synchronize()
-                    segments.append([f"miss_{i}_mm1", (time.perf_counter() - t0) * 1e6])
+                    t1 = time.perf_counter()
+                    ev_e.record()
+                    timing_entries.append(
+                        (f"miss_{i}_mm1", (t1 - t0) * 1e6, ev_s, ev_e))
 
                     # --- mm2 ---
-                    torch.cuda.synchronize()
+                    ev_s = torch.cuda.Event(enable_timing=True)
+                    ev_e = torch.cuda.Event(enable_timing=True)
+                    ev_s.record()
                     t0 = time.perf_counter()
                     result[i] = (inter @ b_f32).view(-1)
-                    torch.cuda.synchronize()
-                    segments.append([f"miss_{i}_mm2", (time.perf_counter() - t0) * 1e6])
+                    t1 = time.perf_counter()
+                    ev_e.record()
+                    timing_entries.append(
+                        (f"miss_{i}_mm2", (t1 - t0) * 1e6, ev_s, ev_e))
+
+                # Batch sync: read all GPU event elapsed times at once
+                torch.cuda.synchronize()
+                for name, cpu_us, ev_s, ev_e in timing_entries:
+                    segments.append({
+                        "name": name,
+                        "cpu_us": cpu_us,
+                        "gpu_us": ev_s.elapsed_time(ev_e) * 1000,
+                    })
 
         elif decompose:
             # Coarse decomposition (existing behavior)
@@ -319,7 +383,8 @@ def handle_s4a_pooled(conn, params):
                 inter = act_f32 @ a_f32.T
                 result[i] = (inter @ b_f32).view(-1)
                 torch.cuda.synchronize()
-                segments.append([f"miss_{i}", (time.perf_counter() - t0) * 1e6])
+                dt = (time.perf_counter() - t0) * 1e6
+                segments.append({"name": f"miss_{i}", "cpu_us": dt, "gpu_us": dt})
         else:
             # No decomposition (existing fast path)
             for i in range(num_miss):
@@ -338,7 +403,8 @@ def handle_s4a_pooled(conn, params):
             torch.cuda.synchronize()
             t0 = time.perf_counter()
             transport.write_to_remote(act_bytes, act_bytes, result_bytes)
-            segments.append(["rdma_write", (time.perf_counter() - t0) * 1e6])
+            dt = (time.perf_counter() - t0) * 1e6
+            segments.append({"name": "rdma_write", "cpu_us": dt, "gpu_us": dt})
         else:
             result_bf16 = result.to(torch.bfloat16)
             copy_gpu_to_gpu(
@@ -349,11 +415,11 @@ def handle_s4a_pooled(conn, params):
             transport.write_to_remote(act_bytes, act_bytes, result_bytes)
 
         if decompose:
-            send_json_response(conn, {
-                "status": "ok",
-                "result_bytes": result_bytes,
-                "segments": segments,
-            })
+            resp = build_timing_response(
+                nm=num_miss, segments=segments, variant=variant)
+            resp["status"] = "ok"
+            resp["result_bytes"] = result_bytes
+            send_json_response(conn, resp)
         else:
             send_json_response(conn, {"status": "ok", "result_bytes": result_bytes})
     finally:
