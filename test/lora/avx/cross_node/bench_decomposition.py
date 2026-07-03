@@ -187,12 +187,20 @@ def _start_concurrent_server(host: str = DEFAULT_SSH_HOST,
     _ssh("pkill -f concurrent_server.py || true", host=host)
     time.sleep(0.5)
     repo = "/home/shufan/LightLLM-integrate-to-SLoRA/test/lora/avx/cross_node"
+    # Use ssh -f -n so SSH forks to background after auth and returns immediately.
+    # The server's stdout/stderr go to a log file; stdin from /dev/null.
     cmd = (
-        f"cd {repo} && nohup python concurrent_server.py "
+        f"cd {repo} && python concurrent_server.py "
         f"--listen-ip {listen_ip} --listen-port {port} "
-        f"> /tmp/concurrent_server.log 2>&1 &"
+        f"> /tmp/concurrent_server.log 2>&1 < /dev/null"
     )
-    _ssh(cmd, host=host, timeout=10)
+    # ssh -f forks after auth; -n redirects stdin from /dev/null
+    proc = subprocess.Popen(
+        ["ssh", "-f", "-n", "-o", "StrictHostKeyChecking=no",
+         f"{DEFAULT_SSH_USER}@{host}", cmd],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    proc.wait(timeout=10)
     time.sleep(2)
     result = _ssh("pgrep -f concurrent_server.py", host=host)
     if result.returncode != 0:
