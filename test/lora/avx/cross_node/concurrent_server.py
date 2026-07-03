@@ -195,6 +195,7 @@ def handle_s4a_pooled(conn, params):
     decompose = params.get("decompose", False)
     decompose_level = params.get("decompose_level", "coarse")
     variant = params.get("variant", "baseline")
+    total_perturbation_us = 0.0  # I2: accumulates perturbation cost across misses
 
     act_bytes = hidden_dim * BYTES_PER_PARAM
     result_bytes = num_miss * intermediate_dim * BYTES_PER_PARAM
@@ -321,11 +322,15 @@ def handle_s4a_pooled(conn, params):
                         _get_scratch_buf().zero_()
                         torch.cuda.synchronize()
                     elif variant == "allocator-reset":
+                        _p0 = time.perf_counter()
                         torch.cuda.empty_cache()
                         torch.cuda.synchronize()
+                        total_perturbation_us += (time.perf_counter() - _p0) * 1e6
                     elif variant == "device-cache-perturbation":
+                        _p0 = time.perf_counter()
                         _get_l2_scratch().zero_()
                         torch.cuda.synchronize()
+                        total_perturbation_us += (time.perf_counter() - _p0) * 1e6
 
                     # --- alloc --- (no-op placeholder, same as original)
                     ev_s = torch.cuda.Event(enable_timing=True)
@@ -428,6 +433,7 @@ def handle_s4a_pooled(conn, params):
                 nm=num_miss, segments=segments, variant=variant)
             resp["status"] = "ok"
             resp["result_bytes"] = result_bytes
+            resp["perturbation_cost_us"] = total_perturbation_us  # I2
             send_json_response(conn, resp)
         else:
             send_json_response(conn, {"status": "ok", "result_bytes": result_bytes})

@@ -358,15 +358,19 @@ def _run_persistent(config: DecompositionConfig, cell_spec: dict, variant: str,
 
                     e2e_us = (t18 - t0) * 1e6
                     latencies_us.append(e2e_us)
-                    segments_per_request.append(response.get("segments", []))
+                    segs = response.get("segments", [])
+                    segments_per_request.append(segs)
 
+                    # I1 fix: feed per-segment cpu_us to account_request
+                    server_intervals = [s["cpu_us"] for s in segs if "cpu_us" in s]
                     tl = RequestTimeline(req_id=req_id, cell=config.cell)
                     tl.set("t0", t0)
                     tl.set("t5", t5)
                     tl.set("t6", t5)    # approximate: server recv ~ client send
                     tl.set("t17", t18)  # approximate: server send ~ client recv
                     tl.set("t18", t18)
-                    accountings.append(account_request(tl))
+                    accountings.append(account_request(
+                        tl, instrumented_server_intervals_us=server_intervals))
 
         else:
             # B2: python_executor with max_workers=1
@@ -382,14 +386,16 @@ def _run_persistent(config: DecompositionConfig, cell_spec: dict, variant: str,
                 finally:
                     qp_pool.return_transport(pool_id, gpu_transport)
                 e2e_us = (t18 - t0) * 1e6
-                segments = response.get("segments", [])
+                segs = response.get("segments", [])
+                server_intervals = [s["cpu_us"] for s in segs if "cpu_us" in s]
                 tl = RequestTimeline(req_id=req_id, cell=config.cell)
                 tl.set("t0", t0)
                 tl.set("t5", t5)
                 tl.set("t6", t5)
                 tl.set("t17", t18)
                 tl.set("t18", t18)
-                return e2e_us, segments, account_request(tl)
+                return e2e_us, segs, account_request(
+                    tl, instrumented_server_intervals_us=server_intervals)
 
             with ThreadPoolExecutor(max_workers=cell_spec["conc"]) as executor:
                 futures = []
@@ -441,7 +447,10 @@ def _run_per_request(config: DecompositionConfig, cell_spec: dict, variant: str,
             qp_pool.return_transport(pool_id, gpu_transport)
 
         e2e_us = (t18 - t0) * 1e6
-        segments = response.get("segments", [])
+        segs = response.get("segments", [])
+        server_intervals = [s["cpu_us"] for s in segs if "cpu_us" in s]
+        # For B5, client-side intervals include connect time (t3-t2)
+        client_intervals = [(t3 - t2) * 1e6] if t2 and t3 else []
 
         tl = RequestTimeline(req_id=req_id, cell=config.cell)
         tl.set("t0", t0)
@@ -451,7 +460,10 @@ def _run_per_request(config: DecompositionConfig, cell_spec: dict, variant: str,
         tl.set("t6", t5)    # approximate
         tl.set("t17", t18)  # approximate
         tl.set("t18", t18)
-        return e2e_us, segments, account_request(tl)
+        return e2e_us, segs, account_request(
+            tl,
+            instrumented_client_intervals_us=client_intervals,
+            instrumented_server_intervals_us=server_intervals)
 
     latencies_us = []
     segments_per_request = []
