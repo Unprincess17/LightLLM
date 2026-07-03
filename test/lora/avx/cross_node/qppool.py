@@ -138,6 +138,7 @@ class QPPoolClient:
             "local_infos": local_infos,
             "mode": self.mode,
             "gpu_buffer_bytes": self.gpu_buffer_bytes,
+            "active_cap": self.active_cap,
         })
 
         if self.mode == "preconnected":

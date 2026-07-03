@@ -85,6 +85,10 @@ class CentralDispatcher:
 # Module-level dispatcher, set by handle_setup_pool when active_cap is provided
 _dispatcher: CentralDispatcher | None = None
 
+# Thread-local for req_id (set per-request in handle_request, used by
+# send_json_response to echo req_id back for PersistentTransport matching).
+_req_id_local = threading.local()
+
 
 def build_timing_response(nm: int, segments: list, variant: str) -> dict:
     """Build the timing response with per-segment CPU and GPU timings."""
@@ -96,6 +100,11 @@ def build_timing_response(nm: int, segments: list, variant: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def send_json_response(conn: socket.socket, obj: dict[str, Any]) -> None:
+    """Send JSON response.  Echoes req_id from thread-local if set (for
+    PersistentTransport request-ID matching)."""
+    req_id = getattr(_req_id_local, "req_id", None)
+    if req_id is not None:
+        obj["req_id"] = req_id
     _send_json(conn, obj)
 
 
@@ -449,38 +458,57 @@ def handle_request(
     listen_ip: str,
     log_fn=print,
 ) -> None:
-    """Receive one JSON message, dispatch, send response, close."""
+    """Receive JSON messages, dispatch, send responses.
+
+    Loops for persistent connections (B1/B2 PersistentTransport).
+    For per-request TCP (B5), the client sends one message and closes;
+    the loop exits cleanly on EOFError.
+    """
     try:
-        header = _recv_exact(conn, 4)
-        msg_len = struct.unpack("!I", header)[0]
-        payload = _recv_exact(conn, msg_len)
-        params = json.loads(payload.decode("utf-8"))
-    except (EOFError, ConnectionResetError, json.JSONDecodeError) as e:
-        log_fn(f"[pool_server] Bad request from {addr}: {e}")
-        return
+        while True:
+            try:
+                header = _recv_exact(conn, 4)
+                msg_len = struct.unpack("!I", header)[0]
+                payload = _recv_exact(conn, msg_len)
+                params = json.loads(payload.decode("utf-8"))
+            except (EOFError, ConnectionResetError) as e:
+                # Connection closed by client — normal for per-request TCP
+                return
+            except json.JSONDecodeError as e:
+                log_fn(f"[pool_server] Bad request from {addr}: {e}")
+                return
 
-    msg_type = params.get("type", "")
-    log_fn(f"[pool_server] {msg_type} from {addr}")
+            # Set req_id for this request (thread-local, used by
+            # send_json_response to echo it back for PersistentTransport).
+            _req_id_local.req_id = params.get("req_id")
 
-    if msg_type == "setup_pool":
-        remote_ip = params.get("client_ip", addr[0])
-        handle_setup_pool(conn, params, listen_ip, remote_ip)
-    elif msg_type == "s4a_pooled":
-        handle_s4a_pooled(conn, params)
-    elif msg_type == "teardown_pool":
-        handle_teardown_pool(conn)
-    elif msg_type == "shutdown":
-        handle_teardown_pool(conn)
-        send_json_response(conn, {"status": "ok"})
-        log_fn("[pool_server] Shutting down")
-        # Give response time to flush
-        time.sleep(0.1)
-        os._exit(0)
-    else:
-        send_json_response(conn, {
-            "status": "error",
-            "message": f"unknown message type: {msg_type}",
-        })
+            msg_type = params.get("type", "")
+            log_fn(f"[pool_server] {msg_type} from {addr}")
+
+            if msg_type == "setup_pool":
+                remote_ip = params.get("client_ip", addr[0])
+                handle_setup_pool(conn, params, listen_ip, remote_ip)
+            elif msg_type == "s4a_pooled":
+                handle_s4a_pooled(conn, params)
+            elif msg_type == "teardown_pool":
+                handle_teardown_pool(conn)
+            elif msg_type == "shutdown":
+                handle_teardown_pool(conn)
+                send_json_response(conn, {"status": "ok"})
+                log_fn("[pool_server] Shutting down")
+                # Give response time to flush
+                time.sleep(0.1)
+                os._exit(0)
+            else:
+                send_json_response(conn, {
+                    "status": "error",
+                    "message": f"unknown message type: {msg_type}",
+                })
+    finally:
+        try:
+            conn.close()
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------
