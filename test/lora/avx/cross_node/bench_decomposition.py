@@ -302,7 +302,8 @@ def _teardown_qp_pool(qp_pool, server_host: str, server_port: int) -> None:
 # ---------------------------------------------------------------------------
 
 def _make_request(req_id: int, config: DecompositionConfig,
-                  cell_spec: dict, variant: str) -> dict:
+                  cell_spec: dict, variant: str,
+                  timing_method: str = "new") -> dict:
     """Build an s4a_pooled request message."""
     return {
         "type": "s4a_pooled",
@@ -315,6 +316,7 @@ def _make_request(req_id: int, config: DecompositionConfig,
         "decompose_level": "fine",
         "variant": variant,
         "active_cap": cell_spec["conc"],
+        "timing_method": timing_method,
     }
 
 
@@ -324,7 +326,8 @@ def _make_request(req_id: int, config: DecompositionConfig,
 
 def _run_persistent(config: DecompositionConfig, cell_spec: dict, variant: str,
                     server_host: str, server_port: int,
-                    qp_pool, act_bytes: int, result_bytes: int):
+                    qp_pool, act_bytes: int, result_bytes: int,
+                    timing_method: str = "new"):
     """B1/B2: persistent TCP transport.
 
     B1 (python_direct): sequential, no executor.
@@ -349,7 +352,7 @@ def _run_persistent(config: DecompositionConfig, cell_spec: dict, variant: str,
 
                     pool_id, gpu_transport, _ = qp_pool.borrow()
                     try:
-                        msg = _make_request(req_id, config, cell_spec, variant)
+                        msg = _make_request(req_id, config, cell_spec, variant, timing_method=timing_method)
                         t5 = time.perf_counter()
                         response = transport.request(msg)
                         t18 = time.perf_counter()
@@ -379,7 +382,7 @@ def _run_persistent(config: DecompositionConfig, cell_spec: dict, variant: str,
                 t0 = time.perf_counter()
                 pool_id, gpu_transport, _ = qp_pool.borrow()
                 try:
-                    msg = _make_request(req_id, config, cell_spec, variant)
+                    msg = _make_request(req_id, config, cell_spec, variant, timing_method=timing_method)
                     t5 = time.perf_counter()
                     response = transport.request(msg)
                     t18 = time.perf_counter()
@@ -419,7 +422,8 @@ def _run_persistent(config: DecompositionConfig, cell_spec: dict, variant: str,
 
 def _run_per_request(config: DecompositionConfig, cell_spec: dict, variant: str,
                      server_host: str, server_port: int,
-                     qp_pool, act_bytes: int, result_bytes: int):
+                     qp_pool, act_bytes: int, result_bytes: int,
+                     timing_method: str = "new"):
     """B5: per-request TCP transport with ThreadPoolExecutor(max_workers=conc).
 
     Each request opens its own TCP socket, sends s4a_pooled, receives the
@@ -437,7 +441,7 @@ def _run_per_request(config: DecompositionConfig, cell_spec: dict, variant: str,
             sock.connect((server_host, server_port))
             t3 = time.perf_counter()
 
-            msg = _make_request(req_id, config, cell_spec, variant)
+            msg = _make_request(req_id, config, cell_spec, variant, timing_method=timing_method)
             t5 = time.perf_counter()
             _sock_send(sock, msg)
             response = _sock_recv(sock)
@@ -638,7 +642,8 @@ class RemoteSession:
         self._started = False
 
     def run(self, nm: int, n_iters: int = 50, n_trials: int = 1,
-            rank: Optional[int] = None) -> dict:
+            rank: Optional[int] = None,
+            timing_method: str = "new") -> dict:
         """Run *n_trials* x *n_iters* requests with the given *nm*.
 
         Returns a result dict with the same shape as ``_run_remote_cell``:
@@ -665,12 +670,14 @@ class RemoteSession:
                 config, self.cell_spec, self.variant,
                 self.server_host, self.server_port,
                 self.qp_pool, act_bytes, result_bytes,
+                timing_method=timing_method,
             )
         else:  # per_request_tcp
             latencies, segments, accountings = _run_per_request(
                 config, self.cell_spec, self.variant,
                 self.server_host, self.server_port,
                 self.qp_pool, act_bytes, result_bytes,
+                timing_method=timing_method,
             )
 
         # Aggregate accounting (mean across all requests)

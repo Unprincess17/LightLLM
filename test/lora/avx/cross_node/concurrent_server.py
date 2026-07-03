@@ -195,6 +195,7 @@ def handle_s4a_pooled(conn, params):
     decompose = params.get("decompose", False)
     decompose_level = params.get("decompose_level", "coarse")
     variant = params.get("variant", "baseline")
+    timing_method = params.get("timing_method", "new")  # "new" (CUDA events) or "old" (sync+perf_counter per segment)
     total_perturbation_us = 0.0  # I2: accumulates perturbation cost across misses
 
     act_bytes = hidden_dim * BYTES_PER_PARAM
@@ -309,8 +310,61 @@ def handle_s4a_pooled(conn, params):
                 for i in range(num_miss):
                     result[i] = static_out[i]
 
+            elif timing_method == "old":
+                # OLD timing: sync + perf_counter per segment (original method).
+                # This is the ablation path — identical compute, different timing.
+                for i in range(num_miss):
+                    # Variant-specific perturbation (same as new method)
+                    if variant == "allocator-reset":
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+                    elif variant == "device-cache-perturbation":
+                        _get_l2_scratch().zero_()
+                        torch.cuda.synchronize()
+
+                    # alloc (sync + perf_counter)
+                    torch.cuda.synchronize()
+                    t0 = time.perf_counter()
+                    t1 = time.perf_counter()
+                    torch.cuda.synchronize()
+                    segments.append({"name": f"miss_{i}_alloc",
+                                     "cpu_us": (t1 - t0) * 1e6,
+                                     "gpu_us": (t1 - t0) * 1e6})
+
+                    # dtype
+                    torch.cuda.synchronize()
+                    t0 = time.perf_counter()
+                    w_idx = 0 if variant == "same_weights" else i
+                    a_f32 = a_gpu[w_idx].to(torch.float32)
+                    b_f32 = b_gpu[w_idx].to(torch.float32)
+                    torch.cuda.synchronize()
+                    t1 = time.perf_counter()
+                    segments.append({"name": f"miss_{i}_dtype",
+                                     "cpu_us": (t1 - t0) * 1e6,
+                                     "gpu_us": (t1 - t0) * 1e6})
+
+                    # mm1
+                    torch.cuda.synchronize()
+                    t0 = time.perf_counter()
+                    inter = act_f32 @ a_f32.T
+                    torch.cuda.synchronize()
+                    t1 = time.perf_counter()
+                    segments.append({"name": f"miss_{i}_mm1",
+                                     "cpu_us": (t1 - t0) * 1e6,
+                                     "gpu_us": (t1 - t0) * 1e6})
+
+                    # mm2
+                    torch.cuda.synchronize()
+                    t0 = time.perf_counter()
+                    result[i] = (inter @ b_f32).view(-1)
+                    torch.cuda.synchronize()
+                    t1 = time.perf_counter()
+                    segments.append({"name": f"miss_{i}_mm2",
+                                     "cpu_us": (t1 - t0) * 1e6,
+                                     "gpu_us": (t1 - t0) * 1e6})
+
             else:
-                # Eager variants: dual-domain timing per sub-segment
+                # Eager variants: dual-domain timing per sub-segment (NEW method)
                 # CPU: perf_counter (no sync inside)
                 # GPU: CUDA events (read after a single end-of-loop sync)
                 timing_entries = []  # (name, cpu_us, start_event, end_event)
