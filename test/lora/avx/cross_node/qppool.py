@@ -102,12 +102,16 @@ class QPPoolClient:
     # setup / teardown
     # ------------------------------------------------------------------
 
-    def setup(self, server_sock: socket.socket) -> None:
+    def setup(self, server_sock: socket.socket, **extra_fields) -> None:
         """Create N transports, start each as GPUDirect server.
 
         Sends ``setup_pool`` over *server_sock* (the main TCP control
         connection to the remote server process) with the local QP info
         for every transport so the server can connect back.
+
+        Extra keyword arguments (e.g. ``scheduling_policy``, ``s_hat``)
+        are merged into the setup_pool message so the server can configure
+        its dispatcher accordingly.
         """
         local_infos = []
         control_ports = []
@@ -130,8 +134,8 @@ class QPPoolClient:
             control_ports.append(port)
             self._transports.append(transport)
 
-        # Send pool setup to server
-        _send_json(server_sock, {
+        # Send pool setup to server (merge any extra fields like scheduling_policy)
+        msg = {
             "type": "setup_pool",
             "pool_size": self.size,
             "control_ports": control_ports,
@@ -139,7 +143,9 @@ class QPPoolClient:
             "mode": self.mode,
             "gpu_buffer_bytes": self.gpu_buffer_bytes,
             "active_cap": self.active_cap,
-        })
+        }
+        msg.update(extra_fields)
+        _send_json(server_sock, msg)
 
         if self.mode == "preconnected":
             self._accept_all()

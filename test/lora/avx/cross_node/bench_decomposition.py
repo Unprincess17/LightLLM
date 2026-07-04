@@ -237,12 +237,18 @@ def _stop_concurrent_server(host: str = DEFAULT_SSH_HOST,
 def _setup_qp_pool(config: DecompositionConfig, cell_spec: dict,
                    server_host: str, server_port: int,
                    local_ip: str, base_control_port: int,
-                   gpu_buffer_bytes: int):
+                   gpu_buffer_bytes: int,
+                   scheduling_policy: str = None,
+                   s_hat: dict = None):
     """Create QPPoolClient on the inference node and send setup_pool to server.
 
     Returns the QPPoolClient instance.  The QP pool uses pool_size=1; the
     server-side CentralDispatcher (active_cap=cell_spec['conc']) manages
     concurrency.
+
+    If *scheduling_policy* is "server_sjf", the server creates a
+    PriorityDispatcher instead of a plain CentralDispatcher.
+    *s_hat* maps NM values to predicted relative service times.
     """
     from qppool import QPPoolClient
     try:
@@ -263,19 +269,27 @@ def _setup_qp_pool(config: DecompositionConfig, cell_spec: dict,
         mode="preconnected",
         active_cap=cell_spec["conc"],
     )
+    # Build extra fields for the setup_pool message
+    setup_extra = {}
+    if scheduling_policy is not None:
+        setup_extra["scheduling_policy"] = scheduling_policy
+    if s_hat is not None:
+        setup_extra["s_hat"] = s_hat
+
     # Open TCP socket for setup_pool message
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(60.0)
     sock.connect((server_host, server_port))
     try:
-        qp_pool.setup(sock)  # sends setup_pool + accepts QP connections
+        qp_pool.setup(sock, **setup_extra)  # sends setup_pool + accepts QP connections
         # Read setup_pool response (server sends after QP connections established)
         response = _sock_recv(sock)
         if response.get("status") != "ok":
             raise RuntimeError(f"setup_pool failed: {response}")
     finally:
         sock.close()
-    print(f"[bench] QP pool ready: size={pool_size}, active_cap={cell_spec['conc']}")
+    print(f"[bench] QP pool ready: size={pool_size}, active_cap={cell_spec['conc']}"
+          f"{f', policy={scheduling_policy}' if scheduling_policy else ''}")
     return qp_pool
 
 
@@ -1111,7 +1125,9 @@ class RemoteSession:
                  ssh_host: str = DEFAULT_SSH_HOST,
                  local_ip: str = DEFAULT_LOCAL_IP,
                  base_control_port: int = DEFAULT_BASE_CONTROL_PORT,
-                 max_nm: int = 8, rank: int = 64):
+                 max_nm: int = 8, rank: int = 64,
+                 scheduling_policy: str = None,
+                 s_hat: dict = None):
         self.cell_spec = cell_spec
         self.cell = cell
         self.variant = variant
@@ -1122,6 +1138,8 @@ class RemoteSession:
         self.base_control_port = base_control_port
         self.max_nm = max_nm
         self.rank = rank
+        self.scheduling_policy = scheduling_policy
+        self.s_hat = s_hat
         self.qp_pool = None
         self._started = False
 
@@ -1149,6 +1167,8 @@ class RemoteSession:
             self.qp_pool = _setup_qp_pool(
                 config, self.cell_spec, self.server_host, self.server_port,
                 self.local_ip, self.base_control_port, gpu_buffer_bytes,
+                scheduling_policy=self.scheduling_policy,
+                s_hat=self.s_hat,
             )
         except Exception:
             # If QP pool setup fails, stop the server before propagating.
