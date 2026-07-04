@@ -11,6 +11,7 @@ No GLOO dependency — pure RDMA via GPUDirectTransport.
 """
 
 import argparse
+import heapq
 import json
 import os
 import signal
@@ -82,8 +83,68 @@ class CentralDispatcher:
         self._sem.release()
 
 
+class PriorityDispatcher:
+    """Central priority dispatcher for Server-SJF.
+
+    A single selector thread acquires active-concurrency slots and
+    dispatches them to the highest-priority (shortest predicted service
+    time) queued request. This ensures priority ordering, not just
+    semaphore FIFO.
+    """
+
+    def __init__(self, active_cap: int, s_hat: dict = None):
+        self.active_cap = active_cap
+        self._sem = threading.Semaphore(active_cap)
+        self._pq = []  # heap of (priority, seq, req_id, event)
+        self._lock = threading.Lock()
+        self._cv = threading.Condition(self._lock)
+        self._seq = 0
+        self._s_hat = s_hat or {}
+        self._selector = threading.Thread(target=self._select_loop, daemon=True)
+        self._selector.start()
+        self.wait_us = []
+
+    def _priority(self, num_miss: int) -> float:
+        return self._s_hat.get(num_miss, float(num_miss))
+
+    def enqueue_and_wait(self, num_miss: int, req_id) -> None:
+        """Enqueue this request and block until selected by the dispatcher."""
+        t0 = time.perf_counter()
+        priority = self._priority(num_miss)
+        event = threading.Event()
+        with self._cv:
+            self._seq += 1
+            heapq.heappush(self._pq, (priority, self._seq, req_id, event))
+            self._cv.notify()
+        event.wait()
+        t1 = time.perf_counter()
+        self.wait_us.append((t1 - t0) * 1e6)
+
+    def _select_loop(self) -> None:
+        """Selector thread: acquire slot, pop highest-priority request, signal."""
+        while True:
+            self._sem.acquire()
+            with self._cv:
+                while not self._pq:
+                    self._cv.wait()
+                priority, seq, req_id, event = heapq.heappop(self._pq)
+            event.set()
+
+    def release(self) -> None:
+        self._sem.release()
+
+
 # Module-level dispatcher, set by handle_setup_pool when active_cap is provided
 _dispatcher: CentralDispatcher | None = None
+
+# S_hat calibration cache (set by client via setup_pool or set_s_hat)
+_s_hat_cache: dict = {}
+
+
+def set_s_hat(s_hat: dict):
+    """Set the S_hat calibration for the current server session."""
+    global _s_hat_cache
+    _s_hat_cache = s_hat
 
 # Thread-local for req_id (set per-request in handle_request, used by
 # send_json_response to echo req_id back for PersistentTransport matching).
@@ -212,7 +273,13 @@ def handle_setup_pool(conn, params, listen_ip, remote_ip):
 
     # Configure central admission dispatcher
     active_cap = params.get("active_cap")
-    if active_cap is not None:
+    scheduling_policy = params.get("scheduling_policy", "fifo")
+    if scheduling_policy == "server_sjf" and active_cap is not None:
+        s_hat = params.get("s_hat", {})
+        _dispatcher = PriorityDispatcher(int(active_cap), s_hat=s_hat)
+        print(f"[pool_server] Priority dispatcher (Server-SJF): active_cap={active_cap}, s_hat={s_hat}",
+              flush=True)
+    elif active_cap is not None:
         _dispatcher = CentralDispatcher(int(active_cap))
         print(f"[pool_server] Central dispatcher: active_cap={active_cap}",
               flush=True)
@@ -236,7 +303,8 @@ def _gpu_copy_in(transport, hidden_dim, act_bytes):
 
 
 def _handle_s4a_sliced(num_miss, quantum, variant, act_f32, a_gpu, b_gpu,
-                       result, hidden_dim, intermediate_dim, rank, segments):
+                       result, hidden_dim, intermediate_dim, rank, segments,
+                       req_id=0):
     """Process misses in quanta with yield between quanta.
 
     Releases the GPU admission token (dispatcher) between quanta so that
@@ -299,7 +367,10 @@ def _handle_s4a_sliced(num_miss, quantum, variant, act_f32, a_gpu, b_gpu,
                 _dispatcher.release()
                 # Brief yield to allow other requests
                 time.sleep(0)  # cooperative yield
-                _dispatcher.acquire()
+                if hasattr(_dispatcher, 'enqueue_and_wait'):
+                    _dispatcher.enqueue_and_wait(num_miss, req_id)
+                else:
+                    _dispatcher.acquire()
             t_yield_end = time.perf_counter()
             segments.append({
                 "name": f"quantum_{quantum_num}_yield",
@@ -344,8 +415,12 @@ def handle_s4a_pooled(conn, params):
     result_bytes = num_miss * intermediate_dim * BYTES_PER_PARAM
 
     handshake_port = params.get("handshake_port")
+    req_id = params.get("req_id", 0)
     if _dispatcher is not None:
-        _dispatcher.acquire()
+        if hasattr(_dispatcher, 'enqueue_and_wait'):
+            _dispatcher.enqueue_and_wait(num_miss, req_id)
+        else:
+            _dispatcher.acquire()
     pool_id = None
     transport = None
     try:
@@ -437,7 +512,8 @@ def handle_s4a_pooled(conn, params):
                 # between quanta (releases GPU admission token)
                 total_perturbation_us = _handle_s4a_sliced(
                     num_miss, quantum, variant, act_f32, a_gpu, b_gpu,
-                    result, hidden_dim, intermediate_dim, rank, segments)
+                    result, hidden_dim, intermediate_dim, rank, segments,
+                    req_id=req_id)
 
             elif timing_method == "old":
                 # OLD timing: sync + perf_counter per segment (original method).
@@ -705,8 +781,12 @@ def handle_s4a_chunk_init(conn, params):
     result_bytes = num_miss * intermediate_dim * BYTES_PER_PARAM
 
     handshake_port = params.get("handshake_port")
+    req_id = params.get("req_id", 0)
     if _dispatcher is not None:
-        _dispatcher.acquire()
+        if hasattr(_dispatcher, 'enqueue_and_wait'):
+            _dispatcher.enqueue_and_wait(num_miss, req_id)
+        else:
+            _dispatcher.acquire()
     pool_id = None
     transport = None
     try:
