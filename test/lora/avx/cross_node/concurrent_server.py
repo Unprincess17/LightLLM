@@ -631,6 +631,255 @@ def handle_s4a_pooled(conn, params):
             _dispatcher.release()
 
 
+# ---------------------------------------------------------------------------
+# Stateful chunk session state (S2 Task 2)
+# ---------------------------------------------------------------------------
+
+_chunk_sessions: dict[str, dict] = {}     # session_id -> {act_f32, a_gpu, b_gpu, result, ...}
+_chunk_sessions_lock = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# Stateful chunk handlers (S2 Task 2)
+# ---------------------------------------------------------------------------
+
+def _compute_misses(act_f32, a_gpu, b_gpu, result, start_idx, end_idx,
+                    variant, hidden_dim, intermediate_dim, rank, segments,
+                    timing_entries):
+    """Compute misses [start_idx, end_idx) using eager dual-domain timing.
+
+    Appends per-miss segments to *segments* (coarse) or *timing_entries*
+    (fine, batched sync later).
+    """
+    for i in range(start_idx, end_idx):
+        # Variant-specific perturbation (synced, before timing)
+        if variant == "cache_flush":
+            torch.cuda.empty_cache()
+            _get_scratch_buf().zero_()
+            torch.cuda.synchronize()
+        elif variant == "allocator-reset":
+            _p0 = time.perf_counter()
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        elif variant == "device-cache-perturbation":
+            _p0 = time.perf_counter()
+            _get_l2_scratch().zero_()
+            torch.cuda.synchronize()
+
+        ev_s = torch.cuda.Event(enable_timing=True)
+        ev_e = torch.cuda.Event(enable_timing=True)
+        ev_s.record()
+        t0 = time.perf_counter()
+        w_idx = 0 if variant == "same_weights" else i
+        a_f32 = a_gpu[w_idx].to(torch.float32)
+        b_f32 = b_gpu[w_idx].to(torch.float32)
+        inter = act_f32 @ a_f32.T
+        result[i] = (inter @ b_f32).view(-1)
+        t1 = time.perf_counter()
+        ev_e.record()
+        timing_entries.append(
+            (f"miss_{i}", (t1 - t0) * 1e6, ev_s, ev_e))
+
+
+def handle_s4a_chunk_init(conn, params):
+    """First chunk of stateful chunking: RDMA READ + compute first chunk_nm misses.
+
+    Stores activation, weights, and partial result in session state for
+    subsequent chunk_continue / chunk_final requests.
+    """
+    global _pool, _dispatcher
+    if _pool is None:
+        send_json_response(conn, {"status": "error", "message": "pool not initialized"})
+        return
+
+    session_id = params["session_id"]
+    rank = params["rank"]
+    num_miss = params["num_miss"]
+    hidden_dim = params["hidden_dim"]
+    intermediate_dim = params["intermediate_dim"]
+    chunk_nm = params["chunk_nm"]
+    variant = params.get("variant", "baseline")
+    decompose = params.get("decompose", False)
+
+    act_bytes = hidden_dim * BYTES_PER_PARAM
+    result_bytes = num_miss * intermediate_dim * BYTES_PER_PARAM
+
+    handshake_port = params.get("handshake_port")
+    if _dispatcher is not None:
+        _dispatcher.acquire()
+    pool_id = None
+    transport = None
+    try:
+        pool_id, transport = _pool.borrow(handshake_port=handshake_port)
+
+        # RDMA READ activation from client's GPU buffer
+        transport.read_from_remote(0, 0, act_bytes)
+
+        # Copy activation to local GPU tensor
+        act_bf16 = torch.empty(hidden_dim, dtype=torch.bfloat16, device="cuda")
+        copy_gpu_to_gpu(act_bf16.data_ptr(), transport.gpu_ptr(), act_bytes)
+        act_f32 = act_bf16.to(torch.float32).view(1, hidden_dim)
+
+        # Generate LoRA weights on GPU
+        a_gpu = torch.randn(num_miss, rank, hidden_dim, dtype=torch.bfloat16, device="cuda")
+        b_gpu = torch.randn(num_miss, rank, intermediate_dim, dtype=torch.bfloat16, device="cuda")
+
+        # Allocate result tensor (full size, filled incrementally)
+        result = torch.zeros(num_miss, intermediate_dim, dtype=torch.float32, device="cuda")
+
+        # Compute first chunk_nm misses
+        segments = []
+        timing_entries = []
+        end_idx = min(chunk_nm, num_miss)
+        _compute_misses(act_f32, a_gpu, b_gpu, result, 0, end_idx,
+                        variant, hidden_dim, intermediate_dim, rank,
+                        segments, timing_entries)
+
+        if decompose:
+            torch.cuda.synchronize()
+            for name, cpu_us, ev_s, ev_e in timing_entries:
+                segments.append({"name": name, "cpu_us": cpu_us,
+                                 "gpu_us": ev_s.elapsed_time(ev_e) * 1000})
+
+        # Store session state
+        with _chunk_sessions_lock:
+            _chunk_sessions[session_id] = {
+                "act_f32": act_f32,
+                "a_gpu": a_gpu,
+                "b_gpu": b_gpu,
+                "result": result,
+                "transport_pool_id": pool_id,
+                "transport": transport,
+                "miss_idx": end_idx,  # next miss to compute
+                "num_miss": num_miss,
+                "hidden_dim": hidden_dim,
+                "intermediate_dim": intermediate_dim,
+                "rank": rank,
+                "variant": variant,
+                "decompose": decompose,
+                "act_bytes": act_bytes,
+                "result_bytes": result_bytes,
+                "all_segments": list(segments),
+                "all_timing_entries": list(timing_entries),
+            }
+        # Don't return transport to pool — it stays reserved for the session
+        pool_id = None  # prevent return in finally
+    finally:
+        if pool_id is not None:
+            _pool.return_transport(pool_id, transport)
+        if _dispatcher is not None:
+            _dispatcher.release()
+
+    resp = {"status": "ok", "session_id": session_id, "chunk_misses": end_idx,
+            "segments": segments if decompose else []}
+    send_json_response(conn, resp)
+
+
+def handle_s4a_chunk_continue(conn, params):
+    """Intermediate chunk: compute next chunk_nm misses using stored state."""
+    session_id = params["session_id"]
+    chunk_nm = params["chunk_nm"]
+
+    with _chunk_sessions_lock:
+        session = _chunk_sessions.get(session_id)
+    if session is None:
+        send_json_response(conn, {"status": "error", "message": f"unknown session {session_id}"})
+        return
+
+    start_idx = session["miss_idx"]
+    end_idx = min(start_idx + chunk_nm, session["num_miss"])
+
+    segments = []
+    timing_entries = []
+    _compute_misses(
+        session["act_f32"], session["a_gpu"], session["b_gpu"],
+        session["result"], start_idx, end_idx,
+        session["variant"], session["hidden_dim"], session["intermediate_dim"],
+        session["rank"], segments, timing_entries)
+
+    if session["decompose"]:
+        torch.cuda.synchronize()
+        for name, cpu_us, ev_s, ev_e in timing_entries:
+            segments.append({"name": name, "cpu_us": cpu_us,
+                             "gpu_us": ev_s.elapsed_time(ev_e) * 1000})
+            session["all_segments"].append(segments[-1])
+    else:
+        session["all_timing_entries"].extend(timing_entries)
+
+    session["miss_idx"] = end_idx
+
+    resp = {"status": "ok", "session_id": session_id, "chunk_misses": end_idx - start_idx,
+            "segments": segments if session["decompose"] else []}
+    send_json_response(conn, resp)
+
+
+def handle_s4a_chunk_final(conn, params):
+    """Last chunk: compute remaining misses + RDMA WRITE accumulated result."""
+    global _pool, _dispatcher
+    session_id = params["session_id"]
+    chunk_nm = params["chunk_nm"]
+
+    with _chunk_sessions_lock:
+        session = _chunk_sessions.pop(session_id, None)
+    if session is None:
+        send_json_response(conn, {"status": "error", "message": f"unknown session {session_id}"})
+        return
+
+    start_idx = session["miss_idx"]
+    end_idx = session["num_miss"]  # compute all remaining
+
+    segments = []
+    timing_entries = []
+    if start_idx < end_idx:
+        _compute_misses(
+            session["act_f32"], session["a_gpu"], session["b_gpu"],
+            session["result"], start_idx, end_idx,
+            session["variant"], session["hidden_dim"], session["intermediate_dim"],
+            session["rank"], segments, timing_entries)
+
+    if session["decompose"]:
+        torch.cuda.synchronize()
+        for name, cpu_us, ev_s, ev_e in timing_entries:
+            segments.append({"name": name, "cpu_us": cpu_us,
+                             "gpu_us": ev_s.elapsed_time(ev_e) * 1000})
+            session["all_segments"].append(segments[-1])
+
+    # RDMA WRITE accumulated result
+    transport = session["transport"]
+    pool_id = session["transport_pool_id"]
+    act_bytes = session["act_bytes"]
+    result_bytes = session["result_bytes"]
+
+    result_bf16 = session["result"].to(torch.bfloat16)
+    copy_gpu_to_gpu(
+        transport.gpu_ptr() + act_bytes,
+        result_bf16.data_ptr(),
+        result_bytes,
+    )
+
+    if session["decompose"]:
+        all_segments = session["all_segments"]
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        transport.write_to_remote(act_bytes, act_bytes, result_bytes)
+        dt = (time.perf_counter() - t0) * 1e6
+        all_segments.append({"name": "rdma_write", "cpu_us": dt, "gpu_us": dt})
+    else:
+        transport.write_to_remote(act_bytes, act_bytes, result_bytes)
+
+    # Return transport to pool (dispatcher was released in chunk_init)
+    try:
+        _pool.return_transport(pool_id, transport)
+    except Exception:
+        pass
+
+    resp = {"status": "ok", "session_id": session_id,
+            "chunk_misses": end_idx - start_idx,
+            "segments": session["all_segments"] if session["decompose"] else [],
+            "result_bytes": result_bytes}
+    send_json_response(conn, resp)
+
+
 def handle_teardown_pool(conn):
     """Destroy the QP pool."""
     global _pool
@@ -683,6 +932,12 @@ def handle_request(
                 handle_setup_pool(conn, params, listen_ip, remote_ip)
             elif msg_type == "s4a_pooled":
                 handle_s4a_pooled(conn, params)
+            elif msg_type == "s4a_chunk_init":
+                handle_s4a_chunk_init(conn, params)
+            elif msg_type == "s4a_chunk_continue":
+                handle_s4a_chunk_continue(conn, params)
+            elif msg_type == "s4a_chunk_final":
+                handle_s4a_chunk_final(conn, params)
             elif msg_type == "teardown_pool":
                 handle_teardown_pool(conn)
             elif msg_type == "shutdown":

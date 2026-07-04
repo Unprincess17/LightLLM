@@ -488,6 +488,260 @@ def _run_per_request(config: DecompositionConfig, cell_spec: dict, variant: str,
 
 
 # ---------------------------------------------------------------------------
+# S2 Task 2: Stateful client chunking + matched persistent fan-out
+# ---------------------------------------------------------------------------
+
+def _make_chunk_request(req_id: int, session_id: str,
+                        config: DecompositionConfig, cell_spec: dict,
+                        variant: str, chunk_nm: int, chunk_idx: int,
+                        num_chunks: int) -> dict:
+    """Build a chunk request message (s4a_chunk_init / continue / final)."""
+    if chunk_idx == 0:
+        msg_type = "s4a_chunk_init"
+    elif chunk_idx == num_chunks - 1:
+        msg_type = "s4a_chunk_final"
+    else:
+        msg_type = "s4a_chunk_continue"
+
+    return {
+        "type": msg_type,
+        "req_id": req_id,
+        "session_id": session_id,
+        "rank": config.rank,
+        "num_miss": config.nm,
+        "hidden_dim": HIDDEN_DIM,
+        "intermediate_dim": INTERMEDIATE_DIM,
+        "chunk_nm": chunk_nm,
+        "variant": variant,
+        "decompose": True,
+        "active_cap": cell_spec["conc"],
+    }
+
+
+def _run_stateful_chunking(config: DecompositionConfig, cell_spec: dict,
+                           variant: str, transport_type: str,
+                           server_host: str, server_port: int,
+                           qp_pool, act_bytes: int, result_bytes: int,
+                           chunk_size: int = 1, policy: str = "contiguous",
+                           timing_method: str = "new"):
+    """Stateful client chunking: N control messages, 1 READ/WRITE.
+
+    chunk_size: number of misses per chunk (1, 2, or 4 for NM=8)
+    policy: "contiguous" (back-to-back) or "interleaved" (round-robin)
+    """
+    num_miss = config.nm
+    # Calculate chunks: init does first chunk, final does last chunk
+    # If chunk_size >= num_miss, we still need init + final (2 messages)
+    if chunk_size >= num_miss:
+        num_chunks = 2  # init (READ + all compute) + final (WRITE only)
+        chunk_nm_init = num_miss
+        chunk_nm_final = 0
+    else:
+        num_chunks = (num_miss + chunk_size - 1) // chunk_size
+        # If only 1 chunk worth of misses, we need init + final
+        if num_chunks == 1:
+            num_chunks = 2
+            chunk_nm_init = num_miss
+            chunk_nm_final = 0
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(120.0)
+    sock.connect((server_host, server_port))
+    persistent_transport = PersistentTransport(sock)
+
+    latencies_us = []
+    segments_per_request = []
+    accountings = []
+
+    try:
+        if policy == "contiguous":
+            # Send all chunks of one logical request back-to-back
+            def _do_one_logical(transport=persistent_transport, qp_pool=qp_pool):
+                session_id = f"sess_{new_request_id()}"
+                t0 = time.perf_counter()
+
+                # Build and send chunk requests sequentially
+                for chunk_idx in range(num_chunks):
+                    req_id = new_request_id()
+                    if chunk_idx == 0:
+                        chunk_nm = chunk_size if chunk_size < num_miss else num_miss
+                    elif chunk_idx == num_chunks - 1:
+                        # Final chunk: remaining misses
+                        remaining = num_miss - (chunk_nm_init if chunk_size >= num_miss else chunk_size * (num_chunks - 1))
+                        # Actually compute remaining properly
+                        if chunk_size >= num_miss:
+                            chunk_nm = 0  # final does WRITE only
+                        else:
+                            chunk_nm = num_miss - chunk_size * (num_chunks - 1)
+                            if chunk_nm <= 0:
+                                chunk_nm = chunk_size  # fallback
+                    else:
+                        chunk_nm = chunk_size
+
+                    msg = _make_chunk_request(
+                        req_id, session_id, config, cell_spec,
+                        variant, chunk_nm, chunk_idx, num_chunks)
+                    response = transport.request(msg)
+
+                t18 = time.perf_counter()
+                e2e_us = (t18 - t0) * 1e6
+
+                segs = response.get("segments", [])
+                server_intervals = [s["cpu_us"] for s in segs if "cpu_us" in s]
+                tl = RequestTimeline(req_id=req_id, cell=config.cell)
+                tl.set("t0", t0)
+                tl.set("t5", t0)
+                tl.set("t6", t0)
+                tl.set("t17", t18)
+                tl.set("t18", t18)
+                return e2e_us, segs, account_request(
+                    tl, instrumented_server_intervals_us=server_intervals)
+
+            if cell_spec["runtime"] == "python_direct":
+                # Sequential, no executor
+                for _trial in range(config.n_trials):
+                    for _i in range(config.n_iters):
+                        e2e_us, segs, acc = _do_one_logical()
+                        latencies_us.append(e2e_us)
+                        segments_per_request.append(segs)
+                        accountings.append(acc)
+            else:
+                # Executor with max_workers = conc
+                with ThreadPoolExecutor(max_workers=cell_spec["conc"]) as executor:
+                    futures = []
+                    for _trial in range(config.n_trials):
+                        for _i in range(config.n_iters):
+                            futures.append(executor.submit(_do_one_logical))
+                    for fut in futures:
+                        e2e_us, segs, acc = fut.result()
+                        latencies_us.append(e2e_us)
+                        segments_per_request.append(segs)
+                        accountings.append(acc)
+
+        elif policy == "interleaved":
+            # Round-robin scheduler across multiple concurrent logical requests
+            # At most one outstanding chunk per logical request
+            conc = cell_spec["conc"]
+            with ThreadPoolExecutor(max_workers=conc) as executor:
+                futures = []
+
+                def _do_one_interleaved(transport=persistent_transport):
+                    session_id = f"sess_{new_request_id()}"
+                    t0 = time.perf_counter()
+
+                    for chunk_idx in range(num_chunks):
+                        req_id = new_request_id()
+                        if chunk_idx == 0:
+                            chunk_nm = chunk_size if chunk_size < num_miss else num_miss
+                        elif chunk_idx == num_chunks - 1:
+                            if chunk_size >= num_miss:
+                                chunk_nm = 0
+                            else:
+                                chunk_nm = num_miss - chunk_size * (num_chunks - 1)
+                                if chunk_nm <= 0:
+                                    chunk_nm = chunk_size
+                        else:
+                            chunk_nm = chunk_size
+
+                        msg = _make_chunk_request(
+                            req_id, session_id, config, cell_spec,
+                            variant, chunk_nm, chunk_idx, num_chunks)
+                        response = transport.request(msg)
+
+                    t18 = time.perf_counter()
+                    e2e_us = (t18 - t0) * 1e6
+                    segs = response.get("segments", [])
+                    server_intervals = [s["cpu_us"] for s in segs if "cpu_us" in s]
+                    tl = RequestTimeline(req_id=req_id, cell=config.cell)
+                    tl.set("t0", t0)
+                    tl.set("t5", t0)
+                    tl.set("t6", t0)
+                    tl.set("t17", t18)
+                    tl.set("t18", t18)
+                    return e2e_us, segs, account_request(
+                        tl, instrumented_server_intervals_us=server_intervals)
+
+                for _trial in range(config.n_trials):
+                    for _i in range(config.n_iters):
+                        futures.append(executor.submit(_do_one_interleaved))
+                for fut in futures:
+                    e2e_us, segs, acc = fut.result()
+                    latencies_us.append(e2e_us)
+                    segments_per_request.append(segs)
+                    accountings.append(acc)
+        else:
+            raise ValueError(f"unknown policy: {policy}")
+    finally:
+        persistent_transport.close()
+
+    return latencies_us, segments_per_request, accountings
+
+
+def _run_persistent_fanout(config: DecompositionConfig, cell_spec: dict,
+                           variant: str, server_host: str, server_port: int,
+                           qp_pool, act_bytes: int, result_bytes: int,
+                           chunk_size: int = 1, timing_method: str = "new"):
+    """Matched persistent fan-out: N concurrent independent RPCs.
+
+    Same persistent TCP, same serialization, same active cap.
+    Multiple chunk requests submitted concurrently as independent executor tasks.
+    Each does its own RDMA READ + compute + RDMA WRITE (full s4a_pooled).
+
+    This is the H1 control — isolates RPC fan-out from transport persistence.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(120.0)
+    sock.connect((server_host, server_port))
+    transport = PersistentTransport(sock)
+
+    latencies_us = []
+    segments_per_request = []
+    accountings = []
+
+    try:
+        def _do_one(transport=transport, qp_pool=qp_pool):
+            req_id = new_request_id()
+            t0 = time.perf_counter()
+
+            pool_id, gpu_transport, _ = qp_pool.borrow()
+            try:
+                msg = _make_request(req_id, config, cell_spec, variant,
+                                    timing_method=timing_method)
+                t5 = time.perf_counter()
+                response = transport.request(msg)
+                t18 = time.perf_counter()
+            finally:
+                qp_pool.return_transport(pool_id, gpu_transport)
+
+            e2e_us = (t18 - t0) * 1e6
+            segs = response.get("segments", [])
+            server_intervals = [s["cpu_us"] for s in segs if "cpu_us" in s]
+            tl = RequestTimeline(req_id=req_id, cell=config.cell)
+            tl.set("t0", t0)
+            tl.set("t5", t5)
+            tl.set("t6", t5)
+            tl.set("t17", t18)
+            tl.set("t18", t18)
+            return e2e_us, segs, account_request(
+                tl, instrumented_server_intervals_us=server_intervals)
+
+        with ThreadPoolExecutor(max_workers=cell_spec["conc"]) as executor:
+            futures = []
+            for _trial in range(config.n_trials):
+                for _i in range(config.n_iters):
+                    futures.append(executor.submit(_do_one))
+            for fut in futures:
+                e2e_us, segs, acc = fut.result()
+                latencies_us.append(e2e_us)
+                segments_per_request.append(segs)
+                accountings.append(acc)
+    finally:
+        transport.close()
+
+    return latencies_us, segments_per_request, accountings
+
+
+# ---------------------------------------------------------------------------
 # _run_remote_cell: B1/B2/B5 dispatch
 # ---------------------------------------------------------------------------
 
