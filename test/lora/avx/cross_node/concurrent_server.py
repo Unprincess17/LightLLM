@@ -140,6 +140,30 @@ _dispatcher: CentralDispatcher | None = None
 # S_hat calibration cache (set by client via setup_pool or set_s_hat)
 _s_hat_cache: dict = {}
 
+# ---------------------------------------------------------------------------
+# S3 Task 3: Execution-order instrumentation
+# ---------------------------------------------------------------------------
+
+_handler_seq = 0          # incremented when a handler is admitted (dispatch done)
+_completion_seq = 0       # incremented when a handler finishes and sends response
+_seq_lock = threading.Lock()
+
+
+def _next_handler_seq() -> int:
+    """Atomically increment and return the next handler-start sequence number."""
+    global _handler_seq
+    with _seq_lock:
+        _handler_seq += 1
+        return _handler_seq
+
+
+def _next_completion_seq() -> int:
+    """Atomically increment and return the next completion sequence number."""
+    global _completion_seq
+    with _seq_lock:
+        _completion_seq += 1
+        return _completion_seq
+
 
 def set_s_hat(s_hat: dict):
     """Set the S_hat calibration for the current server session."""
@@ -421,6 +445,7 @@ def handle_s4a_pooled(conn, params):
             _dispatcher.enqueue_and_wait(num_miss, req_id)
         else:
             _dispatcher.acquire()
+    handler_start_seq = _next_handler_seq()
     pool_id = None
     transport = None
     try:
@@ -687,6 +712,7 @@ def handle_s4a_pooled(conn, params):
             )
             transport.write_to_remote(act_bytes, act_bytes, result_bytes)
 
+        completion_seq = _next_completion_seq()
         if decompose:
             resp = build_timing_response(
                 nm=num_miss, segments=segments, variant=variant)
@@ -697,9 +723,13 @@ def handle_s4a_pooled(conn, params):
             resp["graph_replays"] = sum(_graph_replay_count.values())
             resp["quantum"] = quantum
             resp["yields"] = (num_miss - 1) // quantum if quantum < num_miss else 0
+            resp["handler_start_seq"] = handler_start_seq
+            resp["completion_seq"] = completion_seq
             send_json_response(conn, resp)
         else:
-            send_json_response(conn, {"status": "ok", "result_bytes": result_bytes})
+            send_json_response(conn, {"status": "ok", "result_bytes": result_bytes,
+                                      "handler_start_seq": handler_start_seq,
+                                      "completion_seq": completion_seq})
     finally:
         if pool_id is not None:
             _pool.return_transport(pool_id, transport)

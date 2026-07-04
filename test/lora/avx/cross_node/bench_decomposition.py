@@ -14,6 +14,7 @@ import json
 import socket
 import struct
 import subprocess
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, asdict
@@ -739,6 +740,278 @@ def _run_persistent_fanout(config: DecompositionConfig, cell_spec: dict,
         transport.close()
 
     return latencies_us, segments_per_request, accountings
+
+
+# ---------------------------------------------------------------------------
+# S3 Task 2: Client-SJF dispatch
+# ---------------------------------------------------------------------------
+
+def _make_sjf_request(req_id: int, nm: int, rank: int,
+                      cell_spec: dict, variant: str,
+                      timing_method: str = "new") -> dict:
+    """Build an s4a_pooled request with a custom num_miss (for SJF)."""
+    return {
+        "type": "s4a_pooled",
+        "req_id": req_id,
+        "rank": rank,
+        "num_miss": nm,
+        "hidden_dim": HIDDEN_DIM,
+        "intermediate_dim": INTERMEDIATE_DIM,
+        "decompose": True,
+        "decompose_level": "fine",
+        "variant": variant,
+        "active_cap": cell_spec["conc"],
+        "timing_method": timing_method,
+    }
+
+
+def _run_client_sjf(config: DecompositionConfig, cell_spec: dict, variant: str,
+                    transport: str, qp_pool,
+                    server_host: str, server_port: int,
+                    compositions: list, W: int = None,
+                    timing_method: str = "new",
+                    poisson: bool = False, arrival_rate: float = None):
+    """Client-SJF: dispatch shortest predicted ready job.
+
+    W = outstanding window (default = cell_spec["conc"])
+    compositions: list of NM values (e.g., [8,1,1,1,1,1,1,1,1] for 1h8l)
+
+    For synchronized (poisson=False): sort by NM ascending, send in order.
+    For Poisson: online — arrivals enter ready queue, dispatch picks shortest.
+
+    Returns: (latencies_us, segments_per_request, accountings, scheduling_data)
+        scheduling_data: list of {req_id, nm, submission_seq,
+                                  handler_start_seq, completion_seq}
+    """
+    if W is None:
+        W = cell_spec["conc"]
+
+    rank = config.rank
+    act_bytes = HIDDEN_DIM * BYTES_PER_PARAM
+
+    latencies_us = []
+    segments_per_request = []
+    accountings = []
+    scheduling_data = []
+
+    if not poisson:
+        # ---- Synchronized mode: sort by NM, send in sorted order ----
+        sorted_nms = sorted(compositions, key=lambda x: x)
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(120.0)
+        sock.connect((server_host, server_port))
+        persistent_transport = PersistentTransport(sock)
+
+        submission_counter = 0
+
+        try:
+            if cell_spec["runtime"] == "python_direct" or W == 1:
+                # B2-style: sequential, no executor
+                for _trial in range(config.n_trials):
+                    for nm in sorted_nms:
+                        req_id = new_request_id()
+                        submission_counter += 1
+                        t0 = time.perf_counter()
+
+                        pool_id, gpu_transport, _ = qp_pool.borrow()
+                        try:
+                            msg = _make_sjf_request(
+                                req_id, nm, rank, cell_spec, variant,
+                                timing_method=timing_method)
+                            t5 = time.perf_counter()
+                            response = persistent_transport.request(msg)
+                            t18 = time.perf_counter()
+                        finally:
+                            qp_pool.return_transport(pool_id, gpu_transport)
+
+                        e2e_us = (t18 - t0) * 1e6
+                        latencies_us.append(e2e_us)
+                        segs = response.get("segments", [])
+                        segments_per_request.append(segs)
+
+                        server_intervals = [s["cpu_us"] for s in segs if "cpu_us" in s]
+                        tl = RequestTimeline(req_id=req_id, cell=config.cell)
+                        tl.set("t0", t0)
+                        tl.set("t5", t5)
+                        tl.set("t6", t5)
+                        tl.set("t17", t18)
+                        tl.set("t18", t18)
+                        accountings.append(account_request(
+                            tl, instrumented_server_intervals_us=server_intervals))
+
+                        scheduling_data.append({
+                            "req_id": req_id,
+                            "nm": nm,
+                            "submission_seq": submission_counter,
+                            "handler_start_seq": response.get("handler_start_seq"),
+                            "completion_seq": response.get("completion_seq"),
+                        })
+            else:
+                # B3-style: executor with max_workers=W
+                def _do_one_sjf(nm_val, pt=persistent_transport):
+                    rid = new_request_id()
+                    # submission_seq is assigned at submit time (below)
+                    ts0 = time.perf_counter()
+
+                    pid, gt, _ = qp_pool.borrow()
+                    try:
+                        msg = _make_sjf_request(
+                            rid, nm_val, rank, cell_spec, variant,
+                            timing_method=timing_method)
+                        ts5 = time.perf_counter()
+                        resp = pt.request(msg)
+                        ts18 = time.perf_counter()
+                    finally:
+                        qp_pool.return_transport(pid, gt)
+
+                    e2e = (ts18 - ts0) * 1e6
+                    sgs = resp.get("segments", [])
+                    srv_intervals = [s["cpu_us"] for s in sgs if "cpu_us" in s]
+                    tl2 = RequestTimeline(req_id=rid, cell=config.cell)
+                    tl2.set("t0", ts0)
+                    tl2.set("t5", ts5)
+                    tl2.set("t6", ts5)
+                    tl2.set("t17", ts18)
+                    tl2.set("t18", ts18)
+                    return (rid, nm_val, e2e, sgs,
+                            account_request(tl2, instrumented_server_intervals_us=srv_intervals),
+                            resp.get("handler_start_seq"),
+                            resp.get("completion_seq"),
+                            ts0)
+
+                with ThreadPoolExecutor(max_workers=W) as executor:
+                    futures = []
+                    submit_order = []  # (req_id, nm, submit_seq, submit_time)
+                    for _trial in range(config.n_trials):
+                        for nm in sorted_nms:
+                            submission_counter += 1
+                            fut = executor.submit(_do_one_sjf, nm)
+                            futures.append(fut)
+                            submit_order.append((nm, submission_counter))
+
+                    for i, fut in enumerate(futures):
+                        rid, nm_val, e2e, sgs, acc, h_seq, c_seq, _ = fut.result()
+                        latencies_us.append(e2e)
+                        segments_per_request.append(sgs)
+                        accountings.append(acc)
+                        nm_submitted, sub_seq = submit_order[i]
+                        scheduling_data.append({
+                            "req_id": rid,
+                            "nm": nm_submitted,
+                            "submission_seq": sub_seq,
+                            "handler_start_seq": h_seq,
+                            "completion_seq": c_seq,
+                        })
+        finally:
+            persistent_transport.close()
+
+    else:
+        # ---- Poisson mode: online ready queue with SJF dispatch ----
+        import heapq
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(120.0)
+        sock.connect((server_host, server_port))
+        persistent_transport = PersistentTransport(sock)
+
+        submission_counter = 0
+        # Ready queue: heap of (nm, submit_seq, nm_value)
+        # We use a heap so we can always pick the shortest (lowest NM)
+        ready_queue = []
+        ready_lock = threading.Lock()
+        ready_cv = threading.Condition(ready_lock)
+
+        # Arrival thread: generates arrivals at the given rate
+        import random
+        arrival_rng = random.Random(42)
+
+        def _arrival_worker():
+            """Generate arrivals into the ready queue."""
+            for _trial in range(config.n_trials):
+                for nm in compositions:
+                    with ready_cv:
+                        while len(ready_queue) >= W * 2:  # bound the queue
+                            ready_cv.wait()
+                        nonlocal submission_counter
+                        submission_counter += 1
+                        sub_seq_val = submission_counter
+                        heapq.heappush(ready_queue, (nm, sub_seq_val))
+                        ready_cv.notify()
+                    if arrival_rate and arrival_rate > 0:
+                        inter_arrival = arrival_rng.expovariate(arrival_rate)
+                        time.sleep(inter_arrival)
+            # Signal dispatch threads to stop by pushing W sentinels
+            with ready_cv:
+                for _ in range(W):
+                    heapq.heappush(ready_queue, (float('inf'), -1))
+                ready_cv.notify_all()
+
+        def _dispatch_worker(pt=persistent_transport):
+            """Pick shortest job from ready queue and dispatch."""
+            while True:
+                with ready_cv:
+                    while not ready_queue:
+                        ready_cv.wait()
+                    nm_val, sub_seq_val = heapq.heappop(ready_queue)
+                    ready_cv.notify()
+                # Check for stop sentinel
+                if nm_val == float('inf'):
+                    break
+
+                rid = new_request_id()
+                t0 = time.perf_counter()
+                pid, gt, _ = qp_pool.borrow()
+                try:
+                    msg = _make_sjf_request(
+                        rid, nm_val, rank, cell_spec, variant,
+                        timing_method=timing_method)
+                    t5 = time.perf_counter()
+                    resp = pt.request(msg)
+                    t18 = time.perf_counter()
+                finally:
+                    qp_pool.return_transport(pid, gt)
+
+                e2e = (t18 - t0) * 1e6
+                sgs = resp.get("segments", [])
+                srv_intervals = [s["cpu_us"] for s in sgs if "cpu_us" in s]
+                tl_obj = RequestTimeline(req_id=rid, cell=config.cell)
+                tl_obj.set("t0", t0)
+                tl_obj.set("t5", t5)
+                tl_obj.set("t6", t5)
+                tl_obj.set("t17", t18)
+                tl_obj.set("t18", t18)
+
+                with ready_lock:
+                    latencies_us.append(e2e)
+                    segments_per_request.append(sgs)
+                    accountings.append(account_request(
+                        tl_obj, instrumented_server_intervals_us=srv_intervals))
+                    scheduling_data.append({
+                        "req_id": rid,
+                        "nm": nm_val,
+                        "submission_seq": sub_seq_val,
+                        "handler_start_seq": resp.get("handler_start_seq"),
+                        "completion_seq": resp.get("completion_seq"),
+                    })
+
+        try:
+            arrival_thread = threading.Thread(target=_arrival_worker, daemon=True)
+            dispatch_threads = [
+                threading.Thread(target=_dispatch_worker, daemon=True)
+                for _ in range(W)
+            ]
+            arrival_thread.start()
+            for t in dispatch_threads:
+                t.start()
+            arrival_thread.join(timeout=300)
+            # Dispatch threads exit when they receive sentinel from queue
+            for t in dispatch_threads:
+                t.join(timeout=120)
+        finally:
+            persistent_transport.close()
+
+    return latencies_us, segments_per_request, accountings, scheduling_data
 
 
 # ---------------------------------------------------------------------------
