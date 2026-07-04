@@ -131,7 +131,7 @@ def _get_l2_scratch():
     """Scratch buffer sized to the device's L2 cache (runtime-queried)."""
     global _l2_scratch
     if _l2_scratch is None:
-        l2_size = torch.cuda.get_device_properties(0).l2_cache_size
+        l2_size = torch.cuda.get_device_properties(0).L2_cache_size
         _l2_scratch = torch.empty(l2_size // 4, dtype=torch.float32, device="cuda")
     return _l2_scratch
 
