@@ -235,6 +235,84 @@ def _gpu_copy_in(transport, hidden_dim, act_bytes):
     return act_bf16
 
 
+def _handle_s4a_sliced(num_miss, quantum, variant, act_f32, a_gpu, b_gpu,
+                       result, hidden_dim, intermediate_dim, rank, segments):
+    """Process misses in quanta with yield between quanta.
+
+    Releases the GPU admission token (dispatcher) between quanta so that
+    another logical request's quantum can be admitted.  The CPU worker
+    stays occupied (blocking on semaphore re-acquire), but the GPU
+    admission token is released.
+
+    Per-miss segments are recorded with ``gpu_us`` from CUDA events.
+    Yield segments are recorded with ``cpu_us`` from ``perf_counter``.
+
+    Returns the total perturbation cost in microseconds.
+    """
+    total_perturbation_us = 0.0
+    miss_idx = 0
+    quantum_num = 0
+    while miss_idx < num_miss:
+        # Determine this quantum's range
+        end_idx = min(miss_idx + quantum, num_miss)
+
+        # Process this quantum's misses (same eager compute as baseline)
+        for i in range(miss_idx, end_idx):
+            # Variant-specific perturbation (same as eager baseline)
+            if variant == "cache_flush":
+                torch.cuda.empty_cache()
+                _get_scratch_buf().zero_()
+                torch.cuda.synchronize()
+            elif variant == "allocator-reset":
+                _p0 = time.perf_counter()
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                total_perturbation_us += (time.perf_counter() - _p0) * 1e6
+            elif variant == "device-cache-perturbation":
+                _p0 = time.perf_counter()
+                _get_l2_scratch().zero_()
+                torch.cuda.synchronize()
+                total_perturbation_us += (time.perf_counter() - _p0) * 1e6
+
+            # dtype + mm1 + mm2 with CUDA events (single segment per miss)
+            ev_s = torch.cuda.Event(enable_timing=True)
+            ev_e = torch.cuda.Event(enable_timing=True)
+            ev_s.record()
+            w_idx = 0 if variant == "same_weights" else i
+            a_f32 = a_gpu[w_idx].to(torch.float32)
+            b_f32 = b_gpu[w_idx].to(torch.float32)
+            inter = act_f32 @ a_f32.T
+            result[i] = (inter @ b_f32).view(-1)
+            ev_e.record()
+            torch.cuda.synchronize()  # sync per miss (simplified; batch sync later)
+            segments.append({
+                "name": f"miss_{i}",
+                "cpu_us": 0,  # filled later if needed
+                "gpu_us": ev_s.elapsed_time(ev_e) * 1000,
+            })
+
+        # Yield between quanta (not after the last)
+        if end_idx < num_miss:
+            t_yield_start = time.perf_counter()
+            # Release GPU admission token
+            if _dispatcher is not None:
+                _dispatcher.release()
+                # Brief yield to allow other requests
+                time.sleep(0)  # cooperative yield
+                _dispatcher.acquire()
+            t_yield_end = time.perf_counter()
+            segments.append({
+                "name": f"quantum_{quantum_num}_yield",
+                "cpu_us": (t_yield_end - t_yield_start) * 1e6,
+                "gpu_us": 0,
+            })
+            quantum_num += 1
+
+        miss_idx = end_idx
+
+    return total_perturbation_us
+
+
 def handle_s4a_pooled(conn, params):
     """Execute S4a using a pooled QP.
 
@@ -259,6 +337,7 @@ def handle_s4a_pooled(conn, params):
     decompose_level = params.get("decompose_level", "coarse")
     variant = params.get("variant", "baseline")
     timing_method = params.get("timing_method", "new")  # "new" (CUDA events) or "old" (sync+perf_counter per segment)
+    quantum = params.get("quantum", num_miss)  # default: no slicing
     total_perturbation_us = 0.0  # I2: accumulates perturbation cost across misses
 
     act_bytes = hidden_dim * BYTES_PER_PARAM
@@ -352,6 +431,13 @@ def handle_s4a_pooled(conn, params):
                 # Copy results from static output buffers to result tensor
                 for i in range(num_miss):
                     result[i] = static_out[i]
+
+            elif quantum < num_miss:
+                # Cooperative slicing: process misses in quanta with yield
+                # between quanta (releases GPU admission token)
+                total_perturbation_us = _handle_s4a_sliced(
+                    num_miss, quantum, variant, act_f32, a_gpu, b_gpu,
+                    result, hidden_dim, intermediate_dim, rank, segments)
 
             elif timing_method == "old":
                 # OLD timing: sync + perf_counter per segment (original method).
@@ -533,6 +619,8 @@ def handle_s4a_pooled(conn, params):
             resp["perturbation_cost_us"] = total_perturbation_us  # I2
             resp["graph_captures"] = sum(_graph_capture_count.values())
             resp["graph_replays"] = sum(_graph_replay_count.values())
+            resp["quantum"] = quantum
+            resp["yields"] = (num_miss - 1) // quantum if quantum < num_miss else 0
             send_json_response(conn, resp)
         else:
             send_json_response(conn, {"status": "ok", "result_bytes": result_bytes})
