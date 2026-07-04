@@ -154,7 +154,7 @@ def run_s2(output_dir="results/s2_splitting", n_trials=None, n_iters=None):
                     p99_lo, p99_hi = trial_ci(trial_p99s)
                     rows.append({
                         "cell": cell, "mechanism": mechanism,
-                        "chunk_size": size, "nm": nm,
+                        "chunk_size": size, "nm": nm, "variant": "eager",
                         "p50_median": statistics.median(trial_p50s),
                         "p50_ci_lo": p50_lo, "p50_ci_hi": p50_hi,
                         "p99_median": statistics.median(trial_p99s),
@@ -163,6 +163,37 @@ def run_s2(output_dir="results/s2_splitting", n_trials=None, n_iters=None):
                     print(f"{cell} {mechanism} size={size}: "
                           f"P50={statistics.median(trial_p50s):.0f}us "
                           f"P99={statistics.median(trial_p99s):.0f}us")
+
+        # --- CUDA-graph sub-study (Task 5) ---
+        # Compare eager vs graph for atomic NM=8.
+        # Graph+slicing requires server-side per-quantum graph capture (future work).
+        for variant in ["baseline", "cuda_graph"]:
+            trial_p50s = []
+            trial_p99s = []
+            for trial in range(n_trials):
+                try:
+                    with RemoteSession(cell_spec, cell=cell, variant=variant) as session:
+                        result = run_atomic(session, 8, n_iters)
+                        lats = result.get("latencies_us", [])
+                        if lats:
+                            trial_p50s.append(statistics.median(lats))
+                            trial_p99s.append(sorted(lats)[int(0.99 * len(lats)) - 1])
+                except Exception as e:
+                    print(f"  {cell} graph_substudy {variant} trial {trial}: skipped ({e})")
+                    continue
+            if trial_p50s:
+                p50_lo, p50_hi = trial_ci(trial_p50s)
+                p99_lo, p99_hi = trial_ci(trial_p99s)
+                rows.append({
+                    "cell": cell, "mechanism": "atomic_graph_substudy",
+                    "chunk_size": 8, "nm": 8, "variant": variant,
+                    "p50_median": statistics.median(trial_p50s),
+                    "p50_ci_lo": p50_lo, "p50_ci_hi": p50_hi,
+                    "p99_median": statistics.median(trial_p99s),
+                    "p99_ci_lo": p99_lo, "p99_ci_hi": p99_hi,
+                })
+                print(f"{cell} graph_substudy {variant}: "
+                      f"P50={statistics.median(trial_p50s):.0f}us")
 
     if not rows:
         print("No data collected.")
