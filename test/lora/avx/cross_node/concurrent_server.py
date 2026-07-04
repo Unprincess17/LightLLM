@@ -136,6 +136,69 @@ def _get_l2_scratch():
     return _l2_scratch
 
 
+# ---------------------------------------------------------------------------
+# CUDA graph cache: graphs are captured ONCE per (hidden_dim, intermediate_dim,
+# rank, num_miss) and replayed across requests.  This avoids the 121ms
+# per-request capture cost.
+# ---------------------------------------------------------------------------
+
+_graph_cache = {}            # key -> (graphs, static_act, static_a, static_b, static_inter, static_out)
+_graph_cache_lock = threading.Lock()   # serializes graph replay for thread safety (B5)
+_graph_capture_count = {}   # per-key: how many times captured (should be 1)
+_graph_replay_count = {}    # per-key: how many times replayed
+
+
+def _get_graph_cache_key(hidden_dim, intermediate_dim, rank, num_miss):
+    return (hidden_dim, intermediate_dim, rank, num_miss)
+
+
+def _get_or_capture_graphs(key, hidden_dim, intermediate_dim, rank, num_miss,
+                           act_f32_template, device="cuda"):
+    """Get cached graphs for this key, or capture them if not yet cached.
+
+    Returns (graphs, static_act, static_a, static_b, static_inter, static_out).
+    The caller must copy request data into static buffers before replay.
+    """
+    if key in _graph_cache:
+        return _graph_cache[key]
+
+    with _graph_cache_lock:
+        if key in _graph_cache:  # double-check after acquiring lock
+            return _graph_cache[key]
+
+        # Allocate static buffers (stable addresses for graph capture)
+        static_act = torch.empty(1, hidden_dim, dtype=torch.float32, device=device)
+        static_a = [torch.empty(rank, hidden_dim, dtype=torch.float32, device=device)
+                    for _ in range(num_miss)]
+        static_b = [torch.empty(rank, intermediate_dim, dtype=torch.float32, device=device)
+                    for _ in range(num_miss)]
+        static_inter = [torch.empty(1, rank, dtype=torch.float32, device=device)
+                        for _ in range(num_miss)]
+        static_out = [torch.empty(1, intermediate_dim, dtype=torch.float32, device=device)
+                      for _ in range(num_miss)]
+
+        # Warmup (required before graph capture)
+        for i in range(num_miss):
+            torch.mm(static_act, static_a[i].T, out=static_inter[i])
+            torch.mm(static_inter[i], static_b[i], out=static_out[i].view(-1))
+        torch.cuda.synchronize()
+
+        # Capture one graph per miss
+        graphs = []
+        for i in range(num_miss):
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                torch.mm(static_act, static_a[i].T, out=static_inter[i])
+                torch.mm(static_inter[i], static_b[i], out=static_out[i].view(-1))
+            graphs.append(g)
+
+        _graph_cache[key] = (graphs, static_act, static_a, static_b,
+                             static_inter, static_out)
+        _graph_capture_count[key] = 1
+        _graph_replay_count[key] = 0
+        return _graph_cache[key]
+
+
 def handle_setup_pool(conn, params, listen_ip, remote_ip):
     """Create the server-side QP pool."""
     global _pool, _dispatcher
@@ -255,51 +318,31 @@ def handle_s4a_pooled(conn, params):
 
         if decompose and decompose_level == "fine":
             if variant == "cuda_graph":
-                # Warmup: run one miss to trigger cuBLAS algorithm selection
-                a_warm = a_gpu[0].to(torch.float32)
-                b_warm = b_gpu[0].to(torch.float32)
-                inter_warm = act_f32 @ a_warm.T
-                _ = (inter_warm @ b_warm).view(-1)
-                torch.cuda.synchronize()
+                key = _get_graph_cache_key(hidden_dim, intermediate_dim, rank, num_miss)
+                graphs, static_act, static_a, static_b, static_inter, static_out = \
+                    _get_or_capture_graphs(key, hidden_dim, intermediate_dim,
+                                           rank, num_miss, act_f32)
 
-                # Capture one graph per weight index.
-                # CUDA graphs require static tensor addresses — all intermediate
-                # and output tensors must be pre-allocated and reused via in-place ops.
-                graphs = []
-                static_a = []
-                static_b = []
-                static_inter = []
-                static_out = []
+                # Copy request data into static buffers BEFORE replay
+                static_act.copy_(act_f32)
                 for i in range(num_miss):
-                    sa = torch.empty(rank, hidden_dim, dtype=torch.float32, device="cuda")
-                    sb = torch.empty(rank, intermediate_dim, dtype=torch.float32, device="cuda")
-                    si = torch.empty(1, rank, dtype=torch.float32, device="cuda")
-                    so = torch.empty(intermediate_dim, dtype=torch.float32, device="cuda")
-                    sa.copy_(a_gpu[i].to(torch.float32))
-                    sb.copy_(b_gpu[i].to(torch.float32))
-                    static_a.append(sa)
-                    static_b.append(sb)
-                    static_inter.append(si)
-                    static_out.append(so)
+                    w_idx = 0 if variant == "same_weights" else i
+                    static_a[i].copy_(a_gpu[w_idx].to(torch.float32))
+                    static_b[i].copy_(b_gpu[w_idx].to(torch.float32))
 
-                    g = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(g):
-                        torch.mm(act_f32, sa.T, out=si)
-                        torch.mm(si, sb, out=so.view(1, -1))
-                    graphs.append(g)
-
-                torch.cuda.synchronize()
-
-                # Timed replay: one CUDA event pair around the full batch
+                # Replay (serialized for thread safety)
                 ev_s = torch.cuda.Event(enable_timing=True)
                 ev_e = torch.cuda.Event(enable_timing=True)
-                ev_s.record()
-                t0 = time.perf_counter()
-                for i in range(num_miss):
-                    graphs[i].replay()
-                t1 = time.perf_counter()
-                ev_e.record()
-                torch.cuda.synchronize()
+                with _graph_cache_lock:
+                    ev_s.record()
+                    t0 = time.perf_counter()
+                    for i in range(num_miss):
+                        graphs[i].replay()
+                    t1 = time.perf_counter()
+                    ev_e.record()
+                    torch.cuda.synchronize()
+                    _graph_replay_count[key] = _graph_replay_count.get(key, 0) + 1
+
                 segments.append({
                     "name": "graph_replay",
                     "cpu_us": (t1 - t0) * 1e6,
@@ -488,6 +531,8 @@ def handle_s4a_pooled(conn, params):
             resp["status"] = "ok"
             resp["result_bytes"] = result_bytes
             resp["perturbation_cost_us"] = total_perturbation_us  # I2
+            resp["graph_captures"] = sum(_graph_capture_count.values())
+            resp["graph_replays"] = sum(_graph_replay_count.values())
             send_json_response(conn, resp)
         else:
             send_json_response(conn, {"status": "ok", "result_bytes": result_bytes})
