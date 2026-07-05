@@ -239,7 +239,9 @@ def _setup_qp_pool(config: DecompositionConfig, cell_spec: dict,
                    local_ip: str, base_control_port: int,
                    gpu_buffer_bytes: int,
                    scheduling_policy: str = None,
-                   s_hat: dict = None):
+                   s_hat: dict = None,
+                   heavy_cap: int = None,
+                   heavy_threshold: int = None):
     """Create QPPoolClient on the inference node and send setup_pool to server.
 
     Returns the QPPoolClient instance.  The QP pool uses pool_size=1; the
@@ -275,6 +277,10 @@ def _setup_qp_pool(config: DecompositionConfig, cell_spec: dict,
         setup_extra["scheduling_policy"] = scheduling_policy
     if s_hat is not None:
         setup_extra["s_hat"] = s_hat
+    if heavy_cap is not None:
+        setup_extra["heavy_cap"] = heavy_cap
+    if heavy_threshold is not None:
+        setup_extra["heavy_threshold"] = heavy_threshold
 
     # Open TCP socket for setup_pool message
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1127,7 +1133,9 @@ class RemoteSession:
                  base_control_port: int = DEFAULT_BASE_CONTROL_PORT,
                  max_nm: int = 8, rank: int = 64,
                  scheduling_policy: str = None,
-                 s_hat: dict = None):
+                 s_hat: dict = None,
+                 heavy_cap: int = None,
+                 heavy_threshold: int = None):
         self.cell_spec = cell_spec
         self.cell = cell
         self.variant = variant
@@ -1140,6 +1148,8 @@ class RemoteSession:
         self.rank = rank
         self.scheduling_policy = scheduling_policy
         self.s_hat = s_hat
+        self.heavy_cap = heavy_cap
+        self.heavy_threshold = heavy_threshold
         self.qp_pool = None
         self._started = False
 
@@ -1169,6 +1179,8 @@ class RemoteSession:
                 self.local_ip, self.base_control_port, gpu_buffer_bytes,
                 scheduling_policy=self.scheduling_policy,
                 s_hat=self.s_hat,
+                heavy_cap=self.heavy_cap,
+                heavy_threshold=self.heavy_threshold,
             )
         except Exception:
             # If QP pool setup fails, stop the server before propagating.
