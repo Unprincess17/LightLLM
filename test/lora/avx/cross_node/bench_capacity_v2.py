@@ -3,7 +3,7 @@
 5 workloads: NM=1-only, NM=8-only, 10% heavy, 25% heavy, 50% heavy.
 Per-(cell, mixture) empirical capacity via bracketed binary search (+/-5%).
 """
-import argparse, csv, os, statistics, time, socket, threading, random
+import argparse, csv, os, statistics, time, socket, threading, random, sys
 from bench_decomposition import (
     CELLS, RemoteSession, DecompositionConfig,
     _make_sjf_request, HIDDEN_DIM, INTERMEDIATE_DIM, BYTES_PER_PARAM, new_request_id,
@@ -26,6 +26,8 @@ CELLS_S6 = ["B3"]
 N_TRIALS = 2  # capacity runs are long; fewer trials
 DURATION_S = 10  # seconds per probe (short for first run)
 DRAIN_TIMEOUT_S = 5.0
+LATENCY_P99_THRESHOLD_US = 200_000  # 200ms -- if P99 exceeds this, system is overloaded
+SEARCH_HI = 5000.0  # upper bound for capacity search
 
 
 def _p99(vals):
@@ -99,8 +101,13 @@ def run_at_rate(rate, duration_s, sink, runner_kwargs):
     return counters, sink.get_latencies()
 
 
-def check_stability(counters):
-    """Check if the run was stable."""
+def check_stability(counters, latencies=None):
+    """Check if the run was stable.
+
+    Besides the counter-based checks (generated~=completed, low unfinished),
+    also checks P99 latency if provided.  A system that completes all requests
+    during drain but has exploded tail latency is NOT stable.
+    """
     if counters.generated == 0:
         return False
     # generated ~= admitted (within 1%)
@@ -116,12 +123,17 @@ def check_stability(counters):
     # unfinished should be small (< 5% of generated)
     if counters.unfinished > total * 0.05:
         return False
+    # Latency tail check: P99 must be below threshold
+    if latencies and len(latencies) > 10:
+        p99 = _p99(latencies)
+        if p99 > LATENCY_P99_THRESHOLD_US:
+            return False
     return True
 
 
 def bracket_capacity(sink, runner_kwargs, duration_s=10):
     """Binary search for the highest stable offered rate. Returns (c_low, c_high)."""
-    lo, hi = 10.0, 1000.0
+    lo, hi = 10.0, SEARCH_HI
     c_low = lo
     c_high = hi
 
@@ -129,9 +141,9 @@ def bracket_capacity(sink, runner_kwargs, duration_s=10):
     rate = lo
     while rate <= hi:
         counters, lats = run_at_rate(rate, duration_s, sink, runner_kwargs)
-        stable = check_stability(counters)
+        stable = check_stability(counters, lats)
         print(f"    probe rate={rate:.0f}: gen={counters.generated} comp={counters.completed} "
-              f"unfinished={counters.unfinished} stable={stable}")
+              f"unfinished={counters.unfinished} stable={stable}", flush=True)
         if stable:
             c_low = rate
             rate *= 2
@@ -145,9 +157,9 @@ def bracket_capacity(sink, runner_kwargs, duration_s=10):
     while (c_high - c_low) / max(c_low, 1) > 0.05:
         mid = (c_low + c_high) / 2
         counters, lats = run_at_rate(mid, duration_s, sink, runner_kwargs)
-        stable = check_stability(counters)
+        stable = check_stability(counters, lats)
         print(f"    binary rate={mid:.0f}: gen={counters.generated} comp={counters.completed} "
-              f"unfinished={counters.unfinished} stable={stable}")
+              f"unfinished={counters.unfinished} stable={stable}", flush=True)
         if stable:
             c_low = mid
         else:
@@ -165,7 +177,7 @@ def run_s6(output_dir="results/s6_capacity", n_trials=None):
         cell_spec = CELLS[cell]
 
         for wl_name, wl in WORKLOADS.items():
-            print(f"\n=== {cell} {wl_name} (heavy_frac={wl['heavy_frac']}) ===")
+            print(f"\n=== {cell} {wl_name} (heavy_frac={wl['heavy_frac']}) ===", flush=True)
 
             # Start server + QP pool
             _start_concurrent_server(host=DEFAULT_SSH_HOST, listen_ip=DEFAULT_SERVER_HOST,
@@ -189,7 +201,7 @@ def run_s6(output_dir="results/s6_capacity", n_trials=None):
                     # Bracketed capacity search
                     c_low, c_high = bracket_capacity(sink, runner_kwargs, duration_s=DURATION_S)
                     c_est = (c_low + c_high) / 2
-                    print(f"  Capacity: C_low={c_low:.0f} C_high={c_high:.0f} C_est={c_est:.0f} req/s")
+                    print(f"  Capacity: C_low={c_low:.0f} C_high={c_high:.0f} C_est={c_est:.0f} req/s", flush=True)
 
                     # Run at C_low for final P99
                     counters, lats = run_at_rate(c_low, DURATION_S, sink, runner_kwargs)
@@ -209,7 +221,7 @@ def run_s6(output_dir="results/s6_capacity", n_trials=None):
                         "p50_us": statistics.median(lats) if lats else float("nan"),
                     })
                     print(f"  P50={statistics.median(lats):.0f}us "
-                          f"light_P99={light_p99:.0f}us heavy_P99={heavy_p99:.0f}us")
+                          f"light_P99={light_p99:.0f}us heavy_P99={heavy_p99:.0f}us", flush=True)
 
                     transport.close()
                 finally:
@@ -222,8 +234,8 @@ def run_s6(output_dir="results/s6_capacity", n_trials=None):
         c1 = next((r["c_est"] for r in rows if r["workload"] == "nm1_only"), None)
         c8 = next((r["c_est"] for r in rows if r["workload"] == "nm8_only"), None)
         if c1 and c8:
-            print(f"\n=== Linear Mixture Baseline ===")
-            print(f"  C(NM=1)={c1:.0f} C(NM=8)={c8:.0f}")
+            print(f"\n=== Linear Mixture Baseline ===", flush=True)
+            print(f"  C(NM=1)={c1:.0f} C(NM=8)={c8:.0f}", flush=True)
             for r in rows:
                 if r["workload"] not in ("nm1_only", "nm8_only"):
                     p = r["heavy_frac"]
@@ -231,18 +243,24 @@ def run_s6(output_dir="results/s6_capacity", n_trials=None):
                     r["c_pred"] = c_pred
                     r["interaction_ratio"] = r["c_est"] / c_pred
                     print(f"  {r['workload']}: C_obs={r['c_est']:.0f} C_pred={c_pred:.0f} "
-                          f"ratio={r['interaction_ratio']:.2f}")
+                          f"ratio={r['interaction_ratio']:.2f}", flush=True)
 
     if not rows:
         print("No data collected.")
         return
 
     csv_path = os.path.join(output_dir, "capacity.csv")
+    # Collect all fieldnames across rows (mixture rows have extra fields)
+    all_fields = []
+    for r in rows:
+        for k in r.keys():
+            if k not in all_fields:
+                all_fields.append(k)
     with open(csv_path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        w = csv.DictWriter(f, fieldnames=all_fields)
         w.writeheader()
         w.writerows(rows)
-    print(f"\nWrote {csv_path} ({len(rows)} rows)")
+    print(f"\nWrote {csv_path} ({len(rows)} rows)", flush=True)
 
 
 def main():
