@@ -25,6 +25,7 @@ import os
 import socket
 import statistics
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from bench_decomposition import (
     CELLS, RemoteSession, DecompositionConfig,
@@ -49,18 +50,31 @@ N_ITERS = 10  # iterations per trial (each iteration = one full composition batc
 
 
 # ---------------------------------------------------------------------------
-# Policy runners -- sequential, synchronized mode
+# Concurrent policy runner
 # ---------------------------------------------------------------------------
 
-def run_fifo(session, composition, n_iters, variant="baseline"):
-    """Run FIFO: send requests in arrival order, server FIFO.
+def run_policy(session, composition, n_iters, policy="fifo", variant="baseline"):
+    """Run one scheduling policy with concurrent submission.
 
-    Sends requests one at a time (sequential, not concurrent).  This tests
-    the scheduling policy without concurrency complications.  A concurrent
-    version for B3 can be added later.
+    For B2 (conc=1): sequential (max_workers=1).
+    For B3 (conc=8): concurrent (max_workers=8).
+
+    All requests in one iteration are submitted simultaneously via
+    ThreadPoolExecutor. PersistentTransport supports concurrent request()
+    calls via request-ID multiplexing.
+
+    policy:
+      fifo:       composition as-is, server FIFO
+      client_sjf: composition sorted by NM ascending, server FIFO
+      server_sjf: composition as-is, server PriorityDispatcher
     """
     cell_spec = CELLS[session.cell]
     rank = session.rank
+    conc = cell_spec["conc"]
+
+    # Client-SJF: sort composition so shorter jobs are submitted first
+    if policy == "client_sjf":
+        composition = sorted(composition)
 
     latencies = []
     scheduling_data = []
@@ -71,8 +85,14 @@ def run_fifo(session, composition, n_iters, variant="baseline"):
 
     try:
         for _ in range(n_iters):
+            # Assign req_ids in order (controls submission order)
+            req_specs = []
             for nm in composition:
                 req_id = new_request_id()
+                req_specs.append((req_id, nm))
+
+            # Submit all requests concurrently
+            def _do_one(req_id, nm):
                 pool_id, gpu_t, _ = session.qp_pool.borrow()
                 try:
                     msg = _make_sjf_request(req_id, nm, rank, cell_spec, variant)
@@ -81,42 +101,45 @@ def run_fifo(session, composition, n_iters, variant="baseline"):
                     t1 = time.perf_counter()
                 finally:
                     session.qp_pool.return_transport(pool_id, gpu_t)
-
                 e2e_us = (t1 - t0) * 1e6
-                latencies.append(e2e_us)
-                scheduling_data.append({
+                return {
                     "req_id": req_id,
                     "nm": nm,
                     "submission_seq": req_id,
                     "handler_start_seq": response.get("handler_start_seq", 0),
                     "completion_seq": response.get("completion_seq", 0),
                     "e2e_us": e2e_us,
-                })
+                }
+
+            with ThreadPoolExecutor(max_workers=max(1, conc)) as executor:
+                futures = {executor.submit(_do_one, rid, nm): (rid, nm)
+                           for rid, nm in req_specs}
+                iter_data = []
+                for fut in as_completed(futures):
+                    data = fut.result()
+                    iter_data.append(data)
+                    latencies.append(data["e2e_us"])
+
+            # Sort by req_id to get submission order
+            iter_data.sort(key=lambda d: d["req_id"])
+            scheduling_data.extend(iter_data)
     finally:
         transport.close()
 
     return latencies, scheduling_data
 
 
+def run_fifo(session, composition, n_iters, variant="baseline"):
+    """FIFO: send in arrival order, server FIFO."""
+    return run_policy(session, composition, n_iters, policy="fifo", variant=variant)
+
 def run_client_sjf(session, composition, n_iters, variant="baseline"):
-    """Run Client-SJF: sort composition by NM ascending, then send.
-
-    Same mechanism as run_fifo, but the composition list is sorted so that
-    shorter jobs (lower NM) are submitted first.
-    """
-    sorted_comp = sorted(composition)
-    return run_fifo(session, sorted_comp, n_iters, variant)
-
+    """Client-SJF: sort composition by NM ascending, then send concurrently."""
+    return run_policy(session, composition, n_iters, policy="client_sjf", variant=variant)
 
 def run_server_sjf(session, composition, n_iters, variant="baseline"):
-    """Run Server-SJF: send in arrival order, server uses PriorityDispatcher.
-
-    The server must have been set up with scheduling_policy="server_sjf"
-    via RemoteSession(scheduling_policy="server_sjf", s_hat=...).
-    The PriorityDispatcher reorders execution so that shorter predicted
-    service time (lower NM) requests are admitted first.
-    """
-    return run_fifo(session, composition, n_iters, variant)
+    """Server-SJF: send in arrival order, server PriorityDispatcher reorders."""
+    return run_policy(session, composition, n_iters, policy="server_sjf", variant=variant)
 
 
 # ---------------------------------------------------------------------------
