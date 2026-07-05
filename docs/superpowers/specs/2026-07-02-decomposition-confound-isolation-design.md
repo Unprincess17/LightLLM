@@ -39,6 +39,99 @@ matched decomposition matrix and six targeted studies. The program answers:
 > Is the observed ceiling caused by remote data movement, connection management,
 > Python/executor orchestration, GPU submission, or harmful active concurrency?
 
+## Guiding thesis (expected narrative arc)
+
+This section states the qualitative story the program is designed to support
+*or refute*. It is not a claim of results. Specific magnitudes are intentionally
+omitted; pre-registering target numbers would bias the analysis. Each clause
+maps to a study that can falsify it.
+
+1. **The single-request path is viable.** The first-miss tax is real but smaller
+   than originally reported, and is primarily a property of the Python/PyTorch
+   execution path rather than unavoidable remote-GPU computation. *(S1, with B6
+   as the runtime-stack replacement control.)* "Caused by Python/PyTorch
+   dispatch" is defensible; "dominant contributor" is safer than claiming every
+   source has been independently excluded.
+
+2. **Large jobs are not inherently bad; uncontrolled fan-out is.** The original
+   "splitting hurts" result conflated splitting with RPC fan-out. Server-side
+   cooperative slicing at an appropriate quantum is expected to reduce
+   head-of-line blocking without the catastrophic heavy P99 of client fan-out.
+   Any reported improvement must carry its tested context: active concurrency,
+   workload composition, offered load, baseline policy, slicing quantum.
+   *(S2.)*
+
+3. **Submission priority can be counterproductive under concurrency-dependent
+   interference.** Naive Client-SJF can allow many light requests to reach the
+   GPU together, causing interference that outweighs the queueing benefit.
+   Scheduling must account for both job size *and* the execution interference
+   created by simultaneously active jobs. This also explains why the original
+   SJF result was misleading: it measured a submission artifact rather than
+   controlled server-side scheduling. *(S3, with execution-order
+   instrumentation.)*
+
+4. **Heavy-lane is a graded admission policy, not a universal winner.** H=1 can
+   be too restrictive for sparse-heavy workloads, creating its own queueing
+   catastrophe. A small but non-unit heavy concurrency limit is expected to
+   balance heavy-job queueing against concurrent-execution interference. The
+   value of class-aware gating is workload-dependent; sometimes ordinary bounded
+   concurrency captures most of the benefit. *(S4, with the global-cap control.)*
+
+5. **Physical QP provisioning and active execution must be separated.** A large
+   preconnected QP pool is not harmful by itself. Performance degrades when the
+   pool implicitly permits excessive active concurrency. The architecture can
+   provision many QPs while independently enforcing a smaller active cap.
+   *(S5.)*
+
+6. **Mixed workloads lose capacity nonlinearly.** Mixture capacity is expected
+   to fall below the simple service-demand prediction, with the interaction
+   ratio quantifying heterogeneity overhead. A small heavy fraction can be more
+   damaging to tail latency than its average work contribution suggests.
+   *(S6, with the linear mixture-capacity baseline.)*
+
+### Refinements to two initial reviewer hypotheses
+
+The program is also designed to test two hypotheses from the original review
+that may require softening:
+
+- **Timing-method hypothesis.** If, under the corrected matched server
+  lifecycle, CUDA-event and synchronized wall-clock measurements produce nearly
+  identical first-miss ratios, then timing method was not the dominant confound
+  in this regime. The larger inflation may have come from server lifecycle
+  differences. *(S1.)*
+
+- **Python/TCP bottleneck hypothesis.** The prototype may be control-path-
+  sensitive at low concurrency but concurrency/interference-limited at high
+  load. Declaring either Python or GPU to be "the bottleneck" is too coarse;
+  the dominant factor changes with operating regime. *(Anchor matrix + S4/S5/S6.)*
+
+The expected default design emerging from the campaign, if the thesis holds:
+
+> C++ recovery worker + server-side slicing + decoupled QP provisioning/admission
+> + bounded heavy concurrency + open-loop capacity-based admission thresholds.
+
+The exact active cap, quantum, and heavy cap remain workload- and load-dependent.
+
+## North-star follow-up (out of scope for this program)
+
+This program determines *how to build the remote path correctly*. It does not
+establish *when* remote recovery is better than CoLoRA's local CPU recovery.
+The next case-study layer should compare:
+
+- CoLoRA local CPU recovery
+- Remote GPU recovery, original prototype
+- Remote GPU recovery, improved design (per this program)
+- Local-GPU oracle
+
+using: decode latency and tail; throughput; local CPU memory saved; PCIe
+traffic saved; network traffic; remote GPU cost and utilization; rank and
+adapter size; miss rate and burstiness; EP interference; multiple inference
+clients. That comparison turns the current mechanism result into the larger
+systems claim:
+
+> Under which workload and resource conditions does disaggregated remote
+> recovery outperform local CPU miss recovery?
+
 ## Architecture
 
 > **B0 is an external lower bound. B1–B9 form a matched-contrast matrix over
