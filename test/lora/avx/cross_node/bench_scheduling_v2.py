@@ -44,6 +44,9 @@ COMPOSITIONS = {
     "1h8l":   [8, 1, 1, 1, 1, 1, 1, 1, 1],
     "2h0l":   [8, 8],
     "medium": [8, 4, 4, 1, 1, 1, 1, 1, 1, 1, 1],
+    # Higher-pressure compositions: more requests than conc=8 → real queueing
+    "4h16l":  [8, 8, 8, 8, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+    "8h8l":   [8, 8, 8, 8, 8, 8, 8, 8, 1, 1, 1, 1, 1, 1, 1, 1],
 }
 N_TRIALS = 5
 N_ITERS = 10  # iterations per trial (each iteration = one full composition batch)
