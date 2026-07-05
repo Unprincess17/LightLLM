@@ -134,6 +134,35 @@ class PriorityDispatcher:
         self._sem.release()
 
 
+class HeavyLaneDispatcher:
+    """Class-aware admission: total cap N + heavy sub-cap H.
+
+    Light jobs bypass H. Heavy jobs (NM>=threshold) are limited to H concurrent.
+    Per spec S4: H in {1,2,4,8}, H=8 means no heavy-specific sub-cap.
+    """
+
+    def __init__(self, active_cap: int, heavy_cap: int, heavy_threshold: int = 4):
+        self.active_cap = active_cap
+        self.heavy_cap = heavy_cap
+        self.heavy_threshold = heavy_threshold
+        self._total_sem = threading.Semaphore(active_cap)
+        self._heavy_sem = threading.Semaphore(heavy_cap)
+        self.wait_us = []
+
+    def acquire(self, is_heavy: bool) -> None:
+        t0 = time.perf_counter()
+        self._total_sem.acquire()
+        if is_heavy:
+            self._heavy_sem.acquire()
+        t1 = time.perf_counter()
+        self.wait_us.append((t1 - t0) * 1e6)
+
+    def release(self, is_heavy: bool) -> None:
+        if is_heavy:
+            self._heavy_sem.release()
+        self._total_sem.release()
+
+
 # Module-level dispatcher, set by handle_setup_pool when active_cap is provided
 _dispatcher: CentralDispatcher | None = None
 
@@ -298,7 +327,14 @@ def handle_setup_pool(conn, params, listen_ip, remote_ip):
     # Configure central admission dispatcher
     active_cap = params.get("active_cap")
     scheduling_policy = params.get("scheduling_policy", "fifo")
-    if scheduling_policy == "server_sjf" and active_cap is not None:
+    heavy_cap = params.get("heavy_cap")
+    if heavy_cap is not None and active_cap is not None:
+        heavy_threshold = params.get("heavy_threshold", 4)
+        _dispatcher = HeavyLaneDispatcher(int(active_cap), int(heavy_cap), heavy_threshold)
+        print(f"[pool_server] HeavyLane dispatcher: active_cap={active_cap}, "
+              f"heavy_cap={heavy_cap}, heavy_threshold={heavy_threshold}",
+              flush=True)
+    elif scheduling_policy == "server_sjf" and active_cap is not None:
         s_hat = params.get("s_hat", {})
         _dispatcher = PriorityDispatcher(int(active_cap), s_hat=s_hat)
         print(f"[pool_server] Priority dispatcher (Server-SJF): active_cap={active_cap}, s_hat={s_hat}",
@@ -328,7 +364,7 @@ def _gpu_copy_in(transport, hidden_dim, act_bytes):
 
 def _handle_s4a_sliced(num_miss, quantum, variant, act_f32, a_gpu, b_gpu,
                        result, hidden_dim, intermediate_dim, rank, segments,
-                       req_id=0):
+                       req_id=0, is_heavy=False):
     """Process misses in quanta with yield between quanta.
 
     Releases the GPU admission token (dispatcher) between quanta so that
@@ -388,11 +424,16 @@ def _handle_s4a_sliced(num_miss, quantum, variant, act_f32, a_gpu, b_gpu,
             t_yield_start = time.perf_counter()
             # Release GPU admission token
             if _dispatcher is not None:
-                _dispatcher.release()
+                if hasattr(_dispatcher, 'heavy_cap'):
+                    _dispatcher.release(is_heavy)
+                else:
+                    _dispatcher.release()
                 # Brief yield to allow other requests
                 time.sleep(0)  # cooperative yield
                 if hasattr(_dispatcher, 'enqueue_and_wait'):
                     _dispatcher.enqueue_and_wait(num_miss, req_id)
+                elif hasattr(_dispatcher, 'heavy_cap'):
+                    _dispatcher.acquire(is_heavy)
                 else:
                     _dispatcher.acquire()
             t_yield_end = time.perf_counter()
@@ -440,9 +481,14 @@ def handle_s4a_pooled(conn, params):
 
     handshake_port = params.get("handshake_port")
     req_id = params.get("req_id", 0)
+    is_heavy = num_miss >= 4  # default threshold
+    if _dispatcher is not None and hasattr(_dispatcher, 'heavy_threshold'):
+        is_heavy = num_miss >= _dispatcher.heavy_threshold
     if _dispatcher is not None:
         if hasattr(_dispatcher, 'enqueue_and_wait'):
             _dispatcher.enqueue_and_wait(num_miss, req_id)
+        elif hasattr(_dispatcher, 'heavy_cap'):
+            _dispatcher.acquire(is_heavy)
         else:
             _dispatcher.acquire()
     handler_start_seq = _next_handler_seq()
@@ -538,7 +584,7 @@ def handle_s4a_pooled(conn, params):
                 total_perturbation_us = _handle_s4a_sliced(
                     num_miss, quantum, variant, act_f32, a_gpu, b_gpu,
                     result, hidden_dim, intermediate_dim, rank, segments,
-                    req_id=req_id)
+                    req_id=req_id, is_heavy=is_heavy)
 
             elif timing_method == "old":
                 # OLD timing: sync + perf_counter per segment (original method).
@@ -734,7 +780,10 @@ def handle_s4a_pooled(conn, params):
         if pool_id is not None:
             _pool.return_transport(pool_id, transport)
         if _dispatcher is not None:
-            _dispatcher.release()
+            if hasattr(_dispatcher, 'heavy_cap'):
+                _dispatcher.release(is_heavy)
+            else:
+                _dispatcher.release()
 
 
 # ---------------------------------------------------------------------------
