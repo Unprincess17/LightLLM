@@ -106,3 +106,24 @@ def classify_pair(diff_point, ci_lo, ci_hi, delta):
     if ci_lo >= -delta and ci_hi <= delta:
         return "equivalent"
     return "unresolved"
+
+
+def holm_correct(pvalues, alpha=0.05):
+    """Holm-Bonferroni step-down correction.
+
+    Args:
+        pvalues: list of p-values
+        alpha: family-wise error rate
+
+    Returns: list of booleans, True if the corresponding null is rejected
+    """
+    n = len(pvalues)
+    indexed = sorted(enumerate(pvalues), key=lambda x: x[1])
+    rejected = [False] * n
+    for rank, (orig_idx, p) in enumerate(indexed):
+        threshold = alpha / (n - rank)
+        if p <= threshold:
+            rejected[orig_idx] = True
+        else:
+            break
+    return rejected
