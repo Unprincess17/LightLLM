@@ -110,6 +110,12 @@ class RecoverySink:
 
     def submit(self, event):
         """Process one recovery request. Called by OpenLoopRunner consumer."""
+        # Record arrival time for queue-wait accounting. Prefer the
+        # enqueue timestamp set by OpenLoopRunner (captures ingress queue
+        # wait); fall back to now if not available.
+        arrival_us = event.enqueue_us if event.enqueue_us is not None else (
+            time.perf_counter_ns() / 1000.0)
+
         NM = event.nm
         with self._lock:
             idx = self._weight_index
@@ -140,6 +146,16 @@ class RecoverySink:
                                         self.R, self.H, self.I, NM)
             else:
                 return
+
+            # Override T0 with arrival time so L_recovery includes
+            # ingress queue wait and pre-recovery overhead (activation
+            # creation, weight retrieval).  The original T0 recorded
+            # inside the recovery function represents processing start;
+            # the difference is saved as queue_wait_us for diagnostics.
+            original_t0 = tl.get("T0")
+            tl.set("T0", arrival_us)
+            if original_t0 is not None:
+                tl.set("queue_wait_us", original_t0 - arrival_us)
 
             latency = tl.l_recovery_us()
             if latency is not None:

@@ -18,6 +18,7 @@ class TraceEvent:
     job_class: str             # "light" or "heavy"
     req_id: int
     nm: int = 1                # number of misses for this request
+    enqueue_us: float = None   # wall-clock enqueue time (us) set by OpenLoopRunner
 
 
 @dataclass
@@ -134,6 +135,7 @@ class OpenLoopRunner:
             if now < target:
                 time.sleep(target - now)
             try:
+                ev.enqueue_us = time.perf_counter_ns() / 1000.0
                 self.ingress.put_nowait(ev)
                 with self._lock:
                     self.counters.c0_inserted += 1
