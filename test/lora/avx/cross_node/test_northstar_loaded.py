@@ -22,3 +22,29 @@ def test_paired_traces_reproducible():
                                        heavy_frac=0.25, nm_options_light=[1],
                                        nm_options_heavy=[8])
     assert len(t1a.events) == len(t2a.events)
+
+
+from bench_northstar_loaded import (
+    N2_CONFIG, bracketed_capacity_search, run_load_trial,
+    is_feasible, classify_capacity
+)
+
+def test_is_feasible_stable():
+    """A trial is feasible if stable + SLO met."""
+    # P99 < 2x isolated median, queue stable
+    latencies = [100, 105, 110, 115, 120]  # tight
+    result = is_feasible(latencies, isolated_median=100, slo_factor=2.0,
+                         generated=1000, completed=1000, queue_slope_ci=[-0.1, 0.1])
+    assert result == True
+
+def test_is_feasible_unstable_queue():
+    """Growing queue = infeasible even if latency looks ok."""
+    latencies = [100, 105, 110]
+    result = is_feasible(latencies, isolated_median=100, slo_factor=2.0,
+                         generated=1000, completed=800, queue_slope_ci=[0.5, 2.0])
+    assert result == False
+
+def test_classify_capacity():
+    """Capacity bracket: C_lower / C_upper <= 1.10 -> stop."""
+    assert classify_capacity(c_lower=100, c_upper=105) == "converged"
+    assert classify_capacity(c_lower=100, c_upper=200) == "continue"
