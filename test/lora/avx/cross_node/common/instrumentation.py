@@ -124,3 +124,61 @@ def should_flag_instrumentation_gap(acc: dict, abs_threshold_us: float = 50.0,
     """Per spec: flag if BOTH fraction > 5% AND absolute > 50us."""
     return (acc["instrumentation_gap_fraction"] > frac_threshold
             and acc["instrumentation_gap_us"] > abs_threshold_us)
+
+
+class NorthstarTimeline:
+    """North-star outer boundary (T0, T1) with per-path inner decomposition.
+
+    All timestamps in microseconds, single host monotonic clock
+    (CLOCK_MONOTONIC_RAW). CUDA events are separate diagnostics, not
+    inserted into the host-domain additive identity.
+    """
+
+    # cpu_first stages
+    CF_STAGES = ["cf0", "cf1", "cf2", "cf3", "cf4", "cf5", "cf6", "cf7"]
+    # load_then_run stages
+    LT_STAGES = ["lt0", "lt1", "lt2", "lt3", "lt4"]
+    # remote stages use S1-S6 t0-t18 schema (existing RequestTimeline)
+
+    def __init__(self):
+        self._timestamps = {}
+
+    def set(self, name, value_us):
+        """Set a timestamp in microseconds. None for absent (not zero)."""
+        self._timestamps[name] = value_us
+
+    def get(self, name):
+        return self._timestamps.get(name)
+
+    def l_recovery_us(self):
+        """Primary latency: T1 - T0."""
+        t0 = self._timestamps.get("T0")
+        t1 = self._timestamps.get("T1")
+        if t0 is None or t1 is None:
+            return None
+        return t1 - t0
+
+    def stage_interval(self, start_name, end_name):
+        """Interval between two host-domain timestamps. None if either absent."""
+        s = self._timestamps.get(start_name)
+        e = self._timestamps.get(end_name)
+        if s is None or e is None:
+            return None
+        return e - s
+
+    def instrumentation_gap(self, stage_intervals):
+        """L_recovery - sum(stage_intervals). Flag if > 5% and > 50us."""
+        total_stages = sum(v for v in stage_intervals if v is not None)
+        lr = self.l_recovery_us()
+        if lr is None:
+            return None
+        gap = lr - total_stages
+        return gap
+
+    def should_flag_gap(self, stage_intervals, abs_threshold=50.0, frac_threshold=0.05):
+        """True if instrumentation gap is material."""
+        gap = self.instrumentation_gap(stage_intervals)
+        lr = self.l_recovery_us()
+        if gap is None or lr is None:
+            return False
+        return gap > abs_threshold and (gap / lr) > frac_threshold

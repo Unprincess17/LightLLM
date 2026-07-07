@@ -61,3 +61,42 @@ def test_capacity_bootstrap_basic():
     assert brackets["c_upper_median"] <= 500
     assert "c_lower_ci_lo" in brackets
     assert "c_upper_ci_hi" in brackets
+
+
+from common.instrumentation import NorthstarTimeline
+
+def test_northstar_timeline_basic():
+    """T0/T1 outer boundary with L_recovery = T1 - T0."""
+    tl = NorthstarTimeline()
+    tl.set("T0", 100.0)  # microseconds
+    tl.set("T1", 250.0)
+    assert tl.l_recovery_us() == 150.0
+
+def test_northstar_timeline_cf_stages():
+    """cpu_first inner stages: cf0..cf7, with T1 = cf7."""
+    tl = NorthstarTimeline()
+    tl.set("T0", 100.0)
+    tl.set("cf0", 110.0)  # activation pack start
+    tl.set("cf2", 120.0)  # D2H complete
+    tl.set("cf4", 180.0)  # AVX compute complete
+    tl.set("cf6", 230.0)  # H2D complete
+    tl.set("cf7", 240.0)  # consumer-stream visibility
+    tl.set("T1", 240.0)   # T1 = cf7
+    assert tl.l_recovery_us() == 140.0
+    # Stage intervals (host domain)
+    assert tl.stage_interval("cf0", "cf2") == 10.0   # D2H
+    assert tl.stage_interval("cf2", "cf4") == 60.0   # AVX compute
+    assert tl.stage_interval("cf4", "cf6") == 50.0   # H2D
+
+def test_northstar_timeline_lt_stages():
+    """load_then_run inner stages: lt0..lt4, with T1 = lt4."""
+    tl = NorthstarTimeline()
+    tl.set("T0", 100.0)
+    tl.set("lt0", 105.0)  # A/B H2D enqueue
+    tl.set("lt1", 150.0)  # H2D complete
+    tl.set("lt3", 200.0)  # GPU compute complete
+    tl.set("lt4", 210.0)  # consumer-stream visibility
+    tl.set("T1", 210.0)
+    assert tl.l_recovery_us() == 110.0
+    assert tl.stage_interval("lt0", "lt1") == 45.0   # H2D
+    assert tl.stage_interval("lt1", "lt3") == 50.0   # GPU compute
