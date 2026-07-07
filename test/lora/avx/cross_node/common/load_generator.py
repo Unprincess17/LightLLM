@@ -17,6 +17,7 @@ class TraceEvent:
     arrival_time: float        # seconds from run start
     job_class: str             # "light" or "heavy"
     req_id: int
+    nm: int = 1                # number of misses for this request
 
 
 @dataclass
@@ -33,8 +34,15 @@ class Trace:
 
 
 def generate_poisson_trace(lam: float, duration_s: float, seed: int,
-                           classes: list = None, heavy_frac: float = 0.0) -> Trace:
-    """Pre-generate a Poisson arrival trace. Class assigned by heavy_frac."""
+                           classes: list = None, heavy_frac: float = 0.0,
+                           nm_options_light: list = None,
+                           nm_options_heavy: list = None) -> Trace:
+    """Pre-generate a Poisson arrival trace. Class assigned by heavy_frac.
+
+    NM (number of misses) is assigned per event based on job_class:
+    - heavy events draw from nm_options_heavy (default 1)
+    - light events draw from nm_options_light (default 1)
+    """
     classes = classes or ["light"]
     rng = random.Random(seed)
     events = []
@@ -46,9 +54,18 @@ def generate_poisson_trace(lam: float, duration_s: float, seed: int,
             break
         if "heavy" in classes and rng.random() < heavy_frac:
             cls = "heavy"
+            if nm_options_heavy:
+                nm = rng.choice(nm_options_heavy)
+            else:
+                nm = 1
         else:
             cls = "light"
-        events.append(TraceEvent(arrival_time=t, job_class=cls, req_id=req_id))
+            if nm_options_light:
+                nm = rng.choice(nm_options_light)
+            else:
+                nm = 1
+        events.append(TraceEvent(arrival_time=t, job_class=cls,
+                                 req_id=req_id, nm=nm))
         req_id += 1
     return Trace(events=events, duration_s=duration_s, seed=seed)
 
@@ -173,7 +190,9 @@ def generate_paired_traces(lam, duration_s, seed, heavy_frac,
     # Generate once, return two copies
     trace = generate_poisson_trace(
         lam=lam, duration_s=duration_s, seed=seed,
-        classes=["light", "heavy"], heavy_frac=heavy_frac
+        classes=["light", "heavy"], heavy_frac=heavy_frac,
+        nm_options_light=nm_options_light,
+        nm_options_heavy=nm_options_heavy
     )
     # Deep copy events for the second trace
     import copy

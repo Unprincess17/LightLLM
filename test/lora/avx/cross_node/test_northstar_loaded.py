@@ -24,6 +24,24 @@ def test_paired_traces_reproducible():
     assert len(t1a.events) == len(t2a.events)
 
 
+def test_paired_traces_nm_assignment():
+    """Heavy events get NM from nm_options_heavy, light from nm_options_light."""
+    trace_a, trace_b = generate_paired_traces(
+        lam=100.0, duration_s=5.0, seed=42,
+        heavy_frac=0.25,
+        nm_options_light=[1],
+        nm_options_heavy=[8]
+    )
+    for event in trace_a.events:
+        if event.job_class == "heavy":
+            assert event.nm == 8
+        else:
+            assert event.nm == 1
+    # Paired traces have same NM values
+    for ea, eb in zip(trace_a.events, trace_b.events):
+        assert ea.nm == eb.nm
+
+
 from bench_northstar_loaded import (
     N2_CONFIG, bracketed_capacity_search, run_load_trial,
     is_feasible, classify_capacity
