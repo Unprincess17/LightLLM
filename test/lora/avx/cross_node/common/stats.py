@@ -127,3 +127,52 @@ def holm_correct(pvalues, alpha=0.05):
         else:
             break
     return rejected
+
+
+def capacity_bootstrap(trial_results, n_resamples=2000, rng=None):
+    """Bootstrap the full adaptive capacity-estimation procedure.
+
+    For each replicate: resample trials at each load, recompute feasibility
+    (majority vote), recompute C_lower (highest feasible) and C_upper
+    (lowest infeasible).
+
+    Args:
+        trial_results: dict mapping load -> list of bool (True=feasible)
+        n_resamples: number of bootstrap replicates
+        rng: numpy random Generator
+
+    Returns: dict with c_lower/c_upper median and CI bounds
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+    loads = sorted(trial_results.keys())
+
+    c_lowers = []
+    c_uppers = []
+    for _ in range(n_resamples):
+        feasible = {}
+        for ld in loads:
+            trials = trial_results[ld]
+            resampled = [trials[i] for i in rng.integers(0, len(trials), size=len(trials))]
+            feasible[ld] = sum(resampled) > len(resampled) / 2
+
+        c_lower = 0
+        c_upper = float("inf")
+        for ld in loads:
+            if feasible[ld]:
+                c_lower = ld
+            else:
+                c_upper = ld
+                break
+
+        c_lowers.append(c_lower)
+        c_uppers.append(c_upper if c_upper != float("inf") else max(loads) * 2)
+
+    return {
+        "c_lower_median": float(np.median(c_lowers)),
+        "c_lower_ci_lo": float(np.percentile(c_lowers, 2.5)),
+        "c_lower_ci_hi": float(np.percentile(c_lowers, 97.5)),
+        "c_upper_median": float(np.median(c_uppers)),
+        "c_upper_ci_lo": float(np.percentile(c_uppers, 2.5)),
+        "c_upper_ci_hi": float(np.percentile(c_uppers, 97.5)),
+    }

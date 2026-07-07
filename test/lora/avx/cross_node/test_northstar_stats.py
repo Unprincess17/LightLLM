@@ -1,6 +1,6 @@
 """Tests for north-star statistical methods."""
 import numpy as np
-from common.stats import classify_pair, holm_correct
+from common.stats import classify_pair, holm_correct, capacity_bootstrap
 
 
 def test_classify_pair_a_wins():
@@ -45,3 +45,19 @@ def test_holm_correct_none_pass():
     pvalues = [0.1, 0.2, 0.3]
     rejected = holm_correct(pvalues, alpha=0.05)
     assert not any(rejected)
+
+
+def test_capacity_bootstrap_basic():
+    """Capacity bootstrap replays the full adaptive search per replicate."""
+    rng = np.random.default_rng(42)
+    trial_results = {
+        100: [True]*5,
+        200: [True]*5,
+        300: [True]*4 + [False],
+        400: [False]*5,
+    }
+    brackets = capacity_bootstrap(trial_results, n_resamples=500, rng=rng)
+    assert brackets["c_lower_median"] >= 100
+    assert brackets["c_upper_median"] <= 500
+    assert "c_lower_ci_lo" in brackets
+    assert "c_upper_ci_hi" in brackets
