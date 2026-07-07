@@ -2,8 +2,11 @@
 
 Primary endpoint: paired difference in trial-level median L_recovery.
 Three-way classification per cell: A_wins / B_wins / equivalent / unresolved.
+Holm-Bonferroni step-down correction applied across the full family of
+comparisons (alpha = 0.05).
 """
 import csv
+import math
 import os
 import statistics
 from collections import defaultdict
@@ -44,6 +47,25 @@ def classify_winners(diff_point, ci_lo, ci_hi, delta):
     return classify_pair(diff_point, ci_lo, ci_hi, delta)
 
 
+def _paired_pvalue(trials_a, trials_b):
+    """Paired t-test p-value for the family of comparisons.
+
+    Uses scipy.stats.ttest_rel on trial medians.  Falls back to a CI-based
+    heuristic when scipy is unavailable or returns nan (degenerate
+    zero-variance input): p = 0.0 if the CI excludes zero, else 1.0.
+    """
+    try:
+        from scipy import stats as sp_stats
+        result = sp_stats.ttest_rel(trials_a, trials_b)
+        p = result.pvalue if hasattr(result, "pvalue") else result[1]
+        if math.isnan(p):
+            raise ValueError("nan p-value")
+        return float(p)
+    except Exception:
+        ci_lo, ci_hi = paired_diff_ci(trials_a, trials_b, confidence=0.95)
+        return 0.0 if (ci_lo > 0 or ci_hi < 0) else 1.0
+
+
 def analyze_n1(csv_path, output_dir):
     """Full N1 analysis: crossover curves + winner grid.
 
@@ -79,7 +101,7 @@ def analyze_n1(csv_path, output_dir):
 
     winner_grid = {}
     all_pvalues = []
-    cell_pair_results = []
+    raw_comparisons = []
 
     for R, NM in cells:
         # Calibration median = oracle's median (for delta computation)
@@ -104,18 +126,47 @@ def analyze_n1(csv_path, output_dir):
             # Paired difference CI
             diff_point = statistics.mean(trials_a) - statistics.mean(trials_b)
             ci_lo, ci_hi = paired_diff_ci(trials_a, trials_b, confidence=0.95)
+            pvalue = _paired_pvalue(trials_a, trials_b)
 
-            classification = classify_winners(diff_point, ci_lo, ci_hi, delta)
-            winner_grid[(R, NM)] = winner_grid.get((R, NM), {})
-
-            cell_pair_results.append({
+            raw_comparisons.append({
                 "R": R, "NM": NM,
                 "path_a": path_a, "path_b": path_b,
                 "diff_us": diff_point,
                 "ci_lo": ci_lo, "ci_hi": ci_hi,
                 "delta": delta,
-                "classification": classification,
+                "pvalue": pvalue,
             })
+            all_pvalues.append(pvalue)
+
+    # Apply Holm-Bonferroni step-down correction across the full family
+    holm_rejected = holm_correct(all_pvalues, alpha=0.05) if all_pvalues else []
+
+    cell_pair_results = []
+    for i, raw in enumerate(raw_comparisons):
+        rejected = holm_rejected[i] if i < len(holm_rejected) else False
+        if rejected:
+            classification = classify_winners(
+                raw["diff_us"], raw["ci_lo"], raw["ci_hi"], raw["delta"]
+            )
+        else:
+            # Holm did not reject — cannot claim A_wins or B_wins.
+            # Downgrade to "equivalent" if CI lies within [-delta, +delta],
+            # otherwise "unresolved".
+            if raw["ci_lo"] >= -raw["delta"] and raw["ci_hi"] <= raw["delta"]:
+                classification = "equivalent"
+            else:
+                classification = "unresolved"
+
+        cell_pair_results.append({
+            "R": raw["R"], "NM": raw["NM"],
+            "path_a": raw["path_a"], "path_b": raw["path_b"],
+            "diff_us": raw["diff_us"],
+            "ci_lo": raw["ci_lo"], "ci_hi": raw["ci_hi"],
+            "delta": raw["delta"],
+            "pvalue": raw["pvalue"],
+            "holm_rejected": rejected,
+            "classification": classification,
+        })
 
     # Write winner grid CSV
     os.makedirs(output_dir, exist_ok=True)
@@ -123,7 +174,8 @@ def analyze_n1(csv_path, output_dir):
     with open(grid_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["R", "NM", "path_a", "path_b",
                                                 "diff_us", "ci_lo", "ci_hi",
-                                                "delta", "classification"])
+                                                "delta", "pvalue",
+                                                "holm_rejected", "classification"])
         writer.writeheader()
         writer.writerows(cell_pair_results)
     print(f"Winner grid written to {grid_path}")

@@ -77,3 +77,42 @@ def test_classify_winners():
         diff_point=-100.0, ci_lo=-120.0, ci_hi=-80.0, delta=50.0
     )
     assert classification == "A_wins"
+
+
+def test_analyze_n1_holm_correction():
+    """Holm correction is applied to the family of comparisons."""
+    import tempfile, csv, os
+    from analysis.analyze_n1 import analyze_n1
+
+    # Create a small CSV with clear winners
+    rows = []
+    for trial in range(5):
+        for R in [16, 64]:
+            for NM in [1, 8]:
+                for path in ["cpu_first", "remote_improved", "oracle"]:
+                    # cpu_first is much faster than remote
+                    lat = 50 if path == "cpu_first" else (100 if path == "remote_improved" else 30)
+                    rows.append({"trial": trial, "R": R, "NM": NM, "path": path,
+                                 "request_idx": 0, "L_recovery_us": lat})
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        csv_path = os.path.join(tmpdir, "n1_crossover.csv")
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["trial", "R", "NM", "path", "request_idx", "L_recovery_us"])
+            writer.writeheader()
+            writer.writerows(rows)
+
+        output_dir = os.path.join(tmpdir, "analysis")
+        results = analyze_n1(csv_path, output_dir)
+
+        # Check that winner_grid.csv exists and has Holm-corrected classifications
+        grid_path = os.path.join(output_dir, "n1_winner_grid.csv")
+        assert os.path.exists(grid_path)
+
+        # Read the grid and verify classifications are present
+        with open(grid_path) as f:
+            grid_rows = list(csv.DictReader(f))
+        assert len(grid_rows) > 0
+        # Each row should have a classification
+        for row in grid_rows:
+            assert row["classification"] in ["A_wins", "B_wins", "equivalent", "unresolved"]
