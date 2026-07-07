@@ -68,6 +68,36 @@ def test_classify_capacity():
     assert classify_capacity(c_lower=100, c_upper=200) == "continue"
 
 
+def test_run_load_trial_open_loop():
+    """Open-loop trial dispatches at scheduled times, not synchronously.
+
+    Under overload (lam >> service rate) with a short drain timeout,
+    not all requests complete -- proving arrivals are dispatched
+    independently of completions (open-loop, not closed-loop).
+    """
+    from bench_northstar_loaded import run_load_trial
+
+    # Basic open-loop run: low load, all requests complete
+    result = run_load_trial(
+        "cpu_first", R=64, NM=1, lam=100.0, duration_s=0.5, seed=42,
+        heavy_frac=0.0, H=2048, I=2048,
+    )
+    assert result["generated"] > 0
+    assert result["completed"] > 0
+    assert len(result["latencies"]) > 0
+
+    # Overloaded: high arrival rate, short drain
+    # Not all requests should complete
+    result_overload = run_load_trial(
+        "cpu_first", R=64, NM=1, lam=100000.0, duration_s=0.1, seed=42,
+        heavy_frac=0.0, H=2048, I=2048,
+        drain_timeout_s=0.1,
+    )
+    assert result_overload["generated"] > 0
+    # Open-loop: completed < generated under overload
+    assert result_overload["completed"] < result_overload["generated"]
+
+
 from analysis.analyze_n2 import compute_capacity_brackets, capacity_winner
 
 def test_compute_capacity_brackets():

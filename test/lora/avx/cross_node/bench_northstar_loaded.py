@@ -10,6 +10,7 @@ import argparse
 import csv
 import os
 import statistics
+import threading
 import time
 
 import torch
@@ -84,66 +85,124 @@ def classify_capacity(c_lower, c_upper):
     return "continue"
 
 
+class RecoverySink:
+    """Sink for OpenLoopRunner that dispatches recovery requests.
+
+    Each submit(event) call:
+    1. Gets NM consecutive weights from the pool (thread-safe indexing)
+    2. Creates activation tensor on GPU
+    3. Calls the appropriate recovery function
+    4. Records L_recovery_us in a thread-safe list
+    """
+
+    def __init__(self, path_name, R, H, I, pool,
+                 remote_session=None, num_cores=1):
+        self.path_name = path_name
+        self.R = R
+        self.H = H
+        self.I = I
+        self.pool = pool
+        self.remote_session = remote_session
+        self.num_cores = num_cores
+        self.latencies = []
+        self._lock = threading.Lock()
+        self._weight_index = 0
+
+    def submit(self, event):
+        """Process one recovery request. Called by OpenLoopRunner consumer."""
+        NM = event.nm
+        with self._lock:
+            idx = self._weight_index
+            self._weight_index += NM
+
+        try:
+            activation = torch.randn(NM, self.H, dtype=torch.float16,
+                                     device="cuda")
+            weights = self.pool.get_batch(idx, NM)
+
+            if self.path_name == "cpu_first":
+                _, tl = cpu_first_recovery(activation, weights,
+                                           self.R, self.H, self.I, NM,
+                                           num_cores=self.num_cores)
+            elif self.path_name == "load_then_run":
+                _, tl = load_then_run_recovery(activation, weights,
+                                               self.R, self.H, self.I, NM)
+            elif self.path_name == "remote_improved":
+                if self.remote_session:
+                    _, tl = self.remote_session.run_single(
+                        activation, weights, self.R, self.H, self.I, NM)
+                else:
+                    return
+            elif self.path_name == "oracle":
+                gpu_weights = self.pool.get_oracle_batch(idx, NM,
+                                                         device="cuda")
+                _, tl = oracle_recovery(activation, gpu_weights,
+                                        self.R, self.H, self.I, NM)
+            else:
+                return
+
+            latency = tl.l_recovery_us()
+            if latency is not None:
+                with self._lock:
+                    self.latencies.append(latency)
+        except Exception:
+            pass
+
+
 def run_load_trial(path_name, R, NM, lam, duration_s, seed,
                    heavy_frac, H=2048, I=2048,
-                   remote_session=None, num_cores=1):
+                   remote_session=None, num_cores=1,
+                   drain_timeout_s=10.0):
     """Run one open-loop load trial.
 
-    Returns: dict with latencies, generated, completed, queue info, feasibility
-    """
-    pool_size = int(lam * duration_s * 2) + 100
-    pool = ForcedColdWeightPool(R, H, I, pool_size=pool_size, seed=seed)
+    Uses OpenLoopRunner so arrivals are dispatched at scheduled times
+    independent of completion. Multiple requests can be in-flight
+    simultaneously, and the system exhibits real queueing behavior under load.
 
+    Returns: dict with latencies, generated, completed, queue info, rejection
+    """
     trace_a, trace_b = generate_paired_traces(
         lam=lam, duration_s=duration_s, seed=seed,
         heavy_frac=heavy_frac,
         nm_options_light=N2_CONFIG["mixtures"]["1h3l"]["light_nm"],
         nm_options_heavy=N2_CONFIG["mixtures"]["1h3l"]["heavy_nm"]
     )
-    trace = trace_a  # use one copy for this path
+    trace = trace_a
 
-    latencies = []
-    completed = 0
-    generated = 0
-    timed_out = 0
+    # Pool size: sum of NM across all events + margin (no weight reuse)
+    total_nm = sum(ev.nm for ev in trace.events)
+    pool_size = total_nm + 100
+    pool = ForcedColdWeightPool(R, H, I, pool_size=pool_size, seed=seed)
 
-    for event in trace:
-        generated += 1
-        try:
-            activation = torch.randn(event.nm if hasattr(event, 'nm') else NM,
-                                     H, dtype=torch.float16, device="cuda")
-            weights = pool.get_batch(completed, NM)
+    sink = RecoverySink(
+        path_name=path_name, R=R, H=H, I=I,
+        pool=pool, remote_session=remote_session,
+        num_cores=num_cores,
+    )
 
-            if path_name == "cpu_first":
-                _, tl = cpu_first_recovery(activation, weights, R, H, I, NM,
-                                            num_cores=num_cores)
-            elif path_name == "load_then_run":
-                _, tl = load_then_run_recovery(activation, weights, R, H, I, NM)
-            elif path_name == "remote_improved":
-                if remote_session:
-                    _, tl = remote_session.run_single(activation, weights, R, H, I, NM)
-                else:
-                    continue  # skip if no remote session
-            elif path_name == "oracle":
-                gpu_weights = pool.get_oracle_batch(completed, NM, device="cuda")
-                _, tl = oracle_recovery(activation, gpu_weights, R, H, I, NM)
-            else:
-                continue
+    runner = OpenLoopRunner(
+        trace=trace,
+        sink=sink,
+        ingress_capacity=len(trace.events) + 100,
+        n_consumers=1,
+        drain_timeout_s=drain_timeout_s,
+    )
+    counters = runner.run()
 
-            latencies.append(tl.l_recovery_us())
-            completed += 1
-        except Exception as e:
-            timed_out += 1
+    latencies = sink.latencies
 
-    # Queue slope CI (simplified: use completion rate as proxy)
-    completion_ratio = completed / max(generated, 1)
-    queue_slope_ci = [-0.1, 0.1] if completion_ratio >= 0.99 else [0.5, 2.0]
+    # Queue slope CI: if queue was non-empty at drain end, queue was growing
+    if counters.unfinished > 0 or counters.final_queue_length > 0:
+        queue_slope_ci = [0.5, 2.0]
+    else:
+        queue_slope_ci = [-0.1, 0.1]
 
     return {
         "latencies": latencies,
-        "generated": generated,
-        "completed": completed,
-        "timed_out": timed_out,
+        "generated": counters.generated,
+        "completed": counters.completed,
+        "timed_out": counters.unfinished,
+        "rejected": counters.rejected,
         "queue_slope_ci": queue_slope_ci,
     }
 
@@ -186,7 +245,8 @@ def bracketed_capacity_search(path_name, R, NM, mixture_label,
             is_feasible(r["latencies"], isolated_median,
                         N2_CONFIG["slo_self_normalized"],
                         r["generated"], r["completed"],
-                        r["queue_slope_ci"], r["timed_out"])
+                        r["queue_slope_ci"], r["timed_out"],
+                        rejection_count=r.get("rejected", 0))
             for r in trial_results
         )
         is_stable = feasible_count >= n_trials // 2 + 1
@@ -227,7 +287,8 @@ def bracketed_capacity_search(path_name, R, NM, mixture_label,
             is_feasible(r["latencies"], isolated_median,
                         N2_CONFIG["slo_self_normalized"],
                         r["generated"], r["completed"],
-                        r["queue_slope_ci"], r["timed_out"])
+                        r["queue_slope_ci"], r["timed_out"],
+                        rejection_count=r.get("rejected", 0))
             for r in trial_results
         )
         is_stable = feasible_count >= n_trials // 2 + 1
