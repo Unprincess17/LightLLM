@@ -132,3 +132,34 @@ class TestForcedColdPool:
         # Requesting index 10 should raise (exceeds pool)
         with pytest.raises(IndexError):
             pool.get(10)
+
+
+from common.path_randomization import randomize_path_order, paired_block_order
+
+class TestPathRandomization:
+
+    def test_randomize_path_order(self):
+        """Path order is randomized within a paired block."""
+        paths = ["cpu_first", "load_then_run", "remote_improved", "oracle"]
+        order1 = randomize_path_order(paths, seed=42)
+        order2 = randomize_path_order(paths, seed=42)
+        order3 = randomize_path_order(paths, seed=43)
+        # Same seed = same order (reproducible)
+        assert order1 == order2
+        # Different seed = likely different order
+        assert order1 != order3 or len(paths) <= 2
+        # All paths present
+        assert set(order1) == set(paths)
+
+    def test_paired_block_order(self):
+        """Paired block: same path order across all cells in one trial."""
+        cells = [(16, 1), (16, 8), (64, 1), (64, 8), (256, 8)]
+        paths = ["cpu_first", "load_then_run", "remote_improved", "oracle"]
+        block = paired_block_order(cells, paths, seed=42)
+        # All cells get the same path order within a block
+        first_order = block[cells[0]]
+        for cell in cells:
+            assert block[cell] == first_order
+        # All paths present
+        assert set(first_order) == set(paths)
+
