@@ -99,3 +99,36 @@ class TestOracleRecovery:
         assert result.shape == (NM, I)
         assert timeline.get("T0") is not None
         assert timeline.get("T1") is not None
+
+
+from common.forced_cold import ForcedColdWeightPool
+
+class TestForcedColdPool:
+
+    def test_no_reuse_within_window(self):
+        """Each request gets a distinct weight pair; no reuse until pool exhausted."""
+        pool = ForcedColdWeightPool(R=64, H=2048, I=2048, pool_size=100,
+                                    dtype=torch.bfloat16, device="cpu", seed=42)
+        w0 = pool.get(0)
+        w1 = pool.get(1)
+        assert not torch.equal(w0["A"], w1["A"])
+        assert not torch.equal(w0["B"], w1["B"])
+
+    def test_oracle_exempt(self):
+        """Oracle gets weights on GPU (warm); pool still provides cold weights for others."""
+        pool = ForcedColdWeightPool(R=64, H=2048, I=2048, pool_size=50,
+                                    dtype=torch.bfloat16, device="cpu", seed=42)
+        # Oracle path: weights on GPU (warm) -- not from the cold pool
+        oracle_weights = pool.get_oracle_weights(0, device="cuda")
+        assert oracle_weights["A"].device.type == "cuda"
+        # Cold path: weights on CPU (cold on GPU)
+        cold_weights = pool.get(0)
+        assert cold_weights["A"].device.type == "cpu"
+
+    def test_pool_size_exceeds_measurement_window(self):
+        """Pool must be large enough that no weight is reused in the window."""
+        pool = ForcedColdWeightPool(R=64, H=2048, I=2048, pool_size=10,
+                                    dtype=torch.bfloat16, device="cpu", seed=42)
+        # Requesting index 10 should raise (exceeds pool)
+        with pytest.raises(IndexError):
+            pool.get(10)
