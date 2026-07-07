@@ -89,11 +89,14 @@ def cpu_first_recovery(activation_gpu, weights_cpu, R, H, I, NM,
     _record_event(consumer_stream, tl, "cf3")
     if _HAS_AVX_KERNEL:
         ensure_kernel_loaded()
-        # batch_lora_avx expects [batch, hidden] x [rank, hidden] x [rank, hidden_out]
-        # Process each miss separately since each has distinct A_i, B_i
         result_cpu = torch.empty(NM, I, dtype=torch.bfloat16, device="cpu")
+
+        # Sequential per-miss loop — each batch_lora_avx call uses OpenMP
+        # internally (get_optimal_threads scales with H, R). ThreadPoolExecutor
+        # across misses is counterproductive: per-miss GEMMs are too small
+        # for thread-spawn overhead. Multi-core benefit comes from N2's
+        # concurrent requests (OpenLoopRunner's n_consumers), not per-request.
         for i in range(NM):
-            # x_i = [1, H], A_i = [R, H], B_i = [R, I]
             x_i = activation_cpu[i:i+1, :]  # [1, H]
             A_i = weights_cpu["A"][i]        # [R, H]
             B_i = weights_cpu["B"][i]        # [R, I]
