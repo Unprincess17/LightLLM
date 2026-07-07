@@ -88,3 +88,21 @@ def block_bootstrap_ci(samples: Sequence[float], statistic: Callable = np.mean,
     alpha = 0.025  # 95% CI
     return (float(np.percentile(boot_vals, 100 * alpha)),
             float(np.percentile(boot_vals, 100 * (1 - alpha))))
+
+
+def classify_pair(diff_point, ci_lo, ci_hi, delta):
+    """Classify a paired comparison using simultaneous CI.
+
+    Mutually exclusive categories:
+      A_wins:      CI lies entirely below -delta
+      B_wins:      CI lies entirely above +delta
+      equivalent:  CI lies entirely within [-delta, +delta]
+      unresolved:  all other cases
+    """
+    if ci_hi < -delta:
+        return "A_wins"
+    if ci_lo > delta:
+        return "B_wins"
+    if ci_lo >= -delta and ci_hi <= delta:
+        return "equivalent"
+    return "unresolved"
