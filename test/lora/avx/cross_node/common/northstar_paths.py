@@ -81,11 +81,12 @@ def cpu_first_recovery(activation_gpu, weights_cpu, R, H, I, NM,
     # cf1: D2H enqueue on copy stream
     with torch.cuda.stream(copy_stream):
         activation_cpu = activation_gpu.cpu().to(torch.bfloat16)
-    _sync_record_event(copy_stream, tl, "cf1")
+    _record_event(consumer_stream, tl, "cf1")
     # cf2: D2H observed complete
     _sync_record_event(copy_stream, tl, "cf2")
 
     # cf3: AVX compute start
+    _record_event(consumer_stream, tl, "cf3")
     if _HAS_AVX_KERNEL:
         ensure_kernel_loaded()
         # batch_lora_avx expects [batch, hidden] x [rank, hidden] x [rank, hidden_out]
@@ -111,8 +112,9 @@ def cpu_first_recovery(activation_gpu, weights_cpu, R, H, I, NM,
     _record_event(consumer_stream, tl, "cf4")  # AVX compute complete
 
     # cf5: H2D enqueue
-    result_gpu = result_cpu.to(device="cuda", dtype=torch.float16, non_blocking=True)
-    _sync_record_event(copy_stream, tl, "cf5")
+    with torch.cuda.stream(copy_stream):
+        result_gpu = result_cpu.to(device="cuda", dtype=torch.float16, non_blocking=True)
+    _record_event(consumer_stream, tl, "cf5")
     # cf6: H2D observed complete
     _sync_record_event(copy_stream, tl, "cf6")
 
@@ -153,7 +155,7 @@ def load_then_run_recovery(activation_gpu, weights_cpu, R, H, I, NM,
     with torch.cuda.stream(copy_stream):
         A_gpu = weights_cpu["A"].to("cuda", non_blocking=True)  # [NM,R,H] BF16
         B_gpu = weights_cpu["B"].to("cuda", non_blocking=True)  # [NM,R,I] BF16
-    _sync_record_event(copy_stream, tl, "lt0")
+    _record_event(consumer_stream, tl, "lt0")
     # lt1: H2D complete
     _sync_record_event(copy_stream, tl, "lt1")
 
@@ -169,7 +171,7 @@ def load_then_run_recovery(activation_gpu, weights_cpu, R, H, I, NM,
         z = torch.bmm(x.unsqueeze(1), A_f32.transpose(-1, -2))  # [NM, 1, R]
         y = torch.bmm(z, B_f32)  # [NM, 1, I]
         result_gpu = y.squeeze(1).to(torch.float16)  # [NM, I]
-    _sync_record_event(compute_stream, tl, "lt2")
+    _record_event(consumer_stream, tl, "lt2")
     # lt3: GPU compute complete
     _sync_record_event(compute_stream, tl, "lt3")
 
