@@ -181,4 +181,6 @@ class NorthstarTimeline:
         lr = self.l_recovery_us()
         if gap is None or lr is None:
             return False
+        if lr == 0:
+            return False
         return gap > abs_threshold and (gap / lr) > frac_threshold

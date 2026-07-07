@@ -100,3 +100,47 @@ def test_northstar_timeline_lt_stages():
     assert tl.l_recovery_us() == 110.0
     assert tl.stage_interval("lt0", "lt1") == 45.0   # H2D
     assert tl.stage_interval("lt1", "lt3") == 50.0   # GPU compute
+
+def test_northstar_timeline_instrumentation_gap():
+    """instrumentation_gap = L_recovery - sum(stage_intervals)."""
+    tl = NorthstarTimeline()
+    tl.set("T0", 100.0)
+    tl.set("cf0", 110.0)
+    tl.set("cf2", 120.0)
+    tl.set("cf4", 180.0)
+    tl.set("cf6", 230.0)
+    tl.set("cf7", 240.0)
+    tl.set("T1", 240.0)
+    # L_recovery = 140, stages: cf0-cf2=10, cf2-cf4=60, cf4-cf6=50 = 120
+    # gap = 140 - 120 = 20
+    gap = tl.instrumentation_gap([10.0, 60.0, 50.0])
+    assert gap == 20.0
+
+def test_northstar_timeline_gap_none_when_missing():
+    """instrumentation_gap returns None if T0 or T1 absent."""
+    tl = NorthstarTimeline()
+    tl.set("cf0", 110.0)
+    assert tl.instrumentation_gap([10.0]) is None
+
+def test_should_flag_gap_true():
+    """Gap flagged when > 50us AND > 5% of L_recovery."""
+    tl = NorthstarTimeline()
+    tl.set("T0", 0.0)
+    tl.set("T1", 100.0)  # L_recovery = 100
+    # stages sum to 10, gap = 90 (> 50us and > 5%)
+    assert tl.should_flag_gap([10.0]) == True
+
+def test_should_flag_gap_false_small_gap():
+    """Gap not flagged when < 50us."""
+    tl = NorthstarTimeline()
+    tl.set("T0", 0.0)
+    tl.set("T1", 100.0)
+    # stages sum to 95, gap = 5 (< 50us)
+    assert tl.should_flag_gap([95.0]) == False
+
+def test_should_flag_gap_zero_recovery():
+    """No crash when L_recovery = 0."""
+    tl = NorthstarTimeline()
+    tl.set("T0", 100.0)
+    tl.set("T1", 100.0)  # L_recovery = 0
+    assert tl.should_flag_gap([0.0]) == False
