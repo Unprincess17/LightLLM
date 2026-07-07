@@ -150,3 +150,33 @@ class OpenLoopRunner:
             self.sink.submit(ev)
             with self._lock:
                 self.counters.completed += 1
+
+
+def generate_paired_traces(lam, duration_s, seed, heavy_frac,
+                           nm_options_light, nm_options_heavy):
+    """Generate two identical traces for paired comparison across paths.
+
+    Both traces have the same arrival times, job classes, and NM assignments.
+    Each path receives the same exogenous workload; only the recovery
+    mechanism differs.
+
+    Args:
+        lam: arrival rate (requests/s)
+        duration_s: trace duration
+        seed: random seed (same seed = same trace)
+        heavy_frac: fraction of heavy requests
+        nm_options_light: NM values for light requests
+        nm_options_heavy: NM values for heavy requests
+
+    Returns: (trace_a, trace_b) — identical Trace objects
+    """
+    # Generate once, return two copies
+    trace = generate_poisson_trace(
+        lam=lam, duration_s=duration_s, seed=seed,
+        classes=["light", "heavy"], heavy_frac=heavy_frac
+    )
+    # Deep copy events for the second trace
+    import copy
+    trace_a = trace
+    trace_b = copy.deepcopy(trace)
+    return trace_a, trace_b
