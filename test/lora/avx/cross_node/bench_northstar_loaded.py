@@ -241,19 +241,21 @@ def bracketed_capacity_search(path_name, R, NM, mixture_label,
         # Check feasibility across trials
         all_latencies = [l for r in trial_results for l in r["latencies"]]
         isolated_median = statistics.median(all_latencies) if all_latencies else 1000
-        feasible_count = sum(
+        trial_feasibilities = [
             is_feasible(r["latencies"], isolated_median,
                         N2_CONFIG["slo_self_normalized"],
                         r["generated"], r["completed"],
                         r["queue_slope_ci"], r["timed_out"],
                         rejection_count=r.get("rejected", 0))
             for r in trial_results
-        )
+        ]
+        feasible_count = sum(trial_feasibilities)
         is_stable = feasible_count >= n_trials // 2 + 1
 
         loads_tested[lam] = {
             "feasible": is_stable,
             "trial_results": trial_results,
+            "trial_feasibilities": trial_feasibilities,
         }
 
         if is_stable:
@@ -283,17 +285,22 @@ def bracketed_capacity_search(path_name, R, NM, mixture_label,
 
         all_latencies = [l for r in trial_results for l in r["latencies"]]
         isolated_median = statistics.median(all_latencies) if all_latencies else 1000
-        feasible_count = sum(
+        trial_feasibilities = [
             is_feasible(r["latencies"], isolated_median,
                         N2_CONFIG["slo_self_normalized"],
                         r["generated"], r["completed"],
                         r["queue_slope_ci"], r["timed_out"],
                         rejection_count=r.get("rejected", 0))
             for r in trial_results
-        )
+        ]
+        feasible_count = sum(trial_feasibilities)
         is_stable = feasible_count >= n_trials // 2 + 1
 
-        loads_tested[lam] = {"feasible": is_stable, "trial_results": trial_results}
+        loads_tested[lam] = {
+            "feasible": is_stable,
+            "trial_results": trial_results,
+            "trial_feasibilities": trial_feasibilities,
+        }
 
         if is_stable:
             c_lower = lam
@@ -326,6 +333,7 @@ def run_n2(output_dir, remote_server_host=None):
 
     try:
         results = []
+        raw_trials = []
         for R, NM in anchors:
             for path_name in N2_PATHS:
                 for mixture in ["1h3l"]:  # primary mixture
@@ -342,6 +350,19 @@ def run_n2(output_dir, remote_server_host=None):
                         "c_upper": cap["c_upper"],
                     })
                     print(f"    C=[{cap['c_lower']:.0f}, {cap['c_upper']:.0f}]")
+
+                    # Collect raw trial feasibilities for bootstrap
+                    for load, info in cap["loads_tested"].items():
+                        feasibilities = info.get("trial_feasibilities", [])
+                        for trial_idx, feasible in enumerate(feasibilities):
+                            raw_trials.append({
+                                "R": R, "NM": NM,
+                                "path": path_name,
+                                "mixture": mixture,
+                                "load": load,
+                                "trial": trial_idx,
+                                "feasible": feasible,
+                            })
     finally:
         if remote_session:
             remote_session.__exit__(None, None, None)
@@ -354,6 +375,16 @@ def run_n2(output_dir, remote_server_host=None):
         writer.writeheader()
         writer.writerows(results)
     print(f"Results written to {csv_path}")
+
+    # Write raw trial results for bootstrap analysis
+    raw_path = os.path.join(output_dir, "n2_raw_trials.csv")
+    with open(raw_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["R", "NM", "path", "mixture",
+                                                "load", "trial", "feasible"])
+        writer.writeheader()
+        writer.writerows(raw_trials)
+    print(f"Raw trials written to {raw_path}")
+
     return results
 
 

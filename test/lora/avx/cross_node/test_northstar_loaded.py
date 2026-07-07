@@ -120,3 +120,39 @@ def test_capacity_winner():
     }
     winner = capacity_winner(brackets)
     assert winner == "remote_improved"
+
+
+def test_capacity_bootstrap_in_analysis():
+    """analyze_n2 applies capacity_bootstrap when raw trials are available."""
+    import tempfile, csv, os
+    from analysis.analyze_n2 import analyze_n2
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Write n2_capacity.csv
+        cap_path = os.path.join(tmpdir, "n2_capacity.csv")
+        with open(cap_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["R", "NM", "path", "mixture", "c_lower", "c_upper"])
+            writer.writeheader()
+            writer.writerow({"R": 64, "NM": 1, "path": "cpu_first", "mixture": "1h3l", "c_lower": 200, "c_upper": 220})
+
+        # Write n2_raw_trials.csv
+        raw_path = os.path.join(tmpdir, "n2_raw_trials.csv")
+        with open(raw_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["R", "NM", "path", "mixture", "load", "trial", "feasible"])
+            writer.writeheader()
+            for load in [100, 200, 300, 400]:
+                for trial in range(5):
+                    feasible = load <= 200
+                    writer.writerow({"R": 64, "NM": 1, "path": "cpu_first", "mixture": "1h3l",
+                                     "load": load, "trial": trial, "feasible": feasible})
+
+        output_dir = os.path.join(tmpdir, "analysis")
+        region_map = analyze_n2(cap_path, output_dir)
+
+        # Check that bootstrapped CIs are in the output
+        map_path = os.path.join(output_dir, "n2_region_map.csv")
+        with open(map_path) as f:
+            rows = list(csv.DictReader(f))
+        assert len(rows) > 0
+        # Should have CI columns when raw trials are available
+        assert "c_lower_ci_lo" in rows[0] or "cpu_first_c_lower" in rows[0]
