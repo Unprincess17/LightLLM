@@ -43,3 +43,37 @@ def test_run_single_request_local():
     )
     assert timeline.l_recovery_us() > 0
     assert result.shape == (NM, I)
+
+
+from analysis.analyze_n1 import (
+    compute_trial_medians, classify_winners, tost_margin
+)
+
+def test_compute_trial_medians():
+    """Trial medians computed per (R, NM, path)."""
+    results = [
+        {"trial": 0, "R": 64, "NM": 1, "path": "cpu_first", "L_recovery_us": 100},
+        {"trial": 0, "R": 64, "NM": 1, "path": "cpu_first", "L_recovery_us": 120},
+        {"trial": 1, "R": 64, "NM": 1, "path": "cpu_first", "L_recovery_us": 110},
+        {"trial": 0, "R": 64, "NM": 1, "path": "oracle", "L_recovery_us": 50},
+        {"trial": 0, "R": 64, "NM": 1, "path": "oracle", "L_recovery_us": 55},
+    ]
+    medians = compute_trial_medians(results)
+    assert ("cpu_first", 64, 1) in medians
+    assert ("oracle", 64, 1) in medians
+
+def test_tost_margin():
+    """delta = max(50us, 0.10 * calibration_median)."""
+    margin = tost_margin(calibration_median=1000.0)
+    assert margin == 100.0  # 10% of 1000
+    margin_low = tost_margin(calibration_median=200.0)
+    assert margin_low == 50.0  # floor at 50us
+
+def test_classify_winners():
+    """Three-way classification: A_wins / equivalent / unresolved."""
+    # cpu_first median = 100, remote median = 200, diff = -100
+    # CI [-120, -80], delta = 50 -> cpu_first wins
+    classification = classify_winners(
+        diff_point=-100.0, ci_lo=-120.0, ci_hi=-80.0, delta=50.0
+    )
+    assert classification == "A_wins"
