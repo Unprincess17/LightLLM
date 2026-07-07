@@ -48,3 +48,27 @@ def test_classify_capacity():
     """Capacity bracket: C_lower / C_upper <= 1.10 -> stop."""
     assert classify_capacity(c_lower=100, c_upper=105) == "converged"
     assert classify_capacity(c_lower=100, c_upper=200) == "continue"
+
+
+from analysis.analyze_n2 import compute_capacity_brackets, capacity_winner
+
+def test_compute_capacity_brackets():
+    """Capacity brackets computed from N2 results."""
+    results = [
+        {"R": 64, "NM": 1, "path": "cpu_first", "mixture": "1h3l",
+         "c_lower": 100, "c_upper": 110},
+        {"R": 64, "NM": 1, "path": "remote_improved", "mixture": "1h3l",
+         "c_lower": 200, "c_upper": 220},
+    ]
+    brackets = compute_capacity_brackets(results)
+    assert ("cpu_first", 64, 1) in brackets
+    assert ("remote_improved", 64, 1) in brackets
+
+def test_capacity_winner():
+    """Capacity winner = path with highest C_feasible (= c_lower)."""
+    brackets = {
+        "cpu_first": {"c_lower": 100, "c_upper": 110},
+        "remote_improved": {"c_lower": 200, "c_upper": 220},
+    }
+    winner = capacity_winner(brackets)
+    assert winner == "remote_improved"
